@@ -11,6 +11,15 @@ def strip_tags(s):
 files = sorted(glob.glob(os.path.join(HERE, "src", "*.html")))
 content = "\n".join(open(f, encoding="utf-8").read() for f in files)
 
+# Resolve part-anchor aliases: agents used both "part-xvii" and "p6-part-xvii".
+ids = set(re.findall(r'\bid="([^"]+)"', content))
+alias = {}
+for i in ids:
+    m = re.fullmatch(r"p\d+-(part-[a-z]+)", i)
+    if m and m.group(1) not in ids:
+        alias[m.group(1)] = i
+content = re.sub(r'href="#(part-[a-z]+)"', lambda m: f'href="#{alias.get(m.group(1), m.group(1))}"', content)
+
 # Collect parts and chapters in document order.
 pat = re.compile(r'<section\s+class="(part|chapter)"[^>]*\bid="([^"]+)"[^>]*>', re.I)
 items = []
@@ -69,4 +78,7 @@ page = (shell.replace("<!--TOC-->", "\n".join(toc))
              .replace("<!--DATE-->", datetime.date.today().strftime("%B %Y"))
              .replace("<!--STATS-->", stats))
 open(OUT, "w", encoding="utf-8").write(page)
+all_ids = set(re.findall(r'\bid="([^"]+)"', page))
+broken = sorted({h for h in re.findall(r'href="#([^"]+)"', page) if h not in all_ids})
+print(f"broken internal links ({len(broken)}): {broken[:60]}")
 print(f"wrote {OUT}: {len(page)/1e6:.2f} MB, {len(files)} fragments, {len(items)} toc items, {stats}")
