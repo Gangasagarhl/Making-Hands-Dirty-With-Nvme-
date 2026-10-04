@@ -1,0 +1,594 @@
+<p class="lead">This module goes below the "read, write, copy" summary of <a href="ch62.html">Chapter 62</a> to the places where Subsystem Local Memory (SLM) actually bites engineers: byte-granular transfers and what they do to Physical Region Page (PRP) pointers and PCI Express (PCIe) byte enables, consistency between queues, reset behaviour you must look up rather than assume, host-side planning of offsets, contention with the drive's own DRAM users, and a forensic case where the evidence genuinely points two ways.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p><a href="ch62.html">Chapter 62</a> established what SLM is (byte-addressable working memory inside the NVM subsystem, exposed as memory namespaces), how it differs from the Controller Memory Buffer (CMB), Persistent Memory Region (PMR) and Host Memory Buffer (HMB), and which side performs the Direct Memory Access (DMA) for each operation. This module assumes that and deepens four things: the exact Transaction Layer Packets (TLPs) a byte-granular transfer produces, the consistency rules a host must impose, how to plan and reclaim SLM space, and how to test and debug reset and contention behaviour.</p>
+  <aside class="callout prereq"><p>Read <a href="ch62.html">Subsystem Local Memory</a> first. You also need <a href="ch36.html">Physical Region Pages</a> (PRP1 offset rules), <a href="ch11.html">TLP Header Anatomy</a> (Length, First/Last DW Byte Enables), <a href="ch12.html">Posted vs Non-Posted Transactions</a>, <a href="ch52.html">Completion Rules</a> (Read Completion Boundary, RCB) and <a href="ch48.html">NVMe Reset</a>. The program side is in <a href="dd46.html">Computational Programs</a>; next comes <a href="dd48.html">NVMe-MI</a>.</p></aside>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives by level</caption>
+    <thead><tr><th>Level</th><th>Objective</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Describe a memory namespace by NSID, byte offset and length, and say which TLP types an SLM read, an SLM write and an internal copy produce.</td></tr>
+      <tr><td>Intermediate</td><td>Given a host buffer address, length, Max Payload Size (MPS), Max Read Request Size (MRRS) and RCB, derive PRP1/PRP2 and every device-initiated TLP with its DW length and byte enables.</td></tr>
+      <tr><td>Advanced</td><td>Design a host-side SLM offset plan for concurrent jobs, measure fragmentation, and state the consistency rules (read-after-write, write-after-write) the host library must enforce.</td></tr>
+      <tr><td>Senior</td><td>Build a qualification plan with reset, concurrency, contention and boundary axes, with every expected value traceable to SLM 1.3, Base 2.4 or a device-reported limit.</td></tr>
+      <tr><td>Trace analysis</td><td>Recognise an SLM transfer by its byte-granular sizes and partial byte enables, and separate host-transfer phases from silent internal copies.</td></tr>
+      <tr><td>Debugging</td><td>Localise wrong bytes to host buffer handling, device offset handling, ordering, or reset semantics.</td></tr>
+      <tr><td>Validation</td><td>Prove boundary handling (zero length, maximum, maximum + 1, last byte, misalignment) and data integrity across queues and resets.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>A post office has a huge sorting table in the back room. The table is painted with tiny numbered squares, one for every letter-sized spot: square 0, square 1, square 2, all the way to square one million.</p>
+    <p>Customers never walk into the back room. If you want something put on the table, you fill in a ticket: "Put my 600 letters starting at square 4,000." A clerk comes to your counter, collects the letters in bundles, and lays them out. If you want something back, your ticket says "Bring me squares 4,000 to 4,599," and the clerk carries them out in bundles.</p>
+    <p>Sorting workers can also wheel sacks straight in from the warehouse next door and tip them onto the table, without ever passing the counter. At night the table is wiped clean. And if two customers' tickets both say "square 4,000", whoever's clerk gets there last wins — the table does not care who asked first.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <table>
+    <caption>What the sorting table represents, hides and gets wrong</caption>
+    <thead><tr><th>Story element</th><th>Represents</th><th>Hides</th><th>Misleads when</th></tr></thead>
+    <tbody>
+      <tr><td>Numbered squares</td><td>Byte offsets in a memory namespace</td><td>Device-reported granularity and alignment rules may forbid "any square"</td><td>You assume every byte offset is legal</td></tr>
+      <tr><td>Tickets at the counter</td><td>SLM I/O commands (SQEs)</td><td>The ticket also names the host buffer through PRPs or Scatter Gather Lists (SGLs)</td><td>You forget the host side has its own alignment rules</td></tr>
+      <tr><td>Clerk's bundles</td><td>TLPs: MWr for reads to host, MRd/CplD for writes from host</td><td>Bundle size is bounded by MPS/MRRS and 4 KiB address boundaries</td><td>You expect one bundle per ticket</td></tr>
+      <tr><td>Sacks from the warehouse</td><td>Internal NVM → SLM copies</td><td>Copies compete with the drive's own DRAM users</td><td>You assume internal work is free</td></tr>
+      <tr><td>Wiped at night</td><td>Volatility</td><td>Which resets clear SLM is specified (or left implementation-dependent) per reset type</td><td>You assume "wiped" or "kept" for any particular reset</td></tr>
+      <tr><td>"Last clerk wins"</td><td>No ordering between commands</td><td>Even one queue gives no ordering guarantee</td><td>You think tickets at the same window are processed in order</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout breaks"><p>A real table is shared by everyone who can reach the counter. SLM is reachable only by controllers the memory namespace is attached to, and by programs only through memory range sets. The story also hides that the host, not the device, decides which squares each job uses — SLM in this model has no allocator of its own.</p></aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Terms used in this module</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="memory-namespace">Memory namespace</span></td><td>The sorting table</td><td>A namespace of the SLM command set (CSI 03h as libnvme encodes it — confirm in Base 2.4) addressed in bytes</td><td>Referenced by memory range sets; source/target of copies</td><td>It is not a block namespace and has no LBA format</td></tr>
+      <tr><td>Granularity</td><td>Size of a square</td><td>Device-reported unit that offsets and lengths must respect, if any</td><td>Constrains host planning and boundary tests</td><td>Not the same as the host memory page size (CC.MPS)</td></tr>
+      <tr><td>Maximum transfer</td><td>Biggest ticket</td><td>Largest length one SLM command may move, as reported</td><td>May differ from Maximum Data Transfer Size (MDTS)</td><td>Splitting by MDTS alone can fail</td></tr>
+      <tr><td><span class="g" data-term="byte-enable">First/Last DW Byte Enables</span></td><td>Which bytes of the end words count</td><td>4-bit masks in a memory request header selecting valid bytes in the first and last DW</td><td>Needed when a transfer starts or ends mid-DW</td><td>Single-DW requests put all enables in First BE and set Last BE to 0000b</td></tr>
+      <tr><td>PRP1 offset</td><td>Where in the first page data starts</td><td>PRP Entry 1 may point anywhere in a page (DW-aligned); later entries must be page-aligned</td><td>Byte-granular SLM transfers exercise it</td><td>Host libraries that assume page-aligned buffers break</td></tr>
+      <tr><td>4 KiB boundary rule</td><td>Bundles never straddle a fence</td><td>A PCIe memory request must not cross a 4 KiB address boundary</td><td>Adds TLPs for unaligned buffers</td><td>Independent of MPS</td></tr>
+      <tr><td>Read Completion Boundary (RCB)</td><td>Where reply bundles may split</td><td>Partial completions of a read end on RCB-aligned addresses</td><td>Governs CplD splitting for SLM writes</td><td>A device property only in the sense of what it accepts; the completer chooses splits</td></tr>
+      <tr><td>Host offset plan</td><td>Who gets which squares</td><td>The library's assignment of byte ranges to jobs and range sets</td><td>Feeds Memory Range Set Management</td><td>Assuming the device allocates for you</td></tr>
+      <tr><td>Read-after-write hazard</td><td>Reading before the writer finished</td><td>A read command that may execute before an earlier write/copy/program to the same range</td><td>Prevented only by waiting for CQEs</td><td>Same-queue submission order is not execution order</td></tr>
+      <tr><td>Reset axis</td><td>"What survives which reset?"</td><td>Test dimension across Controller Level Reset, Function Level Reset (FLR), NVM Subsystem Reset and power loss</td><td>Expected values come from SLM 1.3 / Base 2.4</td><td>Treating "reset" as one event</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <figure>
+    <pre class="diagram">
+   HOST MEMORY (IOVA)                    PCIe Gen4 x4               NVM SUBSYSTEM
+  +---------------------------+                               +---------------------------------+
+  | SQ1 0x1_2340_0000         |  doorbell MWr32 ------------&gt;  | BAR0 regs / doorbells           |
+  | CQ1 0x1_2341_0000         |  &lt;------------ SQE MRd64 ----  | command processor               |
+  | result buf 0x2_0000_0F82  |  &lt;---- MWr64 (SLM read) -----  | DMA engine -----+               |
+  | input  buf 0x2_0000_0200  |  ---- CplD (SLM write) -----&gt;  |                 v               |
+  | PRP list  0x1_5000_0000   |  &lt;---- MRd64 (SLM write) ----  | memory ns 3 (SLM, DRAM)  &lt;--+   |
+  +---------------------------+                               |   ^ internal copy            |   |
+                                                              | NVM ns 1 (flash)    compute engines|
+                                                              | FTL tables + write buffer (same DRAM)
+                                                              +---------------------------------+</pre>
+    <figcaption>Conceptual SLM data paths on the lab system; memory namespace 3 as in <a href="ch62.html">Chapter 62</a>. Synthetic example for teaching.</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture inventory</caption>
+    <thead><tr><th>Category</th><th>Items</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>SLM commands (NSID, offset, length, data pointer); host data for writes; NVM namespace LBAs for copies</td></tr>
+      <tr><td>Outputs</td><td>Bytes in host buffers (reads); bytes in SLM (writes, copies, programs); CQE status</td></tr>
+      <tr><td>Actors</td><td>Host library (offset planner, dependency tracker); driver; controller command processor; DMA engine; internal copy engine; compute engines; FTL (as a competing DRAM user)</td></tr>
+      <tr><td>State</td><td>SLM contents; host offset plan; attached controllers; outstanding commands per range</td></tr>
+      <tr><td>Memory</td><td>Host buffers and PRP lists; device DRAM or SRAM backing SLM (implementation-dependent)</td></tr>
+      <tr><td>Registers</td><td>None specific to SLM; doorbells (SQ1 tail BAR0 + 0x1008, CQ1 head BAR0 + 0x100C); CC/CSTS for resets</td></tr>
+      <tr><td>Interfaces</td><td>SLM I/O commands; Identify for limits; namespace management/attachment as the device allows</td></tr>
+      <tr><td>Dependencies</td><td>Base 2.4 (CSI, Identify, resets), PCIe Transport 1.4 (PRP/SGL over PCIe), Computational Programs 1.3 (range sets referencing SLM)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>Worked mechanism: the host reads a 601-byte program result from memory namespace 3, offset 0x10_0000, into a host buffer at IOVA 0x2_0000_0F82 — deliberately unaligned, as happens when results land inside a larger application structure.</p>
+  <table>
+    <caption>Step by step</caption>
+    <thead><tr><th>#</th><th>Who acts</th><th>What changes</th><th>Where</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Host library</td><td>Checks the program's CQE was consumed (dependency)</td><td>Host</td><td>Library log</td></tr>
+      <tr><td>2</td><td>Host library</td><td>Builds PRP1 = 0x2_0000_0F82 (offset 0xF82 in its page), PRP2 = 0x2_0000_1000 (next page, aligned)</td><td>SQE in SQ1 slot 0x20</td><td>SQE bytes when fetched</td></tr>
+      <tr><td>3</td><td>Driver</td><td>SQ1 tail = 0x21</td><td>Doorbell BAR0 + 0x1008</td><td>MWr32 from RC</td></tr>
+      <tr><td>4</td><td>Controller</td><td>Fetches SQE</td><td>SQ1 + 0x800</td><td>MRd64 + CplD</td></tr>
+      <tr><td>5</td><td>Controller</td><td>Validates NSID, offset, length against reported limits</td><td>Command processor</td><td>An immediate error CQE if invalid; otherwise nothing</td></tr>
+      <tr><td>6</td><td>DMA engine</td><td>Reads 601 bytes from SLM, writes 126 bytes up to the page end, then 256, then 219</td><td>Host buffer</td><td>Three MWr64 with byte enables</td></tr>
+      <tr><td>7</td><td>Controller</td><td>Posts CQE; sends MSI-X</td><td>CQ1 slot 0x20; LAPIC window</td><td>MWr64 CQE; MWr32 to 0xFEE0_1000</td></tr>
+      <tr><td>8</td><td>Driver</td><td>Consumes CQE; CQ1 head = 0x21</td><td>BAR0 + 0x100C</td><td>MWr32</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <ol class="seq" data-actors="Host library|Driver|Controller|SLM (ns 3)|Host buffer">
+      <li data-note="Host library">program CQE seen: result is final</li>
+      <li data-from="Host library" data-to="Driver">SLM read 601 B @0x10_0000</li>
+      <li data-from="Driver" data-to="Controller" data-t="0 ns">MWr32 SQ1 tail = 0x21</li>
+      <li data-from="Controller" data-to="Driver" class="dashed">MRd64 SQE / CplD</li>
+      <li data-from="Controller" data-to="SLM (ns 3)">read 601 bytes</li>
+      <li data-from="Controller" data-to="Host buffer">MWr64 126 B, FirstBE 1100</li>
+      <li data-from="Controller" data-to="Host buffer">MWr64 256 B (page 2)</li>
+      <li data-from="Controller" data-to="Host buffer">MWr64 219 B, LastBE 0111</li>
+      <li data-from="Controller" data-to="Driver" class="dashed">MWr64 CQE + MSI-X</li>
+    </ol>
+    <figcaption>Byte-granular SLM read into an unaligned host buffer. The split shown is one valid device policy. Synthetic example for teaching.</figcaption>
+  </figure>
+
+  <h3>The central concept on the ladder: a byte-granular transfer</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>The clerk carries 601 letters in three bundles because bundles have a maximum size and never cross a fence.</p></div>
+    <div class="rung" data-rung="B"><p>An SLM command names bytes, not blocks; the host buffer may start anywhere; the device must move exactly those bytes.</p></div>
+    <div class="rung" data-rung="C"><p>The DMA engine segments by MPS (256 bytes) and 4 KiB boundaries, and marks partial DWs with byte enables; for host → SLM it issues reads up to MRRS (512 bytes) and accepts completions split at RCB (64 bytes).</p></div>
+    <div class="rung" data-rung="D"><p>SLM 1.3 defines offset/length semantics and limits; Base 2.4 and PCIe Transport 1.4 define PRP rules (PRP1 may carry an offset; later entries page-aligned); the PCI Express Base Specification defines the 4 KiB rule, MPS, MRRS, RCB and byte enables.</p></div>
+    <div class="rung" data-rung="E"><p>Posted MWr for SLM → host; non-posted MRd answered by CplD for host → SLM; nothing for internal copies; one CQE per command.</p></div>
+    <div class="rung" data-rung="F"><p>Look for data TLPs whose sizes are not multiples of 512 or 4,096 and whose byte enables are not 1111b: the signature of a byte-granular command.</p></div>
+    <div class="rung" data-rung="G"><p>Wrong bytes at the start or end of a buffer point at PRP1 offset or byte-enable handling; wrong bytes in the middle point at offsets or ordering.</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for a byte-granular SLM read</h3>
+  <table>
+    <caption>Sixteen questions</caption>
+    <tbody>
+      <tr><td>1–3. What, why, problem</td><td>A command moving an exact byte range from SLM to host memory; exists so hosts can fetch small results without block rounding.</td></tr>
+      <tr><td>4–5. Before, better</td><td>Block-rounded reads of vendor scratch areas or MMIO from a CMB; now standard, DMA-driven and limit-reported.</td></tr>
+      <tr><td>6–8. Creator, consumer, location</td><td>Host library creates the SQE; controller DMA consumes it; data goes from device DRAM to the host buffer.</td></tr>
+      <tr><td>9. Memory/registers</td><td>SQ/CQ, PRP1/PRP2 or SGL, the host buffer, doorbells.</td></tr>
+      <tr><td>10–11. Before, after</td><td>The producer's completion (copy, program, write); afterwards the host consumes the buffer.</td></tr>
+      <tr><td>12. If wrong</td><td>Error status for bad offsets/lengths; silently wrong bytes for host buffer mistakes or ordering errors.</td></tr>
+      <tr><td>13–14. Analyzer, Linux</td><td>MWr64 TLPs with partial byte enables, then the CQE; Linux shows only the pass-through result on the generic device.</td></tr>
+      <tr><td>15. Validation</td><td>Every alignment of host start (0–3 mod 4, page-straddling), lengths 1, 2, 3, granule ± 1, maximum and maximum + 1.</td></tr>
+      <tr><td>16. Senior suspicion</td><td>Host PRP construction for unaligned buffers and missing dependency waits.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <p>Applicable: <cite class="spec">NVM Express Subsystem Local Memory Command Set Specification, Revision 1.3</cite>; <cite class="spec">NVM Express Base Specification, Revision 2.4</cite>; <cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4</cite>; <cite class="spec">NVM Express Computational Programs Command Set Specification, Revision 1.3</cite>; and for TLP rules, the <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0</cite>.</p>
+  <table>
+    <caption>Behaviour by category</caption>
+    <thead><tr><th>Category</th><th>SLM examples</th></tr></thead>
+    <tbody>
+      <tr><td><span class="badge normative">Normative</span></td><td>SLM command formats, limits reporting and status definitions; PRP rules (PRP1 offset allowed, PRP2 and list entries page-aligned); PCIe's 4 KiB boundary rule, MPS and MRRS limits and byte-enable semantics; no command ordering in NVMe</td></tr>
+      <tr><td><span class="badge informative">Informative</span></td><td>Overview figures and usage examples of computational storage flows</td></tr>
+      <tr><td><span class="badge optional">Optional</span></td><td>Which copy variants a device supports; SGL support for SLM commands; namespace management of memory namespaces</td></tr>
+      <tr><td><span class="badge impl">Implementation-dependent</span></td><td>Physical memory type; capacity; internal bandwidth; how the DMA engine segments within the rules; contention with FTL DRAM use; behaviour of SLM content across resets where the specification leaves it open</td></tr>
+      <tr><td><span class="badge version">Version-dependent</span></td><td>Fields and capabilities that changed between SLM 1.0 and 1.3; 2026 changes listed in the NVM Express Revision Changes document</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout verified"><p>From well-established sources: PCIe requests must not cross a 4 KiB address boundary; memory write payload ≤ MPS; read request size ≤ MRRS; partial read completions end on RCB boundaries; a one-DW request carries its enables in First DW BE with Last DW BE = 0000b. NVMe: PRP1 may contain a page offset; PRP2 and PRP list entries are page-aligned (4 KiB with CC.MPS = 0 on the lab system). libnvme encodes the SLM CSI as 03h.</p></aside>
+  <aside class="callout notsaid">
+    <p>Read from SLM 1.3, not from this page: SLM command names and opcodes; which command dwords carry offset and length, and their units; granularity, alignment and maximum-transfer fields and their Identify locations; whether SGLs are supported for SLM commands; status codes for misaligned or out-of-range accesses; SLM content behaviour on each reset type; whether memory namespaces are created by namespace management.</p>
+    <p>The specification does not say how a device segments a transfer within the PCIe rules, how fast internal copies run, or how SLM traffic is prioritised against normal I/O inside the drive.</p>
+  </aside>
+  <aside class="callout warn"><p>Never assume: that offsets need only DW alignment; that SLM maximum transfer equals MDTS; that commands on one queue execute in order; that SLM is cleared (or preserved) by a given reset; that a byte-exact read cannot touch bytes outside its range in the host buffer — it must not, and byte enables are how a device guarantees that.</p></aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Participation and observability</caption>
+    <thead><tr><th>Hardware</th><th>Must / may</th><th>Observable?</th></tr></thead>
+    <tbody>
+      <tr><td>Root complex and IOMMU</td><td>Must (translate IOVA, serve reads, absorb writes)</td><td>IOMMU faults in host logs if PRPs point at unmapped pages</td></tr>
+      <tr><td>Controller DMA engine</td><td>Must for host transfers</td><td>Yes: TLPs and byte enables</td></tr>
+      <tr><td>SLM backing memory</td><td>Must</td><td>No</td></tr>
+      <tr><td>Internal copy engine / flash back end</td><td>Must for NVM → SLM copies</td><td>No; completion latency only</td></tr>
+      <tr><td>Compute engines</td><td>May (programs touching SLM)</td><td>No</td></tr>
+      <tr><td>FTL and write buffer in the same DRAM</td><td>May compete</td><td>Indirectly: latency of normal I/O changes</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw"><p>Device DRAM bandwidth is shared. A drive with, say, a 32-bit LPDDR4 interface has a few tens of GB/s of raw bandwidth (illustrative) serving the FTL, write buffering, internal copies into SLM, program loads and stores, and host transfers. Heavy SLM use therefore shows up as higher latency on namespace 1 — evidence you can measure from the host without any device telemetry.</p></aside>
+  <p>Internal and unobservable: whether SLM is a fixed DRAM carve-out or dynamically shared; ECC protection of SLM (a reliability question to ask the vendor); whether the copy engine bypasses the FTL cache; and how many copies run in parallel.</p>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>Transactions per SLM operation on NVMe over PCIe</caption>
+    <thead><tr><th>Operation</th><th>Request/response at NVMe level</th><th>Data TLPs</th><th>Ordering point</th></tr></thead>
+    <tbody>
+      <tr><td>SLM → host read</td><td>SQE → CQE</td><td>Device MWr64, ≤ MPS, split at 4 KiB, byte enables at ends</td><td>Posted data writes precede the posted CQE write</td></tr>
+      <tr><td>Host → SLM write</td><td>SQE → CQE</td><td>Device MRd64 ≤ MRRS; host CplD ≤ MPS, split at RCB</td><td>CQE posted after all CplDs consumed and data committed to SLM</td></tr>
+      <tr><td>NVM → SLM copy</td><td>SQE → CQE</td><td>None</td><td>CQE marks the copy complete</td></tr>
+      <tr><td>Error in validation</td><td>SQE → error CQE</td><td>None (a well-behaved device validates before DMA)</td><td>Immediate</td></tr>
+    </tbody>
+  </table>
+  <h3>Consistency rules the host must impose</h3>
+  <ul>
+    <li><strong>Read-after-write:</strong> a read of range R may be submitted only after the CQE of every earlier writer of R (host write, copy, program) has been consumed.</li>
+    <li><strong>Write-after-write:</strong> two writers of overlapping bytes must be serialised by CQE; otherwise the final content is undefined.</li>
+    <li><strong>Write-after-read:</strong> a buffer whose content is still being read out must not be overwritten (by a new copy) until that read's CQE.</li>
+    <li><strong>Same queue is not enough.</strong> NVMe does not execute commands in submission order even on one queue; only completions order work. <span class="badge normative">Normative</span></li>
+  </ul>
+  <p><strong>Errors.</strong> Invalid offset, length, alignment or NSID returns a status in the CQE (generic statuses such as Invalid Field in Command, SCT 0h SC 02h, or SLM-specific values — check SLM 1.3 for which applies). A PCIe-level failure during a host transfer (completion timeout on a CplD, Unsupported Request because a PRP points at unmapped memory and the IOMMU blocks it) surfaces as a data transfer error status and, on the host, as IOMMU or AER log entries.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic examples for teaching on the lab system: SSD 01:00.0 (Requester ID 0x0100), RC = root complex, BAR0 0xFE60_0000, SQ1 0x1_2340_0000, CQ1 0x1_2341_0000, MPS 256, MRRS 512, RCB 64. Memory namespace 3, NVM namespace 1. SLM commands are named, not given opcodes.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace A — normal: 601-byte SLM read into an unaligned buffer">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Len=1 Data=0x00000021</td><td>SQ1 tail = 0x21</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>790</td><td>MRd64</td><td>Req=0x0100 Tag=0x22 Addr=0x1_2340_0800 Len=16</td><td>Fetch SQE slot 0x20</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,410</td><td>CplD</td><td>Cpl=RC Tag=0x22 SC Len=16</td><td>SQE: SLM read, CID 0x0220, NSID 3, offset 0x10_0000, length 601, PRP1 0x2_0000_0F82, PRP2 0x2_0000_1000</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>2,320</td><td>MWr64</td><td>Addr=0x2_0000_0F80 Len=32 FirstBE=1100 LastBE=1111</td><td>126 bytes: from 0xF82 to the end of the first page</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>2,390</td><td>MWr64</td><td>Addr=0x2_0000_1000 Len=64 FirstBE=1111 LastBE=1111</td><td>256 bytes (MPS)</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>2,450</td><td>MWr64</td><td>Addr=0x2_0000_1100 Len=55 FirstBE=1111 LastBE=0111</td><td>219 bytes; last DW carries 3 valid bytes</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>2,560</td><td>MWr64</td><td>Addr=0x1_2341_0200 Len=4</td><td>CQE slot 0x20: CID 0x0220 Success</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>2,620</td><td>MWr32</td><td>Addr=0xFEE0_1000 Len=1 Data=0x41</td><td>MSI-X vector 1</td></tr>
+        <tr class="dir-down"><td>9</td><td>Host→Dev</td><td>5,800</td><td>MWr32</td><td>Addr=0xFE60_100C Data=0x00000021</td><td>CQ1 head = 0x21</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> 126 + 256 + 219 = 601. The first TLP cannot continue past 0x2_0000_1000 (4 KiB rule and PRP page change) and starts mid-DW, so First BE = 1100b; the last ends one byte short of a DW boundary, so Last BE = 0111b. The bytes 0xF80–0xF81 and 0x11DB of the host buffer are untouched: byte enables are how the device keeps a byte-exact promise. Data writes precede the CQE (rows 4–6 before 7), so the host may consume the buffer when it sees the CQE.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace B — slow: NVM → SLM copies under a write workload">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Idle baseline from <a href="ch62.html#trace">Chapter 62</a>: a 32 MiB copy completes in about 8.1 ms. Here a random-write job on namespace 1 runs on SQ2 at the same time.</td></tr>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0.0 ms</td><td>MRd64</td><td>Tag=0x30 Addr=0x1_2340_0840 Len=16</td><td>Fetch SQE slot 0x21: copy NSID 1 LBA 0x10000 +65,536 LBAs → NSID 3 offset 0, CID 0x0221</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>8.3 ms</td><td>MWr64</td><td>Addr=0x1_2341_0210 Len=4</td><td>CQE CID 0x0221 Success — normal</td></tr>
+        <tr class="note"><td colspan="6">Copies 2–6: 8.0, 9.1, 12.7, 19.8, 26.4 ms as the write job's queue depth rises.</td></tr>
+        <tr class="abnormal"><td>3</td><td>Dev→Host</td><td>+43.9 ms</td><td>MWr64</td><td>Addr=0x1_2341_0270 Len=4</td><td>CQE copy 7, Success — <strong>first abnormal event: 5.4× baseline</strong></td></tr>
+        <tr class="note"><td colspan="6">Over the same interval the write job's own completion latency at the 99th percentile rose from 60 µs to 2.1 ms.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Nothing is wrong on the link and every status is Success; the evidence is the latency trend. Both workloads slowed together, which points at a shared internal resource — flash channels (the copy reads flash that the writes are programming) or DRAM bandwidth — rather than at SLM itself. Hypothesis test: repeat with the write job targeting a separate NVM namespace on different channels if the vendor documents placement, or with reads instead of writes. If the copy slowdown follows write intensity and garbage collection counters, the flash back end is the bottleneck. The design implication: copy completion latency is a function of the whole drive's load, so pipelines must size buffers for loaded, not idle, copy rates.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace C — failed: misaligned SLM write rejected before any data moves">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Identify for namespace 3 reports a granularity of 4 bytes (synthetic value).</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000023</td><td>SQ1 tail = 0x23</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>800</td><td>MRd64</td><td>Tag=0x31 Addr=0x1_2340_0880 Len=16</td><td>Fetch SQE slot 0x22</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,400</td><td>CplD</td><td>Tag=0x31 Len=16</td><td>SQE: SLM write, CID 0x0222, NSID 3, offset 0x4001, length 1,000, PRP1 0x2_0000_0200</td></tr>
+        <tr class="abnormal"><td>4</td><td>Dev→Host</td><td>1,950</td><td>MWr64</td><td>Addr=0x1_2341_0220 Len=4</td><td>CQE CID 0x0222: error status, DNR = 1 — <strong>first abnormal event</strong> (exact status per SLM 1.3)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> No MRd for the 1,000 bytes ever appears: the device validated the offset before starting DMA, which is the behaviour to want and to test for. Offset 0x4001 is not a multiple of the reported granularity. Do Not Retry (DNR) = 1 tells the host that resubmitting unchanged will fail again. A device that first fetched the data and then failed would still be within the rules, but it wastes link bandwidth and, more importantly, might have partially written SLM — the validation test is "after the error, is SLM at 0x4000–0x43FF unchanged?"</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace D — ambiguous: data survives a Function Level Reset">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0 ms</td><td>MWr64</td><td>Addr=0x1_2341_0230 Len=4</td><td>CQE: SLM write of pattern 0xA5 × 4,096 at NSID 3 offset 0x8000 — Success</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>10 ms</td><td>CfgWr0</td><td>Req=RC Target=01:00.0 Reg=PCIe Device Control: Initiate FLR = 1</td><td>Function Level Reset</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>10 ms</td><td>Cpl</td><td>Status=SC</td><td>Configuration write completes</td></tr>
+        <tr class="note"><td colspan="6">Host waits, restores configuration space, re-initialises: CC.EN = 1 written to 0xFE60_0014, CSTS.RDY = 1 read at +410 ms; admin and I/O queues recreated.</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>520 ms</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000001</td><td>SQ1 (new) tail = 1: SLM read NSID 3 offset 0x8000, 4,096 bytes, into a buffer pre-filled with 0x00</td></tr>
+        <tr class="abnormal"><td>5</td><td>Dev→Host</td><td>520 ms + 2.6 µs</td><td>MWr64 ×16</td><td>Addr=0x2_0000_3000… Len=64 each</td><td>Data = 0xA5 × 4,096 — <strong>first event that needs explaining: content survived the FLR</strong></td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>520 ms + 3 µs</td><td>MWr64</td><td>Addr=0x1_2341_0000 Len=4</td><td>CQE Success</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Why it is ambiguous.</strong> The trace proves the controller was re-initialised (rows 2–4) and that the device returned the old pattern (row 5); the host buffer was pre-filled with zeros, so the data is not stale host memory. What it cannot tell you is whether that is correct. Readings: (a) SLM 1.3 says, or leaves to the device, that memory namespace content is not affected by an FLR, and this device preserves it — correct behaviour; (b) the specification requires content to be cleared or undefined after this reset and the device did not clear it — a confidentiality defect if a different tenant owns the function after reset; (c) the test is flawed — for example the "FLR" was not actually performed because the function does not advertise FLR capability and the host fell back to another reset method. Row 2 rules out (c) for the analyzer view, but check the host's reset method log. The senior forensic lab decides between (a) and (b).</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Read-only inspection. The Linux block layer does not handle memory namespaces; expect a generic character device <code>/dev/ng0n3</code> and no <code>/dev/nvme0n3</code>. <span class="badge version">Version-dependent</span></p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Memory namespaces (CSI 3 per libnvme) and their generic devices</span>
+sudo nvme list-ns /dev/nvme0 --csi=3 --all
+sudo nvme ns-descs /dev/ng0n3
+ls -l /dev/ng0n3 /dev/nvme0n3 2&gt;&amp;1
+
+<span class="cm"># The PCIe parameters your TLP predictions depend on</span>
+sudo lspci -vvv -s 01:00.0 | grep -E 'MaxPayload|MaxReadReq|RCB'
+sudo lspci -vvv -s 00:01.1 | grep -E 'MaxPayload|RCB'
+
+<span class="cm"># Which reset methods the kernel would use for this function (affects reset-axis tests)</span>
+cat /sys/bus/pci/devices/0000:01:00.0/reset_method
+
+<span class="cm"># IOMMU faults when a PRP points at unmapped memory</span>
+sudo dmesg | grep -i -E 'dmar|iommu|AMD-Vi' | tail -20</code></pre>
+  <table>
+    <caption>What each output proves and cannot prove</caption>
+    <thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>list-ns --csi=3</code> lists NSID 3</td><td>The controller reports a memory namespace</td><td>Its granularity, maximum transfer or reset behaviour</td></tr>
+      <tr><td><code>MaxPayload 256 bytes, MaxReadReq 512 bytes</code></td><td>The negotiated device settings used in your TLP predictions</td><td>How the device chooses to segment within them</td></tr>
+      <tr><td><code>reset_method</code> lists <code>flr</code></td><td>The kernel considers FLR available</td><td>What FLR does to SLM content</td></tr>
+      <tr><td>IOMMU fault naming 01:00.0</td><td>The device attempted DMA to an unmapped IOVA</td><td>Whether the host library or the device computed the bad address — decode the SQE</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Labs 1–4 use paper, simulation and synthetic evidence. Extending them to real hardware with pass-through SLM commands is a <span class="badge caution">Caution lab</span>: double-check NSIDs and never target an NVM namespace holding data.</p></aside>
+
+  <h3>Beginner lab — predict PRPs and TLP counts</h3>
+  <p><strong>Objective:</strong> derive PRP1/PRP2 and the number of data TLPs by hand. <strong>Prerequisites:</strong> <a href="ch36.html">Physical Region Pages</a>. <strong>Setup:</strong> lab system, MPS 256, MRRS 512, 4 KiB host pages.</p>
+  <p><strong>Procedure:</strong> for each transfer give PRP1, PRP2 and the data TLPs: (a) SLM read of 600 bytes into 0x2_0000_0000; (b) SLM read of 601 bytes into 0x2_0000_0F82; (c) SLM write of 1,500 bytes from 0x2_0000_0200; (d) SLM read of 9,000 bytes into 0x2_0000_0800.</p>
+  <p><strong>Questions:</strong> which transfers need PRP2? Which need a PRP list? <strong>Expected reasoning:</strong> count pages touched first, then split by MPS or MRRS and 4 KiB.</p>
+  <details class="solution"><summary>Solution</summary><p>(a) one page: PRP1 = 0x2_0000_0000, PRP2 unused; MWr 256 + 256 + 88. (b) two pages: PRP1 = 0x2_0000_0F82, PRP2 = 0x2_0000_1000; MWr 126 + 256 + 219. (c) one page: PRP1 = 0x2_0000_0200; MRd 512 + 512 + 476, each answered by two CplDs at MPS 256 (the last 256 + 220). (d) 0x800 + 9,000 = 0x2B28, so pages 0x0000, 0x1000 and 0x2000 are touched — three pages, so PRP2 points to a PRP list with entries 0x2_0000_1000 and 0x2_0000_2000; MWr: 8 × 256 to finish page 1 (2,048 bytes), 16 × 256 for page 2, then 2,856 bytes in page 3 = 11 × 256 + 40, so 36 MWr in total.</p></details>
+  <p><strong>Extension:</strong> repeat (d) with MPS 128 and count again.</p>
+
+  <h3>Intermediate lab — a TLP predictor for byte-granular transfers</h3>
+  <p><strong>Objective:</strong> automate the beginner lab, including byte enables and completion splitting. <strong>Prerequisites:</strong> beginner lab; <a href="ch52.html">Completion Rules</a>. <strong>Setup:</strong> save as <code>slm_tlp.py</code>; run <code>python3 slm_tlp.py</code>.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="slm_tlp.py"><code>#!/usr/bin/env python3
+"""slm_tlp.py - predict the device-initiated TLPs for one SLM host transfer.
+SLM read  (SLM -&gt; host): device issues MWr, each &lt;= MPS, never crossing 4 KiB.
+SLM write (host -&gt; SLM): device issues MRd, each &lt;= MRRS, never crossing 4 KiB;
+the completer returns CplDs &lt;= MPS that end on RCB boundaries (except the last).
+Splitting at MPS/MRRS-aligned addresses is a common device policy, not a rule.
+Addresses &gt;= 4 GiB use 4-DW headers (MWr64/MRd64)."""
+
+def be(addr, length):
+    """First and Last DW Byte Enables (4-bit masks) and length in DW."""
+    first_dw, end = addr &amp; ~3, addr + length
+    dws = (((end + 3) &amp; ~3) - first_dw) // 4
+    fbe = (0xF &lt;&lt; (addr &amp; 3)) &amp; 0xF
+    lbe = 0xF &gt;&gt; ((4 - (end &amp; 3)) &amp; 3)
+    if dws == 1:                       # single DW: First BE covers both ends, Last BE = 0
+        return dws, fbe &amp; lbe, 0
+    return dws, fbe, lbe
+
+def split(addr, length, unit):
+    out = []
+    while length:
+        n = min(length, unit - addr % unit, 4096 - addr % 4096)
+        out.append((addr, n)); addr += n; length -= n
+    return out
+
+def fmt(a):
+    h = f"{a:X}"
+    return "0x" + (h[:-8] + "_" if len(h) &gt; 8 else "") + h[-8:-4].rjust(4, "0") + "_" + h[-4:]
+
+def kind(op, addr):
+    return op + ("64" if addr &gt;= 1 &lt;&lt; 32 else "32")
+
+def slm_read(host_addr, length, mps=256):
+    for a, n in split(host_addr, length, mps):
+        dws, fbe, lbe = be(a, n)
+        print(f"  {kind('MWr', a)} Addr={fmt(a &amp; ~3)} Len={dws}DW FirstBE={fbe:04b} LastBE={lbe:04b} ({n} bytes)")
+
+def slm_write(host_addr, length, mrrs=512, mps=256, rcb=64):
+    for a, n in split(host_addr, length, mrrs):
+        dws, fbe, lbe = be(a, n)
+        print(f"  {kind('MRd', a)} Addr={fmt(a &amp; ~3)} Len={dws}DW FirstBE={fbe:04b} LastBE={lbe:04b} ({n} bytes)")
+        ca, left = a, n
+        while left:                    # completions: &lt;= MPS, ending on an RCB boundary unless last
+            c = min(left, mps)
+            if c &lt; left:
+                c -= (ca + c) % rcb        # a partial completion must end on an RCB boundary
+            print(f"      CplD {c:3d} bytes for {fmt(ca)}")
+            ca += c; left -= c
+
+if __name__ == "__main__":
+    print("SLM read of 601 bytes into host buffer 0x2_0000_0F82 (MPS 256):")
+    slm_read(0x2_0000_0F82, 601)
+    print("SLM write of 1,500 bytes from host buffer 0x2_0000_0200 (MRRS 512, RCB 64):")
+    slm_write(0x2_0000_0200, 1500)
+    print("SLM read of 3 bytes into 0x2_0000_0005:")
+    slm_read(0x2_0000_0005, 3)</code></pre>
+  <p>Expected output (deterministic):</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>SLM read of 601 bytes into host buffer 0x2_0000_0F82 (MPS 256):
+  MWr64 Addr=0x2_0000_0F80 Len=32DW FirstBE=1100 LastBE=1111 (126 bytes)
+  MWr64 Addr=0x2_0000_1000 Len=64DW FirstBE=1111 LastBE=1111 (256 bytes)
+  MWr64 Addr=0x2_0000_1100 Len=55DW FirstBE=1111 LastBE=0111 (219 bytes)
+SLM write of 1,500 bytes from host buffer 0x2_0000_0200 (MRRS 512, RCB 64):
+  MRd64 Addr=0x2_0000_0200 Len=128DW FirstBE=1111 LastBE=1111 (512 bytes)
+      CplD 256 bytes for 0x2_0000_0200
+      CplD 256 bytes for 0x2_0000_0300
+  MRd64 Addr=0x2_0000_0400 Len=128DW FirstBE=1111 LastBE=1111 (512 bytes)
+      CplD 256 bytes for 0x2_0000_0400
+      CplD 256 bytes for 0x2_0000_0500
+  MRd64 Addr=0x2_0000_0600 Len=119DW FirstBE=1111 LastBE=1111 (476 bytes)
+      CplD 256 bytes for 0x2_0000_0600
+      CplD 220 bytes for 0x2_0000_0700
+SLM read of 3 bytes into 0x2_0000_0005:
+  MWr64 Addr=0x2_0000_0004 Len=1DW FirstBE=1110 LastBE=0000 (3 bytes)</code></pre>
+  <p><strong>Procedure:</strong> (1) check the first block against Trace A; (2) call <code>slm_read(0x2_0000_0800, 9000)</code> and compare with beginner answer (d); (3) call <code>slm_write(0x2_0000_0F90, 300)</code> and explain why a 300-byte write needs two read requests. <strong>Questions:</strong> what would a host see if a device set LastBE = 1111b on row 6 of Trace A? Why does the 3-byte case use Last BE = 0000b? <strong>Expected reasoning:</strong> byte enables bound the bytes written; one-DW requests have one enable field.</p>
+  <details class="solution"><summary>Solution</summary><p>(2) 36 MWr64, matching (d). (3) 0x2_0000_0F90 + 300 crosses 0x2_0000_1000, so the read splits into 112 + 188 bytes regardless of MRRS. With LastBE = 1111b the device would overwrite one host byte beyond the buffer (0x2_0000_11DB) — silent corruption of adjacent application data, visible only to someone checking guard bytes. A single-DW request carries its enables in First BE; Last BE must be 0000b by rule.</p></details>
+  <p><strong>Extension:</strong> add a guard-byte checker: simulate host memory, apply the TLPs and assert that no byte outside the target range changes.</p>
+
+  <h3>Advanced lab — planning SLM offsets and measuring fragmentation</h3>
+  <p><strong>Objective:</strong> see why the host library's offset plan decides how much SLM is usable. <strong>Prerequisites:</strong> <a href="dd46.html#labs">Computational Programs labs</a>. <strong>Setup:</strong> save as <code>slm_alloc.py</code>; run it.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="slm_alloc.py"><code>#!/usr/bin/env python3
+"""slm_alloc.py - host-side planning of offsets in one memory namespace.
+SLM has no allocator of its own in this model: the host library decides which
+byte ranges each job uses. Granularity and capacity are parameters, not
+specification values. Compares first-fit and best-fit under a job mix."""
+import random
+
+class Allocator:
+    def __init__(self, capacity, gran, policy):
+        self.cap, self.gran, self.policy = capacity, gran, policy
+        self.free = [(0, capacity)]                     # sorted (offset, length) holes
+    def alloc(self, size):
+        size = -(-size // self.gran) * self.gran        # round up to granularity
+        fits = [h for h in self.free if h[1] &gt;= size]
+        if not fits:
+            return None
+        off, ln = fits[0] if self.policy == "first" else min(fits, key=lambda h: h[1])
+        self.free.remove((off, ln))
+        if ln &gt; size:
+            self.free.append((off + size, ln - size)); self.free.sort()
+        return (off, size)
+    def release(self, rng):
+        self.free.append(rng); self.free.sort()
+        merged = []
+        for off, ln in self.free:                       # coalesce neighbours
+            if merged and merged[-1][0] + merged[-1][1] == off:
+                merged[-1] = (merged[-1][0], merged[-1][1] + ln)
+            else:
+                merged.append((off, ln))
+        self.free = merged
+    def largest_hole(self):
+        return max((ln for _, ln in self.free), default=0)
+
+def run(policy, seed=11, steps=4000):
+    MiB = 1 &lt;&lt; 20
+    rng = random.Random(seed)
+    a = Allocator(capacity=1024 * MiB, gran=4096, policy=policy)
+    live, refused = [], 0
+    for _ in range(steps):
+        if live and rng.random() &lt; 0.48:
+            a.release(live.pop(rng.randrange(len(live))))
+        else:
+            size = rng.choice([1, 2, 4, 8, 16, 64, 128]) * MiB + rng.randrange(0, 4096)
+            r = a.alloc(size)
+            if r is None:
+                refused += 1
+            else:
+                live.append(r)
+    used = sum(n for _, n in live)
+    free = a.cap - used
+    frag = 1 - a.largest_hole() / free if free else 0.0
+    return refused, used // MiB, len(a.free), a.largest_hole() // MiB, frag
+
+if __name__ == "__main__":
+    print("1 GiB memory namespace, 4 KiB granularity, 4000 random alloc/free steps")
+    for policy in ("first", "best"):
+        refused, used, holes, largest, frag = run(policy)
+        print(f"  {policy + '-fit':9s}: refused {refused:4d}, in use {used:4d} MiB, "
+              f"holes {holes:3d}, largest hole {largest:4d} MiB, fragmentation {frag:.2f}")</code></pre>
+  <p>Expected output (deterministic, fixed seed):</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>1 GiB memory namespace, 4 KiB granularity, 4000 random alloc/free steps
+  first-fit: refused   87, in use  784 MiB, holes  17, largest hole   64 MiB, fragmentation 0.73
+  best-fit : refused  101, in use  756 MiB, holes  17, largest hole  128 MiB, fragmentation 0.52</code></pre>
+  <p><strong>Procedure:</strong> (1) explain "fragmentation" as computed; (2) change the job mix to only 64 MiB and 128 MiB jobs and rerun; (3) replace the allocator with fixed 128 MiB slabs and compare refusals. <strong>Questions:</strong> why can a job of 100 MiB be refused when 240 MiB is free? Why can a real library not simply compact SLM? <strong>Expected reasoning:</strong> free space is useful only if contiguous for one range; moving data needs copies and must wait for every referencing execution.</p>
+  <details class="solution"><summary>Solution</summary><p>Fragmentation = 1 − largest hole / total free: 0.73 means the largest hole is only 27% of free space. With uniform large jobs, holes match job sizes and refusals fall. Slabs waste space inside each slab but never fragment externally; for a few known job sizes they are usually the better design. Compaction requires moving bytes (SLM-to-SLM copies, if supported) while no execution or read references them and updating every range set — expensive and race-prone; libraries prefer slabs or per-job namespaces if the device supports several memory namespaces.</p></details>
+  <p><strong>Extension:</strong> add range-set lifetimes: a region cannot be freed until its last execution completes; measure how long-running programs increase refusals.</p>
+
+  <h3>Senior forensic lab — did the FLR leak data?</h3>
+  <p><strong>Objective:</strong> decide between readings (a) and (b) of Trace D and write the conclusion with confidence. <strong>Prerequisites:</strong> <a href="ch49.html">PCIe Reset</a>; <a href="me-forensics.html">Root Cause, Ambiguity and Forensic Reporting</a>.</p>
+  <p><strong>Setup (synthetic evidence):</strong> Trace D; host log "reset_method=flr; FLR issued; config restored"; vendor data sheet: "SLM contents are retained across Controller Level Reset and Function Level Reset and are cleared on NVM Subsystem Reset and power loss"; your excerpt of the SLM 1.3 text on reset behaviour (you must look it up — the solution shows how to use it, not what it says); the platform is a single-tenant server.</p>
+  <p><strong>Procedure:</strong> (1) state what the trace proves; (2) compare device behaviour with the data sheet and with the specification text; (3) decide whether it is a defect, and for whom; (4) design the follow-up tests.</p>
+  <p><strong>Questions:</strong> if the specification leaves FLR behaviour implementation-dependent, is retention a defect? Would your answer change on a multi-tenant system that reassigns the function after reset?</p>
+  <details class="solution"><summary>Solution</summary><p>Proven: an FLR happened, the controller was re-initialised, and the device returned pre-reset content. If the SLM 1.3 text you found requires clearing on FLR, this is a specification non-compliance regardless of the data sheet — confidence high. If the text leaves it implementation-dependent or says content is preserved, the device matches its data sheet and is compliant — but on a multi-tenant platform where a function is handed to a new tenant after FLR, retention is a security finding for the platform, whose reassignment procedure must clear SLM explicitly (or use a reset that clears it). Follow-up tests: each reset type alone with a fresh pattern; NVM Subsystem Reset and power cycle (expect cleared per the data sheet); verify that a "clear" really writes or invalidates the content (read back after reset must not return the old pattern). Record which specification sentence each expectation comes from.</p></details>
+  <p><strong>Extension:</strong> write the platform requirement that closes the multi-tenant gap.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <table>
+    <caption>Five SLM failure patterns</caption>
+    <thead><tr><th>Field</th><th>1. Wrong bytes at buffer edges</th><th>2. Large transfers fail, small succeed</th><th>3. Data differs after maintenance</th><th>4. Normal I/O slows during SLM jobs</th><th>5. SLM "shrinks" over days</th></tr></thead>
+    <tbody>
+      <tr><td>Symptom</td><td>First or last few bytes of results wrong or clobbered next to the buffer</td><td>SLM commands above some size fail with an invalid-field style status</td><td>Results wrong only after a reset or firmware event</td><td>Namespace 1 latency rises while copies/programs run</td><td>Allocation failures with plenty of nominal free space</td></tr>
+      <tr><td>Possible causes</td><td>Host assumed page-aligned PRP1; byte-enable bug; off-by-one length</td><td>SLM maximum transfer smaller than MDTS; granularity of length</td><td>SLM cleared (or not) by that reset; library cached state</td><td>Shared DRAM or flash channels</td><td>Fragmentation; leaked regions; range sets never deleted</td></tr>
+      <tr><td>Evidence</td><td>Guard bytes; analyzer byte enables; SQE PRPs</td><td>Status vs length table</td><td>Reset logs, timeline</td><td>Latency percentiles vs SLM activity</td><td>Library allocation map</td></tr>
+      <tr><td>First check</td><td>Decode PRP1/PRP2 for a failing case</td><td>Reported maximum transfer for NSID 3</td><td>Which reset occurred</td><td>Correlate latency with SLM job timestamps</td><td>Largest hole vs free space</td></tr>
+      <tr><td>Second check</td><td>Analyzer: LastBE on the final MWr</td><td>Does length = max pass and max + 1 fail?</td><td>What SLM 1.3 says for that reset</td><td>Repeat with copies only, then programs only</td><td>Count live range sets vs running jobs</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Sweep host start offsets 0–7 and page-straddling buffers</td><td>Split by the reported SLM maximum instead of MDTS</td><td>Each reset type alone with a fresh pattern</td><td>Move the I/O job to idle hours</td><td>Restart the library (frees leaks); compare</td></tr>
+      <tr><td>Likely conclusion</td><td>Host PRP construction bug (device bugs rarer)</td><td>Library splits by the wrong limit</td><td>Spec-defined reset behaviour not handled</td><td>Expected contention; plan QoS</td><td>Host lifetime bug or allocator design</td></tr>
+      <tr><td>Confidence</td><td>High with guard bytes and trace</td><td>High</td><td>High once mapped to spec text</td><td>Medium (internal resource unproven)</td><td>High</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>How is SLM addressed?</p><details class="answer"><summary>Model answer</summary><p>By memory namespace NSID, byte offset and length, through SLM I/O commands.</p></details></li>
+    <li><p>Which TLPs does an SLM read produce?</p><details class="answer"><summary>Model answer</summary><p>Device-issued MWr to host memory (MWr64 above 4 GiB), then the CQE write and MSI-X.</p></details></li>
+    <li><p>And an SLM write?</p><details class="answer"><summary>Model answer</summary><p>Device MRd requests to host memory answered by CplDs.</p></details></li>
+    <li><p>Why is a 600-byte transfer a clue?</p><details class="answer"><summary>Model answer</summary><p>Block namespaces move LBA multiples; byte-granular sizes suggest SLM (or metadata/log data).</p></details></li>
+    <li><p>Is SLM persistent?</p><details class="answer"><summary>Model answer</summary><p>Treat it as volatile unless SLM 1.3 and the device say otherwise.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>Give PRP1/PRP2 for 601 bytes into 0x2_0000_0F82.</p><details class="answer"><summary>Model answer</summary><p>PRP1 = 0x2_0000_0F82, PRP2 = 0x2_0000_1000.</p></details></li>
+    <li><p>Why does a transfer start with First BE = 1100b?</p><details class="answer"><summary>Model answer</summary><p>It begins at byte 2 of a DW; only bytes 2 and 3 are valid.</p></details></li>
+    <li><p>Why might the same 1,500-byte write produce different CplD counts on two platforms?</p><details class="answer"><summary>Model answer</summary><p>The completer (root complex) chooses how to split within MPS and RCB rules.</p></details></li>
+    <li><p>Does same-queue submission order guarantee a read sees an earlier write?</p><details class="answer"><summary>Model answer</summary><p>No. Only waiting for the write's CQE does.</p></details></li>
+    <li><p>What does an immediate error with no data TLPs tell you?</p><details class="answer"><summary>Model answer</summary><p>The device validated and rejected the command before DMA: an argument problem, not a transfer problem.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>Design boundary tests for SLM writes.</p><details class="answer"><summary>Model answer</summary><p>Length 0, 1, granule − 1, granule, granule + 1, maximum, maximum + 1; offsets at 0, capacity − granule, capacity; host starts at every DW phase and straddling pages; guard bytes on both sides; SLM content checked after every rejection.</p></details></li>
+    <li><p>Why do copies slow under writes?</p><details class="answer"><summary>Model answer</summary><p>They share flash channels and DRAM with programs and garbage collection; the bottleneck is internal and shows only as latency.</p></details></li>
+    <li><p>How should a library plan SLM offsets?</p><details class="answer"><summary>Model answer</summary><p>Slabs sized to job classes, per-tenant partitions, lifetimes tied to range sets and outstanding commands, no reuse until all CQEs are consumed.</p></details></li>
+    <li><p>An IOMMU fault names the SSD during an SLM read. Next step?</p><details class="answer"><summary>Model answer</summary><p>Decode the SQE's PRPs and compare with the faulting IOVA; usually the host built a PRP list for an unmapped page.</p></details></li>
+    <li><p>What makes a reset-axis test trustworthy?</p><details class="answer"><summary>Model answer</summary><p>One reset type per run, a fresh pattern per run, proof from the trace that the reset happened, and expected values quoted from the specification.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>What SLM questions go into a supplier qualification?</p><details class="answer"><summary>Model answer</summary><p>Revision; capacity, granularity, maximum transfer; reset behaviour per type; ECC on SLM; internal bandwidth under load; QoS interaction; telemetry; multi-namespace support.</p></details></li>
+    <li><p>Is data retained across FLR a defect?</p><details class="answer"><summary>Model answer</summary><p>Depends on the specification text and on the platform: compliant retention can still be a multi-tenant security issue that the platform must close.</p></details></li>
+    <li><p>Where should consistency rules be enforced?</p><details class="answer"><summary>Model answer</summary><p>In the host library's dependency tracker, keyed by byte range.</p></details></li>
+    <li><p>SLM vs CMB for staging data — which and why?</p><details class="answer"><summary>Model answer</summary><p>CMB for host-visible, MMIO-reachable buffers and peer-to-peer; SLM for device-internal processing and copies. Different access models, different failure modes.</p></details></li>
+    <li><p>What observability would you demand?</p><details class="answer"><summary>Model answer</summary><p>Per-command timestamps, SLM occupancy, copy throughput counters, reset event logs and error counters for SLM accesses.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>601 bytes into 0x2_0000_0F82 at MPS 256 needs how many MWr TLPs (minimum)?</p>
+      <ul class="options" data-answer="2"><li>2</li><li>3</li><li>4</li><li>5</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>126 to the page end, then 256 + 219: three.</p></details></li>
+    <li><p>A one-DW write of 3 bytes at byte offset 1 carries:</p>
+      <ul class="options" data-answer="4"><li>FirstBE 0111, LastBE 0000</li><li>FirstBE 1111, LastBE 1110</li><li>FirstBE 0000, LastBE 1110</li><li>FirstBE 1110, LastBE 0000</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Bytes 1–3 valid → 1110b; single-DW requests set Last BE to 0000b.</p></details></li>
+    <li><p>Which PRP entry may carry a non-zero page offset?</p>
+      <ul class="options" data-answer="1"><li>PRP1 only</li><li>PRP2 only</li><li>Every PRP list entry</li><li>None</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>PRP1 may point inside a page; PRP2 and list entries are page-aligned.</p></details></li>
+    <li><p>An SLM write fails 0.55 µs after its SQE fetch with no data MRd. Most likely?</p>
+      <ul class="options" data-answer="3"><li>PCIe completion timeout</li><li>Flash error</li><li>Argument validation (offset, length, NSID)</li><li>IOMMU fault</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>No DMA started; the command was rejected on its fields.</p></details></li>
+    <li><p>Copies slow down and namespace 1 latency rises at the same time. Best first hypothesis?</p>
+      <ul class="options" data-answer="2"><li>Link errors</li><li>Shared internal resources (flash channels, DRAM)</li><li>Wrong MPS</li><li>Host CPU starvation</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Two workloads degrading together with no link anomaly point inside the drive.</p></details></li>
+    <li><p>Which value most limits how many SLM bytes one command may move?</p>
+      <ul class="options" data-answer="3"><li>MPS</li><li>MRRS</li><li>The SLM maximum transfer reported for the namespace (and MDTS)</li><li>RCB</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>MPS, MRRS and RCB shape TLPs, not command size.</p></details></li>
+    <li><p>Why can free SLM be useless for a new job?</p><details class="answer"><summary>Model answer</summary><p>It may be fragmented into holes smaller than the job's contiguous range; compaction is expensive and must wait for every reference to drain.</p></details></li>
+    <li><p>What does Trace D prove, and what does it not?</p><details class="answer"><summary>Model answer</summary><p>It proves an FLR and re-initialisation occurred and the device returned pre-reset content; it does not prove whether retention is required, allowed or forbidden — that comes from SLM 1.3.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <p>Explain to three audiences, then compare.</p>
+  <details class="answer"><summary>To a child — model</summary><p>"There's a big table with numbered squares in the back of the post office. You write a ticket saying which squares, and a clerk carries your letters in bundles. Bundles can't be too big or cross a line on the table, so odd amounts need extra bundles. If two people ask for the same squares, the clerk who comes last wins — so you wait until your first job is done before asking for the next."</p></details>
+  <details class="answer"><summary>To a junior engineer — model</summary><p>"SLM commands name an NSID, a byte offset and a length; the host buffer is described with PRPs, and PRP1 can start mid-page. The device turns a read into MWr TLPs no bigger than MPS that never cross 4 KiB, with byte enables for partial DWs; a write becomes MRds of up to MRRS answered by CplDs split at RCB. Internal copies show nothing. Always wait for the producer's CQE before reading."</p></details>
+  <details class="answer"><summary>To a senior engineer — model</summary><p>"Byte granularity moves correctness risk into host buffer handling and offset planning; NVMe's lack of ordering moves it into the library's dependency tracker; shared DRAM and flash make SLM performance a whole-drive property; and reset semantics are a specification lookup plus a platform security decision. A qualification plan needs boundary, concurrency, contention and reset axes with spec-traceable expectations."</p></details>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain how a byte-granular SLM command becomes TLPs, PRPs and a CQE</li>
+      <li>diagram the read, write and copy paths with their ordering points</li>
+      <li>identify an SLM transfer in a trace from sizes and byte enables, and find the first abnormal event in each of the four traces</li>
+      <li>debug the five failure patterns, including the reset-axis ambiguity</li>
+      <li>distinguish SLM from the <a href="ch24.html">CMB and PMR</a>, the Host Memory Buffer, <a href="dd46.html">Computational Programs</a> range sets and ordinary <a href="dd23.html">namespaces</a></li>
+      <li>cite SLM 1.3, Base 2.4, PCIe Transport 1.4 and the PCI Express Base Specification for what each defines</li>
+    </ul>
+  </aside>
+  <p><strong>Next:</strong> <a href="dd48.html">NVMe-MI</a> — managing the drive from outside the host.</p>
+</section>

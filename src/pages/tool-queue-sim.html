@@ -1,0 +1,436 @@
+<p class="lead">A step-by-step simulator of one NVM Express (NVMe) I/O queue pair. You play both sides: the host driver that writes commands and rings doorbells, and the controller that fetches, executes and completes them. Every step updates the rings, the head and tail pointers, the <span class="g" data-term="phase-tag">Phase Tag</span>, and a trace table showing what would cross the PCIe link. Then you break it on purpose.</p>
+
+<section id="what">
+  <h2>What this simulator does</h2>
+  <p>NVMe queues are circular buffers in host memory shared by two agents that never lock anything. The Submission Queue (SQ) is written by the host and read by the controller; the Completion Queue (CQ) is written by the controller and read by the host. Each side owns one pointer of each ring and tells the other side about it through a different channel: the host tells the controller with <strong>doorbell</strong> writes (PCIe Memory Writes into BAR0), and the controller tells the host with the <strong>SQ Head Pointer</strong> field and the <strong>Phase Tag</strong> inside each Completion Queue Entry (CQE).</p>
+  <p>That arrangement is fast and subtle. The simulator makes the subtlety visible. Following master-prompt section 35, it simulates queue creation, command insertion, tail update, doorbell, controller consumption, CQ insertion, head update, phase transitions and interrupt generation, and lets you inject: a doorbell beyond the queue size, a wrong tail, a doorbell to the wrong queue ID, a duplicate Command Identifier (CID), CQ overflow, a stale phase, a missed interrupt and a missing completion.</p>
+  <aside class="callout prereq"><p>Read <a href="ch25.html">Chapter 25 — Queue Architecture</a> (head, tail, phase), <a href="ch27.html">Chapter 27 — I/O Queues</a> (creation and sizing) and <a href="ch28.html">Chapter 28 — Doorbells</a> (what a doorbell write really is) first. The simulator assumes them.</p></aside>
+  <figure>
+    <div class="ring" data-label="I/O Submission Queue 1 (8 entries): host owns the tail, controller owns the head" data-size="8" data-head="2" data-tail="5" data-head-label="Head (controller)" data-tail-label="Tail (host)"></div>
+    <figcaption>The picture the simulator animates: entries between head and tail are waiting to be fetched.</figcaption>
+  </figure>
+</section>
+
+<section id="sim">
+  <h2>The simulator</h2>
+  <p>Start with <strong>Run one normal command</strong> to see a full cycle in the log, then step through by hand. The log shows the newest step first. Faults are armed with the selector and fire on the next action they apply to.</p>
+  <div class="tool" data-tool="qsim">
+    <div class="row">
+      <div><label>SQ1 entries (2–64)</label><input type="number" data-role="sqn" value="8" min="2" max="64"></div>
+      <div><label>CQ1 entries (2–64)</label><input type="number" data-role="cqn" value="8" min="2" max="64"></div>
+      <div><label><input type="checkbox" data-role="int" checked> CQ1 interrupts enabled (IEN = 1)</label></div>
+    </div>
+    <button type="button" class="secondary" data-role="reset">Create queues / reset</button>
+    <button type="button" class="secondary" data-role="cycle">Run one normal command</button>
+    <button type="button" class="secondary" data-role="burst">Run 3 commands, complete out of order</button>
+    <h4>Host</h4>
+    <button type="button" data-role="submit">1. Host writes SQE</button>
+    <button type="button" data-role="ringsq">2. Ring SQ tail doorbell</button>
+    <button type="button" data-role="consume">5. Host consumes CQE</button>
+    <button type="button" data-role="ringcq">6. Ring CQ head doorbell</button>
+    <button type="button" class="secondary" data-role="timeout">Check command timeouts</button>
+    <h4>Controller</h4>
+    <button type="button" data-role="fetch">3. Controller fetches SQE</button>
+    <div class="row">
+      <div><label>Command to complete</label><select data-role="which"></select></div>
+    </div>
+    <button type="button" data-role="complete">4. Controller completes</button>
+    <h4>Faults</h4>
+    <div class="row">
+      <div><label>Arm a fault (fires once)</label>
+        <select data-role="fault">
+          <option value="none">none</option>
+          <option value="dbrange">SQ doorbell value beyond queue size</option>
+          <option value="wrongtail">SQ doorbell = real tail + 2 (wrong tail)</option>
+          <option value="wrongq">doorbell written to non-existent SQ5</option>
+          <option value="dupcid">host reuses an outstanding CID</option>
+          <option value="losecpl">controller loses the next completion</option>
+          <option value="dropint">next MSI-X interrupt is lost</option>
+        </select></div>
+    </div>
+    <button type="button" class="secondary" data-role="phasebug">Toggle host phase-flip bug (stale phase)</button>
+    <div class="out" data-role="view"></div>
+    <div class="out" data-role="log" style="max-height:34rem;overflow:auto"></div>
+  </div>
+</section>
+
+<section id="read">
+  <h2>How to read the display</h2>
+  <h3>The SQ ring</h3>
+  <p>Each cell is one 64-byte slot. Its state is <em>empty</em> (never written), <em>written</em> (host wrote an SQE; controller has not fetched it), <em>fetched</em> (controller has read it; the host may not reuse it until a CQE's SQ Head Pointer says so) or <em>free</em> (released by SQHD). Four markers matter:</p>
+  <table>
+    <caption>SQ pointers: who owns them and who can see them</caption>
+    <thead><tr><th>Marker</th><th>Pointer</th><th>Owner</th><th>How the other side learns it</th></tr></thead>
+    <tbody>
+      <tr><td>T</td><td>Host's tail: next slot the host will write</td><td>Host (private variable)</td><td>Only through a doorbell write</td></tr>
+      <tr><td>DB</td><td>Last value written to the SQ1 Tail doorbell</td><td>Controller's copy</td><td>It is the doorbell</td></tr>
+      <tr><td>H</td><td>Controller's head: next slot to fetch</td><td>Controller (internal)</td><td>SQHD in every CQE</td></tr>
+      <tr><td>hH</td><td>Host's view of the head</td><td>Host</td><td>Updated when the host consumes a CQE</td></tr>
+    </tbody>
+  </table>
+  <p>The controller has work when H ≠ DB. The host may write a new SQE only while (T + 1) mod <var>N</var> ≠ hH — one slot always stays empty, because a ring with head = tail must mean "empty", so "full" has to be one short of that.</p>
+  <div class="formula">
+    <div class="eq">entries waiting = (<var>DB</var> − <var>H</var> + <var>N</var>) mod <var>N</var></div>
+    <dl class="vars">
+      <dt>DB</dt><dd>tail value most recently written to the SQ tail doorbell</dd>
+      <dt>H</dt><dd>controller's head (next slot it will fetch)</dd>
+      <dt>N</dt><dd>number of entries in the queue (QSIZE + 1)</dd>
+    </dl>
+  </div>
+  <h3>The CQ ring and the Phase Tag</h3>
+  <p>Each CQ cell shows the CID and Phase Tag (P) of the entry in memory. CQ memory starts zeroed, so every slot reads P = 0, and the host starts by expecting P = 1. The controller writes P = 1 on its first lap, P = 0 on its second, and so on, flipping every time its tail wraps to slot 0. The host flips its expectation every time its head wraps. A slot is new exactly when its P equals the host's expectation; the simulator colours those cells green (success) or red (error).</p>
+  <p>The CQ is full, from the controller's view, when (tail + 1) mod <var>N</var> = the head it last read from the CQ head doorbell. The controller must then stop posting completions. It cannot see what the host has consumed but not yet reported, which is why ringing the CQ head doorbell is not optional.</p>
+  <h3>The trace table</h3>
+  <p>The "PCIe / bus effect" column shows what a protocol analyzer would see: doorbells are 32-bit Memory Writes (MWr32) to 0xFE60_1008 (SQ1 tail) and 0xFE60_100C (CQ1 head); SQE fetches are 64-byte Memory Reads (MRd64) from 0x1_2340_0000 + 64 × slot; CQEs are 16-byte MWr64 to 0x1_2341_0000 + 16 × slot; interrupts are MWr32 to the MSI-X address. Host reads of the CQ are CPU loads from cached memory: they produce <strong>no</strong> PCIe traffic, which is why an analyzer cannot tell you when the host noticed a completion.</p>
+  <ol class="seq" data-actors="Host driver|Host memory|Controller">
+    <li data-from="Host driver" data-to="Host memory">1. write SQE in slot T</li>
+    <li data-from="Host driver" data-to="Controller">2. MWr32 SQ1 tail doorbell</li>
+    <li data-from="Controller" data-to="Host memory">3. MRd64 SQE (64 B)</li>
+    <li data-from="Host memory" data-to="Controller" class="dashed">CplD with SQE</li>
+    <li data-note="Controller">execute</li>
+    <li data-from="Controller" data-to="Host memory">4. MWr64 CQE (P, SQHD, CID)</li>
+    <li data-from="Controller" data-to="Host driver">MSI-X MWr32</li>
+    <li data-from="Host driver" data-to="Host memory">5. read CQE, check P</li>
+    <li data-from="Host driver" data-to="Controller">6. MWr32 CQ1 head doorbell</li>
+  </ol>
+</section>
+
+<section id="scenarios">
+  <h2>Guided scenarios</h2>
+  <p>Reset the simulator before each scenario. Each one says what to click and what you should see. Write down your prediction before you click.</p>
+
+  <h3>1. A normal command, slowly</h3>
+  <p>Click 1, 2, 3, 4, 5, 6. After step 1 the SQ slot is <em>written</em> but nothing has happened on the link. After step 2 the doorbell (DB) moves: this is the only moment the controller learns anything. Step 3 moves H. Step 4 writes a CQE with P = 1 and SQHD = 1. Step 5 is invisible to PCIe and moves hH. Step 6 tells the controller the CQ slot is free.</p>
+
+  <h3>2. Wrap-around and phase flips</h3>
+  <p>Set both queues to 4 entries and click "Run one normal command" five times. Watch the controller's phase flip to 0 when its CQ tail wraps, then the host's expected phase flip when its head wraps. On the second lap the old entries still say P = 1 but the host now expects 0, so they are correctly ignored. The Phase Tag is what lets the host detect new entries without the controller ever clearing memory.</p>
+
+  <h3>3. Out-of-order completion</h3>
+  <p>Click "Run 3 commands, complete out of order". The third command completes first. CQ entries are in completion order, not submission order; the host matches each by CID, never by position. SQHD is the same in all three CQEs, because it reports how far the controller has <em>fetched</em>, not which commands finished.</p>
+
+  <h3>4. SQ full</h3>
+  <p>With 4 SQ entries, click "1. Host writes SQE" four times. The fourth attempt is refused: three entries fill a 4-entry ring. The host must wait for a CQE whose SQHD moves hH forward.</p>
+
+  <h3>5. CQ overflow</h3>
+  <p>Set SQ = 8, CQ = 4. Submit five commands, ring the doorbell, fetch five times, then complete five times without consuming. The fourth completion stalls: the CQ is full and the controller may not overwrite an entry the host has not released. The host caused this by allowing more commands in flight than its CQ can hold. Real drivers size the CQ at least as large as the commands they let into flight.</p>
+  <aside class="callout spec"><p>What a controller does when a CQ stays full is not something the host can rely on: the NVMe Base Specification makes avoiding it the host's job. Some controllers stall that queue indefinitely; behaviour across the rest of the controller is <span class="badge impl">Implementation-dependent</span>.</p></aside>
+</section>
+
+<section id="faults">
+  <h2>Fault injection: how each error manifests</h2>
+  <table>
+    <caption>Faults the simulator injects, and their first visible symptom</caption>
+    <thead><tr><th>Fault</th><th>How to inject</th><th>First abnormal event</th><th>What a real system shows</th></tr></thead>
+    <tbody>
+      <tr><td>Doorbell beyond queue size</td><td>Arm, then 2</td><td>The MWr32 itself (value ≥ N)</td><td>Controller ignores the value; an asynchronous event reporting an invalid doorbell write value may be posted if an Asynchronous Event Request is outstanding; commands time out</td></tr>
+      <tr><td>Wrong tail (too far)</td><td>1, arm, 2, then 3 three times</td><td>Fetch of a slot the host never wrote</td><td>Invalid Command Opcode completions, or a stale command executed twice (data corruption)</td></tr>
+      <tr><td>Wrong queue ID</td><td>1, arm, 2</td><td>Doorbell MWr32 to an offset for a queue that does not exist</td><td>No fetch at all for SQ1; asynchronous event for an invalid doorbell register; timeouts</td></tr>
+      <tr><td>Duplicate CID</td><td>1, arm, 1, 2, 3, 3</td><td>Second SQE carries an in-flight CID</td><td>Possibly Command ID Conflict; more often a completion matched to the wrong request, then a timeout for the other</td></tr>
+      <tr><td>Missing completion</td><td>Run to a fetched command, arm, 4</td><td>Nothing — the absence of a CQE</td><td>Only a host timeout reveals it; then Abort, then controller reset</td></tr>
+      <tr><td>Missed interrupt</td><td>Arm, then a full cycle</td><td>CQE MWr with no MSI-X MWr after it</td><td>Latency spikes until the next interrupt or poll; looks like a slow device</td></tr>
+      <tr><td>Stale phase (host bug)</td><td>Toggle, 4-entry queues, several cycles</td><td>Host reads a new entry and ignores it</td><td>Completions sit unprocessed; I/O hangs; timeout and reset "fix" it until the next wrap</td></tr>
+      <tr><td>CQ overflow</td><td>Scenario 5</td><td>Controller cannot post</td><td>Queue stalls; the driver's accounting is wrong</td></tr>
+    </tbody>
+  </table>
+  <div class="trace" data-kind="synthetic" data-title="Missed interrupt: what the analyzer shows (4-entry queues)">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE601008 Data=0x00000002</td><td>SQ1 tail = 2</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>780</td><td>MRd64</td><td>Addr=0x1_2340_0040 Len=16</td><td>Fetch slot 1</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,400</td><td>CplD</td><td>ByteCount=64</td><td>SQE returned</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>82,000</td><td>MWr64</td><td>Addr=0x1_2341_0010 Len=4</td><td>CQE slot 1, P=1</td></tr>
+        <tr class="abnormal"><td>5</td><td>—</td><td>—</td><td>(missing)</td><td>no MWr32 to 0xFEE0_xxxx</td><td>First abnormal event: the expected interrupt never appears</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>4,010,000</td><td>MWr32</td><td>Addr=0xFE60100C Data=0x00000002</td><td>CQ1 head = 2, ~4 ms later, after another command's interrupt</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The command finished in 82 µs, but the host released the CQ slot 4 ms later. The device did its job; the gap is between the CQE write and the host noticing it. Check whether the MSI-X vector was masked (MSI-X table or Function Mask), whether interrupt coalescing was configured, and whether the interrupt was routed to an offline CPU. An absence is only visible if you know what should have been there — exactly what the simulator trains.</p>
+  </div>
+</section>
+
+<section id="limits">
+  <h2>What the simulator simplifies</h2>
+  <ul>
+    <li>One SQ feeding one CQ. Real drivers often have one SQ per CPU and may map several SQs to one CQ. The Admin queue pair works the same way but is created by registers (AQA, ASQ, ACQ), not commands.</li>
+    <li>The controller fetches one SQE at a time. Real controllers fetch several in one larger MRd and arbitrate between SQs. <span class="badge impl">Implementation-dependent</span></li>
+    <li>Commands carry no data, so there are no data TLPs; see the <a href="tool-nvme-decoder.html">NVMe Command Decoder</a> and the <a href="tool-prp.html">PRP Visualizer</a> for those.</li>
+    <li>Every completion triggers its own interrupt. Interrupt coalescing (Set Features, Interrupt Coalescing) and polled queues change that.</li>
+    <li>Time is counted in steps, and the timeout is 12 steps. Real timeouts are seconds (the Linux driver's default I/O timeout is 30 s). <span class="badge impl">Implementation-dependent</span></li>
+    <li>The asynchronous-event behaviour for invalid doorbell writes is summarised, not simulated. Check the Asynchronous Event Request command and the doorbell register descriptions in the <cite class="spec">NVM Express Base Specification 2.4 — Controller Registers; Asynchronous Event Request command</cite>.</li>
+    <li>Shadow doorbells (Doorbell Buffer Config) and Controller Memory Buffer queues are not modelled.</li>
+  </ul>
+</section>
+
+<section id="practice">
+  <h2>Practice</h2>
+  <ol class="quiz">
+    <li>
+      <p>An 8-entry SQ has host tail 5 and host-view head 6. How many more SQEs can the host write?</p>
+      <ul class="options" data-answer="1"><li>0</li><li>1</li><li>2</li><li>7</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>(5 + 1) mod 8 = 6 = head, so the ring is already full. Verify it with an 8-entry SQ: write 7 SQEs without completing any.</p></details>
+    </li>
+    <li>
+      <p>CQ of 4 entries, controller has wrapped once. What Phase Tag does it write into slot 2 on this lap?</p>
+      <details class="answer"><summary>Answer</summary><p>0. First lap writes 1; after the first wrap it writes 0.</p></details>
+    </li>
+    <li>
+      <p>Why does SQHD appear in every CQE instead of the controller writing a "head doorbell" to the host?</p>
+      <details class="answer"><summary>Answer</summary><p>The controller already writes the CQE; piggy-backing SQHD on it costs nothing and needs no extra PCIe transaction or host register.</p></details>
+    </li>
+    <li>
+      <p>The analyzer shows CQE writes but never a CQ head doorbell. What will eventually happen?</p>
+      <details class="answer"><summary>Answer</summary><p>The CQ fills from the controller's view; completions stall (scenario 5), then every command on queues using that CQ times out.</p></details>
+    </li>
+    <li>
+      <p>A driver ignores the doorbell beyond the queue size check and writes tail = N. Why is that a bug even though N mod N = 0?</p>
+      <details class="answer"><summary>Answer</summary><p>The doorbell must hold a valid index 0…N−1; the controller does not reduce it modulo N. The host must wrap the tail itself.</p></details>
+    </li>
+    <li>
+      <p>Two completions arrive with CIDs in the order 0x0003, 0x0001. Is the controller broken?</p>
+      <details class="answer"><summary>Answer</summary><p>No. Completion order is not submission order. Only CID matching matters.</p></details>
+    </li>
+    <li>
+      <p>Which fault produces no abnormal PCIe packet at all?</p>
+      <details class="answer"><summary>Answer</summary><p>Missing completion and the stale-phase host bug: both are visible only as absence (no CQE) or as host behaviour (no CQ head doorbell), never as a malformed packet.</p></details>
+    </li>
+    <li>
+      <p>Why must CQ memory be zeroed (or otherwise have P = 0) when the queue is created?</p>
+      <details class="answer"><summary>Answer</summary><p>The host starts expecting P = 1. Garbage with P = 1 in a slot would be read as a valid completion before the controller ever wrote it.</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="next">
+  <h2>Where to go next</h2>
+  <ul>
+    <li><a href="ch25.html">Chapter 25</a>, <a href="ch26.html">Chapter 26</a>, <a href="ch27.html">Chapter 27</a>, <a href="ch28.html">Chapter 28</a>: the queue chapters this simulator exercises.</li>
+    <li><a href="ch42.html">Chapter 42 — Interrupt Architecture</a> and <a href="ch43.html">Chapter 43 — MSI-X</a>: why the missed-interrupt case happens.</li>
+    <li><a href="tool-calculators.html">Calculators</a>: Little's law tells you how many slots you need in flight for a target IOPS.</li>
+  </ul>
+  <aside class="callout mastery">
+    <p>You are done with this simulator when you can:</p>
+    <ul class="checklist">
+      <li>predict every pointer and phase value before clicking</li>
+      <li>explain why one slot of every ring stays empty</li>
+      <li>name the first abnormal event for each injected fault</li>
+      <li>say which faults are visible on the PCIe link and which only as absence</li>
+    </ul>
+  </aside>
+</section>
+
+<script>
+(function () {
+  "use strict";
+  var TB = "tab" + "le";
+  function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+  function hx(v, w) { var s = (v >>> 0).toString(16).toUpperCase(); while (s.length < (w || 1)) { s = "0" + s; } return "0x" + s; }
+  function addr(base, off) { var v = (base + off) >>> 0, s = ("0000000" + v.toString(16).toUpperCase()).slice(-8); return "0x1_" + s.slice(0, 4) + "_" + s.slice(4); }
+  var SQ_BASE = 0x23400000, CQ_BASE = 0x23410000, SQDB = "0xFE60_1008", CQDB = "0xFE60_100C", TIMEOUT = 12;
+
+  function create(sqn, cqn) {
+    var s = { sqn: sqn, cqn: cqn, sq: [], cq: [], sqTail: 0, sqTailDb: 0, sqHead: 0, hostSqHead: 0,
+      cqTail: 0, ctrlPhase: 1, cqHeadDb: 0, cqHead: 0, hostPhase: 1, inflight: [], outstanding: [],
+      nextCid: 1, step: 0, intPending: false, intEnabled: true, phaseBug: false, log: [], fault: "none" };
+    for (var i = 0; i < sqn; i++) { s.sq.push({ cid: null, state: "empty" }); }
+    for (var j = 0; j < cqn; j++) { s.cq.push({ cid: null, phase: 0, status: "", sqhd: 0, written: false }); }
+    return s;
+  }
+  function log(s, actor, action, pcie, result, cls) { s.step++; s.log.push({ n: s.step, actor: actor, action: action, pcie: pcie, result: result || "", cls: cls || "" }); }
+  function take(s, f) { if (s.fault === f) { s.fault = "none"; return true; } return false; }
+  function sqPending(s) { return (s.sqTailDb - s.sqHead + s.sqn) % s.sqn; }
+  function cqFullCtrl(s) { return (s.cqTail + 1) % s.cqn === s.cqHeadDb; }
+
+  function submit(s) {
+    if ((s.sqTail + 1) % s.sqn === s.hostSqHead) {
+      log(s, "Host", "wants to submit, but SQ is full by the host's view (tail + 1 = head " + s.hostSqHead + ")", "none", "Host must wait for a CQE whose SQHD frees slots. One slot is always left empty so full and empty can be told apart.", "note");
+      return;
+    }
+    var cid;
+    if (take(s, "dupcid") && s.outstanding.length) {
+      cid = s.outstanding[0].cid;
+      log(s, "Host", "FAULT: reuses CID " + hx(cid, 4) + " while it is still outstanding", "none", "Two commands now share one CID: completions become ambiguous.", "abnormal");
+    } else { cid = s.nextCid; s.nextCid = (s.nextCid % 0xFFFF) + 1; }
+    var slot = s.sqTail;
+    s.sq[slot] = { cid: cid, state: "written" };
+    s.outstanding.push({ cid: cid, slot: slot, at: s.step + 1 });
+    s.sqTail = (s.sqTail + 1) % s.sqn;
+    log(s, "Host", "writes 64-byte SQE (CID " + hx(cid, 4) + ") into SQ1 slot " + slot + "; local tail → " + s.sqTail, "none: CPU store to " + addr(SQ_BASE, slot * 64), "Controller cannot see it until the doorbell.", "dir-down");
+  }
+  function ringSq(s) {
+    if (take(s, "dbrange")) {
+      var bad = s.sqn + 3;
+      log(s, "Host", "FAULT: writes SQ1 tail doorbell = " + bad + " (queue has " + s.sqn + " entries, valid 0–" + (s.sqn - 1) + ")", "MWr32 " + SQDB + " Len=1 Data=" + bad, "Invalid Doorbell Write Value: the controller does not use the value; it can report an asynchronous event of type Error (if an Asynchronous Event Request is outstanding). Exact handling is implementation-dependent.", "abnormal");
+      return;
+    }
+    if (take(s, "wrongq")) {
+      log(s, "Host", "FAULT: writes tail " + s.sqTail + " to the doorbell of SQ5, which does not exist", "MWr32 0xFE60_1028 Len=1 Data=" + s.sqTail, "Invalid Doorbell Register: SQ1's commands are never fetched; they will time out.", "abnormal");
+      return;
+    }
+    if (take(s, "wrongtail")) {
+      var wt = (s.sqTail + 2) % s.sqn;
+      s.sqTailDb = wt;
+      log(s, "Host", "FAULT: writes SQ1 tail doorbell = " + wt + " (two beyond the real tail " + s.sqTail + ")", "MWr32 " + SQDB + " Len=1 Data=" + wt, "Controller now believes slots up to " + ((wt - 1 + s.sqn) % s.sqn) + " hold commands; it will fetch stale or empty slots.", "abnormal");
+      return;
+    }
+    s.sqTailDb = s.sqTail;
+    log(s, "Host", "rings SQ1 tail doorbell = " + s.sqTail, "MWr32 " + SQDB + " Len=1 Data=" + s.sqTail, sqPending(s) + " entr" + (sqPending(s) === 1 ? "y" : "ies") + " now visible to the controller.", "dir-down");
+  }
+  function fetch(s) {
+    if (s.sqHead === s.sqTailDb) { log(s, "Controller", "has nothing to fetch (SQ head = doorbell tail = " + s.sqHead + ")", "none", "SQ empty from the controller's view.", "note"); return; }
+    var slot = s.sqHead, e = s.sq[slot];
+    s.sqHead = (s.sqHead + 1) % s.sqn;
+    var pcie = "MRd64 " + addr(SQ_BASE, slot * 64) + " Len=16 DW → CplD 64 B";
+    if (e.state !== "written") {
+      s.inflight.push({ cid: e.cid === null ? 0 : e.cid, slot: slot, garbage: true });
+      e.state = "fetched";
+      log(s, "Controller", "fetches SQ1 slot " + slot + ", which the host never wrote (stale or empty entry)", pcie, "Controller executes whatever bytes are there: expect Invalid Command Opcode, or worse, a valid-looking stale command executed twice.", "abnormal");
+      return;
+    }
+    var dup = s.inflight.some(function (x) { return x.cid === e.cid; });
+    s.inflight.push({ cid: e.cid, slot: slot });
+    e.state = "fetched";
+    log(s, "Controller", "fetches SQE CID " + hx(e.cid, 4) + " from slot " + slot + "; SQ head → " + s.sqHead, pcie, dup ? "Another command with the same CID is already executing (the controller may or may not detect this)." : "Command is now executing inside the controller.", dup ? "abnormal" : "dir-up");
+  }
+  function complete(s, idx) {
+    if (!s.inflight.length) { log(s, "Controller", "has no command to complete", "none", "Fetch first.", "note"); return; }
+    if (idx === undefined || idx < 0 || idx >= s.inflight.length) { idx = 0; }
+    var c = s.inflight[idx];
+    if (cqFullCtrl(s)) {
+      log(s, "Controller", "has a completion for CID " + hx(c.cid, 4) + " but CQ1 is full (tail + 1 = head doorbell " + s.cqHeadDb + ")", "none (must not overwrite an unconsumed CQE)", "Completion stalls until the host consumes CQEs and rings the CQ head doorbell. A host that never does this hangs the queue.", "abnormal");
+      return;
+    }
+    s.inflight.splice(idx, 1);
+    if (take(s, "losecpl")) {
+      log(s, "Controller", "FAULT: loses command CID " + hx(c.cid, 4) + " — no CQE will ever be posted", "none", "Nothing on the link reveals this; only the host's timeout will.", "abnormal");
+      return;
+    }
+    var slot = s.cqTail;
+    var status = c.garbage ? "Invalid Command Opcode" : "Success";
+    s.cq[slot] = { cid: c.cid, phase: s.ctrlPhase, status: status, sqhd: s.sqHead, written: true };
+    s.cqTail = (s.cqTail + 1) % s.cqn;
+    var wrapped = s.cqTail === 0;
+    if (wrapped) { s.ctrlPhase ^= 1; }
+    var ooo = idx > 0 ? " (out of order: older commands are still executing)" : "";
+    log(s, "Controller", "posts CQE in CQ1 slot " + slot + ": CID " + hx(c.cid, 4) + ", " + status + ", SQHD " + s.sqHead + ", P=" + s.cq[slot].phase + ooo, "MWr64 " + addr(CQ_BASE, slot * 16) + " Len=4 DW", wrapped ? "CQ tail wrapped to 0: controller's phase flips to " + s.ctrlPhase + "." : "CQ tail → " + s.cqTail + ".", c.garbage ? "abnormal" : "dir-up");
+    if (s.intEnabled) {
+      if (take(s, "dropint")) { log(s, "Controller", "FAULT: MSI-X interrupt for CQ1 is lost", "(MWr32 to 0xFEE0_xxxx never arrives)", "CQE sits in memory; the host does not know until it polls or another interrupt arrives.", "abnormal"); }
+      else { s.intPending = true; log(s, "Controller", "signals MSI-X vector 1", "MWr32 0xFEE0_xxxx Len=1", "Host interrupt handler will run.", "dir-up"); }
+    }
+  }
+  function consume(s) {
+    var e = s.cq[s.cqHead];
+    if (e.phase !== s.hostPhase || !e.written) {
+      var hidden = s.phaseBug && e.written && e.phase === s.ctrlPhase && e.phase !== s.hostPhase;
+      log(s, "Host", "reads CQ1 slot " + s.cqHead + ": P=" + e.phase + ", expected " + s.hostPhase, "none: CPU load from " + addr(CQ_BASE, s.cqHead * 16), hidden ? "Host ignores it — but this entry IS new: the host's expected phase is stale. Commands will time out." : "Phase does not match: no new completion.", hidden ? "abnormal" : "note");
+      return;
+    }
+    var k = -1;
+    for (var i = 0; i < s.outstanding.length; i++) { if (s.outstanding[i].cid === e.cid) { k = i; break; } }
+    var slot = s.cqHead;
+    var how = s.intPending ? "in the interrupt handler" : "by polling";
+    s.cqHead = (s.cqHead + 1) % s.cqn;
+    var flip = s.cqHead === 0;
+    if (flip) { if (s.phaseBug) { /* bug: phase not flipped */ } else { s.hostPhase ^= 1; } }
+    if (k < 0) {
+      log(s, "Host", "consumes CQ1 slot " + slot + " " + how + ": CID " + hx(e.cid, 4) + " matches NO outstanding command", "none", "Stale or duplicate completion. With a phase bug the host re-reads last lap's entries as new.", "abnormal");
+    } else {
+      s.outstanding.splice(k, 1);
+      var old = s.hostSqHead;
+      s.hostSqHead = e.sqhd;
+      for (var j = old; j !== e.sqhd; j = (j + 1) % s.sqn) { if (s.sq[j].state === "fetched") { s.sq[j].state = "free"; } }
+      log(s, "Host", "consumes CQ1 slot " + slot + " " + how + ": CID " + hx(e.cid, 4) + " " + e.status + "; SQHD " + e.sqhd + " frees SQ slots up to " + ((e.sqhd - 1 + s.sqn) % s.sqn), "none: CPU load from " + addr(CQ_BASE, slot * 16), (flip ? (s.phaseBug ? "Head wrapped but the host FAILED to flip its expected phase (bug)." : "Head wrapped: host now expects P=" + s.hostPhase + ".") : "Host head → " + s.cqHead + ".") + " Doorbell not yet rung.", e.status === "Success" ? "dir-down" : "abnormal");
+    }
+  }
+  function ringCq(s) {
+    s.cqHeadDb = s.cqHead; s.intPending = false;
+    log(s, "Host", "rings CQ1 head doorbell = " + s.cqHead, "MWr32 " + CQDB + " Len=1 Data=" + s.cqHead, "Controller may now reuse CQ slots before " + s.cqHead + ".", "dir-down");
+  }
+  function timeouts(s) {
+    var late = s.outstanding.filter(function (o) { return s.step + 1 - o.at >= TIMEOUT; });
+    if (!late.length) { log(s, "Host", "checks command timers", "none", "No command older than " + TIMEOUT + " steps.", "note"); return; }
+    log(s, "Host", "TIMEOUT: CID " + late.map(function (o) { return hx(o.cid, 4); }).join(", ") + " outstanding for ≥ " + TIMEOUT + " steps", "next: Abort command on the Admin SQ, then controller reset if that fails", "First visible symptom of a lost completion, lost doorbell or lost interrupt.", "abnormal");
+  }
+
+  var api = { create: create, submit: submit, ringSq: ringSq, fetch: fetch, complete: complete, consume: consume, ringCq: ringCq, timeouts: timeouts };
+  if (typeof window !== "undefined" && window.__NVME_TOOL_TEST__) { window.__NVME_TOOL_TEST__.qsim = api; }
+  if (typeof document === "undefined") { return; }
+
+  var COL = { empty: "var(--bg-sunk)", written: "var(--warn-soft)", fetched: "var(--accent-soft)", free: "var(--bg-sunk)" };
+  function cell(content, bg, outline) {
+    return '<div style="min-width:3.2rem;flex:1 0 3.2rem;border:1px solid ' + (outline ? "var(--accent)" : "var(--border-strong)") + ";" + (outline ? "box-shadow:0 0 0 1px var(--accent);" : "") + "background:" + bg + ';border-radius:6px;padding:.25rem;font-family:var(--font-mono);font-size:.75rem;text-align:center;line-height:1.35">' + content + "</div>";
+  }
+  function view(s) {
+    var h = "<h4>SQ1 (" + s.sqn + " entries) — host produces, controller consumes</h4><div style=\"display:flex;flex-wrap:wrap;gap:.25rem\">";
+    for (var i = 0; i < s.sqn; i++) {
+      var e = s.sq[i], tags = [];
+      if (i === s.sqTail) { tags.push("T"); }
+      if (i === s.sqTailDb) { tags.push("DB"); }
+      if (i === s.sqHead) { tags.push("H"); }
+      if (i === s.hostSqHead) { tags.push("hH"); }
+      h += cell("<b>" + i + "</b><br>" + (e.cid === null || e.state === "empty" ? "—" : hx(e.cid, 4)) + "<br>" + e.state + "<br><span style=\"color:var(--accent)\">" + (tags.join(" ") || "&nbsp;") + "</span>", COL[e.state], i === s.sqHead);
+    }
+    h += "</div><p><small>T = host's tail (next slot to write) · DB = last tail written to the doorbell · H = controller's head (next fetch) · hH = host's view of the head (from the last SQHD). Pending for fetch: " + sqPending(s) + ". SQ " + ((s.sqTail + 1) % s.sqn === s.hostSqHead ? "<b>FULL</b> (host view)" : (s.sqHead === s.sqTailDb ? "empty (controller view)" : "has work")) + ".</small></p>";
+    h += "<h4>CQ1 (" + s.cqn + " entries) — controller produces, host consumes</h4><div style=\"display:flex;flex-wrap:wrap;gap:.25rem\">";
+    for (var j = 0; j < s.cqn; j++) {
+      var c = s.cq[j], t2 = [];
+      if (j === s.cqTail) { t2.push("T"); }
+      if (j === s.cqHead) { t2.push("H"); }
+      if (j === s.cqHeadDb) { t2.push("DB"); }
+      var isNew = c.written && c.phase === s.hostPhase;
+      h += cell("<b>" + j + "</b><br>" + (c.written ? hx(c.cid, 4) : "—") + "<br>P=" + c.phase + "<br><span style=\"color:var(--accent)\">" + (t2.join(" ") || "&nbsp;") + "</span>", isNew ? (c.status === "Success" ? "var(--ok-soft)" : "var(--bad-soft)") : "var(--bg-sunk)", j === s.cqHead);
+    }
+    h += "</div><p><small>T = controller's tail (next slot to write) · H = host's head (next slot to read) · DB = last head written to the CQ doorbell. Green/red = entries whose phase matches what the host expects (new). Controller phase: <b>" + s.ctrlPhase + "</b> · host expects: <b>" + s.hostPhase + "</b>" + (s.phaseBug ? " (phase-flip bug active)" : "") + " · CQ " + (cqFullCtrl(s) ? "<b>FULL</b> (controller view)" : "has room") + " · interrupt pending: " + (s.intPending ? "yes" : "no") + ".</small></p>";
+    h += "<p><small>Executing in controller: " + (s.inflight.length ? s.inflight.map(function (x) { return hx(x.cid, 4) + (x.garbage ? "(stale)" : ""); }).join(", ") : "none") + " · Host outstanding: " + (s.outstanding.length ? s.outstanding.map(function (x) { return hx(x.cid, 4) + " (age " + (s.step - x.at + 1) + ")"; }).join(", ") : "none") + "</small></p>";
+    return h;
+  }
+  function logHtml(s) {
+    var h = '<div class="table-wrap"><' + TB + ' class="trace-table"><thead><tr><th>#</th><th>Actor</th><th>Action</th><th>PCIe / bus effect</th><th>Result</th></tr></thead><tbody>';
+    for (var i = s.log.length - 1; i >= 0; i--) {
+      var r = s.log[i];
+      h += '<tr class="' + r.cls + '"><td>' + r.n + "</td><td>" + esc(r.actor) + "</td><td>" + esc(r.action) + "</td><td><code>" + esc(r.pcie) + "</code></td><td>" + esc(r.result) + "</td></tr>";
+    }
+    return h + "</tbody></" + TB + "></div>";
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll('[data-tool="qsim"]'), function (root) {
+    if (root.getAttribute("data-ready")) { return; }
+    root.setAttribute("data-ready", "1");
+    function q(r) { return root.querySelector('[data-role="' + r + '"]'); }
+    var s;
+    function reset() {
+      var a = Math.max(2, Math.min(64, parseInt(q("sqn").value, 10) || 8)), b = Math.max(2, Math.min(64, parseInt(q("cqn").value, 10) || 8));
+      q("sqn").value = a; q("cqn").value = b;
+      s = create(a, b); s.intEnabled = q("int").checked;
+      log(s, "Host", "creates CQ1 (" + b + " entries) then SQ1 (" + a + " entries) with Admin commands; all pointers 0; CQ memory zeroed (P=0), host expects P=1", "Admin Create I/O CQ / Create I/O SQ (see the NVMe Command Decoder)", "Queues ready.", "note");
+      draw();
+    }
+    function draw() {
+      q("view").innerHTML = view(s);
+      q("log").innerHTML = logHtml(s);
+      var sel = q("which");
+      sel.innerHTML = "";
+      s.inflight.forEach(function (x, i) { var o = document.createElement("option"); o.value = String(i); o.textContent = hx(x.cid, 4) + (i === 0 ? " (oldest)" : ""); sel.appendChild(o); });
+      if (!s.inflight.length) { var o = document.createElement("option"); o.textContent = "none executing"; o.value = "-1"; sel.appendChild(o); }
+      q("fault").value = s.fault;
+    }
+    function act(fn) { return function () { s.fault = q("fault").value; fn(); draw(); }; }
+    q("reset").addEventListener("click", reset);
+    q("int").addEventListener("change", function () { s.intEnabled = q("int").checked; });
+    q("submit").addEventListener("click", act(function () { submit(s); }));
+    q("ringsq").addEventListener("click", act(function () { ringSq(s); }));
+    q("fetch").addEventListener("click", act(function () { fetch(s); }));
+    q("complete").addEventListener("click", act(function () { complete(s, parseInt(q("which").value, 10)); }));
+    q("consume").addEventListener("click", act(function () { consume(s); }));
+    q("ringcq").addEventListener("click", act(function () { ringCq(s); }));
+    q("timeout").addEventListener("click", act(function () { timeouts(s); }));
+    q("phasebug").addEventListener("click", act(function () { s.phaseBug = !s.phaseBug; log(s, "Host", s.phaseBug ? "FAULT armed: driver bug — forgets to flip its expected phase when the CQ head wraps" : "phase-flip bug removed", "none", "", s.phaseBug ? "abnormal" : "note"); }));
+    q("cycle").addEventListener("click", act(function () { submit(s); ringSq(s); fetch(s); complete(s, s.inflight.length - 1); consume(s); ringCq(s); }));
+    q("burst").addEventListener("click", act(function () {
+      submit(s); submit(s); submit(s); ringSq(s); fetch(s); fetch(s); fetch(s);
+      complete(s, 2); complete(s, 0); complete(s, 0);
+      consume(s); consume(s); consume(s); ringCq(s);
+    }));
+    reset();
+  });
+})();
+</script>

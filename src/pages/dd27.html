@@ -1,0 +1,672 @@
+<p class="lead">Chapter 28 showed what a doorbell is and how to decode one. This module studies doorbells as a concurrent, cross-domain event: CPU memory ordering on one side, posted PCIe writes in the middle, a controller front end on the other, and in virtual machines a hypervisor in between. It adds the races, the latency measurements, the shadow-doorbell mechanics and the lifecycle edge cases that the chapter left out.</p>
+
+<section id="orientation">
+<h2>Orientation</h2>
+<p>A doorbell carries one 16-bit index. Everything difficult about it comes from <em>when</em> and <em>by whom</em> it is written and <em>what state</em> the controller is in when it arrives. This module deepens <a href="ch28.html">Chapter 28</a> in five directions: (1) concurrency — what happens when two CPUs share one Submission Queue (SQ) and ring its doorbell; (2) the doorbell as a performance signal — doorbell-to-fetch latency and its three very different causes; (3) shadow doorbells and EventIdx in depth, including when they save nothing; (4) lifecycle — doorbells written while the controller is resetting, disabled, or in a low-power state, and while Memory Space or Bus Master Enable is off; (5) trace ambiguity — telling a host double-write from a Data Link Layer replay.</p>
+<aside class="callout prereq">
+<p>You need the doorbell address formula, the nine steps and the write barrier from <a href="ch28.html">Chapter 28 — Doorbells</a>; head/tail ownership from <a href="ch25.html">Chapter 25 — Queue Architecture</a>; posted writes from <a href="ch12.html">Chapter 12</a>; PCIe ordering from <a href="ch14.html">Chapter 14</a>; and replay from <a href="ch15.html">Chapter 15 — DLLP</a>. Queue topology is in <a href="dd26.html">Module 26</a>.</p>
+</aside>
+<p>Where it goes next: <a href="dd28.html">Module 28</a> examines the 64 bytes each doorbell publishes, and <a href="dd38.html">Module 38 — Trace Correlation</a> builds the doorbell-to-fetch rule into a general correlation engine.</p>
+</section>
+
+<section id="objectives">
+<h2>Required learning objectives</h2>
+<table>
+<caption>Objectives for this module, by level</caption>
+<thead><tr><th>Level</th><th>You will be able to…</th></tr></thead>
+<tbody>
+<tr><td>Beginner</td><td>Say what a doorbell carries, who writes it, and why writing the same value twice is harmless.</td></tr>
+<tr><td>Intermediate</td><td>Compute doorbell addresses for any queue, stride and BAR location (including a virtual function's BAR above 4 GiB) and choose MWr32 or MWr64 correctly.</td></tr>
+<tr><td>Advanced</td><td>Explain why an atomic slot reservation is not enough when CPUs share an SQ, and design a correct multi-producer submission path.</td></tr>
+<tr><td>Senior</td><td>Judge when shadow doorbells help, when they cannot, and what correctness argument (the lost-wakeup re-check) they depend on; review doorbell code across CPU architectures and hypervisors.</td></tr>
+<tr><td>Trace analysis</td><td>Measure doorbell-to-fetch latency and attribute it to arbitration, internal back-pressure or front-end saturation; tell a replayed TLP from a duplicate doorbell.</td></tr>
+<tr><td>Debugging</td><td>Diagnose "never fetched", "tail moved backwards", "doorbell storms in a VM", and "doorbells lost across reset or power transitions".</td></tr>
+<tr><td>Validation</td><td>Build a doorbell test plan covering invalid values, races, stride, wide and partial writes, reset and power-state windows, and shadow-doorbell semantics.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="kid">
+<h2>Kid story</h2>
+<aside class="callout kid" data-title="The mailbox with a number dial">
+<p>A house at the end of a country lane has a big mailbox. Inside is a row of numbered slots for letters. On the side of the box is a dial, like a clock hand pointing at numbers. When you put letters in, you turn the dial to "my letters go up to slot 8". The mail carrier drives by, looks at the dial, and takes everything up to slot 8. The dial never says "two letters"; it always says "up to here".</p>
+<p>Now two brothers post letters at the same time. Sam puts his letter in slot 5, Ali in slot 6. Ali is faster: he turns the dial to 7. Then Sam, who did not see, turns it back to 6. The carrier sees the dial go <em>backwards</em> and is confused — did someone take letters back? So the family makes a rule: only one person at a time may post a letter and turn the dial.</p>
+<p>On busy days the carrier parks in the driveway and peeks into the box every minute anyway. Then nobody needs to turn the dial at all; they just write the number on a sticky note inside the box. When the carrier leaves, she pins a note saying "turn the dial if you post after letter 12", so the family knows when to call her back.</p>
+</aside>
+</section>
+
+<section id="boundary">
+<h2>Analogy boundary</h2>
+<aside class="callout breaks">
+<p><strong>What it represents.</strong> The slots are SQ entries in host memory; the dial is the SQ tail doorbell; "up to here" is the absolute index; the brothers are two CPUs sharing a queue; the parked carrier peeking is a controller polling a shadow doorbell buffer; the pinned note is EventIdx.</p>
+<p><strong>What it hides.</strong> A real NVM Express (NVMe) doorbell is a register inside the controller, not a dial the carrier reads at leisure: each write is a Memory Write packet that travels over PCI Express (PCIe) and is latched on arrival. The letter must be fully written <em>and visible</em> before the dial moves — a CPU memory-ordering property with no counterpart in the story. And there is also a second dial on the other side of the box (the Completion Queue head doorbell) for "I have read your replies up to here".</p>
+<p><strong>Where it misleads.</strong> The carrier in the story notices a backwards dial and asks. A controller cannot ask: at best it reports an Invalid Doorbell Write Value through an Asynchronous Event, and only if the host left an Asynchronous Event Request outstanding. Otherwise the backwards value is silently interpreted or ignored. The story also suggests the sticky note is always cheaper; in fact shadow doorbells save nothing when the controller is idle, because it is asleep and must be woken by a real doorbell.</p>
+</aside>
+</section>
+
+<section id="vocabulary">
+<h2>Vocabulary</h2>
+<table>
+<caption>Terms used in this module</caption>
+<thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship to adjacent terms</th><th>Common confusion</th></tr></thead>
+<tbody>
+<tr><td><span class="g" data-term="doorbell">Doorbell</span></td><td>"Up to here" signal</td><td>32-bit controller register; bits 15:00 hold the new SQ tail (SQyTDBL) or CQ head (CQyHDBL)</td><td>Lives at BAR0 + 1000h + index × stride</td><td>Thinking it carries a command or a count</td></tr>
+<tr><td><span class="g" data-term="dstrd">CAP.DSTRD</span></td><td>Spacing between dials</td><td>Doorbell Stride, CAP bits 35:32; stride = 4 &lt;&lt; DSTRD bytes</td><td>Determines every doorbell address</td><td>Hard-coding stride 4</td></tr>
+<tr><td><span class="g" data-term="posted">Posted write</span></td><td>Send and forget</td><td>A PCIe Memory Write (MWr) with no completion TLP</td><td>Gives the CPU speed and the host no acknowledgement</td><td>Assuming the store's completion means arrival</td></tr>
+<tr><td><span class="g" data-term="memory-barrier">Write barrier</span> / writel</td><td>"Finish writing before ringing"</td><td>CPU ordering that makes prior normal-memory stores visible before a later MMIO store</td><td>Linux writel() includes it; writel_relaxed() does not</td><td>Believing x86 never needs it in code</td></tr>
+<tr><td>Doorbell-to-fetch latency</td><td>How long until the carrier picks up</td><td>Time from the doorbell MWr to the controller's first MRd of the published slots</td><td>Measures front end, arbitration and back-pressure together</td><td>Treating it as media latency</td></tr>
+<tr><td>Tail regression</td><td>The dial goes backwards</td><td>An SQ tail doorbell value behind the previous one, which the controller reads as a huge forward move</td><td>Usually a multi-producer race</td><td>Thinking the controller "sees backwards" — it only sees modular arithmetic</td></tr>
+<tr><td><span class="g" data-term="shadow-doorbell">Shadow doorbell</span></td><td>Sticky note instead of the dial</td><td>Host-memory copy of a doorbell value, configured by Doorbell Buffer Config (opcode 7Ch, optional, NVMe 1.3+)</td><td>Paired with an EventIdx entry per doorbell</td><td>Assuming physical SSDs implement it</td></tr>
+<tr><td><span class="g" data-term="eventidx">EventIdx</span></td><td>"Call me after letter N"</td><td>Controller-written index; the host performs an MMIO doorbell only when its update crosses it</td><td>Same technique as virtio's event index</td><td>Getting the 16-bit wrap comparison wrong</td></tr>
+<tr><td><span class="g" data-term="async-event-request">Asynchronous Event Request</span></td><td>A standing question "tell me if something goes wrong"</td><td>Admin command that completes when an event occurs, such as an invalid doorbell write</td><td>The only path for doorbell-error reporting</td><td>Forgetting to keep one outstanding</td></tr>
+<tr><td><span class="g" data-term="replay-buffer">Replay</span></td><td>Re-sending a damaged parcel</td><td>Data Link Layer retransmission of a TLP with the same sequence number after a NAK or timeout</td><td>Invisible to the transaction layer when it works</td><td>Reading a replayed doorbell as a host double-write</td></tr>
+<tr><td><span class="g" data-term="memory-space-enable">Memory Space Enable</span></td><td>"The function answers memory addresses"</td><td>Command register bit; when 0 the function does not accept memory requests</td><td>A doorbell to a function with it cleared is an Unsupported Request</td><td>Confusing it with Bus Master Enable</td></tr>
+<tr><td><span class="g" data-term="bus-master-enable">Bus Master Enable</span></td><td>"The function may start transfers"</td><td>Command register bit; when 0 the function may not issue memory requests</td><td>Without it, a doorbell is latched but no fetch can follow</td><td>Blaming the controller for not fetching</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="architecture">
+<h2>Architecture</h2>
+<figure>
+<pre class="diagram">
+ CPU core                       Root complex / IOMMU              Link (+ switch)        NVMe controller (01:00.0)
+ ────────                       ────────────────────              ───────────────        ─────────────────────────
+ store SQE ──► cache / DRAM (SQ1 slot)                                                   doorbell register file
+ writel()  ─ barrier ─► UC MMIO store ─► MWr32 0xFE60_1008 ─────► posted queue ───────►  SQ1 tail latch ──► arbiter ──► fetch engine
+                                                                                              ▲                         │
+ shadow path (optional):                                                                      │ polls when awake         ▼
+ store new tail ──► shadow buffer (host memory) ◄──────────── MRd (device polls) ─────────────┘                MRd SQE ─► RC ─► DRAM
+                    EventIdx buffer (host memory) ◄──────────── MWr (device writes) ◄── "wake me after N"
+</pre>
+<figcaption>The doorbell path, with the optional shadow-doorbell path underneath. Reference lab system: BAR0 = 0xFE60_0000, CAP.DSTRD = 0. Synthetic example for teaching.</figcaption>
+</figure>
+<table>
+<caption>Doorbell architecture</caption>
+<thead><tr><th>Aspect</th><th>Content</th></tr></thead>
+<tbody>
+<tr><td>Inputs</td><td>CPU MMIO stores to SQyTDBL / CQyHDBL; in shadow mode, host stores to shadow buffer slots.</td></tr>
+<tr><td>Outputs</td><td>SQ: arbitration eligibility and SQE fetches. CQ: freed CQ slots. Errors: Asynchronous Event completions. Shadow mode: EventIdx writes.</td></tr>
+<tr><td>Actors</td><td>Submitting CPUs (possibly several per queue), root complex, switches, controller doorbell logic, arbiter, firmware, hypervisor (for emulated controllers).</td></tr>
+<tr><td>State</td><td>Host: tail variable, last value written, lock. Controller: latched tail/head per queue, internal head/tail, error state. Shadow: shadow value, EventIdx value, controller awake/asleep.</td></tr>
+<tr><td>Memory</td><td>SQ ring (what the doorbell publishes); shadow and EventIdx pages (one slot per doorbell, laid out with the doorbell stride).</td></tr>
+<tr><td>Registers</td><td>SQyTDBL, CQyHDBL, CAP.DSTRD, CSTS.RDY, CC.EN; PCI Command register (Memory Space Enable, Bus Master Enable).</td></tr>
+<tr><td>Interfaces</td><td>CPU MMIO, PCIe posted Memory Write, NVMe Asynchronous Event mechanism, Doorbell Buffer Config.</td></tr>
+<tr><td>Dependencies</td><td>Queue exists; controller ready; Memory Space Enable = 1 (so the write is accepted) and Bus Master Enable = 1 (so the fetch can follow); BAR0 mapped uncached; SQE visible before the MMIO store.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="mechanism">
+<h2>Mechanism</h2>
+<p>One submission on an SQ shared by two CPUs, done correctly. Reference lab system, SQ2 (1024 entries, base 0x1_2342_0000), synthetic example for teaching.</p>
+<ol>
+<li><strong>Acquire the queue lock.</strong> <em>Who:</em> CPU 4. <em>What:</em> exclusive right to reserve a slot, write it and ring. <em>Where:</em> host lock variable. <em>Evidence:</em> none on the link; lock statistics on the host.</li>
+<li><strong>Reserve the slot at the tail.</strong> <em>Who:</em> CPU 4. <em>What:</em> slot 5 chosen; host tail 5 → 6. <em>Where:</em> driver variable. <em>Evidence:</em> none.</li>
+<li><strong>Write the 64-byte SQE.</strong> <em>Who:</em> CPU 4. <em>What:</em> slot 5 at 0x1_2342_0140 filled. <em>Where:</em> cache/DRAM. <em>Evidence:</em> only later, as the fetched payload.</li>
+<li><strong>Order, then ring.</strong> <em>Who:</em> CPU 4. <em>What:</em> barrier, then a 32-bit uncached store of 6 to 0xFE60_1010. <em>Where:</em> CPU store path → root complex. <em>Evidence:</em> MWr32, Length 1, First DW BE 1111b, Requester ID of the root complex.</li>
+<li><strong>Release the lock.</strong> Only now may CPU 6 reserve slot 6. Because the lock covers reserve, write and ring, the doorbell values on the link are strictly increasing (modulo wrap) for this queue.</li>
+<li><strong>Latch and validate.</strong> <em>Who:</em> controller. <em>What:</em> new tail 6; checks 6 &lt; size and that (6 − head) does not overfill. <em>Where:</em> doorbell register file. <em>Evidence:</em> none, unless invalid — then an Asynchronous Event completion on the Admin CQ.</li>
+<li><strong>Arbitrate and fetch.</strong> <em>Who:</em> controller. <em>What:</em> SQ2 becomes eligible; when chosen and when internal command slots are free, MRd at 0x1_2342_0140. <em>Evidence:</em> the MRd; the time from step 4 to here is doorbell-to-fetch latency.</li>
+<li><strong>Free completion slots later.</strong> <em>Who:</em> the CPU handling the CQ's vector. <em>What:</em> after reaping, a CQ head doorbell. <em>Evidence:</em> MWr32 to CQ2HDBL (or the shared CQ's head doorbell).</li>
+</ol>
+<figure>
+<ol class="seq" data-actors="CPU 4|CPU 6|Root complex|Controller">
+<li data-note="CPU 4">lock; slot 5; write SQE; barrier</li>
+<li data-from="CPU 4" data-to="Root complex">store 6 to SQ2TDBL</li>
+<li data-from="Root complex" data-to="Controller" data-t="0 ns">MWr32 0xFE60_1010 = 6</li>
+<li data-note="CPU 4|CPU 6">CPU 4 unlocks; CPU 6 locks, slot 6</li>
+<li data-from="CPU 6" data-to="Root complex">store 7 to SQ2TDBL</li>
+<li data-from="Root complex" data-to="Controller" data-t="180 ns">MWr32 0xFE60_1010 = 7</li>
+<li data-note="Controller">tail 5 → 7: slots 5-6 eligible</li>
+<li data-from="Controller" data-to="Root complex" data-t="700 ns">MRd 0x1_2342_0140, 32 DW</li>
+<li data-from="Root complex" data-to="Controller" class="dashed">CplD: two SQEs</li>
+</ol>
+<figcaption>Two producers on one SQ, serialised by a lock. The controller may coalesce both doorbells into one fetch. Synthetic, illustrative timing.</figcaption>
+</figure>
+
+<h3>The central concept on the ladder: a doorbell under concurrency</h3>
+<div class="ladder">
+<div class="rung" data-rung="A"><p>One person at a time posts a letter and turns the dial, so the dial only ever moves forward.</p></div>
+<div class="rung" data-rung="B"><p>Every SQ has exactly one logical producer. If several CPUs share it, a lock must cover reserving the slot, writing the SQE and writing the doorbell.</p></div>
+<div class="rung" data-rung="C"><p>The doorbell is a register latch in the controller; each MWr overwrites it. The controller computes new entries as (new − old) mod size, so a late, smaller value looks like a very large forward move.</p></div>
+<div class="rung" data-rung="D"><p>NVMe Base 2.4 defines the doorbell registers, the full rule, and Asynchronous Event reporting of Invalid Doorbell Write Value. It does not specify host locking — that is derived from the single-producer model.</p></div>
+<div class="rung" data-rung="E"><p>Doorbells are posted MWrs; PCIe keeps posted writes from the same requester in order on one path, so the order in which CPUs' stores leave the root complex is the order the controller sees.</p></div>
+<div class="rung" data-rung="F"><p>Per SQ, doorbell values must be monotonic modulo wrap. A value smaller than its predecessor, without an intervening full wrap, is the trace signature of a race.</p></div>
+<div class="rung" data-rung="G"><p>Asynchronous Event "Invalid Doorbell Write Value" under multi-threaded load, never single-threaded → suspect a lock that covers the slot but not the doorbell.</p></div>
+</div>
+</section>
+
+<section id="spec">
+<h2>Specification discipline</h2>
+<p>Sources: <cite class="spec">NVM Express Base Specification, Revision 2.4 — Controller Registers (Submission Queue y Tail Doorbell, Completion Queue y Head Doorbell, CAP.DSTRD); Asynchronous Event Request (Error status events); Doorbell Buffer Config</cite>; <cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4 — register mapping and memory model</cite>; <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 family — Memory Write requests, Transaction Ordering, Command register, Unsupported Request handling</cite>.</p>
+<table>
+<caption>Classifying doorbell statements</caption>
+<thead><tr><th>Statement</th><th>Kind</th></tr></thead>
+<tbody>
+<tr><td>Doorbell offsets 1000h + (2y) × (4 &lt;&lt; DSTRD) and 1000h + (2y + 1) × (4 &lt;&lt; DSTRD); value in bits 15:00.</td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Invalid doorbell register writes and invalid values are reported as Error status asynchronous events, if a request is outstanding.</td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Doorbell Buffer Config (7Ch) and the shadow/EventIdx buffers.</td><td><span class="badge optional">Optional</span> <span class="badge version">NVMe 1.3+</span></td></tr>
+<tr><td>A memory request to a function whose Memory Space Enable is 0 is handled as an Unsupported Request; a posted request gets no completion, so the error is visible only in the device's error logging/AER.</td><td><span class="badge normative">Normative</span> (PCIe)</td></tr>
+<tr><td>Doorbell values on one SQ must be monotonic modulo wrap when several CPUs share it.</td><td><span class="badge derived">Derived</span> from the single-producer model and the full rule</td></tr>
+<tr><td>Doorbell-to-fetch latency, SQE prefetch size, doorbell coalescing inside the controller.</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+<tr><td>Behaviour of the queue after an invalid doorbell write.</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+<tr><td>Whether a doorbell written while CC.EN = 0 or CSTS.RDY = 0 has any effect.</td><td>Not meaningful: queues do not exist then; do not depend on any behaviour</td></tr>
+</tbody>
+</table>
+<aside class="callout notsaid">
+<p>The specification does not define host locking, batching policy or how often to write the CQ head doorbell. It does not bound doorbell-to-fetch latency or require the controller to fetch everything published at once. It does not define what a read of a doorbell register returns in a way you should rely on. For shadow doorbells, the exact rules for when the controller must re-read shadow values, the buffer layout details and the behaviour across resets must be read in the Doorbell Buffer Config description <span class="badge uncertain">Check details</span>. What a function in a low-power device state (D3hot) does with memory requests is governed by the PCI power-management rules, not by NVMe; check those rules rather than assuming a doorbell is buffered.</p>
+</aside>
+</section>
+
+<section id="hardware">
+<h2>Hardware view</h2>
+<table>
+<caption>Hardware that participates in a doorbell</caption>
+<thead><tr><th>Category</th><th>Hardware</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td rowspan="3">Must</td><td>CPU store path</td><td>Uncached (UC) MMIO store; on weakly ordered CPUs the barrier is a real instruction.</td></tr>
+<tr><td>Root complex</td><td>Converts the store into an MWr TLP; preserves the order of posted writes it emits on one port.</td></tr>
+<tr><td>Controller doorbell block</td><td>Latch, validate, signal the arbiter or the free-slot accounting.</td></tr>
+<tr><td rowspan="3">May</td><td>PCIe switch</td><td>Adds latency; preserves posted order per path.</td></tr>
+<tr><td>Hypervisor trap logic</td><td>For emulated controllers, each MMIO doorbell is a VM exit costing microseconds.</td></tr>
+<tr><td>Controller firmware</td><td>Some designs pass doorbell events to firmware, adding variable delay.</td></tr>
+<tr><td>Observable</td><td colspan="2">The MWr (address, data, byte enables, sequence number at the Data Link Layer), the following fetch, Asynchronous Event completions, shadow-buffer polling reads and EventIdx writes if the controller is a physical device using them.</td></tr>
+<tr><td>Unobservable</td><td colspan="2">The CPU's barrier, lock and stores; the controller's latch state, its internal command-slot occupancy (the reason a fetch may be withheld) and its arbiter decisions.</td></tr>
+</tbody>
+</table>
+<aside class="callout impl">
+<p>A controller only fetches when it has room to hold the command. If its internal command table is full (all slots holding fetched-but-not-completed commands), a newly published SQE waits in host memory. That back-pressure looks exactly like a slow front end in a trace: a long doorbell-to-fetch gap. Count fetched-but-not-completed commands at the moment of the doorbell before concluding the front end is slow.</p>
+</aside>
+</section>
+
+<section id="protocol">
+<h2>Protocol view</h2>
+<table>
+<caption>Doorbell interactions with other traffic</caption>
+<thead><tr><th>Relationship</th><th>Guaranteed by</th><th>What breaks it</th></tr></thead>
+<tbody>
+<tr><td>SQE in host memory before the doorbell reaches the device</td><td>Host barrier (writel)</td><td>Relaxed MMIO accessor, missing barrier, compiler reordering</td></tr>
+<tr><td>SQE written into a Controller Memory Buffer SQ before the doorbell</td><td>Both are posted writes from the root complex to the device on the same path; PCIe keeps them in order</td><td>Write-combining mapping of the CMB that delays SQE bytes; Relaxed Ordering</td></tr>
+<tr><td>Two doorbells to the same register arrive in the order they left the root complex</td><td>PCIe posted ordering on one path</td><td>Nothing on the link; the race is in which CPU's store leaves first</td></tr>
+<tr><td>Doorbell has been received by the device</td><td>Nothing directly (posted). A later non-posted read to the same device that completes proves earlier posted writes on that path arrived</td><td>Reading a different device or path</td></tr>
+<tr><td>Doorbell error is reported</td><td>NVMe Asynchronous Event, if an Asynchronous Event Request is outstanding</td><td>No outstanding request; event type masked</td></tr>
+</tbody>
+</table>
+<p>The fourth row is a standard technique: drivers that must know a posted write has landed (for example before timing a measurement or before powering something down) follow it with a read of a register on the same device, such as CSTS. Because a read completion cannot pass posted writes in the same direction, its return proves the earlier writes arrived. It costs a full non-posted round trip, which is why it is never used on the I/O fast path <span class="badge derived">Derived</span>.</p>
+<p>At the PCIe level a doorbell to a function with Memory Space Enable cleared is not delivered to the NVMe logic at all; it is an Unsupported Request at the PCIe layer, with no completion because it is posted. A doorbell to a function with Bus Master Enable cleared is delivered and latched, but the controller cannot issue the fetch. Both look like "doorbell present, no fetch" in a trace; the PCI Command register tells them apart.</p>
+</section>
+
+<section id="trace">
+<h2>Trace view</h2>
+<p>Synthetic examples for teaching, on the reference lab system (Requester ID 0x0100, BAR0 0xFE60_0000, DSTRD 0, Gen4 x4, MPS 256 B, MRRS 512 B). SQ1 base 0x1_2340_0000 (1024 entries), SQ2 base 0x1_2342_0000 (1024), SQ3 base 0x1_2344_0000 (256 entries). Doorbells are MWr32 (BAR below 4 GiB); queue fetches are MRd64.</p>
+
+<h3>Normal: three CPUs, three batches, one wrap</h3>
+<div class="trace" data-kind="synthetic" data-title="Normal: batched doorbells on SQ1, SQ2 and SQ3, with a wrap on SQ3">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Len=1 FBE=1111 Data=0x0000_000C</td><td>SQ1 tail 9 → 12: three SQEs (slots 9–11)</td></tr>
+<tr class="dir-down"><td>2</td><td>Host→Dev</td><td>140</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1010 Len=1 Data=0x0000_0004</td><td>SQ2 tail 2 → 4: slots 2–3</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>310</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1018 Len=1 Data=0x0000_0001</td><td>SQ3 tail 254 → 1: slots 254, 255, 0 (wrap)</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>690</td><td>MRd64</td><td>Req=0x0100 Tag=0x50 Addr=0x1_2340_0240 Len=48 DW</td><td>SQ1 slots 9–11 (0x240 = 9 × 64): doorbell-to-fetch 690 ns</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>760</td><td>MRd64</td><td>Req=0x0100 Tag=0x51 Addr=0x1_2342_0080 Len=32 DW</td><td>SQ2 slots 2–3: 620 ns</td></tr>
+<tr class="dir-up"><td>6</td><td>Dev→Host</td><td>830</td><td>MRd64</td><td>Req=0x0100 Tag=0x52 Addr=0x1_2344_3F80 Len=32 DW</td><td>SQ3 slots 254–255 (end of ring)</td></tr>
+<tr class="dir-up"><td>7</td><td>Dev→Host</td><td>840</td><td>MRd64</td><td>Req=0x0100 Tag=0x53 Addr=0x1_2344_0000 Len=16 DW</td><td>SQ3 slot 0: a second read, because slot 0 is not adjacent to slot 255</td></tr>
+<tr class="dir-down"><td>8–11</td><td>Host→Dev</td><td>1,350–1,520</td><td>CplD ×4</td><td>Tags 0x50–0x53, ByteCount 192/128/128/64</td><td>All seven SQEs delivered</td></tr>
+<tr class="note"><td colspan="6">Execution, data, CQEs and MSI-X omitted.</td></tr>
+<tr class="dir-down"><td>12</td><td>Host→Dev</td><td>74,900</td><td>MWr32</td><td>Req=RC Addr=0xFE60_100C Data=0x0000_0130</td><td>CQ1 head → 304 (CQ1 is shared by SQ1 and SQ2 in this topology)</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Decode each doorbell to (queue, side, value), compute the published range from the previous tail, and match fetches. SQ1: (12 − 9) = 3 → 192 bytes from 0x240 ✓. SQ2: 2 slots → 128 bytes ✓. SQ3: (1 − 254) mod 256 = 3 → slots 254, 255, 0, fetched as two reads because the ring wraps in memory ✓. The doorbell-to-fetch latencies (620–690 ns) are consistent and small: a healthy front end. The order of fetches (SQ1, SQ2, SQ3) is consistent with round robin. Nothing in the doorbells identifies commands; only the fetched payloads carry CIDs.</p>
+</div>
+
+<h3>Slow: doorbell-to-fetch grows with load</h3>
+<div class="trace" data-kind="synthetic" data-title="Slow: same queue at queue depth 1 and at queue depth 256">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Phase A: one outstanding command at a time on SQ1.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.00</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0031</td><td>SQ1 tail 48 → 49</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.68</td><td>MRd64</td><td>Tag=0x10 Addr=0x1_2340_0C00 Len=16 DW</td><td>Fetch slot 48: 0.68 µs</td></tr>
+<tr class="note"><td colspan="6">Phase B, 10 s later: the benchmark keeps 256 commands outstanding on SQ1. Fetched-but-not-completed count derived from the trace just before row 3: 128.</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>0.00</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_02A1</td><td>SQ1 tail 0x2A0 → 0x2A1</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>38.10</td><td>MWr64</td><td>Addr=0x1_2341_xxxx Len=4 DW</td><td>A CQE for an older command on SQ1</td></tr>
+<tr class="abnormal"><td>5</td><td>Dev→Host</td><td>38.40</td><td>MRd64</td><td>Tag=0x8E Addr=0x1_2340_A800 Len=16 DW</td><td>Fetch slot 0x2A0 after 38.4 µs, 0.3 µs after that CQE — first abnormal-looking event</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Three causes produce a long doorbell-to-fetch gap, and the trace can separate them. <em>Arbitration:</em> other SQs are fetched during the gap — not the case here, only SQ1 is busy. <em>Back-pressure:</em> the controller holds as many fetched-but-not-completed commands as its internal table allows, and fetches only when a completion frees a slot — supported here: the count was at 128 (a plausible internal limit) and every fetch in phase B follows a CQE by a fraction of a microsecond. <em>Front-end saturation:</em> firmware is too busy to service doorbells, so fetches lag even when slots are free — would show fetch delays without a matching CQE just before each fetch. Conclusion: back-pressure, which is normal behaviour; the extra queue depth beyond the device's internal limit only adds waiting in host memory. That is Little's Law in action, not a defect. Confidence medium: the internal limit is inferred, not reported <span class="badge impl">Implementation-dependent</span>.</p>
+</div>
+
+<h3>Failed: the tail moved backwards</h3>
+<div class="trace" data-kind="synthetic" data-title="Failed: two CPUs share SQ2; the lock covers slot reservation but not the doorbell">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Driver variant: slots reserved under a lock; SQE write and doorbell after unlock. CPU 4 reserved slot 5, CPU 6 slot 6. An Asynchronous Event Request (CID 0x7002) is outstanding on the Admin queue.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1010 Len=1 Data=0x0000_0007</td><td>CPU 6 rings first: SQ2 tail 5 → 7 (slots 5 and 6)</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>650</td><td>MRd64</td><td>Tag=0x61 Addr=0x1_2342_0140 Len=32 DW</td><td>Fetch slots 5–6</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>720</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1010 Len=1 Data=0x0000_0006</td><td>CPU 4 rings with its own view: tail 6</td></tr>
+<tr class="dir-down"><td>4</td><td>Host→Dev</td><td>1,300</td><td>CplD</td><td>Tag=0x61 ByteCount=128; slot 5 CDW0=0x0E31_0002 (old); slot 6 CDW0=0x0D42_0002</td><td>Slot 5 still held the previous Read (CID 0x0E31): CPU 4 had not finished writing it</td></tr>
+<tr class="abnormal"><td>5</td><td>Dev→Host</td><td>2,100</td><td>MWr64</td><td>Addr=0x1_0000_1xx0 Len=4 DW DW0: type Error status, info Invalid Doorbell Write Value, log page 01h; DW3=0x0001_7002</td><td>The controller rejects row 3: (6 − 7) mod 1024 = 1023 new entries would overfill SQ2</td></tr>
+<tr class="dir-up"><td>6</td><td>Dev→Host</td><td>2,180</td><td>MWr32</td><td>Addr=0xFEE0_0000 Data=0x0000_0040</td><td>MSI-X vector 0 (Admin; address/data illustrative)</td></tr>
+<tr class="note"><td colspan="6">Later: a completion for CID 0x0E31 — a command the driver completed long ago — and a timeout for the real command in slot 5.</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Row 3 is the first value that breaks the per-queue monotonic rule, and the controller's Asynchronous Event (row 5) confirms it. But the first abnormal <em>event</em> is earlier and quieter: row 1 published slot 5 before CPU 4 had written it, and row 4's payload proves the controller fetched stale contents. One race produced two symptoms: a stale command executed and an invalid doorbell value. The kernel log would show an asynchronous event notice and a completion for an inactive command ID. Fix: one lock covering reserve, SQE write and doorbell — or one SQ per CPU. The intermediate lab enumerates every interleaving of this race.</p>
+</div>
+
+<h3>Ambiguous: the same doorbell twice</h3>
+<div class="trace" data-kind="synthetic" data-title="Ambiguous: identical doorbell TLPs 1.2 µs apart">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Seq=0x2A1 Addr=0xFE60_1008 Data=0x0000_0014</td><td>SQ1 tail → 20</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>420</td><td>DLLP</td><td>Nak Seq=0x2A0</td><td>Device NAKs: last good sequence number 0x2A0, so 0x2A1 arrived damaged</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,200</td><td>MWr32</td><td>Seq=0x2A1 Addr=0xFE60_1008 Data=0x0000_0014</td><td>Same TLP again</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,560</td><td>DLLP</td><td>Ack Seq=0x2A1</td><td>Accepted</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1,890</td><td>MRd64</td><td>Tag=0x22 Addr=0x1_2340_04C0 Len=16 DW</td><td>One fetch, slot 19</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> With Data Link Layer Packets (DLLPs) visible, this is unambiguous: same sequence number plus a NAK means a Data Link Layer replay; the controller's NVMe logic saw one doorbell. If the capture filtered out DLLPs — a common setting to save buffer space — rows 1 and 3 look like a host writing the same doorbell twice. Even then, the doorbell's idempotence means the NVMe outcome is identical; what differs is the diagnosis (link quality problem versus driver redundancy). The decisive field is the sequence number; if your analyzer view hides it, the honest statement is "duplicate doorbell TLP, cause undetermined; check link error counters (receiver errors, bad TLP) in the Advanced Error Reporting registers". A real host double-write would carry two different sequence numbers.</p>
+</div>
+</section>
+
+<section id="linux">
+<h2>Linux view</h2>
+<p>Read-only commands. Doorbell writes themselves are not exposed by Linux; you see their configuration and their consequences.</p>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Stride and limits (every doorbell address follows from DSTRD)</span>
+sudo nvme show-regs /dev/nvme0 -H | grep -iE 'stride|mqes|maximum queue'
+<span class="cm"># Is Doorbell Buffer Config supported? (Optional Admin Command Support)</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -iA14 '^oacs'
+<span class="cm"># Memory Space and Bus Master Enable for the SSD's function</span>
+sudo lspci -s 01:00.0 -vv | grep -E 'Control:'
+<span class="cm"># Link error counters that would explain replays (correctable errors)</span>
+sudo lspci -s 01:00.0 -vv | grep -A3 'CESta'
+<span class="cm"># Asynchronous events and invalid command IDs in the kernel log</span>
+sudo dmesg | grep -iE 'nvme.*(async|aen|invalid id)'
+<span class="cm"># Is this kernel using shadow doorbells? Look for dbbuf in the driver source of your version,</span>
+<span class="cm"># and check whether the controller is emulated (vendor and model):</span>
+cat /sys/class/nvme/nvme0/model</code></pre>
+<table>
+<caption>What each output proves</caption>
+<thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+<tbody>
+<tr><td>show-regs DSTRD</td><td>Every doorbell address</td><td>Which doorbells were written, or their values</td></tr>
+<tr><td>id-ctrl OACS</td><td>Doorbell Buffer Config is supported</td><td>That the driver enabled it</td></tr>
+<tr><td>lspci Control</td><td>Memory Space and Bus Master Enable right now</td><td>Their state at the moment of a past failure</td></tr>
+<tr><td>CESta / AER counters</td><td>Correctable link errors occurred (replays likely)</td><td>Which TLP was replayed</td></tr>
+<tr><td>dmesg asynchronous event notices</td><td>The controller reported an event</td><td>Which doorbell write caused it (read the Error Information log)</td></tr>
+</tbody>
+</table>
+<p>To see doorbells themselves, use a protocol analyzer or an emulated controller: QEMU's NVMe emulation offers trace events for doorbell writes and for shadow-doorbell activity, which turns the shadow-doorbell lab below into something you can observe on a laptop <span class="badge safe">Safe lab</span>. Event names vary by QEMU version; list them with QEMU's trace help rather than assuming names.</p>
+</section>
+
+<section id="labs">
+<h2>Labs</h2>
+
+<h3>Beginner lab — Doorbell address map for a physical and a virtual function</h3>
+<p><span class="badge safe">Safe lab</span> Calculation only.</p>
+<h4>Objective</h4><p>Produce the complete doorbell map and the correct TLP format for two functions with different strides and BAR locations.</p>
+<h4>Prerequisites</h4><p>Doorbell formula (<a href="ch28.html">Chapter 28</a>); 3-DW vs 4-DW headers (<a href="ch11.html">Chapter 11</a>).</p>
+<h4>Setup</h4><p>Physical function: BAR0 0xFE60_0000, DSTRD 0, queues 0–4. A virtual function of an SR-IOV capable SSD (synthetic): BAR0 0x38_0000_4000, DSTRD 1, queues 0–2.</p>
+<h4>Procedure</h4><ol><li>List SQ tail and CQ head doorbell addresses for each queue of each function.</li><li>State MWr32 or MWr64 for each function.</li><li>Decode these writes: (a) PF write to 0xFE60_101C value 0x40; (b) VF write to 0x38_0000_5018 value 3.</li></ol>
+<h4>Observations</h4><p>A table with function, queue, side, offset, absolute address, TLP format.</p>
+<h4>Questions</h4><ol><li>What does the VF write in (b) touch?</li><li>Why must a driver never assume the PF's stride for the VF?</li></ol>
+<h4>Expected reasoning</h4><p>Index = (offset − 1000h) / stride; even index → SQ tail of queue index/2; odd → CQ head.</p>
+<details class="solution"><summary>Solution</summary>
+<p>PF (stride 4): SQ0 1000h, CQ0 1004h, SQ1 1008h, CQ1 100Ch, SQ2 1010h, CQ2 1014h, SQ3 1018h, CQ3 101Ch, SQ4 1020h, CQ4 1024h; absolute 0xFE60_1000… — MWr32 (below 4 GiB). VF (stride 8): SQ0 1000h, CQ0 1008h, SQ1 1010h, CQ1 1018h, SQ2 1020h, CQ2 1028h; absolute 0x38_0000_5000… — MWr64 (above 4 GiB). (a) offset 101Ch → index 7 → CQ3 head = 64. (b) offset 0x5018 − 0x4000 = 1018h → index 3 → CQ1 head = 3 — not SQ3's tail, which a stride-4 assumption would have claimed. (2) Stride is per controller (CAP of that function); emulated and virtual controllers often use larger strides.</p>
+</details>
+<h4>Extension</h4><p>For DSTRD = 2, compute how many queue pairs fit in a 16 KiB BAR0 if the MSI-X table occupies 0x2000–0x2FFF and doorbells may not overlap it.</p>
+
+<h3>Intermediate lab — Enumerate the shared-SQ race</h3>
+<p><span class="badge safe">Safe lab</span> Pure simulation.</p>
+<h4>Objective</h4><p>Show, by enumerating every interleaving, that only a lock covering reserve + SQE + doorbell is correct when two CPUs share an SQ.</p>
+<h4>Prerequisites</h4><p>The Failed trace above; Python 3.8+.</p>
+<h4>Setup</h4>
+<pre class="code" data-kind="executable" data-lang="python" data-title="doorbell_race.py"><code>#!/usr/bin/env python3
+"""Two CPUs submit to ONE shared SQ. Enumerate every interleaving of their
+steps and classify what the controller would see. Synthetic teaching model,
+standard library only. Assumption: the controller fetches up to the new tail
+as soon as each doorbell arrives (a fast controller), so any slot it fetches
+must already hold its SQE.
+"""
+from itertools import combinations
+
+SIZE = 8          # queue entries
+START = 5         # shared tail before both CPUs submit
+
+def run(order, steps):
+    """order: tuple of thread ids, e.g. (0, 1, 1, 0, ...). steps: per-thread op list."""
+    shared = {"tail": START}
+    local = [{}, {}]
+    written = set()                      # slots that hold a fresh SQE
+    last_db = START
+    verdicts = []
+    pc = [0, 0]
+    for t in order:
+        op = steps[pc[t]]; pc[t] += 1
+        L = local[t]
+        if op == "read":                 # racy: load the tail
+            L["slot"] = shared["tail"]
+        elif op == "store":              # racy: store tail + 1
+            shared["tail"] = (L["slot"] + 1) % SIZE
+        elif op == "reserve":            # atomic fetch-and-add
+            L["slot"] = shared["tail"]
+            shared["tail"] = (shared["tail"] + 1) % SIZE
+        elif op == "sqe":
+            if L["slot"] in written:
+                verdicts.append("same slot used twice")
+            written.add(L["slot"])
+        elif op == "doorbell":
+            new = (L["slot"] + 1) % SIZE
+            added = (new - last_db) % SIZE
+            if added == 0:
+                verdicts.append("redundant doorbell")
+            elif (new - START) % SIZE &lt; (last_db - START) % SIZE:
+                verdicts.append("tail moved backwards")
+            else:
+                for k in range(added):
+                    if (last_db + k) % SIZE not in written:
+                        verdicts.append("stale SQE fetched")
+                        break
+                last_db = new
+    if (last_db - START) % SIZE != 2:
+        verdicts.append("a command never published")
+    return sorted(set(verdicts)) or ["correct"]
+
+def explore(name, steps, atomic_block=False):
+    n = len(steps)
+    results = {}
+    if atomic_block:                     # each CPU's whole sequence runs under a lock
+        orders = [(0,) * n + (1,) * n, (1,) * n + (0,) * n]
+    else:
+        orders = []
+        for pos in combinations(range(2 * n), n):
+            o = [1] * (2 * n)
+            for p in pos:
+                o[p] = 0
+            orders.append(tuple(o))
+    for o in orders:
+        key = ", ".join(run(o, steps))
+        results[key] = results.get(key, 0) + 1
+    print(f"{name}: {len(orders)} interleavings")
+    for k, v in sorted(results.items(), key=lambda kv: -kv[1]):
+        print(f"   {v:3d}  {k}")
+
+if __name__ == "__main__":
+    explore("A. racy load/store of tail", ["read", "store", "sqe", "doorbell"])
+    explore("B. atomic slot reservation, no lock", ["reserve", "sqe", "doorbell"])
+    explore("C. lock around reserve+SQE+doorbell", ["reserve", "sqe", "doorbell"], atomic_block=True)</code></pre>
+<h4>Procedure</h4><ol><li>Run it.</li><li>Add a variant D: atomic reservation, and each CPU rings only after waiting until every lower slot it did not reserve has been written ("ring in order").</li><li>Count correct interleavings for D.</li></ol>
+<h4>Observations</h4>
+<pre class="code" data-kind="simulation" data-lang="text"><code>A. racy load/store of tail: 70 interleavings
+    40  a command never published, redundant doorbell, same slot used twice
+    20  correct
+     8  tail moved backwards
+     2  stale SQE fetched, tail moved backwards
+B. atomic slot reservation, no lock: 20 interleavings
+    12  correct
+     6  tail moved backwards
+     2  stale SQE fetched, tail moved backwards
+C. lock around reserve+SQE+doorbell: 2 interleavings
+     2  correct</code></pre>
+<h4>Questions</h4><ol><li>Why does atomic reservation (B) still fail 8 of 20 interleavings?</li><li>Which outcome in A is invisible to the controller but loses a command?</li><li>What does the controller do with a tail that moved backwards on a 1024-entry queue?</li></ol>
+<h4>Expected reasoning</h4><p>The doorbell publishes every slot up to its value; it is only safe if every such slot is already written, and if no later value has already been rung.</p>
+<details class="solution"><summary>Solution</summary>
+<p>(1) Atomic reservation fixes slot ownership, but the two doorbells can still be written in the wrong order (backwards tail), and the higher one can publish the lower slot before it is written (stale fetch). (2) The lost update: both CPUs read tail 5, both write slot 5, both ring 6 — one command overwritten, the second doorbell redundant, nothing for the controller to complain about. (3) It computes (new − old) mod 1024 = 1023 entries, which would overfill the queue: an Invalid Doorbell Write Value event if a request is outstanding; otherwise implementation-dependent behaviour. Variant D is correct in all interleavings but makes one CPU wait for the other — which is why drivers simply use a per-queue lock or per-CPU queues.</p>
+</details>
+<h4>Extension</h4><p>Raise to three CPUs (SIZE = 8, START = 5) and compare counts; then argue why per-CPU queues remove the problem entirely.</p>
+
+<h3>Advanced lab — When do shadow doorbells save anything?</h3>
+<p><span class="badge safe">Safe lab</span> Pure simulation.</p>
+<h4>Objective</h4><p>Measure how many MMIO doorbells EventIdx avoids for dense and sparse workloads, and understand the re-check that prevents lost wakeups.</p>
+<h4>Prerequisites</h4><p>Shadow doorbells in <a href="ch28.html">Chapter 28</a>.</p>
+<h4>Setup</h4>
+<pre class="code" data-kind="executable" data-lang="python" data-title="shadow_db.py"><code>#!/usr/bin/env python3
+"""Shadow doorbell / EventIdx simulation (Doorbell Buffer Config style).
+Synthetic teaching model, standard library only.
+The host writes each new SQ tail into a shadow slot in memory, and performs a
+real MMIO doorbell write only when need_event() says the controller asked for
+one. An emulated controller polls the shadow while busy; when it has been idle
+for IDLE_US it publishes EventIdx = last tail it consumed, re-checks the
+shadow once (to close the lost-wakeup window), and sleeps until an MMIO write.
+"""
+import random
+
+def need_event(event_idx, new_idx, old_idx):
+    """True if event_idx lies in (old_idx, new_idx], all 16-bit wrapping."""
+    return ((new_idx - event_idx - 1) &amp; 0xFFFF) &lt; ((new_idx - old_idx) &amp; 0xFFFF)
+
+def simulate(gaps_us, poll_us=2, idle_us=20, shadow=True):
+    shadow_tail = 0          # host-written shadow doorbell slot
+    event_idx = 0            # controller-written EventIdx slot
+    consumed = 0             # controller's view of the tail it has processed
+    awake, idle_for, mmio, worst_notice = False, 0, 0, 0
+    pending_since = {}       # tail value -&gt; time it was published
+    t, arrivals = 0, []
+    for g in gaps_us:
+        t += g
+        arrivals.append(t)
+    end = arrivals[-1] + 200
+    nxt = 0
+    for now in range(end + 1):
+        while nxt &lt; len(arrivals) and arrivals[nxt] == now:       # host submits one command
+            old, new = shadow_tail, (shadow_tail + 1) &amp; 0xFFFF
+            shadow_tail = new
+            pending_since[new] = now
+            if not shadow or need_event(event_idx, new, old):
+                mmio += 1
+                awake, idle_for = True, 0                        # MMIO wakes the controller
+            nxt += 1
+        if awake and now % poll_us == 0:                         # controller polls the shadow
+            if shadow_tail != consumed:
+                worst_notice = max(worst_notice, now - pending_since[(consumed + 1) &amp; 0xFFFF])
+                consumed, idle_for = shadow_tail, 0
+            else:
+                idle_for += poll_us
+                if idle_for &gt;= idle_us:
+                    event_idx = consumed                         # "wake me after this"
+                    if shadow_tail != consumed:                  # re-check closes the race
+                        idle_for = 0
+                    else:
+                        awake = False
+    lost = consumed != shadow_tail
+    return mmio, worst_notice, lost
+
+if __name__ == "__main__":
+    rng = random.Random(1)
+    busy = [rng.randint(1, 4) for _ in range(2000)]      # dense: one I/O every 1-4 us
+    sparse = [rng.randint(50, 300) for _ in range(200)]   # sparse: one I/O every 50-300 us
+    for label, gaps in (("dense ", busy), ("sparse", sparse)):
+        for sh in (False, True):
+            mmio, notice, lost = simulate(gaps, shadow=sh)
+            print(f"{label} {len(gaps):5d} cmds  shadow={'on ' if sh else 'off'}  "
+                  f"MMIO doorbells={mmio:5d}  worst notice delay={notice:2d} us  lost={lost}")</code></pre>
+<h4>Procedure</h4><ol><li>Run it.</li><li>Change IDLE_US (the idle_us argument) to 2 and rerun.</li><li>Delete the re-check (the <code>if shadow_tail != consumed</code> inside the idle branch, always sleeping) and construct, by reasoning, a timeline that loses a wakeup when the host's EventIdx read and the controller's EventIdx write cross.</li></ol>
+<h4>Observations</h4>
+<pre class="code" data-kind="simulation" data-lang="text"><code>dense   2000 cmds  shadow=off  MMIO doorbells= 2000  worst notice delay= 1 us  lost=False
+dense   2000 cmds  shadow=on   MMIO doorbells=    1  worst notice delay= 1 us  lost=False
+sparse   200 cmds  shadow=off  MMIO doorbells=  200  worst notice delay= 1 us  lost=False
+sparse   200 cmds  shadow=on   MMIO doorbells=  200  worst notice delay= 1 us  lost=False</code></pre>
+<h4>Questions</h4><ol><li>Why does the sparse workload save nothing?</li><li>What does the controller pay for the dense-case savings?</li><li>Why must the host place a full barrier between writing the shadow value and reading EventIdx?</li></ol>
+<h4>Expected reasoning</h4><p>Savings exist only while the controller is awake and polling; the cost is polling (CPU time in an emulator, memory reads in hardware).</p>
+<details class="solution"><summary>Solution</summary>
+<p>(1) Between sparse commands the controller goes idle and publishes EventIdx = its last consumed tail; the very next update crosses it, so every command needs an MMIO write. (2) Continuous polling of the shadow buffer: an emulator burns a host CPU thread; a physical device would issue memory reads. (3) Without it, the host could read an old EventIdx (no MMIO needed) while the controller, having already decided to sleep, published a new EventIdx and stopped polling — the classic lost wakeup. The controller's re-check after publishing EventIdx and the host's barrier together close the window from both sides.</p>
+</details>
+<h4>Extension</h4><p>Add a CQ head shadow and EventIdx and measure how many CQ head MMIO writes are avoided when the host reaps in batches.</p>
+
+<h3>Senior forensic lab — "Our VMs got slower after the platform upgrade"</h3>
+<p><span class="badge safe">Safe lab</span> Reasoning over supplied synthetic evidence.</p>
+<h4>Objective</h4><p>Attribute a virtual-machine storage regression to the doorbell path with evidence, and propose a fix and a regression test.</p>
+<h4>Prerequisites</h4><p>This module; <a href="ch56.html">Chapter 56 — SR-IOV</a> for the alternative of assigning a virtual function.</p>
+<h4>Setup — evidence (synthetic)</h4>
+<ul>
+<li>Guests use an emulated NVMe controller. After a hypervisor and guest-kernel upgrade, 4 KiB random-read IOPS per VM fell 35% at queue depth 32; queue depth 1 latency unchanged.</li>
+<li>Hypervisor statistics: MMIO exits per second rose from about 3,000 to about 210,000 at the same IOPS (roughly one exit per command).</li>
+<li>Guest: Identify Controller OACS still reports Doorbell Buffer Config support. Guest kernel log has no Doorbell Buffer Config related messages.</li>
+<li>Emulator trace (counts only): before the upgrade, "shadow doorbell update" events about equal to commands, "MMIO doorbell" events tiny; after, no shadow events.</li>
+</ul>
+<h4>Procedure</h4><ol><li>State the first abnormal event.</li><li>Rank hypotheses.</li><li>Propose the disambiguating experiment.</li><li>Corrective action and regression test.</li></ol>
+<h4>Observations</h4><p>Separate guest, hypervisor and emulated-device facts.</p>
+<h4>Questions</h4><ol><li>Why is queue-depth-1 latency unchanged?</li><li>Why does the drop appear only at high queue depth?</li></ol>
+<h4>Expected reasoning</h4><p>One VM exit per doorbell is the signature of shadow doorbells not being in use.</p>
+<details class="solution"><summary>Solution</summary>
+<p><strong>First abnormal event:</strong> during guest controller initialisation after the upgrade, no Doorbell Buffer Config command is issued (or it is issued and fails) — confirm with the emulator's Admin command trace. <strong>Hypotheses:</strong> (H1) the new guest kernel's NVMe driver does not enable shadow doorbells for this controller (configuration, quirk list or code path changed) — fits the missing shadow events and unchanged OACS; (H2) the emulator rejects Doorbell Buffer Config after its upgrade — would show the command with an error status; (H3) shadow doorbells are on but the emulator stopped polling, so EventIdx always requests MMIO — would show shadow events plus MMIO per command. <strong>Why QD1 is unchanged:</strong> at queue depth 1 the emulator is idle between commands, so every command needed an MMIO write even before (see the sparse case in the advanced lab). <strong>Why only high QD:</strong> savings only exist while the emulator polls continuously. <strong>Experiment:</strong> boot the old guest kernel on the new hypervisor and vice versa. <strong>Fix:</strong> restore Doorbell Buffer Config use in the guest driver (or fix the emulator). <strong>Regression test:</strong> per-release check of MMIO exits per I/O at QD 32 with an alarm threshold, plus a functional test that Doorbell Buffer Config completes successfully during init.</p>
+</details>
+<h4>Extension</h4><p>Estimate the per-exit cost from the numbers given (IOPS drop vs added exits) and compare with the gain from assigning an SR-IOV virtual function instead.</p>
+</section>
+
+<section id="debugging">
+<h2>Debugging</h2>
+
+<h3>Pattern 1 — Doorbell present, no fetch, ever</h3>
+<dl>
+<dt>Symptom</dt><dd>Analyzer shows correct-looking doorbells; no MRd follows; commands time out.</dd>
+<dt>Possible causes</dt><dd>Bus Master Enable cleared; Memory Space Enable cleared (doorbell is an Unsupported Request); controller not ready or fatal (CSTS.RDY = 0, CSTS.CFS = 1); queue not created; invalid value with no Asynchronous Event Request outstanding; wrong address that happens to decode inside BAR0.</dd>
+<dt>Evidence</dt><dd>PCI Command register; CSTS; Admin create completions; AER Unsupported Request status for the device.</dd>
+<dt>First check</dt><dd><code>lspci -vv</code> Control line: Mem+ and BusMaster+.</dd>
+<dt>Second check</dt><dd>CSTS (read through nvme show-regs): RDY and CFS.</dd>
+<dt>Disambiguating experiment</dt><dd>Ring the Admin SQ doorbell with a harmless Identify. If it is fetched, the controller can fetch; the I/O queue itself or its doorbell value is the problem.</dd>
+<dt>Likely conclusion</dt><dd>Enables or controller state (host/platform) far more often than doorbell logic.</dd>
+<dt>Confidence</dt><dd>High once both registers are read.</dd>
+</dl>
+
+<h3>Pattern 2 — Invalid Doorbell Write Value only under multi-threaded load</h3>
+<dl>
+<dt>Symptom</dt><dd>Asynchronous event notices and occasional completions for inactive command IDs, never with one thread.</dd>
+<dt>Possible causes</dt><dd>Shared SQ without a lock that covers the doorbell; per-CPU queue assumption broken by CPU hotplug or migration; two driver instances (for example a user-space driver and the kernel) touching the same queue.</dd>
+<dt>Evidence</dt><dd>Non-monotonic doorbell values per SQ; Error Information log entry naming the queue.</dd>
+<dt>First check</dt><dd>Read the Error Information log (Get Log Page 01h) for the queue identifier.</dd>
+<dt>Second check</dt><dd>Review the submission path for the lock's scope.</dd>
+<dt>Disambiguating experiment</dt><dd>Pin the workload to one CPU per queue; if the events vanish, it is a producer race.</dd>
+<dt>Likely conclusion</dt><dd>Host concurrency bug.</dd>
+<dt>Confidence</dt><dd>High.</dd>
+</dl>
+
+<h3>Pattern 3 — Doorbell-to-fetch latency spikes</h3>
+<dl>
+<dt>Symptom</dt><dd>Tail latency grows; the gap is before the fetch.</dd>
+<dt>Possible causes</dt><dd>Arbitration (other SQs fetched in the gap); internal back-pressure (fetch follows a CQE); firmware front-end saturation (neither).</dd>
+<dt>Evidence</dt><dd>What the link carries during the gap.</dd>
+<dt>First check</dt><dd>Are other SQs fetched during the gap?</dd>
+<dt>Second check</dt><dd>Does each delayed fetch follow a CQE closely?</dd>
+<dt>Disambiguating experiment</dt><dd>Reduce queue depth to below the suspected internal limit; back-pressure delays vanish, front-end saturation does not.</dd>
+<dt>Likely conclusion</dt><dd>Usually back-pressure (benign) or arbitration (policy); front-end saturation is a device performance defect.</dd>
+<dt>Confidence</dt><dd>Medium.</dd>
+</dl>
+
+<h3>Pattern 4 — Admin queue misbehaves after I/O doorbell writes</h3>
+<dl>
+<dt>Symptom</dt><dd>Admin commands stall or Admin CQ entries are overwritten while I/O runs.</dd>
+<dt>Possible causes</dt><dd>Stride assumed 4 on a DSTRD ≥ 1 controller, so an "SQ1 tail" write lands on CQ0's head; 64-bit store spanning two doorbells.</dd>
+<dt>Evidence</dt><dd>Doorbell addresses vs DSTRD; MWr Length = 2.</dd>
+<dt>First check</dt><dd>DSTRD in CAP.</dd>
+<dt>Second check</dt><dd>Length and byte enables of every doorbell MWr.</dd>
+<dt>Disambiguating experiment</dt><dd>Disable I/O and run Admin only; if the problem vanishes, I/O doorbells are corrupting Admin state.</dd>
+<dt>Likely conclusion</dt><dd>Host address arithmetic or access width.</dd>
+<dt>Confidence</dt><dd>High.</dd>
+</dl>
+
+<h3>Pattern 5 — Commands hang after resume or reset</h3>
+<dl>
+<dt>Symptom</dt><dd>Submissions made just before or during a reset or power transition never complete.</dd>
+<dt>Possible causes</dt><dd>Doorbells written between CC.EN = 0 and CSTS.RDY = 1 (queues do not exist); doorbells to a function in a low-power state or with Memory Space disabled during the transition; host tail not reset after recreation.</dd>
+<dt>Evidence</dt><dd>Timeline of CC/CSTS accesses and doorbells; AER Unsupported Request logging; first doorbell values after recreation.</dd>
+<dt>First check</dt><dd>Are any doorbells in the reset window?</dd>
+<dt>Second check</dt><dd>Is the first post-reset doorbell value consistent with a tail reset to 0?</dd>
+<dt>Disambiguating experiment</dt><dd>Quiesce submissions before reset and resubmit after queues are recreated; the hang should disappear.</dd>
+<dt>Likely conclusion</dt><dd>Host lifecycle ordering.</dd>
+<dt>Confidence</dt><dd>High with a timeline.</dd>
+</dl>
+</section>
+
+<section id="interview">
+<h2>Interview</h2>
+<h3>Beginner</h3>
+<ol>
+<li><p>What does an SQ tail doorbell value mean?</p><details class="answer"><summary>Model answer</summary><p>The index of the next free slot: every slot before it (since the previous value) holds a new command.</p></details></li>
+<li><p>Why is writing the same doorbell value twice harmless?</p><details class="answer"><summary>Model answer</summary><p>Because it is an absolute position; the second write adds zero new entries.</p></details></li>
+<li><p>Is there an SQ head doorbell?</p><details class="answer"><summary>Model answer</summary><p>No. The controller owns the SQ head and reports it in each CQE's SQ Head Pointer.</p></details></li>
+<li><p>Does the CPU wait for a doorbell write to complete?</p><details class="answer"><summary>Model answer</summary><p>No. It becomes a posted Memory Write; there is no completion.</p></details></li>
+<li><p>Where is the CQ1 head doorbell with stride 4?</p><details class="answer"><summary>Model answer</summary><p>BAR0 + 100Ch.</p></details></li>
+</ol>
+<h3>Intermediate</h3>
+<ol>
+<li><p>A VF's BAR0 is above 4 GiB. Which TLP carries its doorbells?</p><details class="answer"><summary>Model answer</summary><p>MWr64 (4-DW header), Length 1, First DW BE 1111b.</p></details></li>
+<li><p>Why does an SQ wrap often produce two fetches for one doorbell?</p><details class="answer"><summary>Model answer</summary><p>The last slot and slot 0 are not adjacent in memory; one Memory Read covers one contiguous range.</p></details></li>
+<li><p>Name two reasons for "doorbell, but no fetch".</p><details class="answer"><summary>Model answer</summary><p>Bus Master Enable off; controller not ready; queue not created; invalid value; Memory Space Enable off (then the doorbell is not even accepted).</p></details></li>
+<li><p>How can a driver prove a posted doorbell reached the device?</p><details class="answer"><summary>Model answer</summary><p>Follow it with a read of a register on the same device; the read completion cannot pass earlier posted writes on that path. Too expensive for the fast path.</p></details></li>
+<li><p>What does EventIdx tell the host?</p><details class="answer"><summary>Model answer</summary><p>The index after which the controller wants a real MMIO doorbell; updates that do not cross it can stay in the shadow buffer.</p></details></li>
+</ol>
+<h3>Advanced</h3>
+<ol>
+<li><p>Why is atomic slot reservation insufficient for a shared SQ?</p><details class="answer"><summary>Model answer</summary><p>Doorbells can be written out of reservation order (tail regression) and a higher doorbell can publish a lower slot not yet written (stale fetch). The lock must cover reserve, write and ring.</p></details></li>
+<li><p>Three causes of long doorbell-to-fetch latency and how to tell them apart?</p><details class="answer"><summary>Model answer</summary><p>Arbitration (other SQs fetched in the gap), back-pressure (fetch follows a CQE), front-end saturation (neither). Lower queue depth below the internal limit to separate back-pressure.</p></details></li>
+<li><p>How does a CMB-resident SQ change doorbell ordering?</p><details class="answer"><summary>Model answer</summary><p>SQE writes become posted writes to the device on the same path as the doorbell, so PCIe ordering keeps them in order — provided the CMB mapping does not delay the SQE bytes (write-combining) and Relaxed Ordering is not used.</p></details></li>
+<li><p>Why do shadow doorbells not help at queue depth 1?</p><details class="answer"><summary>Model answer</summary><p>The controller is idle between commands and has published an EventIdx that the next update crosses, so every command needs an MMIO write.</p></details></li>
+<li><p>Two identical doorbell TLPs in a capture: what do you check?</p><details class="answer"><summary>Model answer</summary><p>Sequence numbers and DLLPs: same sequence with a NAK is a replay; different sequence numbers is a genuine double write. Either way the NVMe effect is the same.</p></details></li>
+</ol>
+<h3>Senior</h3>
+<ol>
+<li><p>Review checklist for a new driver's doorbell code?</p><details class="answer"><summary>Model answer</summary><p>Stride from CAP; 32-bit ordered MMIO accessor; barrier placement; lock scope per queue; wrap at size; never ring before SQEs complete; batch-end doorbell on every path including error paths; no doorbells across reset windows; tail/head reset on recreation; Asynchronous Event Request always outstanding; shadow-doorbell barrier and EventIdx comparison with 16-bit wrap.</p></details></li>
+<li><p>Validation plan for doorbells?</p><details class="answer"><summary>Model answer</summary><p>Address decode for every DSTRD; values ≥ size, overfill, CQ head past tail, nonexistent queue, reserved bits, Length 2, partial byte enables; with and without outstanding Asynchronous Event Requests; doorbells during reset, disable and power transitions; multi-producer stress; shadow semantics and lost-wakeup tests; doorbell-to-fetch latency distribution under load.</p></details></li>
+<li><p>A hypervisor vendor wants to drop shadow-doorbell support. What do you tell them?</p><details class="answer"><summary>Model answer</summary><p>Quantify: at high queue depth shadow doorbells remove nearly all MMIO exits; at low depth they save nothing. Without them, high-IOPS guests pay one exit per doorbell. Offer data, and the alternative of device assignment.</p></details></li>
+<li><p>Why is "absence of a doorbell" often the key evidence?</p><details class="answer"><summary>Model answer</summary><p>Missing batch-end doorbells, missing CQ head doorbells and doorbells never sent after reset are host bugs that look like device hangs; only a capture that includes host-to-device writes to the doorbell range can show them.</p></details></li>
+<li><p>How would you design a controller's response to a backwards tail?</p><details class="answer"><summary>Model answer</summary><p>Reject it as an invalid value (do not treat as a massive forward move), report through the asynchronous event and error log with queue and value, keep the queue's previous tail so already-published commands still execute, and document the behaviour for host developers.</p></details></li>
+</ol>
+</section>
+
+<section id="quiz">
+<h2>Quiz</h2>
+<ol class="quiz">
+<li><p>DSTRD = 1. Address offset 1018h is:</p>
+<ul class="options" data-answer="2"><li>SQ3 tail</li><li>CQ1 head</li><li>SQ1 tail</li><li>CQ3 head</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>(1018h − 1000h) / 8 = 3 → odd → CQ head of queue 1.</p></details></li>
+<li><p>A 256-entry SQ: previous tail 254, new tail 1. How many new entries?</p>
+<ul class="options" data-answer="3"><li>253</li><li>1</li><li>3</li><li>Invalid</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>(1 − 254) mod 256 = 3: slots 254, 255, 0.</p></details></li>
+<li><p>A doorbell to a function with Memory Space Enable = 0 results in:</p>
+<ul class="options" data-answer="1"><li>An Unsupported Request at the PCIe level, no completion</li><li>An NVMe Invalid Doorbell event</li><li>A Completer Abort completion to the CPU</li><li>A normal fetch</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The function does not accept memory requests; the posted request is an Unsupported Request with no completion.</p></details></li>
+<li><p>Which mechanism lets a controller report a bad doorbell value?</p>
+<ul class="options" data-answer="4"><li>A PCIe completion status</li><li>CSTS.CFS</li><li>An MSI-X write with special data</li><li>An Asynchronous Event Request completion</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Posted writes have no completion; NVMe uses Error status asynchronous events.</p></details></li>
+<li><p>Atomic slot reservation without a lock around the doorbell can cause:</p>
+<ul class="options" data-answer="2"><li>Nothing</li><li>Tail regression and stale fetches</li><li>Only redundant doorbells</li><li>PCIe ordering violations</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>See the race lab: 8 of 20 interleavings fail.</p></details></li>
+<li><p>Shadow doorbells save the most when:</p>
+<ul class="options" data-answer="3"><li>The workload is sparse</li><li>The device is physical</li><li>The controller is continuously busy polling</li><li>The stride is large</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Only an awake, polling controller picks updates from the shadow buffer without an MMIO write.</p></details></li>
+<li><p>Explain why a long doorbell-to-fetch gap that ends just after a CQE is usually benign.</p><details class="answer"><summary>Model answer</summary><p>It indicates the controller's internal command table was full; a completion freed a slot and the controller fetched the next command. The extra depth is waiting in host memory rather than inside the device — expected when the host queue depth exceeds the device's internal concurrency.</p></details></li>
+<li><p>How do you distinguish a replayed doorbell from a duplicated one?</p><details class="answer"><summary>Model answer</summary><p>Replay: same Data Link Layer sequence number, usually preceded by a NAK or replay timeout. Duplicate: different sequence numbers. Only the former suggests a link-quality issue.</p></details></li>
+</ol>
+</section>
+
+<section id="teachback">
+<h2>Teach-back</h2>
+<ol>
+<li><p><strong>To a child:</strong> the mailbox dial, why it only says "up to here", and why only one brother may turn it at a time.</p>
+<details class="answer"><summary>Model explanation</summary><p>"You put your letter in the box first, then turn the dial to the last slot that has a letter. The carrier takes everything up to the dial. If two people turn it at once, it can go backwards and the carrier gets confused — so one person at a time. On busy days the carrier peeks anyway, so you just leave a note."</p></details></li>
+<li><p><strong>To a junior engineer:</strong> how to write a correct multi-producer submission path.</p>
+<details class="answer"><summary>Model explanation</summary><p>"Prefer one SQ per CPU. If CPUs share an SQ, take the queue lock, reserve the tail slot, write the full SQE, advance the tail, call writel with the new tail (it includes the barrier), then unlock. Never ring outside the lock, never ring a value you did not just compute under the lock, and wrap at size, not size − 1."</p></details></li>
+<li><p><strong>To a senior engineer:</strong> how you attribute doorbell-to-fetch latency and when shadow doorbells pay off.</p>
+<details class="answer"><summary>Model explanation</summary><p>"I classify each delayed fetch by what happened in the gap: other SQs fetched means arbitration; a CQE just before the fetch means internal back-pressure; neither means front-end saturation. Shadow doorbells pay off only while the controller polls — high queue depth on emulated controllers — and depend on a full barrier on the host and an EventIdx re-check on the controller to avoid lost wakeups."</p></details></li>
+</ol>
+</section>
+
+<section id="mastery">
+<h2>Mastery gate</h2>
+<aside class="callout mastery">
+<p>Do not consider this module mastered until you can:</p>
+<ul class="checklist">
+<li>explain the doorbell as a posted, absolute, idempotent index and what that implies for concurrency</li>
+<li>diagram the doorbell path including the barrier, the root complex, the controller latch and the optional shadow path</li>
+<li>identify doorbells in a trace, compute published ranges including wraps, and measure doorbell-to-fetch latency</li>
+<li>debug "no fetch", "tail moved backwards", latency spikes, Admin corruption from stride errors, and reset-window losses</li>
+<li>distinguish doorbells from <a href="dd26.html">queue creation</a>, from <a href="dd19.html">MSI-X interrupts</a>, from fabrics command capsules (<a href="ch65.html">Chapter 65</a>) and from <a href="dd16.html">Data Link Layer replays</a></li>
+<li>cite NVMe Base 2.4 (Controller Registers, Asynchronous Event Request, Doorbell Buffer Config), NVMe over PCIe Transport 1.4 and the PCI Express Base Specification (posted writes, ordering, Unsupported Request)</li>
+</ul>
+</aside>
+<p>Next: <a href="dd28.html">Module 28 — NVMe Command Structure</a>.</p>
+</section>

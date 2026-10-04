@@ -1,0 +1,739 @@
+<p class="lead">The WRITE chapters taught one write at a time. Real systems run dozens at once, on hosts with busy memory and an Input/Output Memory Management Unit (IOMMU) in the way, and they lose power at the worst moment. This module goes inside the data pull: how a controller keeps enough reads in flight, how it reassembles split completions, what it must do when a completion arrives poisoned, late or never, and what "atomic" and "ordered" really mean for overlapping writes.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p>This module deepens the Non-Volatile Memory Express (NVMe) Write command from the point where <a href="ch33.html">Chapter 33 (WRITE)</a> and <a href="ch40.html">Chapter 40 (End-to-End Write)</a> stopped. Those chapters gave you the command fields, the single-command Peripheral Component Interconnect Express (PCIe) footprint (doorbell, SQE fetch, Memory Read requests, Completions with Data, Completion Queue Entry, interrupt) and the durability contract of the volatile write cache, Force Unit Access (FUA) and Flush. Here we assume all of that and push into four harder areas: the <em>pull pipeline</em> under concurrency, <em>completion reassembly and its failure modes</em>, <em>atomicity and ordering</em> between writes, and <em>validation</em> of the whole write path. The traces are new (concurrent writes, a host-latency-limited pull, a poisoned completion, overlapping writes) and the labs are harder (you will build a completion checker and a pipeline model, then work a forensic case).</p>
+  <aside class="callout prereq">
+    <p>Read first: <a href="ch33.html">WRITE</a> (command fields, FUA, the durability table), <a href="ch40.html">End-to-End Write</a> (the seventeen stages, Byte Count and Lower Address), <a href="ch13.html">PCIe Tags and Outstanding Requests</a>, <a href="ch52.html">Completion Rules</a> and <a href="ch36.html">Physical Region Pages</a>. The companion READ module is <a href="dd30.html">Deep dive: READ</a>.</p>
+  </aside>
+  <p>Where it goes next: <a href="dd32.html">Deep dive: FLUSH</a> takes the durability half further; <a href="dd36.html">Deep dive: DMA with NVMe</a> generalises the pull and push engines; <a href="dd12.html">Deep dive: PCIe Completions</a> and <a href="dd13.html">Deep dive: PCIe Tags</a> give the PCIe-side rules in full.</p>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>What you should be able to do after this module</caption>
+    <thead><tr><th>Level</th><th>Objective</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Decode a raw 64-byte Write Submission Queue Entry (SQE) from hex, and state for any Write how many bytes move, in which direction, and which agent requests them.</td></tr>
+      <tr><td>Intermediate</td><td>Predict the Memory Read (MRd) and Completion with Data (CplD) counts for several concurrent writes, including Byte Count and Lower Address of each split completion, for a root complex that splits at 64, 128 or 256 bytes.</td></tr>
+      <tr><td>Advanced</td><td>Compute how many outstanding read requests a controller needs to saturate the link for a given host round-trip time, and recognise in a trace whether a slow write is limited by the device, the link, or the host's read latency.</td></tr>
+      <tr><td>Senior</td><td>Explain the controller's obligations when the data pull fails (Unsupported Request, Completer Abort, poisoned data, Completion Timeout), the host's obligations for ordering and buffer ownership, and what Atomic Write Unit Power Fail (AWUPF) does and does not protect.</td></tr>
+      <tr><td>Trace analysis</td><td>Correlate interleaved MRd/CplD streams of several commands back to their Command Identifiers (CIDs) using only addresses, tags and Byte Counts, and find the first abnormal event in a concurrent write capture.</td></tr>
+      <tr><td>Debugging</td><td>Separate host-side causes (IOMMU, memory errors, buffer reuse, missing ordering) from device-side causes (cache back-pressure, firmware, media) for at least six write failure patterns, with a disambiguating experiment for each.</td></tr>
+      <tr><td>Validation</td><td>Design a write test matrix covering completion splitting, error completions on the pull, overlapping writes, maximum-size transfers, atomic boundaries and power-cut durability, and state the pass criterion for each.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>A mosaic artist is building a picture on a museum wall. Your class has made the coloured tiles, and they are lying on your desks. The artist cannot walk into the classroom; she sends a robot with request cards. Each card has a number and says "bring me the tiles from desk 3, row 2". She can send out sixteen cards at once, so sixteen robots are rolling around at the same time.</p>
+    <p>The classroom helpers fill each robot's tray. Sometimes a tray is too small, so a robot comes back in two or four trips, and each trip it says "this is card 7, and there are still 6 tiles to come for card 7". The artist must never mix up card 7's tiles with card 8's. Robots for different cards come back in any order, but the trips for one card always come back in order.</p>
+    <p>When every tile for a picture is in the artist's glass box, she rings a little bell: "Got it!" She glues the tiles on the wall later. Two rules: do not touch the tiles on your desk until you hear "Got it!", and if you ask for two pictures in the same spot at the same time, nobody promises which one ends up on the wall.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <aside class="callout breaks">
+    <p><strong>What it represents.</strong> Request cards are MRd Transaction Layer Packets (TLPs); card numbers are PCIe tags; robot trips are split CplDs; "still 6 tiles to come" is the Byte Count field; the glass box is the controller's write buffer or volatile cache; gluing to the wall is the NAND program; "Got it!" is the Completion Queue Entry (CQE) plus interrupt; the "same spot" rule is the absence of ordering between NVMe commands.</p>
+    <p><strong>What it hides.</strong> Card numbers are reused within microseconds, so a tag identifies a request only while it is outstanding. The helpers are not free: every card passes through an address translator (the IOMMU) whose cache can miss, and a slow helper slows the artist even though the artist did nothing wrong. A tray can come back marked "poisoned" (the data was damaged in host memory), or not at all. And the artist's glass box can be full, in which case she stops sending cards altogether.</p>
+    <p><strong>Where it becomes misleading.</strong> "Got it" sounds like a promise the picture is on the wall. It is not, unless FUA was set, no volatile cache exists, or a later Flush completed (<a href="ch33.html#engineering">Chapter 33</a>). Also, real tiles cannot be changed on the desk while the robot is away; real memory can, and the controller may read the same byte twice. Finally, the story suggests the artist checks every tile; a controller checks packet framing and Byte Count, not whether your data is what you meant.</p>
+  </aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Terms this module relies on (basic Write terms are in <a href="ch33.html">Chapter 33</a>)</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship to adjacent terms</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="data-pull">Data pull</span></td><td>The drive fetching what you want written</td><td>The sequence of non-posted MRd requests a controller issues to host addresses from PRP/SGL, answered by CplDs</td><td>Opposite of the READ's push (posted Memory Write (MWr) data)</td><td>Expecting host MWrs to carry write data</td></tr>
+            <tr><td><span class="g" data-term="completion-reassembly">Completion reassembly</span></td><td>Putting the trips back together</td><td>Placing each CplD payload at request offset derived from tag, Byte Count and Lower Address</td><td>Depends on <span class="g" data-term="rcb">RCB</span>, Max Payload Size (MPS)</td><td>Assuming one completion per request</td></tr>
+      <tr><td><span class="g" data-term="byte-count">Byte Count</span></td><td>"How much is still coming, including this"</td><td>Completion header field: remaining bytes of the request including this completion's payload</td><td>Last completion has Byte Count = its payload length</td><td>Reading it as "bytes in this packet"</td></tr>
+      <tr><td><span class="g" data-term="lower-address">Lower Address</span></td><td>Where this piece starts, roughly</td><td>Low 7 bits of the byte address of the first byte in the completion</td><td>Lets the receiver check placement</td><td>Expecting values above 7Fh</td></tr>
+      <tr><td><span class="g" data-term="completion-timeout">Completion Timeout</span></td><td>A card that never came back</td><td>Requester-side error when a non-posted request is not completed in time; range set in Device Control 2</td><td>Uncorrectable error reported via Advanced Error Reporting (AER)</td><td>Treating it as an NVMe timeout (that is the host driver's command timer)</td></tr>
+      <tr><td><span class="g" data-term="poisoned-tlp">Poisoned TLP</span></td><td>A tray marked "damaged"</td><td>TLP with the EP bit set: the payload is known bad, typically from an uncorrectable host memory error</td><td>Receiver must not use it as good data</td><td>Blaming the SSD for host DRAM errors</td></tr>
+      <tr><td><span class="g" data-term="unsupported-request">Unsupported Request</span> / <span class="g" data-term="completer-abort">Completer Abort</span></td><td>"No" from the helper</td><td>Completion status for a request the completer will not or cannot serve (for example an IOMMU-blocked address)</td><td>Ends the request with no data</td><td>Confusing with NVMe status codes</td></tr>
+            <tr><td><span class="g" data-term="awupf">AWUPF</span> / AWUN</td><td>Biggest write that is all-or-nothing</td><td>Atomic Write Unit Power Fail / Normal in Identify Controller; namespace variants NAWUPF/NAWUN; 0's based counts of logical blocks</td><td>Boundaries (NABSPF, NABO) restrict where the unit applies</td><td>Assuming Flush or FUA prevents tearing</td></tr>
+      <tr><td><span class="g" data-term="torn-write">Torn write</span></td><td>Half old, half new</td><td>After power loss, a write larger than the atomic unit may leave a mix of old and new blocks</td><td>Prevented only within atomic unit and boundaries</td><td>Thinking sector-level writes can tear (a single LBA is the minimum unit)</td></tr>
+      <tr><td>Buffer ownership</td><td>Who may touch the tiles</td><td>From doorbell to CQE the controller may read the buffer at any time, possibly more than once</td><td>Ends at CQE consumption; Linux "stable pages" protect page-cache pages</td><td>Reusing a buffer after submission "because the data is already in flight"</td></tr>
+      <tr><td><span class="g" data-term="limited-retry">Limited Retry</span></td><td>"Don't try too hard"</td><td>CDW12 bit 31: controller should apply limited error recovery</td><td>Trade latency for possible failure</td><td>Thinking it affects PCIe retries</td></tr>
+      <tr><td><span class="g" data-term="iotlb">IOTLB</span></td><td>The translator's notebook</td><td>IOMMU translation cache; a miss costs a page-table walk on each affected request</td><td>Raises MRd round-trip time for writes</td><td>Thinking IOMMU cost is the same for reads and writes</td></tr>
+      <tr><td>Write Fault</td><td>The drive could not store it</td><td>Media and Data Integrity Errors status for a write the controller could not commit (value: confirm in the NVM Command Set status tables)</td><td>Distinct from Data Transfer Error (pull failure)</td><td>Treating every write error as a media problem</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <p>The write path is a pipeline with four buffers that can each run out: host submission slots, PCIe tags, device receive (reassembly) buffer, and device write cache. Back-pressure travels from the last one to the first.</p>
+  <figure>
+    <pre class="diagram">
+ HOST                                   LINK (Gen4 x4)                 NVMe CONTROLLER
+ ┌──────────────────────────┐                                      ┌──────────────────────────────┐
+ │ app buffers (IOVA 0x2_…) │◄── MRd (headers only, upstream) ─────│ pull engine: PRP/SGL walker  │
+ │ IOMMU + IOTLB            │                                      │ tag pool (≤256, 8-bit tags)  │
+ │ memory controller / DRAM │─── CplD (data, downstream) ─────────►│ reassembly buffer            │
+ │                          │                                      │      │                       │
+ │ SQ1 ring 0x1_2340_0000   │◄── MRd SQE / CplD ───────────────────│ queue manager / arbitration  │
+ │ CQ1 ring 0x1_2341_0000   │◄── MWr CQE ──────────────────────────│ completion engine            │
+ │ LAPIC 0xFEE0_1000        │◄── MWr MSI-X ────────────────────────│      │                       │
+ │ driver: CID table, PRPs  │─── MWr doorbells 0xFE60_1008/100C ──►│ write cache (DRAM/SRAM)      │
+ └──────────────────────────┘                                      │ FTL → NAND channels, dies    │
+                                                                   └──────────────────────────────┘
+    </pre>
+    <figcaption>Write-path architecture on the course lab system. Synthetic example for teaching; block names are generic.</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture of the write path</caption>
+    <thead><tr><th>Aspect</th><th>Content</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>Write SQE (opcode 01h, NSID, SLBA, NLB, FUA, LR, PRINFO, directive fields), data buffer described by PRP or Scatter Gather List (SGL), optional metadata buffer.</td></tr>
+      <tr><td>Outputs</td><td>One CQE (status, SQ Head Pointer (SQHD), CID, phase), an MSI-X message, and, later and invisibly, programmed NAND pages plus updated mapping tables.</td></tr>
+      <tr><td>Actors</td><td>Application, filesystem, block layer, NVMe driver, CPU, IOMMU, root complex, memory controller, controller front end, pull engine, cache manager, flash translation layer (FTL), NAND back end.</td></tr>
+      <tr><td>State</td><td>Per command: CID, PRP/SGL cursor, bytes requested, bytes received, error flags. Per request: tag, address, length, bytes outstanding. Per controller: tag pool, reassembly space, cache occupancy (dirty data).</td></tr>
+      <tr><td>Memory</td><td>SQ and CQ rings, data pages, PRP lists or SGL segments (all host DRAM via IOVA); controller SRAM (command contexts, reassembly) and DRAM (cache, mapping table).</td></tr>
+      <tr><td>Registers</td><td>SQ1 tail doorbell 0xFE60_1008, CQ1 head doorbell 0xFE60_100C; PCIe Device Control (MPS, MRRS, Extended Tag), Device Control 2 (Completion Timeout value/disable, 10-bit tag requester enable); AER status registers; MSI-X table entry for vector 1.</td></tr>
+      <tr><td>Interfaces</td><td>CPU→memory (SQE writes), CPU→MMIO (doorbells), device→host memory (MRd/CplD, MWr), device→LAPIC window (MSI-X), controller→NAND (internal).</td></tr>
+      <tr><td>Dependencies</td><td>IOMMU mappings alive until CQE; Identify data (MDTS 128 KiB, VWC, AWUN/AWUPF) read at initialisation; Volatile Write Cache feature state; link trained with agreed MPS/MRRS.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>We follow two concurrent 4 KiB writes, CID 0x0210 and CID 0x0211, submitted with a single doorbell to SQ1 slots 0x20 and 0x21. This is the normal trace in the Trace view, step by step.</p>
+  <ol>
+    <li><strong>Driver builds two SQEs.</strong> Who: NVMe driver on CPU 3. What changes: 128 bytes at 0x1_2340_0800–0x1_2340_087F; CID table marks 0x0210/0x0211 busy; the two 4 KiB buffers (IOVA 0x2_0010_0000 and 0x2_0010_3000) are mapped. Where: host DRAM and IOMMU page tables. Evidence: <code>nvme_setup_cmd</code> tracepoints with both CIDs.</li>
+    <li><strong>One doorbell.</strong> Who: CPU. What: SQ1 tail 0x20 → 0x22. Where: BAR0 + 0x1008 (MWr32). Evidence: analyzer row with Data=0x00000022. One doorbell for two commands is normal batching.</li>
+    <li><strong>SQE fetch, possibly batched.</strong> Who: queue manager. What: it may fetch both entries in one 128-byte MRd (Len=32 DW) or two 64-byte reads <span class="badge impl">Implementation-dependent</span>. Where: SQ1 ring. Evidence: MRd at 0x1_2340_0800, CplD with 128 bytes; Byte Count tells you which.</li>
+    <li><strong>Command contexts and buffer reservation.</strong> Who: controller firmware. What: allocates 4 KiB of reassembly/cache space per command; if unavailable, nothing further happens yet (back-pressure). Where: controller SRAM/DRAM. Evidence: only the gap between SQE CplD and first data MRd.</li>
+    <li><strong>Pull issue.</strong> Who: pull engine. What: 8 MRds per command (512 B each, MRRS limit), tags allocated from the pool; the two commands' requests may interleave. Where: upstream link. Evidence: 16 MRd64 rows with distinct tags and addresses inside each PRP page.</li>
+    <li><strong>Host serves reads.</strong> Who: root complex, IOMMU, memory controller. What: translate IOVA (IOTLB hit or walk), read DRAM coherently, form completions of at most MPS and split on RCB-aligned boundaries. Where: host. Evidence: MRd-to-first-CplD latency per tag.</li>
+    <li><strong>Reassembly.</strong> Who: pull engine. What: for each CplD, check tag outstanding, Byte Count equals remaining, Lower Address matches, payload ≤ MPS, EP clear; place payload; retire tag when Byte Count equals payload. Where: reassembly buffer. Evidence: CplD sequence per tag; any violation becomes an AER-logged error at the device.</li>
+    <li><strong>Commit decision.</strong> Who: cache manager. What: with cache enabled and FUA clear, data is "accepted"; with FUA or no cache, it must reach non-volatile media first. Where: device DRAM/NAND. Evidence: last-CplD-to-CQE gap (sub-microsecond to a few microseconds cached; hundreds of microseconds with FUA).</li>
+    <li><strong>CQEs, in completion order, not submission order.</strong> Who: completion engine. What: 16-byte MWrs into CQ1 slots 0x20 and 0x21 — CID 0x0211 may complete first. Where: CQ1 ring. Evidence: CQE MWr rows; slot order equals completion order, CID order need not.</li>
+    <li><strong>Interrupt and release.</strong> Who: controller then driver. What: MSI-X MWr32 to 0xFEE0_1000 data 0x41; driver matches CIDs, unmaps buffers, writes CQ1 head doorbell 0x22. Where: LAPIC window, CQ1, BAR0 + 0x100C. Evidence: MSI-X row, <code>nvme_complete_rq</code>, head doorbell row.</li>
+    <li><strong>Destage (invisible).</strong> Who: FTL and NAND back end. What: the 8 KiB join other dirty data in a program unit. Where: NAND. Evidence: none on the link; only later latency effects and Self-Monitoring, Analysis and Reporting Technology (SMART) counters.</li>
+  </ol>
+  <figure>
+    <ol class="seq" data-actors="Driver (CPU)|Host memory + IOMMU|NVMe controller|NAND">
+      <li data-from="Driver (CPU)" data-to="Host memory + IOMMU">SQEs in SQ1 slots 0x20, 0x21</li>
+      <li data-from="Driver (CPU)" data-to="NVMe controller" data-t="0 ns">MWr32 SQ1 tail = 0x22</li>
+      <li data-from="NVMe controller" data-to="Host memory + IOMMU" data-t="0.74 µs">MRd 128 B: both SQEs (tag 0x3F)</li>
+      <li data-from="Host memory + IOMMU" data-to="NVMe controller" class="dashed" data-t="1.30 µs">CplD 128 B</li>
+      <li data-from="NVMe controller" data-to="Host memory + IOMMU" data-t="1.9 µs">16 × MRd 512 B, tags 0x40–0x4F</li>
+      <li data-note="Host memory + IOMMU">IOTLB lookups, DRAM reads</li>
+      <li data-from="Host memory + IOMMU" data-to="NVMe controller" class="dashed" data-t="2.5–3.9 µs">64 × CplD 128 B, interleaved</li>
+      <li data-note="NVMe controller">reassemble; 0x0211 complete first</li>
+      <li data-from="NVMe controller" data-to="Host memory + IOMMU" data-t="4.6 µs">MWr CQE CID 0x0211 (slot 0x20)</li>
+      <li data-from="NVMe controller" data-to="Host memory + IOMMU" data-t="4.9 µs">MWr CQE CID 0x0210 (slot 0x21)</li>
+      <li data-from="NVMe controller" data-to="Driver (CPU)" data-t="5.0 µs">MSI-X vector 1</li>
+      <li data-from="Driver (CPU)" data-to="NVMe controller" data-t="7.9 µs">MWr32 CQ1 head = 0x22</li>
+      <li data-from="NVMe controller" data-to="NAND" data-t="later">program unit with other data</li>
+    </ol>
+    <figcaption>Two concurrent cached 4 KiB writes. Synthetic example for teaching; timings illustrative and platform-dependent.</figcaption>
+  </figure>
+  <h3>The central concept on the ladder: the pull pipeline</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>The artist sends many numbered request cards at once, gets tiles back in trips, never mixes cards, and says "Got it" only when every tile of a picture is in her box.</p></div>
+    <div class="rung" data-rung="B"><p>For each Write the controller issues several read requests to host memory, keeps many outstanding across commands, rebuilds each request's data from one or more completions, and posts the CQE only after all data needed is inside the drive.</p></div>
+    <div class="rung" data-rung="C"><p>A tag allocator, a request table indexed by tag, a reassembly buffer sized for the worst-case outstanding bytes (the device advertises infinite completion credits, so it must reserve space before issuing), a cache allocator that can stall the pull, and a completion engine.</p></div>
+    <div class="rung" data-rung="D"><p>NVM Command Set: Write semantics, FUA, atomicity fields in Identify. NVMe Base: CQE, status codes such as Data Transfer Error, buffer rules for PRP/SGL. PCI Express Base Specification: MRd/CplD, MRRS, MPS, RCB, Byte Count, Lower Address, completion ordering within a request, EP, Unsupported Request, Completer Abort, Completion Timeout.</p></div>
+    <div class="rung" data-rung="E"><p>Upstream: header-only MRds, CQE MWrs, MSI-X. Downstream: CplDs carrying all the data, doorbell MWrs. Completions for one request arrive in increasing address order; completions for different requests may interleave in any order.</p></div>
+    <div class="rung" data-rung="F"><p>Look for: bursts of MRd with rising tags; CplDs whose Byte Count steps down (512, 384, 256, 128) per tag; interleaved tags; the gap from MRd to first CplD (host latency); the gap from last CplD to CQE (device commit).</p></div>
+    <div class="rung" data-rung="G"><p>Long MRd→CplD gaps convict the host; long SQE→first-MRd gaps convict device back-pressure; error completions or EP point at addresses or host memory; CQEs out of submission order are normal; overlapping writes with surprising results convict the host's ordering.</p></div>
+  </div>
+  <p>The sixteen questions for the Write command are answered in <a href="ch33.html#engineering">Chapter 33</a> and for the pulled write in <a href="ch40.html#engineering">Chapter 40</a>; this module adds the pipeline and failure answers above and in the Debugging section.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <p>Applicable documents in the course baseline: <cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3 — Write command; Identify Namespace atomicity fields</cite>, <cite class="spec">NVM Express Base Specification, Revision 2.4 — Completion Queue Entry; Status Field; Identify Controller (AWUN, AWUPF, VWC, MDTS)</cite>, <cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite>, and <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Completion Rules; Error Signaling and Logging</cite>.</p>
+  <table>
+    <caption>Classifying write-path behaviour</caption>
+    <thead><tr><th>Behaviour</th><th>Class</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>FUA: data and metadata on non-volatile media before completion</td><td><span class="badge normative">Normative</span></td><td>NVM Command Set, Write command</td></tr>
+      <tr><td>A request must not exceed MRRS or cross a 4 KiB address boundary; completions ≤ MPS; split completions on RCB-aligned addresses, in increasing address order for one request</td><td><span class="badge normative">Normative</span></td><td>PCIe Base</td></tr>
+      <tr><td>Receiver of a poisoned TLP must not treat the data as good; error is logged</td><td><span class="badge normative">Normative</span></td><td>PCIe Base; exact handling (e.g. advisory vs reported) depends on configuration and role — confirm in "Error Signaling and Logging"</td></tr>
+      <tr><td>A write within the atomic unit (and not crossing a reported boundary) is all-old or all-new after power loss</td><td><span class="badge normative">Normative</span></td><td>Read the AWUPF/NAWUPF and boundary text for your revision <span class="badge version">Version-dependent</span></td></tr>
+      <tr><td>No ordering between commands, even in one SQ</td><td><span class="badge normative">Normative</span></td><td>Except fused Compare and Write</td></tr>
+      <tr><td>Which NVMe status follows a failed pull (Data Transfer Error is usual)</td><td><span class="badge impl">Implementation-dependent</span></td><td>Check controller documentation</td></tr>
+      <tr><td>Batched SQE fetch; MRd size below MRRS; number of outstanding reads; pull start policy; read-ahead of the buffer</td><td><span class="badge impl">Implementation-dependent</span></td><td>Visible in traces only</td></tr>
+      <tr><td>Root complex completion size (64/128/256 B)</td><td><span class="badge impl">Implementation-dependent</span></td><td>Platform choice within PCIe rules</td></tr>
+      <tr><td>Directive/placement fields in CDW12–13, storage tags, extended protection information</td><td><span class="badge optional">Optional</span> <span class="badge version">Version-dependent</span></td><td>Decode only from your revision's figures</td></tr>
+      <tr><td>Bytes counted per tag in the analyzer, the pipeline formula, the "host latency limits writes" claim</td><td><span class="badge derived">Derived</span></td><td>Reasoned from PCIe rules and Little's Law</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout notsaid">
+    <p>The specifications do not say: how many reads a controller should keep outstanding; whether a controller must re-read the buffer or may read it twice; how long it may wait before pulling; what NVMe status reports a poisoned or timed-out pull; how a controller orders the commit of two overlapping writes; or whether a write larger than AWUPF tears at LBA granularity or at some larger internal unit. Check in the specification: the Status Field layout (SCT, SC, More, Command Retry Delay (CRD), Do Not Retry (DNR)); the value of Write Fault in the Media and Data Integrity Errors table; and the exact atomic-boundary rules (NABSN, NABO, NABSPF).</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never infer commit order from CQE order. Never treat a successful CQE as proof that the bytes the device read are the bytes you intended (the buffer could have changed). Never assume a controller that tolerated a malformed completion stream on one platform will tolerate it on another: tolerance is not a requirement.</p>
+  </aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Hardware participation in a write</caption>
+    <thead><tr><th>Category</th><th>Components</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Must participate</td><td>CPU (SQE, doorbell), host DRAM, root port/root complex, PCIe link, controller front end, pull/DMA engine, reassembly buffer, completion engine, MSI-X logic (if interrupts enabled), some non-volatile media eventually</td><td>Every write moves bytes from host DRAM into the device and reports back</td></tr>
+      <tr><td>May participate</td><td>IOMMU and its IOTLB; PCIe switches and retimers; volatile write cache; power-loss protection capacitors; SLC-mode cache region; encryption and ECC engines; Controller Memory Buffer (CMB) if the data buffer lives there (then no host pull)</td><td>Platform and product choices</td></tr>
+      <tr><td>Observable</td><td>All TLPs and DLLPs on the link (analyzer); PCIe configuration (MPS, MRRS, tags, AER) via <code>lspci</code>; driver tracepoints; IOMMU faults and memory machine-check logs in the kernel log; NVMe logs (Error Information, SMART)</td><td>Host-visible state and wire traffic</td></tr>
+      <tr><td>Internal and generally unobservable</td><td>Reassembly buffer occupancy, cache occupancy, destage schedule, FTL map updates, NAND program, program failures and retries, internal data-path ECC</td><td>Inferred only from timing, status and logs</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw" data-title="The reassembly buffer is a hard limit">
+    <p>An endpoint advertises infinite completion credits, so it may not refuse a completion. It therefore issues an MRd only when it has reserved space for the whole requested length. A controller with 64 KiB of reassembly space can never have more than 128 outstanding 512-byte reads, whatever its tag count. That number, not the 256 tags, is often the real pipeline limit <span class="badge derived">Derived</span>.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>Messages and transactions in a write</caption>
+    <thead><tr><th>Message</th><th>Layer</th><th>Request / response pair</th><th>Ordering rule that matters</th><th>Error forms</th></tr></thead>
+    <tbody>
+      <tr><td>SQ tail doorbell (MWr32)</td><td>PCIe posted</td><td>None (posted)</td><td>Must follow SQE memory writes (driver barrier)</td><td>Dropped doorbell → command never fetched</td></tr>
+      <tr><td>SQE fetch (MRd64 → CplD)</td><td>PCIe non-posted</td><td>Tag-matched</td><td>Within request: address order</td><td>UR/CA → controller cannot read command (fatal-ish; often controller fatal status)</td></tr>
+      <tr><td>PRP list / SGL segment fetch</td><td>PCIe non-posted</td><td>Tag-matched</td><td>Must precede data that depends on it</td><td>UR → Data Transfer Error</td></tr>
+      <tr><td>Data pull (MRd64 → CplD×n)</td><td>PCIe non-posted</td><td>Tag-matched; Byte Count steps down</td><td>Within request: increasing address; across tags: any</td><td>UR, CA, EP, Completion Timeout, malformed completion, unexpected completion</td></tr>
+      <tr><td>CQE (MWr64)</td><td>NVMe over PCIe</td><td>Answers the SQE (by CID)</td><td>After all data needed is received; after FUA commit</td><td>Status ≠ 0 (Data Transfer Error, LBA Out of Range, Write Fault, Namespace Not Ready …)</td></tr>
+      <tr><td>MSI-X (MWr32)</td><td>PCIe posted</td><td>None</td><td>Behind the CQE MWr (same direction, no Relaxed Ordering)</td><td>Masked vector → pending bit only</td></tr>
+      <tr><td>CQ head doorbell (MWr32)</td><td>PCIe posted</td><td>None</td><td>After CQEs consumed</td><td>Late head update → CQ full → controller stalls completions</td></tr>
+      <tr><td>ERR_COR / ERR_NONFATAL / ERR_FATAL (Msg)</td><td>PCIe message</td><td>None</td><td>Sent by device on error detection, if enabled</td><td>Seen in AER logs at the root port</td></tr>
+    </tbody>
+  </table>
+  <h3>Completion: two different words</h3>
+  <p>A PCIe <em>completion</em> answers one MRd; an NVMe <em>completion</em> (CQE) answers one command. A 128 KiB write produces 256 data MRds and, on a root complex that returns 128-byte completions, 1,024 PCIe completions — and exactly one CQE. When colleagues say "the completion was late", ask which kind.</p>
+  <h3>Errors on the pull, and what the controller must do</h3>
+  <ul>
+    <li><strong>UR or CA completion.</strong> The request ends with no data. The controller cannot complete the write successfully; it posts an error CQE (commonly Data Transfer Error) and must not commit partial data as if it were the full write. Whether it signals ERR_NONFATAL depends on whether it treats the event as an Advisory Non-Fatal error and on AER mask/severity settings <span class="badge impl">Implementation-dependent</span>.</li>
+    <li><strong>Poisoned CplD.</strong> The payload is known bad. The controller must not program it as good data; it fails the command and logs "Poisoned TLP Received" in its AER status if AER is implemented.</li>
+    <li><strong>Completion Timeout.</strong> Some bytes never arrive. The controller's timer (range in Device Control 2; the PCIe default range is 50 µs to 50 ms) expires; it logs the error, fails the command, and must ignore any late completion for that tag (which would be an Unexpected Completion).</li>
+    <li><strong>Malformed completion</strong> (payload larger than MPS, Byte Count inconsistent). A malformed TLP is a receiver error the device reports; the command fails.</li>
+  </ul>
+  <aside class="callout proto" data-title="The CQE-after-data rule, stated precisely">
+    <p>The controller may post the CQE only when it no longer needs the host buffer. Since the host may unmap and reuse the buffer the instant it sees the CQE, any data CplD for that command arriving after the CQE is a controller bug — and if the CplD arrives, the host has already lost the right to assume its buffer is unchanged <span class="badge derived">Derived</span>.</p>
+  </aside>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Four synthetic traces from the lab system (Gen4 x4, MPS 256 B, MRRS 512 B, RCB 64 B, IOMMU on, I/O queue pair 1, namespace 1 with 512-byte LBAs). Abbreviations: RC root complex, Req Requester ID, Len length in Dwords, BC Byte Count, LA Lower Address, SC Successful Completion, UR Unsupported Request, EP poisoned bit; in CQEs SQHD, SQID, CID, P phase, SCT Status Code Type, SC Status Code, DNR Do Not Retry. Times are illustrative.</p>
+
+  <h3>Normal: two concurrent writes, 128-byte completions, out-of-order CQEs</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M31-N — CIDs 0x0210 and 0x0211, 4 KiB each, root complex returns 128-byte completions">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Len=1 Data=0x00000022 Req=RC</td><td>SQ1 tail 0x20 → 0x22: two new commands</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>740</td><td>MRd64</td><td>Addr=0x1_2340_0800 Len=32 Tag=0x3F Req=0x0100</td><td>Batched fetch of slots 0x20 and 0x21 (128 B)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,300</td><td>CplD</td><td>Len=32 Tag=0x3F BC=128 LA=0x00 SC</td><td>SQE A: opc 01h CID 0x0210 SLBA 0x0010_0000 NLB 7 PRP1 0x2_0010_0000; SQE B: CID 0x0211 SLBA 0x0020_0000 NLB 7 PRP1 0x2_0010_3000</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,900</td><td>MRd64</td><td>Addr=0x2_0010_0000 Len=128 Tag=0x40</td><td>A bytes 0–511</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1,912</td><td>MRd64</td><td>Addr=0x2_0010_3000 Len=128 Tag=0x48</td><td>B bytes 0–511 (engine alternates commands)</td></tr>
+        <tr class="note"><td colspan="6">Rows 6–19: fourteen more MRd64, alternating A (tags 0x41–0x47, +0x200 each) and B (tags 0x49–0x4F). All 16 issued by ≈2,090 ns.</td></tr>
+        <tr class="dir-down"><td>20</td><td>Host→Dev</td><td>2,480</td><td>CplD</td><td>Len=32 Tag=0x40 BC=512 LA=0x00 SC</td><td>A, tag 0x40, first 128 B</td></tr>
+        <tr class="dir-down"><td>21</td><td>Host→Dev</td><td>2,500</td><td>CplD</td><td>Len=32 Tag=0x48 BC=512 LA=0x00 SC</td><td>B, tag 0x48, first 128 B — tags interleave</td></tr>
+        <tr class="dir-down"><td>22</td><td>Host→Dev</td><td>2,518</td><td>CplD</td><td>Len=32 Tag=0x40 BC=384 LA=0x00 SC</td><td>A, tag 0x40, next 128 B (LA 0x80 &amp; 0x7F = 0x00)</td></tr>
+        <tr class="dir-down"><td>23</td><td>Host→Dev</td><td>2,536</td><td>CplD</td><td>Len=32 Tag=0x40 BC=256 SC</td><td></td></tr>
+        <tr class="dir-down"><td>24</td><td>Host→Dev</td><td>2,554</td><td>CplD</td><td>Len=32 Tag=0x40 BC=128 SC</td><td>BC equals payload: tag 0x40 retires</td></tr>
+        <tr class="note"><td colspan="6">Rows 25–83: 59 more CplDs, four per tag (BC 512, 384, 256, 128), tags interleaved in the order the host memory system finished them. B's last tag retires at 3,850 ns, A's at 3,910 ns.</td></tr>
+        <tr class="dir-up"><td>84</td><td>Dev→Host</td><td>4,620</td><td>MWr64</td><td>Addr=0x1_2341_0200 Len=4 SQHD=0x22 SQID=1 CID=0x0211 P=1 SC=00h</td><td>CQ1 slot 0x20 holds B's completion</td></tr>
+        <tr class="dir-up"><td>85</td><td>Dev→Host</td><td>4,880</td><td>MWr64</td><td>Addr=0x1_2341_0210 Len=4 SQHD=0x22 SQID=1 CID=0x0210 P=1 SC=00h</td><td>CQ1 slot 0x21 holds A's completion</td></tr>
+        <tr class="dir-up"><td>86</td><td>Dev→Host</td><td>4,960</td><td>MWr32</td><td>Addr=0xFEE0_1000 Len=1 Data=0x00000041</td><td>MSI-X vector 1 (one message for both; aggregation is implementation-dependent)</td></tr>
+        <tr class="dir-down"><td>87</td><td>Host→Dev</td><td>7,900</td><td>MWr32</td><td>Addr=0xFE60_100C Len=1 Data=0x00000022 Req=RC</td><td>CQ1 head doorbell</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Count: 16 MRds × 512 B = 8 KiB, and 64 CplDs × 128 B = 8 KiB: the pull is complete. Correlate by address, not by tag: tags 0x40–0x47 fall inside A's PRP page 0x2_0010_0000, 0x48–0x4F inside B's. Two things that look odd are normal. CID 0x0211 completed first: completion order is the controller's business. Both CQEs report SQHD 0x22, because the controller had already consumed both SQEs. The 128-byte completions mean four CplDs per request; the RC is within its rights (MPS is a maximum, splits are on RCB multiples). The commit gap (last CplD to CQE) of ≈0.7 µs says the data went to cache.</p>
+  </div>
+
+  <h3>Slow: a 128 KiB write limited by host read latency</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M31-S — CID 0x0230, 128 KiB, IOTLB pressure from a parallel workload">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.00</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000031</td><td>Doorbell, Write CID 0x0230 in slot 0x30</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.75</td><td>MRd64</td><td>Addr=0x1_2340_0C00 Len=16 Tag=0x10</td><td>SQE fetch</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.33</td><td>CplD</td><td>BC=64 SC</td><td>NLB 0xFF (128 KiB), PRP1 0x2_0040_0000, PRP2 = list 0x1_5000_0400</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1.40</td><td>MRd64</td><td>Addr=0x1_5000_0400 Len=62 Tag=0x11</td><td>PRP list, 31 entries</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2.02</td><td>CplD</td><td>BC=248 SC</td><td>List returned (0.6 µs: list page is IOTLB-hot)</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>2.10–2.34</td><td>MRd64 ×16</td><td>Addr=0x2_0040_0000 … +0x1E00 Len=128 Tags 0x12–0x21</td><td>First wave: 16 outstanding (this controller's limit)</td></tr>
+        <tr class="abnormal"><td>7</td><td>Host→Dev</td><td>5.21</td><td>CplD</td><td>Len=64 Tag=0x12 BC=512 SC</td><td>First abnormal event: first data arrives 3.1 µs after its request (≈0.6 µs expected)</td></tr>
+        <tr class="note"><td colspan="6">Every later MRd→first-CplD gap is 2.8–3.4 µs. The upstream link idles between waves; the downstream link carries data only ≈40% of the time.</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>5.30</td><td>MRd64</td><td>Addr=0x2_0040_2000 Tag=0x12</td><td>Tag 0x12 reused as soon as it retired</td></tr>
+        <tr class="note"><td colspan="6">Pull of 256 requests ends at ≈51.2 µs (data phase ≈49 µs). Device's own time from last CplD to CQE: 0.8 µs.</td></tr>
+        <tr class="dir-up"><td>9</td><td>Dev→Host</td><td>52.00</td><td>MWr64</td><td>Addr=0x1_2341_0300 CID=0x0230 SC=00h</td><td>Success, 52 µs after doorbell (≈22 µs on an idle host)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The device behaved consistently: it fetched promptly, kept exactly 16 reads outstanding, reissued each tag within 0.1 µs of retirement, and committed quickly. The throughput is the pipeline formula: 16 × 512 B per 3.1 µs ≈ 2.6 GB/s, matching the 128 KiB / 49 µs observed (<code>pull_pipeline.py</code> in the Labs gives 49.1 µs for k = 16, RTT 3,000 ns). The host's round trip rose fivefold. The PRP list fetch was fast while data reads were slow, which points at translation of the data pages (many distinct 4 KiB IOVA pages under IOTLB pressure) rather than at DRAM bandwidth. Disambiguate by repeating with the competing workload stopped, with huge-page-backed buffers (fewer translations), or on a test machine with the IOMMU in pass-through mode. A READ of the same size would barely notice, because posted writes do not make the device wait. The ticket "SSD write throughput halves under load" belongs to the platform team.</p>
+  </div>
+
+  <h3>Failed: a poisoned completion during the pull</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M31-F — CID 0x0244, 8 KiB write, one CplD with EP=1">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000045</td><td>Doorbell, slot 0x44</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>750</td><td>MRd64</td><td>Addr=0x1_2340_1100 Len=16 Tag=0x58</td><td>SQE fetch</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,310</td><td>CplD</td><td>BC=64 SC</td><td>Write CID 0x0244 NLB 15 PRP1 0x2_0051_0000 PRP2 0x2_0051_1000</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,850–2,090</td><td>MRd64 ×16</td><td>Tags 0x59–0x68, 512 B each</td><td>Pull both pages</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2,420–2,480</td><td>CplD ×3</td><td>256 B each, SC, EP=0</td><td>Tag 0x59 (both halves) and tag 0x5A first half (BC=512)</td></tr>
+        <tr class="abnormal"><td>6</td><td>Host→Dev</td><td>2,500</td><td>CplD</td><td>Len=64 Tag=0x5A BC=256 LA=0x00 SC <strong>EP=1</strong></td><td>First abnormal event: second half of tag 0x5A (IOVA 0x2_0051_0300–0x2_0051_03FF) arrives poisoned</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>2,650</td><td>Msg</td><td>ERR_NONFATAL Req=0x0100</td><td>Device reports the uncorrectable non-fatal error (AER enabled, severity non-fatal)</td></tr>
+        <tr class="note"><td colspan="6">The remaining 28 CplDs (tags 0x5B–0x68) arrive normally by ≈3,900 ns; the device still accepts and drains them (it must accept completions it requested).</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>6,950</td><td>MWr64</td><td>Addr=0x1_2341_0440 CID=0x0244 SCT=0h SC=04h DNR=0</td><td>CQE: Data Transfer Error (status choice is the controller's)</td></tr>
+        <tr class="dir-up"><td>9</td><td>Dev→Host</td><td>7,100</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x00000041</td><td>MSI-X</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The SSD did not damage anything: the root complex marked the data poisoned because the memory controller hit an uncorrectable error reading 0x2_0051_0300–0x2_0051_03FF (after IOMMU translation). The kernel log around the same instant should hold two records: a machine-check or memory-error report naming a physical address and DIMM, and an AER report from the root port for 0000:01:00.0 with "Poisoned TLP" in the device's uncorrectable status. The NVMe driver logs a write error for the request, the block layer may retry (DNR is clear), and a retry will poison again if the same page is reused. The correct conclusion is "host DRAM fault surfaced through a storage write"; the fix is memory replacement and page retirement, not an SSD return. Note the device's correct behaviour: it refused to commit and did not post success.</p>
+  </div>
+
+  <h3>Ambiguous: overlapping writes, both successful</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M31-A — two writes to SLBA 0x0030_0000 in flight together">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000052</td><td>Slot 0x50: Write CID 0x0250, SLBA 0x0030_0000, NLB 7, buffer 0x2_0060_0000 (pattern AAh)</td></tr>
+        <tr class="note"><td colspan="6">The same doorbell (tail 0x50 → 0x52) also covers slot 0x51: Write CID 0x0251, same SLBA, NLB 7, buffer 0x2_0060_8000 (pattern BBh).</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>740</td><td>MRd64</td><td>Addr=0x1_2340_1400 Len=32 Tag=0x70</td><td>Both SQEs fetched together</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>1,900–2,080</td><td>MRd64 ×16</td><td>Tags 0x71–0x78 → 0x2_0060_0xxx; 0x79–0x80 → 0x2_0060_8xxx</td><td>Both pulls interleaved</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>2,450–3,900</td><td>CplD ×32</td><td>Payloads AAh… and BBh…</td><td>Data for both arrives intact</td></tr>
+        <tr class="abnormal"><td>5</td><td>Dev→Host</td><td>4,700</td><td>MWr64</td><td>CQ1 slot 0x50: CID=0x0251 SC=00h</td><td>First abnormal event (from the host's point of view): the later-submitted write completes first</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>5,020</td><td>MWr64</td><td>CQ1 slot 0x51: CID=0x0250 SC=00h</td><td>Earlier write completes second</td></tr>
+        <tr class="note"><td colspan="6">The application later reads SLBA 0x0030_0000 and gets AAh. It expected BBh ("the last write wins").</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Is the device wrong? The trace cannot tell you in which order the controller placed the two versions in its cache or on NAND; CQE order does not even imply that. What the trace <em>can</em> prove is decisive: both commands were outstanding at the same time (the second was submitted before the first completed). For that situation NVMe defines no order, so either final content is legal and the device is not at fault. The row marked abnormal is not a protocol violation but the first event that contradicts the host's (wrong) assumption. The root cause is in the host: a missing dependency between two writes to the same LBA (a cache-flush daemon racing an application write, or two threads of a user-space I/O library). Remaining ambiguity: had the trace shown the second write submitted <em>after</em> the first's CQE, the AAh result would be a genuine device bug (stale cache entry). That single fact — submission time of B versus completion time of A — decides the case. Confidence: high that the host is at fault given row 1 and the note under it.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>All commands are read-only unless marked. Device names follow the lab system: controller <code>/dev/nvme0</code>, namespace <code>/dev/nvme0n1</code>, PCIe function 0000:01:00.0. Output formats differ between nvme-cli and kernel versions; this page does not reproduce output, only what to look for.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Atomicity: controller-wide and namespace values (0's based logical block counts)</span>
+sudo nvme id-ctrl /dev/nvme0 | grep -iE '^(awun|awupf|acwu|vwc|mdts)'
+sudo nvme id-ns /dev/nvme0n1 -H | grep -iE 'nawun|nawupf|nacwu|nabsn|nabo|nabspf|nsfeat'
+
+<span class="cm"># How the kernel exposes atomic writes (attributes exist only on newer kernels)</span>
+grep . /sys/block/nvme0n1/queue/atomic_write_* 2&gt;/dev/null
+
+<span class="cm"># PCIe parameters that shape the pull: MPS, MRRS, extended/10-bit tags, completion timeout</span>
+sudo lspci -vvv -s 01:00.0 | grep -E 'DevCap:|DevCtl:|MaxPayload|MaxReadReq|ExtTag|DevCap2|DevCtl2|10BitTag|CmpltTO'
+
+<span class="cm"># AER: has the device seen poisoned TLPs or completion timeouts?</span>
+sudo lspci -vvv -s 01:00.0 | grep -A4 'Advanced Error Reporting'
+grep . /sys/bus/pci/devices/0000:01:00.0/aer_dev_* 2&gt;/dev/null
+
+<span class="cm"># Kernel log: IOMMU faults, memory errors, NVMe write errors around an incident</span>
+sudo dmesg -T | grep -iE 'nvme0|DMAR|AMD-Vi|iommu|mce|EDAC|AER' | tail -50
+
+<span class="cm"># NVMe-side error history</span>
+sudo nvme error-log /dev/nvme0 -e 16
+sudo nvme smart-log /dev/nvme0 | grep -iE 'data_units_written|media_errors|num_err_log_entries|unsafe'</code></pre>
+  <table>
+    <caption>What each output can and cannot prove</caption>
+    <thead><tr><th>Output category</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>AWUN/AWUPF/NAWUPF and boundary fields</td><td>What size and alignment of write the device promises not to tear</td><td>That the promise holds (only power-cut testing shows it); what tears look like above the unit</td></tr>
+      <tr><td><code>atomic_write_*</code> sysfs</td><td>What the kernel will let applications submit as an atomic write on this kernel</td><td>Anything on kernels that lack the attributes <span class="badge version">Version-dependent</span></td></tr>
+      <tr><td><code>DevCtl</code> MaxPayload / MaxReadReq, tag settings</td><td>The limits the pull must obey right now</td><td>Root-complex completion size, outstanding-read policy of the device</td></tr>
+      <tr><td>AER status (poisoned TLP, completion timeout, unexpected completion)</td><td>That the device detected the error class, since last clear</td><td>Which command was affected; timestamps (correlate with the kernel log)</td></tr>
+      <tr><td>IOMMU fault lines</td><td>That a DMA from 0000:01:00.0 hit an unmapped or forbidden IOVA, and which</td><td>Which command; whether the driver or the device was wrong (compare with tracepoint PRPs)</td></tr>
+      <tr><td>Memory-error (MCE/EDAC) lines</td><td>A host DRAM uncorrectable error at a physical address</td><td>That the poisoned data was this write's (map physical page to IOVA mapping)</td></tr>
+      <tr><td>Error Information log, SMART</td><td>The controller's own record of failed commands and media errors</td><td>Host-side causes (the device sees only the symptom)</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout warn">
+    <p>Do not change MRRS or MPS with <code>setpci</code> on a live system to "test" pull behaviour: mismatched settings across a hierarchy can produce malformed TLPs and fatal errors. That belongs on a lab machine with nothing mounted (<span class="badge expert">Expert lab</span>).</p>
+  </aside>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+
+  <h3>Beginner lab — decode a raw Write SQE and predict its footprint</h3>
+  <p><span class="badge safe">Safe lab</span> Paper and pencil, or a Python prompt.</p>
+  <dl>
+    <dt>Objective</dt><dd>Turn 64 bytes of hex into a full command description and a packet-count prediction.</dd>
+    <dt>Prerequisites</dt><dd><a href="ch33.html">Chapter 33</a> field table; <a href="ch36.html">Chapter 36</a> page-count rule.</dd>
+    <dt>Setup</dt><dd>The SQE below was captured as the payload of an SQE-fetch CplD (shown as little-endian Dwords CDW0…CDW15).</dd>
+    <dt>Procedure</dt><dd>
+      <pre class="code" data-kind="simulation" data-lang="text"><code>CDW0  0x02A7_4001   CDW1  0x0000_0001   CDW2  0x0000_0000   CDW3  0x0000_0000
+CDW4  0x0000_0000   CDW5  0x0000_0000   CDW6  0x0071_0A00   CDW7  0x0000_0002
+CDW8  0x0071_1000   CDW9  0x0000_0002   CDW10 0x0012_3450   CDW11 0x0000_0000
+CDW12 0x4000_0007   CDW13 0x0000_0000   CDW14 0x0000_0000   CDW15 0x0000_0000</code></pre>
+      Decode opcode, PSDT, CID, NSID, PRP1, PRP2, SLBA, NLB, FUA, LR. Then compute the bytes, the pages touched, the MRds (MRRS 512, never crossing 4 KiB), and the CplDs if the root complex returns 256-byte completions.</dd>
+    <dt>Observations</dt><dd>Write down whether PRP2 is a data page or a list and why.</dd>
+    <dt>Questions</dt><dd>(1) Why is PRP2 used although the write is only 4 KiB? (2) How many MRds and CplDs? (3) What gap would you expect between the last CplD and the CQE on a cached drive with no power-loss protection?</dd>
+    <dt>Expected reasoning</dt><dd>Decode CDW0 bit by bit before anything else: opcode (bits 7:0), FUSE (9:8), PSDT (15:14), CID (31:16). Only the PSDT value tells you how to read CDW6–9.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>CDW0 = 0x02A7_4001: opcode 01h (Write); bits 9:8 FUSE = 00b; bits 15:14 of 0x4001 are <code>01</code> — so PSDT = 01b, which would select an SGL. That is the trap in this lab: the data-pointer Dwords look like two PRPs, but the command says SGL. On a controller with SGLS bits 1:0 = 00b this is rejected (Invalid Field in Command is the usual outcome; confirm the expected status). If you corrected the dump to the intended CDW0 = 0x02A7_0001, the rest decodes as: CID 0x02A7; NSID 1; PRP1 0x2_0071_0A00 (offset 0xA00); PRP2 0x2_0071_1000; SLBA 0x0012_3450; CDW12 = 0x4000_0007 → NLB 7 (8 blocks, 4 KiB) with FUA set. Pages touched: offset 0xA00 + 4096 → 2 pages (1,536 B in the first, 2,560 B in the second), so PRP2 is the second data page. MRds: first page 1,536 B = 3 × 512; second page 2,560 B = 5 × 512 → 8 MRds (0xA00 is a multiple of 512, so no extra partial request). CplDs at 256 B: 16. With FUA on a drive with a volatile cache and no power-loss protection, the gap from last CplD to CQE grows to a NAND program time (hundreds of µs in our synthetic drive). The meta-lesson: decode CDW0 bit-exactly before believing what DPTR "looks like".</p>
+  </details>
+  <p><strong>Extension.</strong> Change PRP1 to 0x2_0071_0A40 and recount, assuming the controller cuts requests only at MRRS and 4 KiB boundaries: the page split becomes 1,472 + 2,624 B, giving 2 full requests and one of 448 B in the first page, and 5 full requests and one of 64 B in the second — 9 MRds instead of 8. A controller that re-aligns its requests to 512-byte addresses would issue a different, equally legal pattern <span class="badge impl">Implementation-dependent</span>.</p>
+
+  <h3>Intermediate lab — build a completion-stream checker</h3>
+  <p><span class="badge safe">Safe lab</span> Python 3, standard library.</p>
+  <dl>
+    <dt>Objective</dt><dd>Implement the receiver-side rules a pull engine applies to CplDs, and use them on synthetic streams.</dd>
+    <dt>Prerequisites</dt><dd><a href="ch40.html">Chapter 40</a> (Byte Count, Lower Address), <a href="ch52.html">Completion Rules</a>.</dd>
+    <dt>Setup</dt><dd>Save the script below as <code>cpl_reassembly.py</code>.</dd>
+  </dl>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="cpl_reassembly.py"><code>#!/usr/bin/env python3
+"""cpl_reassembly.py - check Completions with Data against the Memory Read requests they answer.
+
+Synthetic teaching model (standard library only). Lab-system limits: MPS 256 B, RCB 64 B.
+Each completion is (tag, byte_count, lower_addr, payload_bytes, status, ep).
+"""
+MPS, RCB = 256, 64
+
+def check(requests, completions):
+    """requests: {tag: (address, length)}. Returns a list of findings, first abnormal first."""
+    done = {tag: 0 for tag in requests}
+    live = set(requests)
+    findings = []
+    for i, (tag, bc, la, n, status, ep) in enumerate(completions, 1):
+        where = f"cpl #{i} tag 0x{tag:02X}"
+        if tag not in live:
+            findings.append(f"{where}: unexpected completion (tag not outstanding)")
+            continue
+        addr, length = requests[tag]
+        if status != "SC":
+            findings.append(f"{where}: error completion {status}; request fails, no data")
+            live.discard(tag)
+            continue
+        remaining = length - done[tag]
+        if bc != remaining:
+            findings.append(f"{where}: Byte Count {bc} but {remaining} bytes remain")
+        if la != (addr + done[tag]) &amp; 0x7F:
+            findings.append(f"{where}: Lower Address 0x{la:02X}, expected 0x{(addr + done[tag]) &amp; 0x7F:02X}")
+        if n &gt; MPS:
+            findings.append(f"{where}: payload {n} B exceeds MPS {MPS} B (malformed)")
+        if ep:
+            findings.append(f"{where}: poisoned (EP=1); data must not be committed as good")
+        done[tag] += n
+        if n &lt; bc and (addr + done[tag]) % RCB:
+            findings.append(f"{where}: partial completion ends at 0x{addr + done[tag]:X}, not RCB-aligned")
+        if done[tag] &gt;= length:
+            live.discard(tag)
+    for tag in sorted(live):
+        findings.append(f"tag 0x{tag:02X}: {requests[tag][1] - done[tag]} bytes never arrived -&gt; Completion Timeout")
+    return findings or ["all requests satisfied; no findings"]
+
+if __name__ == "__main__":
+    reqs = {0x40: (0x2_0010_0000, 512), 0x41: (0x2_0010_0200, 512)}
+    good = [(0x40, 512, 0x00, 128, "SC", 0), (0x41, 512, 0x00, 64, "SC", 0),
+            (0x41, 448, 0x40, 64, "SC", 0), (0x40, 384, 0x00, 128, "SC", 0),
+            (0x41, 384, 0x00, 128, "SC", 0), (0x40, 256, 0x00, 256, "SC", 0),
+            (0x41, 256, 0x00, 256, "SC", 0)]
+    bad = [(0x40, 512, 0x00, 256, "SC", 0), (0x41, 512, 0x00, 200, "SC", 0),
+           (0x40, 256, 0x00, 256, "SC", 1), (0x42, 64, 0x00, 64, "SC", 0)]
+    for name, stream in (("good", good), ("bad", bad)):
+        print(f"--- {name} stream")
+        for f in check(reqs, stream):
+            print("  " + f)</code></pre>
+  <dl>
+    <dt>Procedure</dt><dd>(1) Run it; the good stream prints "no findings" and the bad stream prints four findings. (2) Encode Trace M31-N rows 20–24 for tag 0x40 as a stream and check it. (3) Add a check that the payload length is a multiple of 4 bytes unless it is the last completion of an unaligned request. (4) Add a "first abnormal" flag that prints only the first finding with its index.</dd>
+    <dt>Observations</dt><dd>Which finding in the bad stream is the cause and which are consequences?</dd>
+    <dt>Questions</dt><dd>(a) Why can Lower Address never be 0x80? (b) Why does the 200-byte completion fail the RCB rule but would be legal as the last completion of a request? (c) What should a real controller do with the late completion for tag 0x42?</dd>
+    <dt>Expected reasoning</dt><dd>Lower Address is 7 bits. A non-final split must end on an RCB boundary; the final one ends wherever the request ends. A completion for a non-outstanding tag is an Unexpected Completion: discard and log, never place the data.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>Bad stream: finding 1 (tag 0x41 split at a non-RCB boundary) is the first abnormal event; the later "312 bytes never arrived → Completion Timeout" is a consequence of the same stream stopping. The poisoned completion for tag 0x40 is an independent problem. Tag 0x42 was never requested, so it is an unexpected completion. (a) 0x80 needs 8 bits; the field holds bits 6:0 of the address, so 128-aligned addresses read 00h. (b) RCB governs where a completer may cut a request; the final piece ends at the request's end. (c) Discard, log Unexpected Completion in AER (a correctable or advisory class depending on configuration — confirm), and never let it update a buffer. For step (4), keep a boolean <code>first_reported</code> and return after the first append if set.</p>
+  </details>
+  <p><strong>Extension.</strong> Accept 10-bit tags (0x000–0x3FF) and model the root complex returning completions for one tag out of address order; add the check that flags it.</p>
+
+  <h3>Advanced lab — how deep must the pull pipeline be?</h3>
+  <p><span class="badge safe">Safe lab</span> Python 3, standard library.</p>
+  <dl>
+    <dt>Objective</dt><dd>Quantify how outstanding-read depth and host round-trip time limit write throughput, and connect the numbers to Trace M31-S.</dd>
+    <dt>Prerequisites</dt><dd>Little's Law (<a href="tool-calculators.html">calculators</a>), the formula in <a href="ch33.html#engineering">Chapter 33</a>.</dd>
+    <dt>Setup</dt><dd>Save <code>pull_pipeline.py</code>.</dd>
+  </dl>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="pull_pipeline.py"><code>#!/usr/bin/env python3
+"""pull_pipeline.py - how many outstanding Memory Reads does a WRITE data pull need?
+
+Synthetic teaching model (standard library only). The controller pulls TOTAL bytes in
+requests of REQ bytes, keeping at most k requests outstanding. Each request's data comes
+back RTT ns after issue, but the downstream link can only deliver LINK bytes per ns, so
+completions queue behind each other. A tag is reused as soon as its last byte arrives.
+"""
+import heapq
+
+def pull_time_ns(total, req, k, rtt, link):
+    n = total // req
+    ser = req / link                 # ns the link is busy delivering one request's data
+    link_free = 0.0
+    slots = [0.0] * k                # times at which each tag becomes free
+    heapq.heapify(slots)
+    finish = 0.0
+    for _ in range(n):
+        issue = heapq.heappop(slots)                 # wait for a free tag
+        start = max(issue + rtt - ser, link_free)    # data streams in at the end of the round trip
+        done = start + ser
+        link_free = done
+        finish = max(finish, done)
+        heapq.heappush(slots, done)
+    return finish
+
+if __name__ == "__main__":
+    TOTAL, REQ, LINK = 128 * 1024, 512, 7.0   # 128 KiB write, MRRS 512 B, ~7 GB/s = 7 B/ns
+    print("k   " + "".join(f"RTT={r:&gt;5} ns   " for r in (600, 1000, 3000)))
+    for k in (1, 2, 4, 8, 16, 32, 64):
+        row = []
+        for rtt in (600, 1000, 3000):
+            t = pull_time_ns(TOTAL, REQ, k, rtt, LINK)
+            row.append(f"{t / 1000:6.1f} us {TOTAL / t:4.2f}GB/s")
+        print(f"{k:&lt;4}" + "  ".join(row))</code></pre>
+  <dl>
+    <dt>Procedure</dt><dd>(1) Run it. For RTT 600 ns, find the smallest k that reaches ≈6.8 GB/s. (2) Repeat for 3,000 ns. (3) Change REQ to 256 (an MRRS of 256) and repeat.</dd>
+    <dt>Observations</dt><dd>Record the knee of each curve: the k beyond which throughput stops rising.</dd>
+    <dt>Questions</dt><dd>(a) Derive the knee from k ≥ RTT × link ÷ REQ. (b) Why does halving MRRS double the needed k? (c) A controller has 256 tags but a 32 KiB reassembly buffer; what is its effective k at MRRS 512?</dd>
+    <dt>Expected reasoning</dt><dd>Little's Law: bytes in flight = rate × round trip.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>The script prints (values rounded): at RTT 600 ns, k = 8 gives 6.65 GB/s and k = 16 saturates at 6.81 GB/s; at RTT 1,000 ns, k = 16 reaches 6.67 GB/s; at RTT 3,000 ns, k = 16 gives only 2.67 GB/s (49.1 µs) and even k = 64 reaches 6.05 GB/s. (a) Knee ≈ 600 × 7 ÷ 512 ≈ 8.2 and 3,000 × 7 ÷ 512 ≈ 41. (b) Each request carries half the bytes, so twice as many must be in flight for the same bytes in flight. (c) 32 KiB ÷ 512 B = 64 requests; the buffer, not the tag pool, is the limit.</p>
+  </details>
+  <p><strong>Extension.</strong> Give RTT a distribution (for example 90% at 600 ns and 10% at 5 µs for IOTLB misses) using <code>random</code> with a fixed seed, and show that tail round trips cost far more than their share.</p>
+
+  <h3>Senior forensic lab — "the SSD corrupts our log segments"</h3>
+  <p><span class="badge safe">Safe lab</span> Evidence analysis only.</p>
+  <dl>
+    <dt>Objective</dt><dd>Work an incident from mixed evidence to a defensible root cause and a fix owner.</dd>
+    <dt>Prerequisites</dt><dd>This module; <a href="ch38.html">PRP/SGL Debugging Lab</a>; <a href="debug-method.html">Debugging Methodology</a>.</dd>
+    <dt>Setup (the evidence pack, synthetic)</dt><dd>
+      <ul>
+        <li>A logging service built on a user-space NVMe driver writes 64 KiB segments with a per-512-byte checksum. About 1 in 2 million segments fails verification on read-back: the bad region is always a whole 4 KiB page, and its content is a valid page from a <em>later</em> segment.</li>
+        <li>No NVMe errors, no AER errors, no IOMMU faults. All CQEs report success.</li>
+        <li>The driver keeps a ring of 64 buffers. A recent change "recycles a buffer as soon as its write is submitted if the ring is nearly empty, because the data has already been fetched by then".</li>
+        <li>An analyzer capture of one failing segment shows the 128 pulls for the segment's 16 pages; one page (the 9th) is pulled 31 µs after the doorbell, while the others are pulled within 6 µs. The CplD payload for that page already contains the later segment's data.</li>
+        <li>The failure rate rises sharply when the drive is near full and sustained writes run.</li>
+      </ul></dd>
+    <dt>Procedure</dt><dd>Write the timeline; identify the first abnormal event; name the root cause, the contributing condition, the owner, the fix and a regression test.</dd>
+    <dt>Observations</dt><dd>Separate "what the device did" from "what the host allowed".</dd>
+    <dt>Questions</dt><dd>(1) Is a 31 µs delay before pulling one page legal? (2) Why does it correlate with full-drive sustained writes? (3) Why are there no errors anywhere? (4) What test would have caught this before release?</dd>
+    <dt>Expected reasoning</dt><dd>Buffer ownership lasts until the CQE; the device chose to pull late; the host changed the buffer in between.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p><strong>Timeline:</strong> doorbell → SQE fetch → most pages pulled within 6 µs → driver recycles the buffer (the recent change) and fills it with the next segment → controller pulls page 9 at 31 µs and receives the new content → success CQE. <strong>First abnormal event:</strong> the host writing new data into a buffer whose command had not completed; in the capture, the first evidence is the CplD payload for page 9 containing later-segment bytes. <strong>Device behaviour:</strong> legal. The controller may pull any part of the buffer at any time before posting the CQE; under cache pressure (full drive, sustained writes, garbage collection) firmware commonly pulls only as cache space frees, which explains the correlation. <strong>No errors</strong> because every protocol rule was obeyed; the data was simply not the data intended. <strong>Root cause:</strong> host buffer reuse before completion. <strong>Owner:</strong> the user-space driver team. <strong>Fix:</strong> release buffers only on CQE; if the ring runs dry, apply back-pressure to the producer. <strong>Regression test:</strong> fill each buffer with a signature, overwrite it with a poison pattern immediately after the CQE (never before), and run sustained writes on a near-full drive with verification; also a fault-injection build that randomly delays recycling in the opposite direction to prove the invariant. Confidence: high.</p>
+  </details>
+  <p><strong>Extension.</strong> Write the one-line invariant you would add to the driver's design document.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <p>Six write failure patterns. Each is written as symptom → possible causes → evidence → first check → second check → disambiguating experiment → likely conclusion → confidence. Patterns covered in <a href="ch33.html#debugging">Chapter 33</a> (simple Data Transfer Error from an unmapped IOVA, durability loss from missing Flush) are only cross-referenced here.</p>
+
+  <h3>Write throughput plateaus well below link rate</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Sequential 128 KiB writes stall at 2–4 GB/s on a Gen4 x4 link; reads reach ≈7 GB/s.</dd>
+    <dt>Possible causes</dt><dd>Host read latency (IOMMU, memory congestion, remote NUMA node); device outstanding-read limit; small MRRS; device back-end limit; cache full (steady state).</dd>
+    <dt>Evidence</dt><dd>Analyzer: MRd→first CplD latency; number of outstanding MRds; link utilisation per direction.</dd>
+    <dt>First check</dt><dd><code>lspci -vvv</code> MaxReadReq: 128 B instead of 512 B quadruples the needed depth.</dd>
+    <dt>Second check</dt><dd>Is throughput low from the first second (pipeline) or only after minutes (cache/garbage collection)?</dd>
+    <dt>Disambiguating experiment</dt><dd>Repeat with buffers on the SSD's local NUMA node and huge pages; if throughput rises with no device change, the host round trip was the limit.</dd>
+    <dt>Likely conclusion</dt><dd>Round-trip × depth limit (Trace M31-S) when latency is high and outstanding count is flat at a fixed value.</dd>
+    <dt>Confidence</dt><dd>High once both MRd latency and outstanding count are measured; medium from host-side measurements only.</dd>
+  </dl>
+
+  <h3>Write fails with a poisoned completion</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Occasional write errors (Data Transfer Error or Internal Error) with AER "Poisoned TLP" on the SSD.</dd>
+    <dt>Possible causes</dt><dd>Host DRAM uncorrectable error; poisoned data forwarded from another device (peer-to-peer); a switch or root complex fault.</dd>
+    <dt>Evidence</dt><dd>Kernel MCE/EDAC lines; AER status of device and root port; analyzer EP bit.</dd>
+    <dt>First check</dt><dd>Memory-error log at the same timestamp, with a physical address.</dd>
+    <dt>Second check</dt><dd>Does the same physical page fail repeatedly?</dd>
+    <dt>Disambiguating experiment</dt><dd>Offline the suspect page or move the workload to another socket; errors follow the memory, not the SSD.</dd>
+    <dt>Likely conclusion</dt><dd>Host memory fault (Trace M31-F).</dd>
+    <dt>Confidence</dt><dd>High with a matching memory-error record; medium without.</dd>
+  </dl>
+
+  <h3>Write hangs, then a Completion Timeout on the device</h3>
+  <dl>
+    <dt>Symptom</dt><dd>A write takes the driver's I/O timeout (30 s default on Linux), Abort fails, controller reset follows; AER shows Completion Timeout on 0000:01:00.0.</dd>
+    <dt>Possible causes</dt><dd>Root complex or switch dropped a completion; a completion arrived but was malformed and discarded; device lost track of a tag (firmware); link recovery that lost a TLP (should be impossible with a healthy Data Link Layer).</dd>
+    <dt>Evidence</dt><dd>Analyzer: an MRd with no CplD for its tag; any Replay or NAK DLLPs nearby; device AER status.</dd>
+    <dt>First check</dt><dd>Find the MRd without completions and the time it was sent.</dd>
+    <dt>Second check</dt><dd>Was a completion sent but rejected (malformed, wrong Requester ID or tag)? Check the root port side of the capture too.</dd>
+    <dt>Disambiguating experiment</dt><dd>Capture both sides of a switch; a completion seen upstream but not downstream convicts the switch.</dd>
+    <dt>Likely conclusion</dt><dd>Usually platform (switch/RC) or device tag bookkeeping; rarely the link.</dd>
+    <dt>Confidence</dt><dd>Medium until the missing completion is localised to a hop.</dd>
+  </dl>
+
+  <h3>Corrupt data with success status, whole pages from other writes</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Read-back verification fails on whole 4 KiB pages containing other valid data; no errors anywhere.</dd>
+    <dt>Possible causes</dt><dd>Host buffer reuse before CQE; PRP list slot reuse (<a href="ch38.html">Chapter 38</a>, Case 2); overlapping writes in flight; device mapping bug.</dd>
+    <dt>Evidence</dt><dd>Content of the bad page (which later write?), CplD payloads in a capture, driver buffer lifecycle.</dd>
+    <dt>First check</dt><dd>Is the bad content from a write submitted <em>later</em> than the victim (reuse) or to the same LBA (overlap)?</dd>
+    <dt>Second check</dt><dd>Does the failure rate rise with device pull latency (full drive, sustained writes)?</dd>
+    <dt>Disambiguating experiment</dt><dd>Poison buffers right after CQE and delay recycling; failures disappear if reuse was the cause.</dd>
+    <dt>Likely conclusion</dt><dd>Host buffer-ownership bug (senior forensic lab).</dd>
+    <dt>Confidence</dt><dd>High when the CplD payload already contains the wrong data.</dd>
+  </dl>
+
+  <h3>Torn data after power loss</h3>
+  <dl>
+    <dt>Symptom</dt><dd>After a power cut, a 16 KiB database page reads back with the first 8 KiB new and the last 8 KiB old.</dd>
+    <dt>Possible causes</dt><dd>Write larger than AWUPF/NAWUPF or crossing an atomic boundary; application relying on atomicity the device never promised; device not honouring its stated unit.</dd>
+    <dt>Evidence</dt><dd>Identify values (AWUPF, NAWUPF, NABSPF, NABO); the write's SLBA and size; whether the write was in flight at the cut.</dd>
+    <dt>First check</dt><dd>Compute whether the write fit within the power-fail atomic unit and did not cross a boundary.</dd>
+    <dt>Second check</dt><dd>Was the write completed (and flushed) before the cut? A completed and flushed write must not tear at all.</dd>
+    <dt>Disambiguating experiment</dt><dd>Power-cut test with writes exactly at, and one block above, the atomic unit, aligned and misaligned; count torn outcomes per class.</dd>
+    <dt>Likely conclusion</dt><dd>Usually the application assumption (16 KiB pages on a device with AWUPF of one block); a device bug only if tears occur within the unit.</dd>
+    <dt>Confidence</dt><dd>High for the arithmetic; medium for device behaviour until power-cut statistics exist.</dd>
+  </dl>
+
+  <h3>CQE arrives before the last data completion</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Rare corruption of the tail of large writes; analyzer shows a data CplD for a command's address range after that command's CQE MWr.</dd>
+    <dt>Possible causes</dt><dd>Controller firmware posting completion on "last MRd issued" instead of "last CplD received"; analyzer timestamping across two capture ports (false alarm).</dd>
+    <dt>Evidence</dt><dd>Single-port capture with both directions on one time base.</dd>
+    <dt>First check</dt><dd>Confirm the timestamps come from one time base.</dd>
+    <dt>Second check</dt><dd>Is the late CplD's tag one of this command's requests?</dd>
+    <dt>Disambiguating experiment</dt><dd>Slow the host's read latency deliberately (busy memory); a real bug becomes more frequent.</dd>
+    <dt>Likely conclusion</dt><dd>Controller bug violating the CQE-after-data rule.</dd>
+    <dt>Confidence</dt><dd>High once the time base is trusted.</dd>
+  </dl>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>In an NVMe Write over PCIe, which packets carry the user data, and in which direction?</p><details class="answer"><summary>Model answer</summary><p>Completions with Data travelling host-to-device, answering Memory Read requests the controller sends upstream. Host MWrs carry only doorbells.</p></details></li>
+    <li><p>What is NLB = 15 in bytes on a 512-byte-LBA namespace?</p><details class="answer"><summary>Model answer</summary><p>NLB is 0's based: 16 blocks × 512 B = 8 KiB.</p></details></li>
+    <li><p>Why can the host not reuse a write buffer right after ringing the doorbell?</p><details class="answer"><summary>Model answer</summary><p>The controller may read the buffer any time until it posts the CQE, possibly late or more than once; ownership returns only at completion.</p></details></li>
+    <li><p>What does FUA guarantee and what does it not?</p><details class="answer"><summary>Model answer</summary><p>This command's data and metadata are on non-volatile media before completion. It does not flush other cached data and does not order commands.</p></details></li>
+    <li><p>Two writes are in flight; the second completes first. Is that a bug?</p><details class="answer"><summary>Model answer</summary><p>No. NVMe defines no completion order between commands.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>A 4 KiB write is pulled with 8 MRds of 512 B; the root complex returns 128-byte completions. Give the Byte Count sequence for one request.</p><details class="answer"><summary>Model answer</summary><p>512, 384, 256, 128 — each value is bytes remaining including the current completion. 32 CplDs for the 4 KiB.</p></details></li>
+    <li><p>Why is the PCIe tag limit often not the limit on outstanding reads?</p><details class="answer"><summary>Model answer</summary><p>The device must reserve receive space for every outstanding request because it advertises infinite completion credits; its reassembly buffer size divided by request size is usually smaller than 256.</p></details></li>
+    <li><p>How do you attribute interleaved MRds to commands in a trace without an NVMe-aware decoder?</p><details class="answer"><summary>Model answer</summary><p>Decode each SQE's PRP/SGL from the SQE fetch CplD, then map each MRd address into those pages or descriptors; tags are only valid while outstanding.</p></details></li>
+    <li><p>What is in the gap between the SQE completion and the first data MRd, and when is it long?</p><details class="answer"><summary>Model answer</summary><p>Command decoding, buffer/cache reservation, PRP list fetch. It grows under cache back-pressure in steady-state writes.</p></details></li>
+    <li><p>What does AWUPF = 7 mean on a 512-byte-LBA namespace with no namespace-specific value?</p><details class="answer"><summary>Model answer</summary><p>0's based: 8 blocks = 4 KiB. A write of up to 4 KiB that does not cross an atomic boundary is all-old or all-new after power failure.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>Derive the outstanding-read depth needed for 7 GB/s at a 1.5 µs host round trip with MRRS 512.</p><details class="answer"><summary>Model answer</summary><p>Bytes in flight = 7×10⁹ × 1.5×10⁻⁶ = 10,500 B; ÷ 512 ≈ 21 requests.</p></details></li>
+    <li><p>A CplD arrives with EP=1 during a write pull. What must the controller do, and what does the host see?</p><details class="answer"><summary>Model answer</summary><p>Not commit the data as good, drain remaining completions, fail the command with an error status (implementation's choice, often Data Transfer Error), log Poisoned TLP Received and signal per AER configuration. The host sees an error CQE, AER logs, and likely a memory-error record.</p></details></li>
+    <li><p>Why does an IOMMU hurt write throughput more than read throughput?</p><details class="answer"><summary>Model answer</summary><p>Translation latency adds directly to the non-posted MRd round trip the device waits on; posted read-data writes are buffered by the root complex and only consume credits.</p></details></li>
+    <li><p>How would you tell from a trace whether a slow write is device- or host-limited?</p><details class="answer"><summary>Model answer</summary><p>Split time into SQE fetch, SQE→first MRd (device), MRd→CplD (host), last CplD→CQE (device). Long MRd→CplD with a flat outstanding count convicts the host; long device gaps convict the device.</p></details></li>
+    <li><p>What evidence decides whether overlapping-write results are a device bug?</p><details class="answer"><summary>Model answer</summary><p>Whether the second write was submitted after the first completed. If both were in flight, any result is legal; if strictly serialised, stale data is a device bug.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>Design a validation plan for the write pull of a new controller.</p><details class="answer"><summary>Model answer</summary><p>Exerciser-driven completions at every legal split (RCB multiples, 4…256 B), interleaving across tags, maximum outstanding, injected UR/CA/EP/no-completion per request position (first, middle, last), malformed completions, late unexpected completions, MRRS 128–4096, 10-bit tags, plus host-level PRP/SGL alignment matrix, MDTS-size writes, overlapping writes and power-cut atomicity. Pass criteria: no success CQE with bad data, correct error status, no buffer access after CQE, no hang.</p></details></li>
+    <li><p>A customer says "your SSD corrupted data" with no errors logged. How do you run the investigation?</p><details class="answer"><summary>Model answer</summary><p>Characterise the corruption (granularity, content provenance, timing), collect driver tracepoints and, if possible, a capture; test the host invariants (buffer ownership, ordering, flush) before device hypotheses; reproduce with signature-writing tools; only then examine firmware.</p></details></li>
+    <li><p>What is the controller's correct behaviour if power fails mid-pull?</p><details class="answer"><summary>Model answer</summary><p>The command has not completed, so the host has no durability claim; the LBAs must read back as old or new within the atomic unit and boundary rules, and may be mixed above them. The controller must never expose a partially pulled LBA (a single LBA cannot be half written).</p></details></li>
+    <li><p>Should a driver choose FUA or a following Flush for a commit record?</p><details class="answer"><summary>Model answer</summary><p>Flush (or preflush) to make prior data durable, then FUA on the commit record so it alone pays the program cost — the Linux REQ_PREFLUSH|REQ_FUA pattern. On a device without volatile cache both are no-ops.</p></details></li>
+    <li><p>How do reassembly buffer size, MRRS and host latency interact in a product spec review?</p><details class="answer"><summary>Model answer</summary><p>Required bytes in flight = target rate × worst realistic round trip (including IOMMU misses and switches); the buffer must exceed it with margin; smaller MRRS raises request count and header overhead but not bytes in flight; validate on the slowest supported platform, not the reference board.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>A non-final split completion for a 512-byte request ends at address 0x…02C8 on a platform with RCB 64 B. This is:</p>
+      <ul class="options" data-answer="2">
+        <li>Legal, because it is smaller than MPS</li>
+        <li>A violation: non-final splits must end on an RCB-aligned address</li>
+        <li>Legal only with Relaxed Ordering</li>
+        <li>Legal if the Byte Count is correct</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>0x2C8 is not a multiple of 64; only the final completion of a request may end off an RCB boundary.</p></details>
+    </li>
+    <li>
+      <p>Which agent sets EP=1 on a CplD during a write pull?</p>
+      <ul class="options" data-answer="3">
+        <li>The SSD controller</li>
+        <li>The NVMe driver</li>
+        <li>The completer (root complex), typically after an uncorrectable host memory error</li>
+        <li>The IOMMU on a translation fault</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The completer marks known-bad data. An IOMMU fault produces UR/CA, not poisoned data.</p></details>
+    </li>
+    <li>
+      <p>CQEs for CIDs 0x0211 then 0x0210 appear, though 0x0210 was submitted first. What can you conclude about media content if both wrote different LBAs?</p>
+      <ul class="options" data-answer="4">
+        <li>0x0211's data is durable, 0x0210's is not</li>
+        <li>The controller is non-compliant</li>
+        <li>0x0210 was retried</li>
+        <li>Nothing about durability or commit order; completion order is not defined</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Completion order carries no ordering or durability meaning.</p></details>
+    </li>
+    <li>
+      <p>Host round trip 2 µs, MRRS 512 B, target 7 GB/s. Minimum outstanding reads?</p>
+      <ul class="options" data-answer="2">
+        <li>14</li>
+        <li>28</li>
+        <li>56</li>
+        <li>256</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>7×10⁹ × 2×10⁻⁶ = 14,000 B; ÷ 512 ≈ 27.3 → 28.</p></details>
+    </li>
+    <li>
+      <p>Which status best signals a failed data pull (UR on a data MRd) on most controllers?</p>
+      <ul class="options" data-answer="1">
+        <li>Generic status 04h, Data Transfer Error</li>
+        <li>LBA Out of Range</li>
+        <li>Invalid Namespace or Format</li>
+        <li>Write Fault</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Data Transfer Error describes a transfer failure; Write Fault describes failure to commit to media. The exact choice is implementation-dependent, which is why the trace matters.</p></details>
+    </li>
+    <li>
+      <p>A device reports NAWUPF = 3 (512-byte LBAs). Which write is guaranteed not to tear on power loss, assuming no boundary is crossed?</p>
+      <ul class="options" data-answer="3">
+        <li>A 4 KiB write</li>
+        <li>A 3 KiB write</li>
+        <li>A 2 KiB write</li>
+        <li>Any FUA write</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>0's based: 4 blocks = 2 KiB. FUA governs durability on completion, not atomicity of an in-flight write.</p></details>
+    </li>
+    <li><p>Why does a READ trace almost never show Completion Timeouts for user data, while a WRITE trace can?</p><details class="answer"><summary>Model answer</summary><p>Read data travels as posted MWrs, which have no completions; write data is fetched with non-posted MRds, each of which can time out.</p></details></li>
+    <li><p>In Trace M31-S, what single measurement best separates "device slow" from "host slow"?</p><details class="answer"><summary>Model answer</summary><p>The MRd→first-CplD latency per tag (host) compared with SQE→first-MRd and last-CplD→CQE (device).</p></details></li>
+    <li><p>Give two reasons a controller might read part of a write buffer twice.</p><details class="answer"><summary>Model answer</summary><p>Internal retry after a reassembly or internal ECC error; firmware that pulls once to compute protection information and again to store; a reset/abort path re-executing. Hence buffers must stay stable until the CQE.</p></details></li>
+    <li><p>What is the difference between Data Transfer Error and Write Fault in diagnosis?</p><details class="answer"><summary>Model answer</summary><p>Data Transfer Error points to the host transfer (addresses, IOMMU, poisoned data); Write Fault points inside the device (media commit failure). Look for PCIe/IOMMU evidence for the former, SMART/media logs for the latter.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <ol>
+    <li><p><strong>To a child:</strong> explain why the mosaic artist must not have you change the tiles on your desk until she says "Got it".</p>
+      <details class="answer"><summary>Model explanation</summary><p>The artist's robots might still be on their way to your desk. If you swap a tile, the robot brings the new one, and the picture on the wall ends up with the wrong tile even though the artist did everything right.</p></details></li>
+    <li><p><strong>To a junior engineer:</strong> explain how a write's data reaches the drive and why the trace shows four completions per request.</p>
+      <details class="answer"><summary>Model explanation</summary><p>The controller asks for the data with Memory Read requests of up to MRRS, here 512 bytes, each with a tag. The root complex answers with Completions with Data no larger than MPS and may split them at RCB multiples; this platform splits at 128 bytes, so four completions with Byte Counts 512, 384, 256 and 128 answer each request. The controller rebuilds the data by tag, and posts the CQE only after the last byte has arrived.</p></details></li>
+    <li><p><strong>To a senior engineer:</strong> argue whether a given write-throughput regression belongs to the SSD or the platform.</p>
+      <details class="answer"><summary>Model explanation</summary><p>Write throughput is bytes in flight divided by round trip. The capture shows the controller holding a constant 16 requests outstanding and reissuing tags within 100 ns of retirement, with commit gaps under a microsecond, so its behaviour is unchanged. The MRd→CplD round trip rose from 0.6 to 3.1 µs, consistent with IOTLB pressure since list reads stayed fast. That predicts 2.6 GB/s, which is what we measured. Platform owns it; the SSD's only lever would be a deeper pipeline, which we can request as an enhancement but not as a defect fix.</p></details></li>
+  </ol>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain the pull pipeline, buffer ownership, atomicity and the absence of ordering in your own words;</li>
+      <li>draw the sequence for two concurrent writes, including split completions and out-of-order CQEs;</li>
+      <li>identify in a trace each command's MRds by address, the Byte Count sequence per tag, and the host and device gaps;</li>
+      <li>debug the six failure patterns above, naming the first check and the disambiguating experiment for each;</li>
+      <li>distinguish the Write from its neighbours: READ's push (<a href="dd30.html">Deep dive: READ</a>), Flush (<a href="dd32.html">Deep dive: FLUSH</a>), Write Zeroes and Write Uncorrectable (<a href="ch31.html">NVM Command Set</a>), PCIe completions in general (<a href="dd12.html">Deep dive: PCIe Completions</a>) and DMA in general (<a href="dd36.html">Deep dive: DMA with NVMe</a>);</li>
+      <li>cite the NVM Command Set Specification 1.3 (Write, atomicity), NVMe Base Specification 2.4 (CQE, status, Identify) and PCI Express Base Specification (completion rules, error signaling) for each claim you make.</li>
+    </ul>
+  </aside>
+  <p>Next: <a href="dd32.html">Deep dive: FLUSH</a>.</p>
+</section>

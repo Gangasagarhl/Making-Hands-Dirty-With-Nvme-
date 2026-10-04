@@ -1,0 +1,601 @@
+<p class="lead">Chapter 52 taught the arithmetic of completions: how a read is split, what Byte Count and Lower Address must be, and how timeouts are configured. This module treats the completion as a protocol between two state machines — a completer that decides <em>what</em> to answer and a requester that decides <em>whether to believe it</em> — and follows completions into the places where NVMe failures actually hide: error statuses, retries during reset, poisoned data, latency tails and evidence gaps in captures.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p>Every non-posted request is a promise that exactly one of three things will happen: all of its completions arrive with Successful Completion status, an error completion arrives, or the requester's timer expires. This module deepens each branch. It covers the completer side (who generates which status, and why), the requester side (the matching and acceptance machine), configuration-retry behaviour around resets, how an NVMe controller turns a failed completion into an NVMe status, and how to prove from a capture that a completion was really missing rather than missed by the analyzer.</p>
+  <aside class="callout prereq">
+    <p>Posted versus non-posted and Completion Timeout basics: <a href="ch12.html">Chapter 12</a>. Completion header fields, splitting rules, Read Completion Boundary (RCB), Byte Count/Lower Address arithmetic, timeout ranges and Unexpected Completions: <a href="ch52.html">Chapter 52 — Completion Rules</a>. Header decoding: <a href="ch11.html">Chapter 11</a> and <a href="dd11.html">Module 11</a>. This module does not repeat the arithmetic; it uses it.</p>
+  </aside>
+  <p>Where this goes next: the Tag that ties a completion to its request in <a href="dd13.html">Module 13 — PCIe Tags</a>; why completions must not pass posted writes in <a href="dd14.html">Module 14 — PCIe Ordering</a>; error reporting in <a href="ch46.html">Chapter 46 — AER</a>.</p>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives by level</caption>
+    <thead><tr><th>Level</th><th>Objective</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>State the three ways a non-posted request ends, and which TLP kinds produce Cpl versus CplD.</td></tr>
+      <tr><td>Intermediate</td><td>For each completion status (SC, UR, CRS/RRS, CA), name the components that generate it and typical causes in an NVMe system.</td></tr>
+      <tr><td>Advanced</td><td>Describe the requester's acceptance machine (match, status, MPS, Byte Count/Lower Address continuity, completion) and the completer's generation policy (when to split, which status, latency sources).</td></tr>
+      <tr><td>Senior</td><td>Trace a failed completion to the NVMe status the host finally sees, and decide whether a missing completion was lost, never generated, or missed by the instrument.</td></tr>
+      <tr><td>Trace analysis</td><td>Compute per-tag completion latency (request to first and to last completion) and spot the tail.</td></tr>
+      <tr><td>Debugging</td><td>Separate cause from consequence among Completion Timeout, Unexpected Completion, Malformed TLP, UR and Poisoned TLP Received.</td></tr>
+      <tr><td>Validation</td><td>Specify completer and requester tests: every status, split policy, late, duplicate and poisoned completions, retry during reset.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>You order a big puzzle from a toy shop by post, and the shop always writes back. Sometimes the whole puzzle comes in one box. Sometimes it comes in several boxes, each with a sticker: "pieces still to come, counting this box" and "where on the board these pieces go". Sometimes a letter comes instead: "we don't sell that" (that is Unsupported Request) or "our machine broke while packing it" (Completer Abort). And sometimes, when the shop has just opened in the morning, the letter says "we're not open yet, ask again in a minute" — that is the retry status.</p>
+    <p>You keep a list on the fridge of every order you are waiting for. When a box arrives, you check it against the list. If a box comes for an order that is not on your list, you are puzzled — maybe you crossed it out because you gave up waiting. And if you wait too long, you cross the order out and tell your parents something went wrong.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <aside class="callout breaks">
+    <p><strong>What it represents.</strong> One request, one or more answers; the answers say how much is left and where they belong; error letters end the order; a retry letter is special; the fridge list is the requester's outstanding-request table.</p>
+    <p><strong>What it hides.</strong> The shop does not know your address in full — completions carry only the requester's ID and the low 7 address bits, so the requester must remember the rest. Boxes for one order must arrive in order (address order); boxes for different orders may arrive in any order. And a PCIe completion travels hop by hop through switches, which route it by ID without looking inside.</p>
+    <p><strong>Where it misleads.</strong> "We're not open yet" only applies to configuration requests; a memory read never gets a retry status. Real shops may send a partial order and an apology; in PCIe an error completion ends the request, and any data already received for it must be treated as failed. And you cannot phone the shop to ask where the box is: a PCIe requester has no query mechanism, only its timer.</p>
+  </aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Terms for completions as a protocol</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="completion">Completion</span></td><td>An answer</td><td>Cpl (no data) or CplD, ID-routed to the requester, matched by Transaction ID</td><td>Discharges a non-posted request</td><td>Thinking posted writes get completions</td></tr>
+      <tr><td><span class="g" data-term="completer">Completer</span></td><td>Who answers</td><td>The function (or Root Complex, or switch port) that generates the completion</td><td>Identified by Completer ID</td><td>Assuming it is always the addressed device (a switch may answer UR)</td></tr>
+      <tr><td><span class="g" data-term="completion-status">Completion Status</span></td><td>How it went</td><td>SC 000b, UR 001b, CRS/RRS 010b, CA 100b</td><td>Non-SC ends the request</td><td>Reading the status nibble without converting to binary</td></tr>
+      <tr><td>Error completion</td><td>A "no" letter</td><td>Cpl with UR or CA status, no data</td><td>Contrast timeout (no answer at all)</td><td>Treating it as a timeout</td></tr>
+      <tr><td><span class="g" data-term="crs">CRS / RRS</span></td><td>"Try again later"</td><td>Configuration Request Retry Status (renamed Request Retry Status in recent revisions)</td><td>Used while a function initialises after reset</td><td>Expecting it for memory requests</td></tr>
+      <tr><td><span class="g" data-term="crs-sv">CRS Software Visibility</span></td><td>Let software see "not ready"</td><td>Root Control enable: a CRS on a Vendor ID read returns 0x0001 to software instead of automatic re-issue</td><td>Root Capabilities advertises it</td><td>Mistaking Vendor ID 0x0001 for a real vendor</td></tr>
+      <tr><td><span class="g" data-term="unexpected-completion">Unexpected Completion</span></td><td>An answer nobody waits for</td><td>Completion whose Transaction ID matches no outstanding request at the receiver</td><td>Often follows a timeout or reset</td><td>Blaming the completer first</td></tr>
+      <tr><td><span class="g" data-term="completion-timeout">Completion Timeout</span></td><td>Gave up waiting</td><td>Requester error when completions do not all arrive in the configured window</td><td>Configured in Device Control 2</td><td>Confusing with the NVMe driver's command timeout</td></tr>
+      <tr><td><span class="g" data-term="poisoned-tlp">Poisoned completion</span></td><td>Delivered but known bad</td><td>CplD with EP = 1</td><td>Receiver logs Poisoned TLP Received</td><td>Treating it as a format error</td></tr>
+      <tr><td>Completion latency</td><td>Time to answer</td><td>Request transmission to first (or last) completion of a tag</td><td>Drives outstanding-read needs (Little's Law)</td><td>Measuring only to the first piece</td></tr>
+      <tr><td><span class="g" data-term="infinite-credits">Infinite completion credits</span></td><td>"Always room for answers"</td><td>Endpoints and Root Complexes typically advertise unlimited Cpl credits and must pre-reserve space before asking</td><td>Flow control (<a href="ch53.html">Chapter 53</a>)</td><td>Thinking completions can be flow-blocked at an endpoint</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <figure>
+    <pre class="diagram">   REQUESTER (Lab SSD read DMA)                         COMPLETER (Root Complex for host memory)
+  +--------------------------------------+            +-------------------------------------------+
+  | outstanding table (by Tag)           |   MRd      | request decode: address in a valid range? |
+  |  addr, len, BEs, buffer, BC_left,    | ---------> | IOMMU lookup (IOVA -> PA)  -- fail -> UR/CA|
+  |  next_LA, timer                      |            | memory/coherency fetch (cache lines)      |
+  | acceptance machine (per completion): |   CplD(s)  | completion builder: status, split at RCB, |
+  |  match? status? MPS? LA/BC ok? last? | <--------- |  size <= MPS, Byte Count, Lower Address    |
+  | reassembly buffer (pre-reserved)     |            | poisoning if memory reports uncorrectable |
+  | AER: CmpltTO, UnxCmplt, Malformed,   |            | AER at the RC/Root Port for its own errors|
+  |      Poisoned TLP Received           |            +-------------------------------------------+
+  +--------------------------------------+
+        ^ also a COMPLETER for CPU MMIO reads (CSTS, CAP) and config reads -> its own completion builder</pre>
+    <figcaption>The two state machines of the completion protocol. Conceptual; real designs differ.</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture elements</caption>
+    <thead><tr><th>Element</th><th>In the example system</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>Non-posted requests: SQE, PRP-list and WRITE-data reads from the SSD; CPU MMIO reads of BAR0; configuration requests</td></tr>
+      <tr><td>Outputs</td><td>Cpl/CplD with status; or nothing (lost, discarded, never generated)</td></tr>
+      <tr><td>Actors</td><td>Requester Transaction Layer; completer (Root Complex, Lab SSD, or a switch port answering UR); every switch on the ID-routed path</td></tr>
+      <tr><td>State</td><td>Requester: per-tag entry and timer. Completer: request queue, translation and fetch state. Path: bus-number ranges for ID routing</td></tr>
+      <tr><td>Memory</td><td>Requester reassembly buffer; Root Complex read buffers; host DRAM and caches</td></tr>
+      <tr><td>Registers</td><td>Device Control 2 (Completion Timeout Value/Disable); Link Control (RCB); Root Control/Capabilities (CRS Software Visibility); AER status, mask, severity, Header Log; Command register (Memory Space Enable affects whether a function claims memory requests)</td></tr>
+      <tr><td>Interfaces</td><td>The link (TLPs), the IOMMU (translation faults), the NVMe front-end (DMA result to command status)</td></tr>
+      <tr><td>Dependencies</td><td>Correct bus numbers (routing), IOMMU mappings, power state (a function in D3hot does not complete memory requests normally), reset state (CRS window)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>Follow one 512-byte WRITE-data read (Lab SSD, Tag 0x40, IOVA 0x2_0001_0000) through both machines. Each step: who acts, what changes, where, evidence.</p>
+  <ol>
+    <li><strong>Reserve and send.</strong> The SSD's read DMA allocates Tag 0x40, reserves 512 bytes of reassembly buffer, starts the timer, records BC_left = 512 and next_LA = 0x00. Evidence: MRd64 on the link, <code>20000080 010040ff 00000002 00010000</code>.</li>
+    <li><strong>Decode at the completer.</strong> The Root Complex checks the address belongs to system memory and asks the IOMMU to translate the IOVA for Requester ID 0x0100. Evidence: none on the link; an IOMMU fault log if it fails.</li>
+    <li><strong>Choose the status.</strong> Translation succeeds → SC path. If it failed, the Root Complex would answer Cpl with UR or CA (platform-dependent choice) and no data. <span class="badge impl">Implementation-dependent</span></li>
+    <li><strong>Fetch and split.</strong> The memory system returns cache lines; the completion builder emits CplDs of at most MPS = 256 bytes, cutting only at RCB = 64-byte boundaries. Evidence: CplD rows with BC 512 then 256 (or 512, 448, … for 64-byte pieces).</li>
+    <li><strong>Route back.</strong> Each CplD is ID-routed to bus 01 via the Root Port. Switches compare the Requester ID's bus with their secondary/subordinate ranges. Evidence: completion appears on each link segment.</li>
+    <li><strong>Accept or reject.</strong> The SSD's acceptance machine: Tag 0x40 outstanding? status SC? Length ≤ MPS? Lower Address = next_LA? Byte Count = BC_left? If all yes, copy data, BC_left −= bytes, next_LA advances. Evidence: no error; data in the buffer.</li>
+    <li><strong>Finish.</strong> When a completion's Byte Count equals the bytes it delivers, the request is complete: timer stops, Tag 0x40 is freed. Evidence: the tag may reappear in a later MRd.</li>
+    <li><strong>Report upward.</strong> The DMA engine tells the NVMe front-end the 512 bytes are ready; when all data for the command has arrived and been processed, the controller posts a CQE. On any failure branch, the front-end must fail the command (see the protocol view).</li>
+  </ol>
+  <figure>
+    <ol class="seq" data-actors="SSD requester|Switch / Root Port|Root Complex|IOMMU + memory">
+      <li data-from="SSD requester" data-to="Switch / Root Port" data-t="0 ns">MRd64 Tag 0x40, 512 B</li>
+      <li data-from="Switch / Root Port" data-to="Root Complex">forward (address-routed)</li>
+      <li data-from="Root Complex" data-to="IOMMU + memory">translate IOVA, read lines</li>
+      <li data-from="IOMMU + memory" data-to="Root Complex" class="dashed">data (or fault)</li>
+      <li data-from="Root Complex" data-to="SSD requester" class="dashed" data-t="≈ 900 ns">CplD BC=512 LA=0x00 (256 B)</li>
+      <li data-from="Root Complex" data-to="SSD requester" class="dashed">CplD BC=256 LA=0x00 (256 B)</li>
+      <li data-note="SSD requester">BC = bytes carried: free Tag 0x40</li>
+    </ol>
+    <figcaption>One read, two completions, both machines. Synthetic example for teaching; times illustrative.</figcaption>
+  </figure>
+
+  <h3>The ladder for "a completion"</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Every order gets an answer — boxes, a "no" letter, a "try later" letter — or you stop waiting.</p></div>
+    <div class="rung" data-rung="B"><p>Non-posted requests end with SC completions carrying all bytes, one error completion, or a Completion Timeout; Unexpected Completions are answers to orders already crossed out.</p></div>
+    <div class="rung" data-rung="C"><p>Requester: tag table, timers, pre-reserved buffers, an acceptance machine. Completer: decode, translation, memory fetch, completion builder with status choice and split policy.</p></div>
+    <div class="rung" data-rung="D"><p>PCI Express Base Specification — Completion Rules, Completion Handling Rules, Completion Timeout Mechanism, Configuration Request Retry (Request Retry) Status, Root Control CRS Software Visibility, error classification in Error Signaling and Logging.</p></div>
+    <div class="rung" data-rung="E"><p>Completions are ID-routed in the opposite direction to their request, may interleave across tags, stay in address order within a tag, and must not pass earlier posted writes unless relaxed.</p></div>
+    <div class="rung" data-rung="F"><p>A trace shows each tag's request row and its completion rows; the latency between them; status columns; and gaps — the hardest thing to see.</p></div>
+    <div class="rung" data-rung="G"><p>Order the evidence in time: the first non-SC status, the first missing piece, or the first poisoned CplD is the cause; timeouts and unexpected completions after it are usually consequences.</p></div>
+  </div>
+
+  <h3>Who generates which status</h3>
+  <table>
+    <caption>Completion status sources in an NVMe-over-PCIe system</caption>
+    <thead><tr><th>Status</th><th>Generated by</th><th>Typical cause here</th><th>What the requester sees</th></tr></thead>
+    <tbody>
+      <tr><td>SC</td><td>Any completer</td><td>Normal</td><td>Data (CplD) or confirmation (Cpl for config/IO writes)</td></tr>
+      <tr><td>UR</td><td>Root Complex</td><td>DMA to an IOVA the IOMMU blocks (on platforms that answer UR); address outside system memory</td><td>NVMe controller: DMA failure for the command</td></tr>
+      <tr><td>UR</td><td>Switch port</td><td>Non-posted request that matches no downstream window</td><td>Cpl UR with the switch port's Completer ID</td></tr>
+      <tr><td>UR</td><td>Lab SSD</td><td>CPU read of BAR0 while Memory Space Enable is clear, or while in D3hot; unsupported request type</td><td>CPU load returns all ones (platform-dependent synthesis)</td></tr>
+      <tr><td>CA</td><td>Root Complex or Lab SSD</td><td>Internal error, or a request that violates the completer's programming model (for example an access size a register does not support)</td><td>Same as UR for software; logged as Completer Abort</td></tr>
+      <tr><td>CRS/RRS</td><td>Lab SSD (configuration only)</td><td>Function still initialising after a reset</td><td>Root Complex re-issues the request, or returns 0x0001 for a Vendor ID read if CRS Software Visibility is enabled</td></tr>
+    </tbody>
+  </table>
+  <p>Which of UR or CA a Root Complex uses for an IOMMU-blocked DMA read, and whether it also raises a platform error, is <span class="badge impl">Implementation-dependent</span>. The PCIe rules define the meaning of each status; the choice for a given failure is the completer's.</p>
+
+  <h3>The sixteen questions, for the completion</h3>
+  <table>
+    <caption>The completion through the sixteen questions (short answers)</caption>
+    <thead><tr><th>#</th><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>1–3</td><td>What, why, what problem?</td><td>The answer TLP that discharges a non-posted request; created for split transactions so a link is not held during the request; lets many requests be in flight and fail individually.</td></tr>
+      <tr><td>4–5</td><td>Before; why better?</td><td>PCI delayed transactions (retry until data ready) and PCI-X split completions; PCIe adds uniform ID routing, statuses, and timeouts.</td></tr>
+      <tr><td>6–7</td><td>Who creates and consumes?</td><td>The completer creates; the requester's acceptance machine consumes; switches route by ID.</td></tr>
+      <tr><td>8–9</td><td>Where; which registers?</td><td>Completion buffers and the requester's tag table; Device Control 2, Link Control RCB, Root Control CRS SV, AER.</td></tr>
+      <tr><td>10–11</td><td>Before and after?</td><td>Before: a non-posted request, decode, translation, fetch. After: data placed, tag freed, NVMe front-end notified — or an error path.</td></tr>
+      <tr><td>12</td><td>If wrong?</td><td>Malformed TLP, Unexpected Completion, Completion Timeout, silent misplacement of data, NVMe data transfer errors.</td></tr>
+      <tr><td>13–14</td><td>Analyzer; Linux?</td><td>Request/completion pairing, status, latency, gaps; AER bits (UnsupReq, CmpltAbrt, CmpltTO, UnxCmplt), IOMMU fault logs, NVMe error messages.</td></tr>
+      <tr><td>15–16</td><td>Validation; senior suspicion?</td><td>Every status, split policy, late/duplicate/poisoned completions, CRS after reset; seniors suspect the platform's memory/translation path and look for the first non-SC event.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <p><strong>Applicable documents.</strong> PCI Express Base Specification, Revision 6.x/7.0 (PCI-SIG members' document): Transaction Layer — Completion Rules, Completion Handling Rules, Completion Timeout Mechanism; Configuration — Root Control and Root Capabilities (CRS Software Visibility), Device Control 2, Link Control (RCB); Error Signaling and Logging and the AER capability. NVM Express Base Specification 2.4 — status codes (for example the Generic Command Status value Data Transfer Error) and controller fatal status; NVMe over PCIe Transport Specification 1.4 for the PCIe mapping.</p>
+  <table>
+    <caption>Classifying the claims</caption>
+    <thead><tr><th>Claim</th><th>Class</th></tr></thead>
+    <tbody>
+      <tr><td>Status encodings; non-SC terminates the request; completions ID-routed; same-tag completions in address order</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>CRS/RRS only for configuration requests; CRS Software Visibility returns 0x0001 for a Vendor ID read when enabled</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>Requester must implement Completion Timeout (with permitted disable where supported)</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>Explanatory text on why completions are split, examples</td><td><span class="badge informative">Informative</span></td></tr>
+      <tr><td>Completion Timeout ranges beyond the default; Completion Timeout Disable; CRS Software Visibility</td><td><span class="badge optional">Optional</span> capabilities</td></tr>
+      <tr><td>UR versus CA for IOMMU-blocked DMA; completion size policy; which receive checks a requester performs; NVMe status chosen after a DMA failure</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+      <tr><td>CRS renamed RRS and broadened; 10-bit and 14-bit tags widen the match key; Flit Mode completion header</td><td><span class="badge version">Version-dependent</span></td></tr>
+      <tr><td>Latency decomposition and the "first non-SC event is the cause" heuristic</td><td><span class="badge derived">Derived</span></td></tr>
+    </tbody>
+  </table>
+  <aside class="callout notsaid">
+    <p>The PCIe specification does not say what an NVMe controller must do with a failed DMA read beyond PCIe error reporting; the NVMe Base Specification defines status codes and leaves the mapping to the controller. Neither says how long a Root Complex may take to answer, how large its completions are, or which status it uses for translation faults. The time a function may keep answering CRS after reset, and how software must wait, are defined in the reset and configuration-readiness rules — read them there rather than relying on a remembered number.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume: a completion's Completer ID is the addressed device; a UR came from the endpoint; partial data before an error completion is usable; a Vendor ID of 0x0001 is real.</p>
+  </aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Hardware participation</caption>
+    <thead><tr><th>Category</th><th>Hardware</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>Must participate</td><td>Requester tag table, timers, reassembly buffer; completer decode and completion builder</td><td>Generate and accept completions</td></tr>
+      <tr><td>Must participate</td><td>Switch ID-routing logic</td><td>Forward completions by bus number; answer UR for unclaimed non-posted requests</td></tr>
+      <tr><td>May participate</td><td>IOMMU, memory controller ECC, coherency fabric</td><td>Decide UR/CA, poison data, add latency</td></tr>
+      <tr><td>Observable</td><td>Completions on each link; AER bits; IOMMU fault records</td><td>Evidence</td></tr>
+      <tr><td>Internal, unobservable</td><td>Root Complex queues, page-walk caches, DRAM scheduling; the SSD's internal DMA-to-firmware status path</td><td>Latency and status decisions you infer, not see</td></tr>
+    </tbody>
+  </table>
+  <p>Completion latency has components no analyzer separates: Root Complex queueing, IOMMU translation (an IOTLB miss can add a page walk of several memory accesses), DRAM access, and coherency (snooping CPU caches). An analyzer sees only the sum, request-to-completion at its tap point. Senior engineers compare latency distributions under controlled changes (IOMMU off in a lab, huge pages, local versus remote NUMA buffers) to attribute the parts. <span class="badge derived">Derived</span></p>
+  <p>On the SSD side, the reassembly buffer and the acceptance checks are in the PCIe IP or DMA front-end. What happens on failure is a firmware design choice: abort only the affected command, quiesce the queue, or enter a controller fatal state (CSTS.CFS). Good designs fail the single command and keep going.</p>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <h3>From completion outcome to NVMe status</h3>
+  <table>
+    <caption>What the host finally sees for each completion outcome on a controller DMA read</caption>
+    <thead><tr><th>PCIe outcome at the SSD</th><th>PCIe-level reporting</th><th>Typical NVMe-level result</th></tr></thead>
+    <tbody>
+      <tr><td>All SC</td><td>None</td><td>Command proceeds</td></tr>
+      <tr><td>UR or CA completion</td><td>The completer logs/sends its error; the SSD may log the received error completion depending on its error handling</td><td>Command completes with an error status, commonly Data Transfer Error (Generic Command Status 04h) <span class="badge impl">Implementation-dependent</span></td></tr>
+      <tr><td>CplD with EP = 1</td><td>SSD logs Poisoned TLP Received; ERR_NONFATAL by default</td><td>Command fails rather than writing poisoned data to media; status chosen by controller</td></tr>
+      <tr><td>No completion within the window</td><td>SSD logs Completion Timeout; ERR_NONFATAL by default</td><td>Command fails (often Data Transfer Error) or controller enters fatal state, by design</td></tr>
+      <tr><td>Completion fails checks (bad BC/LA, &gt; MPS)</td><td>SSD logs Malformed TLP or Unexpected Completion</td><td>Usually followed by a timeout of the real request</td></tr>
+    </tbody>
+  </table>
+  <h3>Configuration completions and resets</h3>
+  <p>After a reset (Conventional reset, Function Level Reset), a function may answer configuration requests with CRS/RRS until it is ready. Without CRS Software Visibility, the Root Complex re-issues the request, and the CPU instruction that started it can stall for a long time. With it enabled, a configuration read of the Vendor ID returns 0x0001 and software polls. NVMe enters this picture during controller and function resets (<a href="ch48.html">Chapter 48</a>, <a href="ch49.html">Chapter 49</a>). Memory requests to a function that is not ready do not get CRS; they get UR or are not answered usefully, which is why drivers must wait for configuration readiness before touching BAR0.</p>
+  <h3>Ordering of completions</h3>
+  <p>Completions for different tags may pass each other; completions of the same tag may not. A completion must not pass an earlier posted write in the same direction unless relaxed (its RO bit, copied from the request, or IDO). That is why a CPU's read of CSTS returns after all writes the SSD issued earlier have gone ahead of it — see <a href="dd14.html">Module 14</a>.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic examples for teaching on the example system (Gen4 x4, MPS 256 B, MRRS 512 B, RCB 64 B, Root Port 0x0009, Lab SSD 0x0100). Times are illustrative.</p>
+
+  <h3>Normal: two policies, one result</h3>
+  <div class="trace" data-kind="synthetic" data-title="Normal: same 1 KiB of WRITE data, two Root Complex completion policies">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64</td><td>Tag=0x40 Addr=0x2_0001_0000 Len=128</td><td>Bytes 0–511</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>10</td><td>MRd64</td><td>Tag=0x41 Addr=0x2_0001_0200 Len=128</td><td>Bytes 512–1023</td></tr>
+        <tr class="note"><td colspan="6">Platform A (coalescing completer): two 256-byte CplDs per tag.</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>880</td><td>CplD</td><td>Tag=0x40 Len=64 BC=512 LA=0x00 SC</td><td></td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>920</td><td>CplD</td><td>Tag=0x41 Len=64 BC=512 LA=0x00 SC</td><td>Interleave across tags: legal</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>960</td><td>CplD</td><td>Tag=0x40 Len=64 BC=256 LA=0x00 SC</td><td>Tag 0x40 done</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>1,000</td><td>CplD</td><td>Tag=0x41 Len=64 BC=256 LA=0x00 SC</td><td>Tag 0x41 done</td></tr>
+        <tr class="note"><td colspan="6">Platform B (cache-line completer): eight 64-byte CplDs per tag, BC 512, 448, 384 … 64; LA alternates 0x00, 0x40.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Both are legal. Platform B costs more link time (each 64-byte CplD carries a 12-byte header plus framing, ≈ 76% efficiency versus ≈ 93%) but may deliver the first bytes sooner. Latency per tag should be measured to the <em>last</em> completion (BC = bytes carried), because that is when the requester can free the tag. <span class="badge derived">Derived</span></p>
+  </div>
+
+  <h3>Slow: a latency tail from translation misses</h3>
+  <div class="trace" data-kind="synthetic" data-title="Slow: per-tag completion latency during a 1 MiB WRITE with a cold IOTLB">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64</td><td>Tag=0x50 Addr=0x2_8000_0000 Len=128</td><td>First read in a new 4 KiB page</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>10</td><td>MRd64</td><td>Tag=0x51 Addr=0x2_8000_0200 Len=128</td><td>Same page</td></tr>
+        <tr class="abnormal"><td>3</td><td>Host→Dev</td><td>3,400</td><td>CplD</td><td>Tag=0x50 BC=512 LA=0x00</td><td>First abnormal event: 3.4 µs to first completion (typical here ≈ 0.9 µs)</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>3,450</td><td>CplD</td><td>Tag=0x51 BC=512 LA=0x00</td><td>Same page: equally late (queued behind the same translation)</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>3,500</td><td>MRd64</td><td>Tag=0x58 Addr=0x2_8000_0400 Len=128</td><td>Later read, same page</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>4,380</td><td>CplD</td><td>Tag=0x58 BC=512 LA=0x00</td><td>Back to ≈ 0.9 µs: translation now cached</td></tr>
+        <tr class="note"><td colspan="6">Pattern repeats at every new 4 KiB page; latency histogram is bimodal (≈ 0.9 µs and ≈ 3.4 µs). Throughput: ≈ 4.1 GB/s instead of ≈ 6.8 GB/s.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The completer is correct; it is slow at page boundaries. With about 16 outstanding 512-byte reads the device covers ≈ 1 µs of latency but not 3.4 µs (Little's Law: 6.8 GB/s × 3.4 µs ≈ 23 KB outstanding needed). Hypothesis: IOTLB misses on each new page (the buffer is mapped with 4 KiB pages). Disambiguate in a lab: map the buffer with huge pages, or test with the IOMMU in pass-through mode; the bimodal tail should collapse. Confidence: medium until the experiment.</p>
+  </div>
+
+  <h3>Failed: an error completion in the middle of a command</h3>
+  <div class="trace" data-kind="synthetic" data-title="Failed: UR completion for one page of a 16 KiB WRITE">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64</td><td>Tag=0x60 Addr=0x2_0007_0000 Len=128</td><td>Page 0 (PRP1)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>40</td><td>MRd64</td><td>Tag=0x68 Addr=0x2_0009_3000 Len=128</td><td>Page 1 (from PRP list)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>900</td><td>CplD</td><td>Tag=0x60 BC=512 SC</td><td>Normal</td></tr>
+        <tr class="abnormal"><td>4</td><td>Host→Dev</td><td>1,150</td><td>Cpl</td><td>Tag=0x68 Status=UR Cmpl=0x0009 (no data)</td><td>First abnormal event: Root Complex refuses page 1</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1,200</td><td>—</td><td>No further MRds for page 1; other tags for pages 0, 2, 3 complete SC</td><td>Controller abandons the command's data transfer</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>4,800</td><td>MWr64</td><td>CQE CID=0x0042 Status: Data Transfer Error</td><td>NVMe status (controller's choice)</td></tr>
+        <tr class="note"><td colspan="6">Host log at the same time: IOMMU fault for device 01:00.0, read, address 0x2_0009_3000.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The UR is not the SSD's fault; it is the Root Complex's answer to a DMA the IOMMU would not translate. The IOMMU fault address equals the PRP entry for page 1, so the question becomes: why was that IOVA unmapped? Candidates: the driver unmapped the buffer early (use-after-unmap), the PRP list was built with a stale entry, or a different device's mapping domain was used. The SSD behaved well: it failed one command with an NVMe status instead of hanging or going fatal. A beginner would chase the SSD; the evidence points to the host driver or the application's buffer lifetime.</p>
+  </div>
+
+  <h3>Ambiguous: a missing piece — lost, or not captured?</h3>
+  <div class="trace" data-kind="synthetic" data-title="Ambiguous: a completion piece missing from the capture">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64</td><td>Tag=0x22 Len=128</td><td></td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>870</td><td>CplD</td><td>Seq=0x5A1 Tag=0x22 BC=512 LA=0x00 Len=64</td><td>First half</td></tr>
+        <tr class="abnormal"><td>3</td><td>Host→Dev</td><td>930</td><td>CplD</td><td>Seq=0x5A3 Tag=0x31 BC=256 LA=0x00 Len=64</td><td>First abnormal event: sequence number jumps 0x5A1 → 0x5A3</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,050</td><td>DLLP Ack</td><td>AckNak_Seq_Num=0x5A3</td><td>SSD acknowledges everything through 0x5A3</td></tr>
+        <tr class="note"><td colspan="6">No further CplD for Tag 0x22 in the capture. No Completion Timeout is ever reported by the SSD, and the command completes successfully.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> At first sight Tag 0x22 is short by 256 bytes. But the Data Link Layer tells a different story: sequence number 0x5A2 is missing from the <em>capture</em>, yet the SSD's Ack at row 4 covers 0x5A3, which it would only send after receiving 0x5A2 in order. So the TLP crossed the link; the analyzer missed it (buffer overflow, a lane deskew glitch at the probe, or a filter). The missing piece was almost certainly Tag 0x22's second half. Confidence: high, because a receiver never Acks past a gap. Lesson: before concluding "a completion was lost", check the sequence numbers and Acks around the gap. This is where <a href="dd15.html">Module 15</a> pays for itself.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Completion-related error bits at the SSD and at the Root Port</span>
+sudo lspci -vvv -s 01:00.0 | grep -E 'UESta|UEMsk|UESvrt'
+sudo lspci -vvv -s 00:01.1 | grep -E 'UESta|RootCap|RootCtl'
+
+<span class="cm"># CRS Software Visibility support and enable (Root Port)</span>
+sudo lspci -vvv -s 00:01.1 | grep -E 'RootCap|RootCtl'
+
+<span class="cm"># IOMMU faults that a Root Complex may answer with UR/CA</span>
+sudo journalctl -k | grep -iE 'DMAR|AMD-Vi|iommu.*fault'
+
+<span class="cm"># NVMe consequences: failed commands, resets</span>
+sudo journalctl -k | grep -iE 'nvme.*(error|status|reset|timeout)'</code></pre>
+  <table>
+    <caption>What each output category proves</caption>
+    <thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>UESta bits UnsupReq, CmpltAbrt, CmpltTO, UnxCmplt, PoisonedTLP</td><td>That port detected that kind of event since the bits were last cleared</td><td>How many, which tag, or who caused it</td></tr>
+      <tr><td>RootCap/RootCtl CRSVisible</td><td>Whether software can see CRS as Vendor ID 0x0001</td><td>Whether any CRS occurred</td></tr>
+      <tr><td>IOMMU fault line with device and address</td><td>The Root Complex refused a translation for that requester and address</td><td>Whether the device's request was legitimate (buffer lifetime is a host question)</td></tr>
+      <tr><td>NVMe error status in the kernel log</td><td>The controller completed a command with that status</td><td>The PCIe event behind it, without the AER/IOMMU correlation</td></tr>
+    </tbody>
+  </table>
+  <p>Wording of <code>lspci</code>, IOMMU and NVMe driver messages varies by version; match on concepts, not exact strings.</p>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+  <aside class="callout safety"><p>All labs are <span class="badge safe">Safe lab</span>: simulation and read-only inspection only.</p></aside>
+
+  <h3>Beginner lab — who answers, and how?</h3>
+  <p><strong>Objective.</strong> Predict the completion (or its absence) for eight situations. <strong>Prerequisites.</strong> <a href="ch12.html">Chapter 12</a>. <strong>Setup.</strong> The example system.</p>
+  <p><strong>Procedure.</strong> For each, give: completion type (Cpl, CplD, none), status, Completer ID. (a) CPU reads CSTS normally. (b) CPU reads CSTS while the SSD's Memory Space Enable is clear. (c) Configuration read of 01:00.0 Vendor ID 50 ms after a Function Level Reset, CRS SV disabled. (d) Same with CRS SV enabled. (e) SSD reads an SQE at a mapped IOVA. (f) SSD reads data at an unmapped IOVA. (g) CPU writes the SQ1 doorbell. (h) Configuration write to 01:00.0 Command register.</p>
+  <p><strong>Observations / questions.</strong> Which cases produce no completion at all? Which hide a retry from software?</p>
+  <p><strong>Expected reasoning.</strong> Request type first (posted or not), then completer state.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(a) CplD, SC, 0x0100. (b) Cpl, UR, 0x0100; CPU sees all ones. (c) If the function is not ready: Cpl CRS from 0x0100, re-issued by the Root Complex until success — software sees a slow read. (d) Same CRS, but the Root Complex returns 0x0001 as Vendor ID to software. (e) CplD, SC, 0x0009. (f) Cpl, UR or CA (platform-dependent), from the Root Complex side. (g) None — posted. (h) Cpl, SC, 0x0100. Retries are hidden in (c).</p>
+  </details>
+  <p><strong>Extension.</strong> Add a switch between Root Port and SSD and a CPU read of an address inside the switch's window but outside the SSD's BAR. Who answers?</p>
+
+  <h3>Intermediate lab — an acceptance machine under fault injection</h3>
+  <p><strong>Objective.</strong> Implement a requester's acceptance machine and see which error each injected fault produces. <strong>Prerequisites.</strong> Chapter 52 arithmetic. <strong>Setup.</strong> Save as <code>cpl_accept.py</code>.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="cpl_accept.py"><code>#!/usr/bin/env python3
+"""Requester-side completion acceptance machine with fault injection.
+Standard library only. Teaching model: real devices differ in which checks they do."""
+MPS, RCB = 256, 64
+
+class Requester:
+    def __init__(self):
+        self.out = {}          # tag -&gt; dict(addr, bc_left, next_la)
+        self.log = []
+
+    def issue(self, tag, addr, nbytes):
+        assert tag not in self.out, "tag already outstanding"
+        self.out[tag] = dict(addr=addr, bc_left=nbytes, next=addr)
+
+    def timeout(self, tag):
+        if tag in self.out:
+            self.log.append(f"Completion Timeout tag {tag:#x}")
+            del self.out[tag]
+
+    def cpl(self, tag, status="SC", length_dw=0, bc=0, la=0, ep=0):
+        e = self.out.get(tag)
+        if e is None:
+            return self.log.append(f"Unexpected Completion tag {tag:#x}")
+        if status != "SC":
+            self.log.append(f"tag {tag:#x} failed with {status}")
+            del self.out[tag]
+            return
+        if 4 * length_dw &gt; MPS:
+            return self.log.append(f"Malformed TLP (payload &gt; MPS) tag {tag:#x}")
+        if ep:
+            self.log.append(f"Poisoned TLP Received tag {tag:#x}")
+            del self.out[tag]
+            return
+        if bc != e["bc_left"] or la != e["next"] &amp; 0x7F:
+            return self.log.append(f"inconsistent BC/LA tag {tag:#x} "
+                                   f"(got BC={bc} LA={la:#x}, want BC={e['bc_left']} "
+                                   f"LA={e['next'] &amp; 0x7F:#x})")
+        got = min(4 * length_dw, e["bc_left"])
+        e["bc_left"] -= got
+        e["next"] += got
+        if e["bc_left"] == 0:
+            self.log.append(f"tag {tag:#x} complete")
+            del self.out[tag]
+
+def run(name, script):
+    r = Requester()
+    for step in script:
+        getattr(r, step[0])(*step[1:])
+    print(f"--- {name}")
+    for line in r.log:
+        print("   ", line)
+    if r.out:
+        print("    still outstanding:", ", ".join(hex(t) for t in r.out))
+
+A = 0x2_0001_0000
+run("normal", [("issue", 0x40, A, 512), ("cpl", 0x40, "SC", 64, 512, 0x00),
+               ("cpl", 0x40, "SC", 64, 256, 0x00)])
+run("error mid-request", [("issue", 0x40, A, 512), ("cpl", 0x40, "SC", 64, 512, 0x00),
+                          ("cpl", 0x40, "UR")])
+run("late after timeout", [("issue", 0x40, A, 512), ("timeout", 0x40),
+                           ("cpl", 0x40, "SC", 64, 512, 0x00)])
+run("wrong byte count", [("issue", 0x40, A, 512), ("cpl", 0x40, "SC", 64, 512, 0x00),
+                         ("cpl", 0x40, "SC", 64, 192, 0x00), ("timeout", 0x40)])
+run("oversized", [("issue", 0x40, A, 512), ("cpl", 0x40, "SC", 128, 512, 0x00),
+                  ("timeout", 0x40)])
+run("poisoned", [("issue", 0x40, A, 512), ("cpl", 0x40, "SC", 64, 512, 0x00, 1)])</code></pre>
+  <p><strong>Procedure.</strong> Run it. For each scenario, write down which error is the cause and which is a consequence. Then add a scenario: two completions for the same tag arrive out of address order.</p>
+  <p><strong>Questions.</strong> (1) Why does "wrong byte count" end in a timeout? (2) Why is "late after timeout" reported as Unexpected Completion and not as a second timeout? (3) What should happen to the 256 bytes already received in "error mid-request"?</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(1) The inconsistent completion is rejected, so the request never reaches BC_left = 0 and the timer fires: the real first event is the inconsistency, the timeout is a consequence. (2) The tag was freed at timeout; the late completion matches nothing. (3) Discarded: a non-SC completion terminates the whole request, so the controller must not use partial data for the command. Out-of-order pieces of one tag fail the LA check here; a real device would report Malformed TLP or Unexpected Completion depending on design.</p>
+  </details>
+  <p><strong>Extension.</strong> Add a duplicate-completion scenario and decide whether your machine should report it as unexpected (after completion) or inconsistent (mid-request).</p>
+
+  <h3>Advanced lab — completion latency from a trace</h3>
+  <p><strong>Objective.</strong> Compute per-tag latency (to first and to last completion) and connect it to throughput. <strong>Prerequisites.</strong> <a href="ch12.html">Chapter 12</a> Little's Law. <strong>Setup.</strong> The synthetic rows below (time ns, direction, type, tag, BC, bytes).</p>
+  <pre class="code" data-kind="simulation" data-lang="text" data-title="lat.txt (synthetic)"><code>0     up   MRd  0x40 512
+10    up   MRd  0x41 512
+20    up   MRd  0x42 512
+880   down CplD 0x40 512 256
+900   down CplD 0x41 512 256
+940   down CplD 0x40 256 256
+990   down CplD 0x41 256 256
+3410  down CplD 0x42 512 256
+3460  down CplD 0x42 256 256</code></pre>
+  <p><strong>Procedure.</strong> Parse it (a few lines of Python or by hand). Compute latency to first and last completion per tag. Then compute how many outstanding 512-byte reads would be needed to sustain 6.8 GB/s if every read behaved like Tag 0x42.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>Tag 0x40: 880 / 940 ns. 0x41: 890 / 980 ns. 0x42: 3,390 / 3,440 ns. Using last-completion latency for 0x42: 6.8 GB/s × 3.44 µs ≈ 23.4 KB ⇒ ≈ 46 reads of 512 B outstanding, versus ≈ 13 at 0.98 µs. The tail, not the average, sets the requirement when the slow reads cluster (as at page boundaries).</p>
+  </details>
+  <p><strong>Extension.</strong> Generate a histogram for 10,000 synthetic reads with 5% at 3.4 µs and compute throughput for 16 and 48 outstanding reads.</p>
+
+  <h3>Senior forensic lab — the reset that produced unexpected completions</h3>
+  <p><strong>Objective.</strong> Order evidence across layers to find the first abnormal event. <strong>Prerequisites.</strong> <a href="ch49.html">Chapter 49</a>, <a href="ch46.html">Chapter 46</a>.</p>
+  <p><strong>Setup (synthetic evidence, times in ms from an NVMe I/O timeout):</strong></p>
+  <ul>
+    <li>t = 0: NVMe driver: I/O timeout on QID 3, aborting; then "resetting controller".</li>
+    <li>t = 2: driver issues a Function Level Reset (FLR) to 01:00.0.</li>
+    <li>t = 2.3: Lab SSD AER: Unexpected Completion; Header Log <code>4a000040 00090100 01005a40 00000000</code>.</li>
+    <li>t = 104: configuration read of Vendor ID returns 0x0001 twice, then the real Vendor ID.</li>
+    <li>Earlier, t = −30,000 (30 s before): Lab SSD AER: Completion Timeout (no header logged).</li>
+  </ul>
+  <p><strong>Questions.</strong> (1) Decode the Header Log. (2) Is the Unexpected Completion a device bug? (3) What do the 0x0001 reads tell you? (4) What was the first abnormal event and what would you investigate?</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(1) CplD, Length 64 DW, Completer 0x0009, SC, Byte Count 256, Requester 0x0100, Tag 0x5A, Lower Address 0x40 — the second half of a 512-byte read. (2) No: the FLR discarded the SSD's outstanding requests; a completion still in flight from the Root Complex arrived afterwards and matched nothing. (3) CRS Software Visibility is enabled and the function was initialising after FLR; software polled correctly. (4) The first abnormal event is the Completion Timeout 30 s earlier: a DMA read never completed, the controller could not finish the command, and the NVMe driver's own timeout (≈ 30 s) fired later. Investigate the host side of that read: IOMMU faults, Root Port errors, memory errors around t = −30 s, and capture with a trigger on the SSD's ERR_NONFATAL message. Everything after t = 0 is recovery behaving correctly.</p>
+  </details>
+  <p><strong>Extension.</strong> Explain why a shorter Completion Timeout would not shorten the NVMe-level outage unless the controller fails the command immediately on timeout.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <h3>Pattern 1 — WRITE latency tail with no errors</h3>
+  <table><tbody>
+    <tr><th>Symptom</th><td>p99.9 WRITE latency high; READs fine; no AER errors.</td></tr>
+    <tr><th>Possible causes</th><td>Slow completions for some DMA reads (IOTLB misses, remote NUMA memory, memory contention); too few outstanding reads.</td></tr>
+    <tr><th>Evidence</th><td>Per-tag completion latency distribution; buffer page sizes and NUMA placement.</td></tr>
+    <tr><th>First check</th><td>Is the latency histogram bimodal, and do slow tags cluster at page boundaries?</td></tr>
+    <tr><th>Second check</th><td>Outstanding-read ceiling of the device versus Little's Law at tail latency.</td></tr>
+    <tr><th>Disambiguating experiment</th><td>Huge-page buffers or IOMMU pass-through in a lab; NUMA-local buffers.</td></tr>
+    <tr><th>Likely conclusion</th><td>Translation or memory latency on the completer side.</td></tr>
+    <tr><th>Confidence</th><td>Medium; high if the tail collapses in the experiment.</td></tr>
+  </tbody></table>
+  <h3>Pattern 2 — NVMe Data Transfer Errors on specific buffers</h3>
+  <table><tbody>
+    <tr><th>Symptom</th><td>Some commands fail with a data-transfer-class status; others fine.</td></tr>
+    <tr><th>Possible causes</th><td>UR/CA completions from IOMMU-blocked addresses; poisoned completions from memory errors; device bug.</td></tr>
+    <tr><th>Evidence</th><td>IOMMU fault logs, memory-error (EDAC/machine-check) logs, SSD AER bits.</td></tr>
+    <tr><th>First check</th><td>Correlate IOMMU faults by time and address with the failed commands' PRPs/SGLs.</td></tr>
+    <tr><th>Second check</th><td>Poisoned TLP Received at the SSD plus host memory errors?</td></tr>
+    <tr><th>Disambiguating experiment</th><td>Reproduce with buffers kept mapped longer; with memory error injection disabled or on different DIMMs.</td></tr>
+    <tr><th>Likely conclusion</th><td>Host buffer lifetime bug (unmap before completion) or host memory error.</td></tr>
+    <tr><th>Confidence</th><td>High when addresses match.</td></tr>
+  </tbody></table>
+  <h3>Pattern 3 — Unexpected Completions after resets</h3>
+  <table><tbody>
+    <tr><th>Symptom</th><td>UnxCmplt at the SSD right after FLR or controller reset.</td></tr>
+    <tr><th>Possible causes</th><td>In-flight completions for discarded requests (benign consequence); bus renumbering; device tag-table bug.</td></tr>
+    <tr><th>Evidence</th><td>Header Log tag versus requests issued before the reset; timing relative to reset.</td></tr>
+    <tr><th>First check</th><td>Did the Unexpected Completion arrive within a few microseconds of the reset?</td></tr>
+    <tr><th>Second check</th><td>Was there an earlier timeout that triggered the reset (the real cause)?</td></tr>
+    <tr><th>Disambiguating experiment</th><td>Quiesce I/O before reset in a lab; the errors should disappear.</td></tr>
+    <tr><th>Likely conclusion</th><td>Consequence of reset; look earlier for the cause.</td></tr>
+    <tr><th>Confidence</th><td>High.</td></tr>
+  </tbody></table>
+  <h3>Pattern 4 — CPU stalls during device recovery</h3>
+  <table><tbody>
+    <tr><th>Symptom</th><td>Long CPU stalls or watchdog warnings while an NVMe device resets; sometimes machine checks.</td></tr>
+    <tr><th>Possible causes</th><td>MMIO reads to a function that is not answering (Root Port waits its full timeout); configuration reads retried on CRS without software visibility.</td></tr>
+    <tr><th>Evidence</th><td>Root Port Completion Timeout setting; RootCtl CRSVisible; timing of stalls versus reset.</td></tr>
+    <tr><th>First check</th><td>Root Port DevCtl2 Completion Timeout range.</td></tr>
+    <tr><th>Second check</th><td>Is CRS Software Visibility enabled?</td></tr>
+    <tr><th>Disambiguating experiment</th><td>Lab comparison with CRS SV enabled and the driver waiting for readiness before MMIO.</td></tr>
+    <tr><th>Likely conclusion</th><td>Recovery path touching MMIO too early, or long retry without visibility.</td></tr>
+    <tr><th>Confidence</th><td>Medium.</td></tr>
+  </tbody></table>
+  <h3>Pattern 5 — "Missing completion" that is not missing</h3>
+  <table><tbody>
+    <tr><th>Symptom</th><td>Capture shows a request without all its completions, but no timeout is reported.</td></tr>
+    <tr><th>Possible causes</th><td>Analyzer dropped TLPs; filter excluded them; capture on the wrong side of a switch.</td></tr>
+    <tr><th>Evidence</th><td>Sequence numbers and Acks around the gap; analyzer buffer statistics.</td></tr>
+    <tr><th>First check</th><td>Are sequence numbers contiguous on that link direction?</td></tr>
+    <tr><th>Second check</th><td>Does an Ack cover the missing sequence number?</td></tr>
+    <tr><th>Disambiguating experiment</th><td>Re-capture with filters off and a deeper buffer.</td></tr>
+    <tr><th>Likely conclusion</th><td>Instrument artefact.</td></tr>
+    <tr><th>Confidence</th><td>High if an Ack covers the gap.</td></tr>
+  </tbody></table>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>Which requests get a Cpl without data when successful?</p><details class="answer"><summary>Model answer</summary><p>Configuration writes and I/O writes.</p></details></li>
+    <li><p>How is a completion routed?</p><details class="answer"><summary>Model answer</summary><p>By ID: the Requester ID copied from the request.</p></details></li>
+    <li><p>Name the four defined completion statuses.</p><details class="answer"><summary>Model answer</summary><p>SC, UR, CRS (RRS), CA.</p></details></li>
+    <li><p>What ends a non-posted request?</p><details class="answer"><summary>Model answer</summary><p>All completions with SC, one error completion, or a Completion Timeout.</p></details></li>
+    <li><p>Does an MSI-X write get a completion?</p><details class="answer"><summary>Model answer</summary><p>No; it is a posted memory write.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>When does a switch generate a completion itself?</p><details class="answer"><summary>Model answer</summary><p>When a non-posted request it receives matches no downstream window or target: it answers UR with its own Completer ID.</p></details></li>
+    <li><p>What is CRS Software Visibility?</p><details class="answer"><summary>Model answer</summary><p>A Root Port option: when a Vendor ID configuration read gets CRS, software receives 0x0001 instead of the Root Complex silently re-issuing; software can poll without stalling.</p></details></li>
+    <li><p>Why measure latency to the last completion?</p><details class="answer"><summary>Model answer</summary><p>The tag and buffer are held until the last piece; outstanding-request sizing depends on that time.</p></details></li>
+    <li><p>What happens to partial data before an error completion?</p><details class="answer"><summary>Model answer</summary><p>The request has failed; the data must not be used as a successful result.</p></details></li>
+    <li><p>Why do endpoints usually advertise infinite completion credits?</p><details class="answer"><summary>Model answer</summary><p>They reserve space before issuing each read, so completions can always be accepted and never block the path.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>Describe a requester's acceptance checks.</p><details class="answer"><summary>Model answer</summary><p>Match Transaction ID; check status; check size ≤ MPS; check Byte Count and Lower Address continuity; place data; detect the final piece; free tag and stop timer.</p></details></li>
+    <li><p>UR or CA for an IOMMU-blocked read — what decides?</p><details class="answer"><summary>Model answer</summary><p>The Root Complex implementation; both mean failure to the requester. Confirm with the platform's documentation and IOMMU logs.</p></details></li>
+    <li><p>Explain how you prove a gap in a capture is an instrument artefact.</p><details class="answer"><summary>Model answer</summary><p>Sequence numbers on that direction skip, and the receiver's Ack covers the skipped number; a receiver never acknowledges past a gap.</p></details></li>
+    <li><p>Why are memory requests never answered with CRS?</p><details class="answer"><summary>Model answer</summary><p>CRS is defined for configuration requests (readiness after reset); memory semantics have no retry status, so readiness must be established before BAR access.</p></details></li>
+    <li><p>How does a poisoned completion differ from an error completion?</p><details class="answer"><summary>Model answer</summary><p>Poisoned: status SC with data marked bad (EP); the receiver reports Poisoned TLP Received. Error completion: no data, status UR/CA.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>How should an NVMe controller react to a UR completion on a data read?</p><details class="answer"><summary>Model answer</summary><p>Fail only the affected command with an appropriate status, release its resources, keep other queues running, and report the PCIe event per its error enables; avoid a controller-fatal state for a host-side mapping problem.</p></details></li>
+    <li><p>Design completion-path validation for a new Root Complex.</p><details class="answer"><summary>Model answer</summary><p>Every split policy at every alignment and RCB; status generation for each fault (translation, unmapped, poisoned memory); latency under translation misses and contention; behaviour with many requesters; late completions after requester reset; CRS handling with and without visibility.</p></details></li>
+    <li><p>A customer sees Completion Timeouts only under heavy load. Your hypothesis tree?</p><details class="answer"><summary>Model answer</summary><p>Completer latency exceeding a short timeout range; lost completions in a switch under congestion; replay storms on a marginal link delaying TLPs; a Root Complex starving one requester. Check timeout range, link error counters, per-tag latency, and switch counters.</p></details></li>
+    <li><p>Why is "Unexpected Completion" weak evidence on its own?</p><details class="answer"><summary>Model answer</summary><p>It is commonly a consequence of the receiver's own earlier timeout or reset; the cause lies earlier in time.</p></details></li>
+    <li><p>Who owns the decision of the Completion Timeout value for NVMe DMA?</p><details class="answer"><summary>Model answer</summary><p>Platform firmware and OS policy, balancing detection speed against the platform's worst legitimate completer latency (virtualization, error recovery), and coordinated with NVMe command timeouts.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>Completion DW1 = 0x01002000. What is the status?</p>
+      <ul class="options" data-answer="2"><li>SC</li><li>UR</li><li>CRS</li><li>CA</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Low 16 bits 0x2000 = 0010 0000 0000 0000b; bits 15:13 = 001b = UR.</p></details></li>
+    <li><p>A Vendor ID read returns 0x0001. Most likely?</p>
+      <ul class="options" data-answer="3"><li>A real vendor</li><li>A UR completion</li><li>CRS with Software Visibility enabled</li><li>A Completion Timeout</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>CRS Software Visibility returns 0x0001 for a Vendor ID read that received CRS.</p></details></li>
+    <li><p>Which component typically answers UR for an IOMMU-blocked DMA read?</p>
+      <ul class="options" data-answer="1"><li>The Root Complex</li><li>The SSD</li><li>A retimer</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The completer for host memory is the Root Complex; it decides the status (UR or CA, platform-dependent).</p></details></li>
+    <li><p>A request receives an SC CplD with BC 512, then a Cpl UR. What is the outcome?</p>
+      <ul class="options" data-answer="2"><li>256 bytes usable</li><li>The whole request failed</li><li>A timeout will follow</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>A non-SC completion terminates the request as failed.</p></details></li>
+    <li><p>Which statuses can a memory read receive?</p>
+      <ul class="options" data-answer="3"><li>All four</li><li>SC and CRS</li><li>SC, UR and CA</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>CRS/RRS applies to configuration requests.</p></details></li>
+    <li><p>A gap in a capture's completion stream is covered by a later Ack. What does that prove?</p>
+      <ul class="options" data-answer="1"><li>The TLP crossed the link; the analyzer missed it</li><li>The completion was lost</li><li>The receiver ignored an error</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>A receiver acknowledges only in-order, intact TLPs.</p></details></li>
+    <li><p>Why can an Unexpected Completion appear right after an FLR?</p><details class="answer"><summary>Model answer</summary><p>FLR discards outstanding requests; completions already in flight arrive and match nothing.</p></details></li>
+    <li><p>Why does a 3.4 µs completion tail cut WRITE throughput but not READ throughput?</p><details class="answer"><summary>Model answer</summary><p>WRITE data is fetched with non-posted reads whose latency must be covered by outstanding requests; READ data is pushed with posted writes.</p></details></li>
+    <li><p>Name two reasons a CPU MMIO read can return all ones.</p><details class="answer"><summary>Model answer</summary><p>A UR/CA completion (e.g. Memory Space Enable clear, D3hot) or a Completion Timeout at the Root Port (device gone, link down) — the Root Complex synthesises the value.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <ol>
+    <li><p><strong>To a child:</strong> why the toy shop sometimes says "ask again in a minute".</p>
+      <details class="answer"><summary>Model explanation</summary><p>"The shop just opened and is still turning on the lights. It's not saying no — it's saying not yet. So you ask again a bit later, and then it can answer."</p></details></li>
+    <li><p><strong>To a junior engineer:</strong> the three endings of a non-posted request and what each looks like in a trace.</p>
+      <details class="answer"><summary>Model explanation</summary><p>"Success: CplDs with the same Requester ID and Tag until Byte Count equals the bytes carried. Error: a Cpl with UR or CA and no data — done immediately. Timeout: nothing; the requester's timer fires, it logs Completion Timeout and sends an error message. A late answer after that shows up as an Unexpected Completion."</p></details></li>
+    <li><p><strong>To a senior engineer:</strong> why NVMe failures caused by completions usually start on the host side.</p>
+      <details class="answer"><summary>Model explanation</summary><p>"The SSD's fast-path non-posted requests target host memory, so the completer is the Root Complex, its IOMMU and the memory system. UR/CA come from translation faults or buffer lifetime bugs, poison from memory errors, latency tails from page walks and NUMA. The SSD is the detector and should fail the command cleanly; the cause is upstream until evidence says otherwise."</p></details></li>
+  </ol>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain the completer and requester state machines and the three endings of a non-posted request</li>
+      <li>diagram a read with split completions, an error completion and a timeout on one sequence diagram</li>
+      <li>identify in a trace: per-tag latency, error completions, poisoned completions, unexpected completions and instrument gaps</li>
+      <li>debug a Data Transfer Error back to an IOMMU fault, a memory error or a timeout</li>
+      <li>distinguish completions from <a href="dd13.html">tag management</a>, from <a href="dd14.html">ordering rules</a>, and from <a href="dd15.html">link-level Acks</a></li>
+      <li>cite the PCI Express Base Specification — Completion Rules, Completion Timeout Mechanism, Root Control (CRS Software Visibility) — and the NVMe Base Specification 2.4 status code definitions</li>
+    </ul>
+  </aside>
+  <p>Next: <a href="dd13.html">Module 13 — PCIe Tags</a>.</p>
+</section>

@@ -1,0 +1,603 @@
+<p class="lead">Every address an NVMe controller puts on the PCIe link — the queue it fetches from, the Physical Region Page (PRP) entries it follows, the buffer it writes — is a <em>device-visible</em> address. This module follows that address from the driver's mapping call, through the I/O memory-management unit (IOMMU) and its caches, to DRAM, and shows how Address Translation Services (ATS), the Page Request Interface (PRI) and Process Address Space IDs (PASIDs) change the picture.</p>
+
+<section id="orientation">
+<h2>Orientation</h2>
+<p><a href="ch20.html">Chapter 20</a> taught why Direct Memory Access (DMA) exists and how a controller's Memory Read becomes a Completion with Data. Here we go one layer down: who chooses the number the device puts on the wire, who translates it, what is cached where, what happens on a miss, and what happens when a mapping disappears while the device is still using it. These questions decide whether an IOMMU fault in the kernel log is a driver bug, a device bug, a firmware bug or a harmless race.</p>
+<aside class="callout prereq">
+<p>You need <a href="ch20.html">Chapter 20 — DMA</a>, the address-space picture from <a href="ch01.html">Chapter 1</a> and the CPU-side rules in <a href="dd01.html">Module 01</a>. PRPs are in <a href="ch36.html">Chapter 36</a>; TLP header fields in <a href="ch11.html">Chapter 11</a>.</p>
+</aside>
+<p>Next: <a href="dd03.html">Module 03</a> shows how topology and Access Control Services decide which DMA even reaches the IOMMU; <a href="dd36.html">Module 36 — DMA with NVMe</a> applies all of this to PRP and SGL traffic; <a href="dd52.html">Module 52 — SR-IOV</a> uses it for virtual functions.</p>
+</section>
+
+<section id="objectives">
+<h2>Required learning objectives</h2>
+<table>
+<caption>Objectives by level</caption>
+<thead><tr><th>Level</th><th>Objective</th></tr></thead>
+<tbody>
+<tr><td>Beginner</td><td>Explain why the address in a device's TLP need not equal the physical address of the memory it reaches.</td></tr>
+<tr><td>Intermediate</td><td>Describe the Linux DMA mapping API (coherent and streaming mappings, DMA masks, bounce buffers) and what each produces on the link.</td></tr>
+<tr><td>Advanced</td><td>Walk an IOMMU translation, including the IOTLB, page walk, permission check and fault; explain ATS translation requests, the device's Address Translation Cache (ATC), invalidation, PRI and PASID.</td></tr>
+<tr><td>Senior</td><td>Weigh isolation against performance (strict versus deferred invalidation, passthrough, huge pages, ATS) and judge when a fault is a symptom rather than a cause.</td></tr>
+<tr><td>Trace analysis</td><td>Recognize untranslated, translation-request and translated TLPs by the Address Type (AT) field; find the first DMA to an address the host no longer considers mapped.</td></tr>
+<tr><td>Debugging</td><td>Correlate an IOMMU fault log line with the TLP and NVMe command that caused it.</td></tr>
+<tr><td>Validation</td><td>Test DMA under IOMMU strict mode, unmapping races, 32-bit masks, ATS invalidation, and buffer layouts that stress the IOTLB.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="kid">
+<h2>Kid story</h2>
+<aside class="callout kid">
+<p>A town has a parcel company whose vans may deliver only to <em>post-box numbers</em>, never to street addresses. When your family wants a parcel, your parent goes to the post office and says: "Please let box 4017 mean our kitchen table, just for this week." The clerk writes that line in a big book. The van driver arrives at the post office gate with "box 4017"; the gatekeeper looks it up, sees "kitchen table, may deliver, may not take anything away", and lets the van through to the right house.</p>
+<p>Some drivers keep a little notebook in the van with the boxes they visited recently, so they can go straight to the house. When your parent tells the post office "box 4017 is cancelled", the post office must phone every driver with a notebook and say "cross out 4017" — and wait until each says "done" — before it can give box 4017 to another family.</p>
+</aside>
+</section>
+
+<section id="boundary">
+<h2>Analogy boundary</h2>
+<aside class="callout breaks">
+<p><strong>Represents.</strong> Post-box number = I/O virtual address (IOVA); the book = IOMMU page tables; the gatekeeper = IOMMU translation and permission check; the gatekeeper's memory of recent lookups = IOTLB; the driver's notebook = the device's Address Translation Cache under ATS; "cross out 4017" = ATS invalidation; "this week" = the lifetime of a DMA mapping.</p>
+<p><strong>Hides.</strong> Translation works on whole pages (4 KiB, 2 MiB, 1 GiB), not boxes; one van can carry many families' parcels under different PASIDs; a rejected van does not go home quietly — reads get an error completion and writes are dropped and logged; and the book lives in the same DRAM the parcels go to.</p>
+<p><strong>Misleads.</strong> The story implies the post office always exists. Many systems run with the IOMMU off or in passthrough (identity) mode, where box number equals street address. It also suggests drivers always use the gate; with ATS, a van carrying a <em>translated</em> address may be waved through with a lighter check, which is why ATS is a trust decision.</p>
+</aside>
+</section>
+
+<section id="vocabulary">
+<h2>Vocabulary</h2>
+<table>
+<caption>Terms introduced or deepened here</caption>
+<thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+<tbody>
+<tr><td><span class="g" data-term="dma-address">DMA address</span></td><td>The number the device uses.</td><td>Linux <code>dma_addr_t</code>: what the driver programs into PRPs and queue base registers.</td><td>Equals an IOVA with the IOMMU translating; equals a physical (bus) address without it.</td><td>Passing a kernel virtual or physical address to the device.</td></tr>
+<tr><td><span class="g" data-term="iova">IOVA</span></td><td>The post-box number.</td><td>I/O virtual address in an IOMMU domain's address space.</td><td>Allocated by the DMA layer per mapping.</td><td>Thinking it is the process's virtual address (only with shared virtual addressing).</td></tr>
+<tr><td><span class="g" data-term="iommu">IOMMU</span></td><td>The gatekeeper.</td><td>Translates and permission-checks device-originated requests; also remaps interrupts.</td><td>Vendor implementations: Intel VT-d, AMD-Vi, Arm SMMU.</td><td>Believing it sits in the device; it is in the platform.</td></tr>
+<tr><td><span class="g" data-term="iommu-domain">IOMMU domain</span></td><td>One book.</td><td>A set of page tables; every device attached to it shares one IOVA space.</td><td>A VM's assigned devices typically share its domain.</td><td>Confusing domain (translation) with group (isolation).</td></tr>
+<tr><td><span class="g" data-term="iommu-group">IOMMU group</span></td><td>Devices that cannot be told apart.</td><td>Smallest set of functions the platform can isolate from each other.</td><td>Shaped by topology and ACS (<a href="dd03.html">Module 03</a>).</td><td>Expecting to pass one function to a VM when its group has others.</td></tr>
+<tr><td><span class="g" data-term="iotlb">IOTLB</span></td><td>Gatekeeper's short-term memory.</td><td>Cache of recent translations in the IOMMU.</td><td>Miss → page walk in DRAM; unmap → invalidation.</td><td>Thinking unmap is instant; an invalidation must complete first.</td></tr>
+<tr><td><span class="g" data-term="dma-mask">DMA mask</span></td><td>How far the van can drive.</td><td>Address bits a device can generate (e.g. 32 or 64), set with <code>dma_set_mask_and_coherent()</code>.</td><td>Too small a mask forces bouncing or low IOVAs.</td><td>Assuming every device does 64-bit DMA.</td></tr>
+<tr><td><span class="g" data-term="swiotlb">Bounce buffer (SWIOTLB)</span></td><td>A forwarding depot.</td><td>Kernel buffer the device can reach; data is copied to or from the real buffer by the CPU.</td><td>Used for small masks without IOMMU, and in some confidential-computing guests.</td><td>Missing it in a profile: it shows as memcpy, not as I/O.</td></tr>
+<tr><td><span class="g" data-term="ats">ATS</span></td><td>The van notebook system.</td><td>Address Translation Services: a device asks the translation agent for translations and caches them in its ATC.</td><td>Uses the AT field, translation requests/completions, invalidation messages.</td><td>Thinking ATS removes the IOMMU; the IOMMU still issues translations.</td></tr>
+<tr><td><span class="g" data-term="atc">ATC</span></td><td>The notebook.</td><td>Address Translation Cache inside the device.</td><td>Must be invalidated on unmap.</td><td>Confusing it with the IOTLB.</td></tr>
+<tr><td><span class="g" data-term="pri">PRI</span></td><td>"Please put a parcel there first."</td><td>Page Request Interface: device asks the host to make a non-resident page present.</td><td>Needs ATS; used with shared virtual addressing.</td><td>Expecting NVMe data paths to use it — they normally pin memory.</td></tr>
+<tr><td><span class="g" data-term="pasid">PASID</span></td><td>Which family a parcel is for.</td><td>Process Address Space ID: a 20-bit tag selecting an address space within one function.</td><td>Carried with the request (a TLP prefix in non-Flit Mode).</td><td>Thinking it identifies a function; the Requester ID does that.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="architecture">
+<h2>Architecture</h2>
+<figure>
+<pre class="diagram">
+ Driver (CPU)                                        Platform
+ ───────────                                         ─────────────────────────────────────────
+ buf = kmalloc/page          dma_map_*()             ┌─────────────── Root Complex ───────────┐
+ PA 0x8_7A31_2000  ───────▶  IOVA allocator  ───────▶│ IOMMU                                   │
+                             write PTE in            │  context/device table: RID 0x0100 → dom │
+                             domain page tables ────▶│  page tables (in DRAM)                  │
+ SQE.PRP1 = IOVA 0x2_0000_0000                       │  IOTLB (cache)   fault log / queue      │
+                                                     │  invalidation queue                     │
+                                                     └───────▲──────────────┬──────────────────┘
+                                                             │ MRd/MWr      │ physical access
+                                    Root Port 00:01.1 ───────┘              ▼
+                                       PCIe Gen4 x4                    DRAM (PA 0x8_7A31_2000)
+                                    Lab SSD 01:00.0 (RID 0x0100)
+                                    [optional ATC if ATS enabled]
+</pre>
+<figcaption>Synthetic example for teaching: the driver maps a buffer at physical address 0x8_7A31_2000 to IOVA 0x2_0000_0000; the device only ever sees the IOVA.</figcaption>
+</figure>
+<table>
+<caption>Architecture of one translated DMA</caption>
+<thead><tr><th>Aspect</th><th>Content</th></tr></thead>
+<tbody>
+<tr><td>Inputs / outputs</td><td>A kernel buffer and a direction / a <code>dma_addr_t</code> for the driver; on each TLP, a physical address or a fault.</td></tr>
+<tr><td>Actors</td><td>Driver, Linux DMA layer, IOVA allocator, IOMMU driver, IOMMU hardware, device DMA engine, optionally the device ATC.</td></tr>
+<tr><td>State</td><td>Page-table entries (address, read/write permission), IOTLB entries, ATC entries, pending invalidations, IOVA free lists, fault records.</td></tr>
+<tr><td>Memory</td><td>IOMMU page tables and device/context tables in DRAM; data buffers; SWIOTLB pool.</td></tr>
+<tr><td>Registers</td><td>IOMMU control and invalidation registers (vendor-specific); PCI Command Bus Master Enable; ATS, PRI and PASID capability control bits in the device's configuration space.</td></tr>
+<tr><td>Interfaces</td><td>DMA API ↔ driver; IOMMU driver ↔ hardware; PCIe TLPs with Requester ID, address and AT field; ATS messages.</td></tr>
+<tr><td>Dependencies</td><td>Correct Requester ID (an aliasing bridge or wrong RID selects the wrong context); mapping exists for the whole DMA lifetime; invalidation completes before IOVA reuse.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="mechanism">
+<h2>Mechanism</h2>
+<h3>Translated DMA without ATS</h3>
+<table>
+<caption>One 4 KiB Read into a mapped buffer</caption>
+<thead><tr><th>#</th><th>Who acts</th><th>What changes, where</th><th>Evidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Driver calls <code>dma_map_page()</code> (via the block layer's scatterlist mapping)</td><td>IOVA allocated; PTE written in the domain's tables (DRAM): IOVA 0x2_0000_0000 → PA 0x8_7A31_2000, write permitted (device-to-memory direction)</td><td>With DMA-API debugging enabled, a debugfs record; otherwise none</td></tr>
+<tr><td>2</td><td>Driver</td><td>PRP1 in the SQE = 0x2_0000_0000</td><td>SQE bytes in the fetch completion</td></tr>
+<tr><td>3</td><td>Controller</td><td>Issues MWr with address 0x2_0000_0000, AT = 00b (untranslated), RID 0x0100</td><td>Analyzer shows the IOVA, never the PA</td></tr>
+<tr><td>4</td><td>IOMMU</td><td>Uses RID to find the device's context and domain; IOTLB lookup; on a miss, walks the page tables (several DRAM reads)</td><td>Only in IOMMU performance counters, if exposed</td></tr>
+<tr><td>5</td><td>IOMMU</td><td>Permission check; write goes to PA 0x8_7A31_2000</td><td>Data appears in memory</td></tr>
+<tr><td>6</td><td>Driver, after completion</td><td><code>dma_unmap</code>: PTE cleared; IOTLB invalidated synchronously (strict) or batched (deferred, "flush queue")</td><td>Nothing on the link (no ATS)</td></tr>
+<tr><td>7</td><td>IOVA allocator</td><td>IOVA returned to free list — only after invalidation completes</td><td>None</td></tr>
+</tbody>
+</table>
+<aside class="callout warn">
+<p>Deferred (lazy) invalidation trades isolation for speed: for a short window after unmap, a stale IOTLB entry may still let the device reach the old page. Linux's default for each device type and architecture is <span class="badge version">Version-dependent</span>; check <code>/sys/kernel/iommu_groups/*/type</code> ("DMA" versus "DMA-FQ") on your kernel.</p>
+</aside>
+
+<h3>With ATS: the device holds translations</h3>
+<figure>
+<ol class="seq" data-actors="Lab SSD (ATC)|Root Port|IOMMU (TA)|DRAM">
+<li data-from="Lab SSD (ATC)" data-to="IOMMU (TA)" data-t="0">Translation Request, AT=01b, IOVA page</li>
+<li data-note="IOMMU (TA)">IOTLB miss → page walk</li>
+<li data-from="IOMMU (TA)" data-to="DRAM">read page-table entries</li>
+<li data-from="IOMMU (TA)" data-to="Lab SSD (ATC)" class="dashed" data-t="1.6 µs">Translation Completion: PA, R/W</li>
+<li data-note="Lab SSD (ATC)">store in ATC</li>
+<li data-from="Lab SSD (ATC)" data-to="DRAM" data-t="1.7 µs">MWr AT=10b (translated) to PA</li>
+<li data-note="Root Port|IOMMU (TA)">driver unmaps later</li>
+<li data-from="IOMMU (TA)" data-to="Lab SSD (ATC)">Invalidate Request message (ITag)</li>
+<li data-note="Lab SSD (ATC)">drop entry, drain users</li>
+<li data-from="Lab SSD (ATC)" data-to="IOMMU (TA)" class="dashed">Invalidate Completion message</li>
+</ol>
+<figcaption>Synthetic ATS sequence. TA = Translation Agent (the IOMMU's role in ATS terms). Times illustrative.</figcaption>
+</figure>
+<p>Why ATS exists: devices that touch many pages (accelerators, virtual functions in VMs) suffer IOTLB contention in a shared IOMMU; caching translations in the device spreads that load. The cost: each unmap must wait for every ATC holder to confirm invalidation, a slow or buggy device can stall the host, and the platform must trust translated requests. PRI extends ATS: if the translation completion says a page is not present, a PRI-capable device sends a Page Request, the host faults the page in, and answers with a PRG (Page Request Group) Response. PASID lets one function work in several address spaces, which shared virtual addressing needs.</p>
+<aside class="callout insight">
+<p>Most NVMe SSDs on bare metal run without ATS: their DMA pattern (pinned buffers, sequential PRP walks) is IOTLB-friendly, and enabling ATS adds a trust and invalidation burden for little gain. Expect ATS mostly with virtualization and accelerators. Whether a given SSD implements ATS is <span class="badge impl">Implementation-dependent</span>; <code>lspci -vvv</code> shows the capability.</p>
+</aside>
+
+<h3>The ladder for "a translated DMA address"</h3>
+<div class="ladder">
+<div class="rung" data-rung="A"><p>The van may deliver only to post-box numbers; the gatekeeper turns the box into a house, and refuses boxes not in the book.</p></div>
+<div class="rung" data-rung="B"><p>The driver maps a buffer and gives the device an IOVA. The IOMMU translates every device access and blocks anything unmapped.</p></div>
+<div class="rung" data-rung="C"><p>Page tables in DRAM, an IOTLB in the IOMMU, an optional ATC in the device, a context table indexed by Requester ID, an invalidation queue.</p></div>
+<div class="rung" data-rung="D"><p>PCIe defines the AT field, ATS translation requests and completions, invalidation messages, PRI and PASID. The IOMMU itself is defined by platform architecture specifications (VT-d, AMD IOMMU, Arm SMMU), not by PCIe or NVMe. NVMe only says PRPs and SGLs hold host memory addresses.</p></div>
+<div class="rung" data-rung="E"><p>Untranslated MRd/MWr carry IOVAs (AT=00b); with ATS, translation requests (AT=01b), translated requests (AT=10b), and invalidation request/completion messages appear.</p></div>
+<div class="rung" data-rung="F"><p>The analyzer shows IOVAs and Requester IDs, never physical addresses (unless ATS is in use). A blocked read shows an error completion; a blocked write shows nothing after it.</p></div>
+<div class="rung" data-rung="G"><p>An IOMMU fault names the device, address and direction. Match it to the TLP, then to the PRP or queue that contained the address, then ask why that address was not mapped at that time.</p></div>
+</div>
+
+<h3>The sixteen questions, for "the IOMMU translation"</h3>
+<table>
+<caption>Master-prompt §4</caption>
+<thead><tr><th>#</th><th>Question</th><th>Answer</th></tr></thead>
+<tbody>
+<tr><td>1–3</td><td>What, why, problem solved</td><td>Per-device address translation and permission checking; created to stop devices reaching memory they should not (bugs, malicious devices, VM isolation) and to let 32-bit devices reach high memory without bouncing.</td></tr>
+<tr><td>4–5</td><td>Before; why better</td><td>Devices used physical addresses directly (any bug could scribble anywhere); bounce buffers for limited devices. Now each device is confined to its mappings, and assigned devices can use guest addresses.</td></tr>
+<tr><td>6–7</td><td>Creator; consumer</td><td>The OS (DMA layer, IOMMU driver, or hypervisor) creates mappings; the IOMMU consumes them on every device request.</td></tr>
+<tr><td>8–9</td><td>Where; memory/registers</td><td>Platform hardware near the Root Complex; tables in DRAM; IOTLB; vendor control registers; device ATS/PASID capabilities.</td></tr>
+<tr><td>10–11</td><td>Before; after</td><td>Before: map and program the address into the command. After: unmap, invalidate, free the IOVA.</td></tr>
+<tr><td>12</td><td>If wrong</td><td>Missing mapping → fault, read error completion, dropped write; stale mapping → silent corruption of reused memory.</td></tr>
+<tr><td>13–14</td><td>Analyzer; Linux</td><td>IOVAs and AT field on TLPs; kernel fault messages naming device and address, group/type in sysfs.</td></tr>
+<tr><td>15</td><td>Validation</td><td>Strict mode, unmap-during-I/O races, masks, ATS invalidation latency, fault reporting accuracy.</td></tr>
+<tr><td>16</td><td>Senior suspicion</td><td>Late DMA after timeout/abort, driver unmapping too early, Requester ID aliasing, firmware leaving devices DMA-active across handoff.</td></tr>
+</tbody>
+</table>
+
+<h3>IOTLB reach</h3>
+<div class="formula">
+<div class="eq"><var>R</var> = <var>E</var> × <var>P</var>, &nbsp;&nbsp; <var>t</var><sub>avg</sub> = <var>h</var> × <var>t</var><sub>hit</sub> + (1 − <var>h</var>) × <var>t</var><sub>walk</sub></div>
+<dl class="vars">
+<dt>R</dt><dd>IOTLB reach: bytes of IOVA space covered by cached translations</dd>
+<dt>E</dt><dd>number of IOTLB entries usable by the device <span class="badge impl">Implementation-dependent</span></dd>
+<dt>P</dt><dd>page size of the mappings (4 KiB, 2 MiB, 1 GiB)</dd>
+<dt>t<sub>avg</sub></dt><dd>average translation time per request</dd>
+<dt>h</dt><dd>IOTLB hit rate (0–1)</dd>
+<dt>t<sub>hit</sub>, t<sub>walk</sub></dt><dd>translation time on a hit, and on a miss including the page walk</dd>
+</dl>
+</div>
+<p>Synthetic example: 64 entries of 4 KiB give 256 KiB of reach; a random-read workload over a 64 GiB buffer pool hits rarely. With <var>h</var> = 0.3, <var>t</var><sub>hit</sub> = 20 ns, <var>t</var><sub>walk</sub> = 500 ns, <var>t</var><sub>avg</sub> = 356 ns per request — added to every DMA read's latency. The same pool mapped with 2 MiB pages raises reach to 128 MiB.</p>
+</section>
+
+<section id="spec">
+<h2>Specification discipline</h2>
+<table>
+<caption>Sources and their character</caption>
+<thead><tr><th>Topic</th><th>Source</th><th>Character</th></tr></thead>
+<tbody>
+<tr><td>AT field, ATS requests, completions, invalidation, ATS capability</td><td><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Address Translation Services</cite></td><td><span class="badge normative">Normative</span>; ATS is <span class="badge optional">Optional</span> for devices</td></tr>
+<tr><td>PRI and PASID</td><td><cite class="spec">PCI Express Base Specification — Page Request Services; PASID</cite></td><td><span class="badge normative">Normative</span> when implemented; <span class="badge optional">Optional</span></td></tr>
+<tr><td>IOMMU tables, faults, invalidation queues</td><td>Intel Virtualization Technology for Directed I/O; AMD I/O Virtualization Technology (IOMMU) Specification; Arm System Memory Management Unit Architecture Specification</td><td>Platform-normative; <span class="badge impl">Implementation-dependent</span> from a PCIe view</td></tr>
+<tr><td>PRP and SGL addresses</td><td><cite class="spec">NVM Express Base Specification, Revision 2.4 — Physical Region Page entry and list; Scatter Gather List</cite></td><td><span class="badge normative">Normative</span> format; silent about translation</td></tr>
+<tr><td>Linux DMA API</td><td>Kernel documentation: <code>Documentation/core-api/dma-api.rst</code>, <code>dma-api-howto.rst</code></td><td>Kernel contract</td></tr>
+</tbody>
+</table>
+<aside class="callout verified">
+<p>Stated plainly: the 2-bit AT field distinguishes untranslated (00b), translation request (01b) and translated (10b) requests, with 11b reserved; PASID values are 20 bits wide; ATS invalidation uses an Invalidate Request message answered by Invalidate Completion messages.</p>
+</aside>
+<aside class="callout derived">
+<p>Derived: because NVMe does not know about the IOMMU, the same controller firmware must work whether PRPs hold physical addresses or IOVAs; any fault is therefore a host mapping fact, not an NVMe protocol fact, unless the controller used an address the host never gave it.</p>
+</aside>
+<aside class="callout impl">
+<p>Implementation-dependent: what completion status a blocked read receives (Unsupported Request or Completer Abort are common), whether blocked writes are reported per-write, IOTLB size, page-walk cost, fault-log capacity, whether ATS is supported or enabled by the OS.</p>
+</aside>
+<aside class="callout version">
+<p>Version-dependent: ATS was originally a separate PCI-SIG specification and was folded into the Base specification in a later revision; in Flit Mode (PCIe 6.0 and later) PASID and similar information travel in Orthogonal Header Content rather than in a TLP prefix — confirm encodings for your revision <span class="badge uncertain">Uncertain</span> on exact field placement.</p>
+</aside>
+<aside class="callout notsaid">
+<p>Not said by PCIe or NVMe: how long a mapping must live, the IOVA allocation policy, the fault message format, or whether an IOMMU exists at all. Check platform IOMMU documentation and kernel source for those.</p>
+</aside>
+<aside class="callout warn">
+<p>Never assume a fault address is a physical address, that an address in a trace is physical, or that "IOMMU on" means "strict".</p>
+</aside>
+</section>
+
+<section id="hardware">
+<h2>Hardware view</h2>
+<table>
+<caption>Participation and observability</caption>
+<thead><tr><th>Category</th><th>Hardware</th></tr></thead>
+<tbody>
+<tr><td>Must participate</td><td>Device DMA engine; Root Port; memory controller and DRAM. With translation enabled: IOMMU and its table walker.</td></tr>
+<tr><td>May participate</td><td>Switches (and ACS redirection, <a href="dd03.html">Module 03</a>); device ATC (ATS); PRI logic; SWIOTLB copying by the CPU.</td></tr>
+<tr><td>Observable</td><td>IOVAs, Requester IDs, AT field, ATS messages and error completions on the link; fault records via kernel logs; IOMMU counters on some platforms.</td></tr>
+<tr><td>Internal</td><td>IOTLB contents, page-walk latency, context-table lookups, invalidation-queue progress, ATC contents inside the device.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="protocol">
+<h2>Protocol view</h2>
+<table>
+<caption>Transactions related to address translation</caption>
+<thead><tr><th>Transaction</th><th>Direction</th><th>Kind</th><th>Response</th><th>Errors</th></tr></thead>
+<tbody>
+<tr><td>MRd/MWr, AT=00b</td><td>Dev→Host</td><td>Normal DMA with IOVA</td><td>CplD for reads</td><td>Blocked read: UR/CA completion (platform choice); blocked write: dropped, logged</td></tr>
+<tr><td>Translation Request (MRd, AT=01b)</td><td>Dev→Host</td><td>Non-posted</td><td>Translation Completion carrying translated address and permissions</td><td>Completion indicating no access; UR if ATS not enabled</td></tr>
+<tr><td>MRd/MWr, AT=10b</td><td>Dev→Host</td><td>DMA with translated address</td><td>CplD for reads</td><td>Rejected if platform does not permit translated requests from this device</td></tr>
+<tr><td>Invalidate Request / Completion</td><td>Host→Dev / Dev→Host</td><td>Messages</td><td>Completion per ITag</td><td>Timeout → host IOMMU error, device often isolated</td></tr>
+<tr><td>Page Request / PRG Response</td><td>Dev→Host / Host→Dev</td><td>Messages</td><td>Response per page request group</td><td>Response failure → device must handle the fault</td></tr>
+</tbody>
+</table>
+<aside class="callout proto">
+<p>Ordering: unmapping and reusing an IOVA is safe only once the device can no longer use the old translation. Without ATS that is when the IOTLB invalidation completes; with ATS it is when every Invalidate Completion has arrived, and the device must have finished, or drained, earlier requests that used the stale entry.</p>
+</aside>
+</section>
+
+<section id="trace">
+<h2>Trace view</h2>
+<p>All four traces are <strong>synthetic examples for teaching</strong>. The analyzer sees only link traffic; "host log" rows come from a hypothetical synchronized kernel trace.</p>
+
+<h3>Trace 1 — normal: PRP list walk under the IOMMU</h3>
+<div class="trace" data-kind="synthetic" data-title="Normal: 16 KiB Read using a PRP list, IOMMU translating">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Host log: dma_map_sg → 4 pages, IOVAs 0x2_0000_0000, 0x2_0000_1000, 0x2_0000_2000, 0x2_0000_3000; PRP list at IOVA 0x1_5000_0000.</td></tr>
+<tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0.8</td><td>MRd64</td><td>Addr=0x1_2340_0180 Len=16 Tag=0x30 Req=0x0100 AT=00</td><td>SQE fetch: PRP1=0x2_0000_0000, PRP2=0x1_5000_0000 (list)</td></tr>
+<tr class="dir-down"><td>2</td><td>Host→Dev</td><td>1.3</td><td>CplD</td><td>Tag=0x30 Status=SC</td><td>SQE</td></tr>
+<tr class="dir-up"><td>3</td><td>Dev→Host</td><td>1.5</td><td>MRd64</td><td>Addr=0x1_5000_0000 Len=6 Tag=0x31 AT=00</td><td>Read three PRP entries (24 bytes)</td></tr>
+<tr class="dir-down"><td>4</td><td>Host→Dev</td><td>2.1</td><td>CplD</td><td>Tag=0x31 Data=0x2_0000_1000, 0x2_0000_2000, 0x2_0000_3000</td><td>All IOVAs, never PAs</td></tr>
+<tr class="dir-up"><td>5–68</td><td>Dev→Host</td><td>62–66</td><td>MWr64</td><td>Len=64 each across the four IOVA pages AT=00</td><td>16 KiB of data</td></tr>
+<tr class="dir-up"><td>69</td><td>Dev→Host</td><td>66.3</td><td>MWr64</td><td>Addr=0x1_2341_0060 Len=4</td><td>CQE</td></tr>
+<tr class="note"><td colspan="6">Host log: completion, then dma_unmap_sg (deferred flush queue).</td></tr>
+</tbody>
+</table>
+<p>Analysis: every address is an IOVA from the host log; the IOMMU is invisible except through timing. The PRP-list read (row 3) is itself a DMA that needs a mapping — forgetting to map the list page is a classic bug.</p>
+</div>
+
+<h3>Trace 2 — slow: ATS-enabled function with ATC misses</h3>
+<div class="trace" data-kind="synthetic" data-title="Slow: Lab SSD variant with ATS enabled (virtual function in a VM), random 4 KiB reads">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0.0</td><td>MRd64</td><td>Addr=0x7_F300_8000 Len=2 Tag=0x40 AT=01</td><td>Translation Request for the buffer page</td></tr>
+<tr class="abnormal"><td>2</td><td>Host→Dev</td><td>2.9</td><td>CplD</td><td>Tag=0x40 Status=SC (translation: PA page, R=1 W=1)</td><td>First abnormal event: 2.9 µs translation round trip (baseline 0.9 µs)</td></tr>
+<tr class="dir-up"><td>3–18</td><td>Dev→Host</td><td>3.0–4.1</td><td>MWr64</td><td>Translated PA, Len=64 each AT=10</td><td>Data written with translated addresses</td></tr>
+<tr class="note"><td colspan="6">Pattern repeats for almost every I/O: each buffer page is new to the ATC, and the IOMMU misses its IOTLB too (guest uses 4 KiB pages, host stage uses 4 KiB pages).</td></tr>
+</tbody>
+</table>
+<p>Analysis: correct but slow. Two caches miss in series: the device ATC and the IOMMU IOTLB, and with nested (guest + host) translation the page walk is longer still. Evidence for page size as the lever: the same test with the VM's memory backed by 2 MiB huge pages on the host shortens the translation round trip. Confidence that IOTLB/page-walk cost explains the latency: medium; confirm with IOMMU counters if the platform exposes them.</p>
+</div>
+
+<h3>Trace 3 — failed: DMA after unmap (timeout race)</h3>
+<div class="trace" data-kind="synthetic" data-title="Failed: late data write after the host aborted and unmapped">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64</td><td>SQE fetch CID 0x0077, PRP1=0x2_0010_0000</td><td>Read accepted</td></tr>
+<tr class="note"><td colspan="6">30 s pass with no data for CID 0x0077 (controller stuck on a media error retry). Host log at 30.0 s: timeout → Abort sent → abort completes "not aborted" → driver resets the controller; block layer fails the request and unmaps 0x2_0010_0000 (strict mode).</td></tr>
+<tr class="dir-down"><td>2</td><td>Host→Dev</td><td>30.002 s</td><td>MWr32</td><td>Addr=0xFE60_0014 Data: CC.EN=0</td><td>Controller disable written</td></tr>
+<tr class="abnormal"><td>3</td><td>Dev→Host</td><td>30.002 s + 3 µs</td><td>MWr64</td><td>Addr=0x2_0010_0000 Len=64 AT=00</td><td>First abnormal event: data write to an IOVA the host unmapped 1 ms earlier</td></tr>
+<tr class="note"><td colspan="6">Kernel log (illustrative format): "DMAR: [DMA Write] Request device [01:00.0] fault addr 0x200100000 … PTE Write access is not set". Write dropped by the IOMMU.</td></tr>
+</tbody>
+</table>
+<p>Analysis: the IOMMU did its job — without it, the write would have landed in a page possibly reused by another process. The bug is a lifecycle race: the host unmapped before the controller was quiesced. NVMe controllers are expected to stop DMA once disabled and CSTS.RDY reads 0, so the host must wait for that before releasing buffers. Root cause sits in the driver ordering (unmap before disable completed) or in the controller (DMA continuing after disable acknowledged) — row 3 is 3 µs after the disable write, before any RDY=0 could be observed, which points at the host ordering. Confidence: high for "host released early", given the timing.</p>
+</div>
+
+<h3>Trace 4 — ambiguous: read of a tiny address gets Unsupported Request</h3>
+<div class="trace" data-kind="synthetic" data-title="Ambiguous: controller reads IOVA 0x0000_1000 and gets UR">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0.8</td><td>MRd64</td><td>SQE fetch CID 0x0101</td><td>CplD returns PRP1=0x2_0040_0000, PRP2=0x0000_0000_0000_1000</td></tr>
+<tr class="abnormal"><td>2</td><td>Dev→Host</td><td>1.6</td><td>MRd32</td><td>Addr=0x0000_1000 Len=6 Tag=0x52 AT=00</td><td>First abnormal event: PRP-list read from a near-zero address</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>2.0</td><td>Cpl</td><td>Tag=0x52 Status=UR</td><td>Rejected</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>2.4</td><td>MWr64</td><td>CQE CID 0x0101, status: data transfer error (generic)</td><td>Controller reports the failure</td></tr>
+</tbody>
+</table>
+<p>Analysis: three hypotheses fit. (a) The driver built a bad PRP2 (for example a length calculation that should not have needed a list, leaving a junk value); (b) the SQE bytes were corrupted (memory or ordering); (c) the PRP2 was correct and the IOMMU mapping for 0x1000 genuinely exists in the guest but not here (wrong domain because of Requester ID aliasing). The trace cannot decide. Disambiguate: check the host's SQE log for CID 0x0101 (a vs b); check the fault log for the Requester ID the IOMMU saw (c — a different RID means aliasing). A near-zero IOVA is never allocated by Linux's default allocator for normal mappings, which weighs toward (a) or (b).</p>
+</div>
+</section>
+
+<section id="linux">
+<h2>Linux view</h2>
+<p><span class="badge safe">Safe lab</span> All commands read only.</p>
+<pre class="code" data-kind="read-only" data-lang="sh" data-title="IOMMU and DMA inspection"><code><span class="cm"># Is an IOMMU active, and in which mode? (kernel messages vary by vendor)</span>
+sudo dmesg | grep -i -E "iommu|dmar|amd-vi|smmu"
+cat /proc/cmdline
+
+<span class="cm"># Group and domain type of the SSD</span>
+readlink /sys/bus/pci/devices/0000:01:00.0/iommu_group
+cat /sys/bus/pci/devices/0000:01:00.0/iommu_group/type
+ls /sys/bus/pci/devices/0000:01:00.0/iommu_group/devices/
+
+<span class="cm"># All groups and members</span>
+for g in /sys/kernel/iommu_groups/*; do echo "${g##*/}: $(ls $g/devices)"; done
+
+<span class="cm"># DMA mask the driver set</span>
+cat /sys/bus/pci/devices/0000:01:00.0/dma_mask_bits
+
+<span class="cm"># ATS / PRI / PASID capabilities and whether enabled</span>
+sudo lspci -vvv -s 01:00.0 | grep -A3 -E "Address Translation|Page Request|Process Address Space"
+
+<span class="cm"># Bounce-buffer pool usage (needs debugfs)</span>
+sudo ls /sys/kernel/debug/swiotlb/ 2&gt;/dev/null</code></pre>
+<table>
+<caption>What the output proves</caption>
+<thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+<tbody>
+<tr><td>Kernel IOMMU messages</td><td>That an IOMMU was found and initialised; faults with device, direction and address</td><td>Which NVMe command caused a fault</td></tr>
+<tr><td>Group <code>type</code></td><td>Identity (passthrough), DMA (strict) or DMA-FQ (deferred) translation for that group</td><td>Per-mapping behaviour or invalidation latency</td></tr>
+<tr><td>Group members</td><td>Which functions share isolation</td><td>Why (topology or missing ACS)</td></tr>
+<tr><td><code>dma_mask_bits</code></td><td>The mask the driver requested</td><td>Whether bouncing is happening right now</td></tr>
+<tr><td><code>lspci</code> ATS lines</td><td>Capability present, enable bit state</td><td>That the device's ATC works correctly</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="labs">
+<h2>Labs</h2>
+
+<h3>Beginner lab — IOMMU inventory</h3>
+<p><span class="badge safe">Safe lab</span></p>
+<dl>
+<dt>Objective</dt><dd>Determine whether your NVMe device's DMA is translated, and in which mode.</dd>
+<dt>Prerequisites</dt><dd><a href="ch20.html">Chapter 20</a>.</dd>
+<dt>Setup</dt><dd>Linux shell.</dd>
+<dt>Procedure</dt><dd>Run the Linux-view commands; record IOMMU vendor, kernel parameters, group number, group type, group members, DMA mask.</dd>
+<dt>Observations</dt><dd>A table of the six facts.</dd>
+<dt>Questions</dt><dd>(1) Do PRPs on your system hold physical addresses or IOVAs? (2) Could you assign this SSD alone to a VM? (3) What does group type "identity" mean for a fault investigation?</dd>
+<dt>Expected reasoning</dt><dd>Type DMA/DMA-FQ → IOVAs; identity or no IOMMU → physical. Assignment needs the whole group. Identity mode means no translation faults: a bad address would hit memory.</dd>
+</dl>
+<details class="solution"><summary>Solution</summary><p>Many distributions enable the IOMMU in translated mode by default on recent hardware; others default to passthrough or leave it off; firmware may disable it. A group with only the SSD (plus possibly its parent bridge on some platforms) means it can be assigned alone. With identity mode, an investigation of "data appeared in the wrong place" cannot rely on IOMMU faults at all.</p></details>
+<p><strong>Extension:</strong> compare a VM's view: inside a guest without a virtual IOMMU there is no group, but the host still translates guest-physical addresses.</p>
+
+<h3>Intermediate lab — Build a toy IOMMU</h3>
+<p><span class="badge safe">Safe lab</span> Simulation.</p>
+<dl>
+<dt>Objective</dt><dd>Implement map, translate and unmap with a two-level table and an IOTLB, and watch faults and stale-IOTLB hazards.</dd>
+<dt>Prerequisites</dt><dd>Mechanism section; Python 3.</dd>
+<dt>Setup</dt><dd>Save as <code>toy_iommu.py</code> and run it.</dd>
+</dl>
+<pre class="code" data-kind="executable" data-lang="python" data-title="toy_iommu.py"><code>#!/usr/bin/env python3
+"""Toy IOMMU: 4 KiB pages, two-level table, small LRU IOTLB, strict or lazy unmap."""
+from collections import OrderedDict
+
+PAGE = 4096
+
+class ToyIOMMU:
+    def __init__(self, tlb_entries=4, strict=True):
+        self.l1 = {}                       <span class="cm"># L1 index -&gt; {L2 index: (pa_page, perms)}</span>
+        self.tlb = OrderedDict()
+        self.tlb_entries, self.strict = tlb_entries, strict
+        self.walks = self.hits = 0
+        self.pending_inval = []
+
+    @staticmethod
+    def split(iova):
+        pfn = iova // PAGE
+        return pfn &gt;&gt; 9, pfn &amp; 0x1FF, iova % PAGE
+
+    def map(self, iova, pa, perms):
+        i1, i2, _ = self.split(iova)
+        self.l1.setdefault(i1, {})[i2] = (pa // PAGE, perms)
+
+    def unmap(self, iova):
+        i1, i2, _ = self.split(iova)
+        self.l1.get(i1, {}).pop(i2, None)
+        if self.strict:
+            self.tlb.pop(iova // PAGE, None)          <span class="cm"># invalidate now</span>
+        else:
+            self.pending_inval.append(iova // PAGE)   <span class="cm"># flush later</span>
+
+    def flush(self):
+        for pfn in self.pending_inval:
+            self.tlb.pop(pfn, None)
+        self.pending_inval.clear()
+
+    def translate(self, iova, op):
+        pfn = iova // PAGE
+        if pfn in self.tlb:
+            self.hits += 1
+            self.tlb.move_to_end(pfn)
+            entry = self.tlb[pfn]
+        else:
+            self.walks += 1
+            i1, i2, _ = self.split(iova)
+            entry = self.l1.get(i1, {}).get(i2)
+            if entry is None:
+                return f"FAULT  {op} iova={iova:#x} (not mapped)"
+            self.tlb[pfn] = entry
+            if len(self.tlb) &gt; self.tlb_entries:
+                self.tlb.popitem(last=False)
+        pa_page, perms = entry
+        if op not in perms:
+            return f"FAULT  {op} iova={iova:#x} (permission {perms})"
+        return f"OK     {op} iova={iova:#x} -&gt; pa={pa_page * PAGE + iova % PAGE:#x}"
+
+def demo(strict):
+    print(f"--- strict={strict}")
+    m = ToyIOMMU(strict=strict)
+    m.map(0x2_0000_0000, 0x8_7A31_2000, "W")    <span class="cm"># Read command buffer: device writes</span>
+    m.map(0x1_5000_0000, 0x8_1000_0000, "R")    <span class="cm"># PRP list: device reads</span>
+    print(m.translate(0x1_5000_0008, "R"))
+    print(m.translate(0x2_0000_0100, "W"))
+    print(m.translate(0x2_0000_0100, "R"))      <span class="cm"># wrong direction</span>
+    m.unmap(0x2_0000_0000)
+    print(m.translate(0x2_0000_0200, "W"))      <span class="cm"># late DMA after unmap</span>
+    m.flush()
+    print(m.translate(0x2_0000_0300, "W"))
+    print(f"walks={m.walks} hits={m.hits}")
+
+demo(strict=True)
+demo(strict=False)</code></pre>
+<dl>
+<dt>Observations</dt><dd>Strict: the late write after unmap faults. Lazy: the late write still translates through the stale IOTLB entry until <code>flush()</code>, then faults.</dd>
+<dt>Questions</dt><dd>(1) Why does the wrong-direction access fault? (2) What could the lazy-mode late write corrupt in a real system? (3) Why must the IOVA not be reused before the flush?</dd>
+<dt>Expected reasoning</dt><dd>A Read command's buffer is mapped write-only for the device (DMA_FROM_DEVICE). The stale entry points at a page that may now belong to someone else. Reusing the IOVA before the flush could let a stale translation and a new mapping coexist.</dd>
+</dl>
+<details class="solution"><summary>Solution</summary><p>Expected output: strict run shows OK, OK, FAULT (permission W), FAULT (not mapped), FAULT; lazy run shows OK, OK, FAULT (permission), <strong>OK</strong> (stale!), FAULT. (2) In a real system the physical page may already have been freed and reused, so the device writes into unrelated data. (3) That is exactly why Linux's deferred flush keeps IOVAs on a queue until the batched invalidation completes.</p></details>
+<p><strong>Extension:</strong> add an ATC on the "device" side and an invalidation that must be acknowledged before <code>unmap()</code> returns.</p>
+
+<h3>Advanced lab — IOTLB reach versus workload</h3>
+<p><span class="badge safe">Safe lab</span> Simulation.</p>
+<dl>
+<dt>Objective</dt><dd>Measure hit rate for sequential and random buffer access with 4 KiB and 2 MiB mappings.</dd>
+<dt>Prerequisites</dt><dd>The toy IOMMU above; the reach formula.</dd>
+<dt>Setup</dt><dd>Add this function to <code>toy_iommu.py</code> (replacing the two <code>demo</code> calls).</dd>
+</dl>
+<pre class="code" data-kind="simulation" data-lang="python" data-title="reach.py (append to toy_iommu.py)"><code>import random
+
+def hit_rate(page, pattern, entries=64, pool=1 &lt;&lt; 30, ios=20000, io=4096):
+    tlb, hits = OrderedDict(), 0
+    rng = random.Random(7)
+    for n in range(ios):
+        off = (n * io) % pool if pattern == "seq" else rng.randrange(pool // io) * io
+        key = off // page
+        if key in tlb:
+            hits += 1
+            tlb.move_to_end(key)
+        else:
+            tlb[key] = True
+            if len(tlb) &gt; entries:
+                tlb.popitem(last=False)
+    return hits / ios
+
+for page in (4096, 2 &lt;&lt; 20):
+    for pattern in ("seq", "rand"):
+        print(f"page={page:&gt;8} {pattern:4}: hit rate {hit_rate(page, pattern):.2f}")</code></pre>
+<dl>
+<dt>Procedure</dt><dd>Run; then vary <code>entries</code> and <code>pool</code>.</dd>
+<dt>Observations</dt><dd>Sequential 4 KiB I/O misses once per page (hit rate near 0 with 4 KiB pages because each I/O is a new page); random over 1 GiB with 4 KiB pages: almost always miss; 2 MiB pages: sequential near 1, random improves greatly because 64 × 2 MiB = 128 MiB of a 1 GiB pool is covered.</dd>
+<dt>Questions</dt><dd>Why does even sequential I/O miss with 4 KiB pages? What does that tell you about the value of the IOTLB for streaming NVMe traffic?</dd>
+<dt>Expected reasoning</dt><dd>Every 4 KiB I/O touches a new page exactly once; the IOTLB helps only when multiple TLPs hit the same page (16 MWr of 256 B per page) — the first misses, the next fifteen hit. Real hit rates are per TLP, not per I/O.</dd>
+</dl>
+<details class="solution"><summary>Solution</summary><p>Per-I/O hit rates: 4 KiB seq ≈ 0.00, 4 KiB rand ≈ 0.00, 2 MiB seq ≈ 1.00, 2 MiB rand ≈ 0.12 (64 of the pool's 512 two-MiB pages are covered: 0.125). Counting per TLP instead, each 4 KiB page costs one walk then fifteen hits. Conclusion: huge-page-backed buffers (or ATS for devices that revisit pages) are the lever; for bare-metal NVMe the per-page walk is usually hidden behind media latency.</p></details>
+<p><strong>Extension:</strong> model per-TLP lookups (16 per 4 KiB) and plug the hit rate into the t<sub>avg</sub> formula.</p>
+
+<h3>Senior forensic lab — Faults that appear only during error recovery</h3>
+<p><span class="badge safe">Safe lab</span> Paper exercise.</p>
+<dl>
+<dt>Objective</dt><dd>Decide whether recurring IOMMU write faults are a host lifecycle bug, a controller bug, or both.</dd>
+<dt>Prerequisites</dt><dd>Trace 3; <a href="ch48.html">Chapter 48 — NVMe Reset</a>.</dd>
+<dt>Setup</dt><dd>Synthetic evidence: in a fleet, 0.1% of machines log IOMMU write faults from NVMe devices, always within 5 ms after a "resetting controller" message, always at IOVAs belonging to requests that timed out. A capture on one machine shows: CC.EN=0 written at t; host-side log shows buffers unmapped at t + 0.2 ms; CSTS read at t + 0.5 ms returns RDY=1; MWr to the timed-out request's IOVA at t + 1.1 ms; CSTS read at t + 4 ms returns RDY=0.</dd>
+<dt>Procedure</dt><dd>Establish the first abnormal event; list hypotheses; state what each predicts; choose a fix.</dd>
+</dl>
+<details class="solution"><summary>Solution</summary><p>Two facts are abnormal and their order matters. First: the host unmapped at t + 0.2 ms while RDY still read 1 — the controller had not completed shutdown of its DMA, so the host released buffers too early (host bug). Second: the controller wrote at t + 1.1 ms — permitted, because RDY=1 means it had not yet finished disabling. So the controller behaved within its contract; the host did not wait for RDY=0 (or a reset completion) before tearing down mappings. Fix: in the driver, unmap timed-out requests only after the controller is disabled (RDY=0) or after a reset that guarantees DMA has stopped; add a regression test that injects a slow-to-disable controller. Confidence high. The IOMMU's faults are the evidence that prevented corruption — on a system in identity mode this would have been silent memory corruption.</p></details>
+<p><strong>Extension:</strong> write the regression test plan and the oracle (no faults, no data corruption) using <a href="validation.html">Validation Engineering</a>.</p>
+</section>
+
+<section id="debugging">
+<h2>Debugging</h2>
+<table>
+<caption>Five address-translation failure patterns</caption>
+<thead><tr><th></th><th>1. Faults after timeouts</th><th>2. Throughput low, high CPU in memcpy</th><th>3. Throughput drop with IOMMU strict</th><th>4. VM passthrough refused</th><th>5. ATS invalidation timeout</th></tr></thead>
+<tbody>
+<tr><th>Symptom</th><td>IOMMU write faults near controller resets</td><td>NVMe slower than expected; <code>perf</code> shows copying</td><td>IOPS falls when the group type is DMA versus DMA-FQ</td><td>Hypervisor will not assign the SSD alone</td><td>Kernel IOMMU error mentioning invalidation timeout; device disabled</td></tr>
+<tr><th>Possible causes</th><td>Unmap before DMA quiesced; controller DMA after disable</td><td>SWIOTLB bouncing (small DMA mask, confidential guest, IOMMU off with high memory)</td><td>Synchronous invalidation per unmap</td><td>IOMMU group contains other functions (no ACS on a switch or Root Port)</td><td>Device ATC not answering Invalidate Requests</td></tr>
+<tr><th>Evidence</th><td>Fault IOVA belongs to a timed-out request</td><td><code>dma_mask_bits</code> &lt; 64; swiotlb debugfs counters</td><td>A/B by group type</td><td>Group membership in sysfs</td><td>Trace: Invalidate Request with no matching Invalidate Completion</td></tr>
+<tr><th>First check</th><td>Time of unmap vs CSTS.RDY = 0</td><td>Mask bits; kernel boot messages about swiotlb</td><td>Group type</td><td><code>ls …/iommu_group/devices</code></td><td>Is ATS enabled (<code>lspci</code>)?</td></tr>
+<tr><th>Second check</th><td>Trace for DMA after disable</td><td>Whether the platform forces bouncing (e.g. encrypted-memory guests)</td><td>IOMMU invalidation counters if available</td><td>ACS capability and control on upstream bridges (<a href="dd03.html">Module 03</a>)</td><td>Device firmware version and errata</td></tr>
+<tr><th>Disambiguating experiment</th><td>Delay unmap until RDY=0: faults vanish → host ordering</td><td>Force 64-bit mask on a test kernel (if the device supports it)</td><td>Switch to deferred mode on a test system</td><td>Move the SSD to a slot under a different Root Port</td><td>Disable ATS for the device; errors stop → device ATC</td></tr>
+<tr><th>Likely conclusion</th><td>Driver lifecycle bug</td><td>Bounce-buffer overhead</td><td>Invalidation cost; accept or use DMA-FQ with risk review</td><td>Topology/ACS limits isolation</td><td>Device ATS implementation fault</td></tr>
+<tr><th>Confidence</th><td>High with timing</td><td>High if counters move</td><td>Medium-high</td><td>High</td><td>Medium until vendor confirms</td></tr>
+</tbody>
+</table>
+<aside class="callout debug">
+<p>Sixth pattern: a device behind a PCIe-to-PCI bridge, or one using phantom functions, may present a different Requester ID than its BDF, landing in the wrong context and faulting on every access. The fault names the RID the IOMMU saw; compare it with the device's BDF.</p>
+</aside>
+</section>
+
+<section id="interview">
+<h2>Interview</h2>
+<h3>Beginner</h3>
+<ol>
+<li><p>What is an IOVA?</p><details class="answer"><summary>Model answer</summary><p>The address a device uses for DMA when an IOMMU translates it into a physical address.</p></details></li>
+<li><p>Why do devices not use the CPU's virtual addresses?</p><details class="answer"><summary>Model answer</summary><p>They are per-process and change; the device needs addresses fixed for the DMA's lifetime that the platform can translate or that are physical.</p></details></li>
+<li><p>What does an IOMMU protect against?</p><details class="answer"><summary>Model answer</summary><p>Devices reaching memory not mapped for them: buggy drivers or firmware, malicious devices, other VMs' memory.</p></details></li>
+<li><p>What is a DMA mask?</p><details class="answer"><summary>Model answer</summary><p>The number of address bits a device can generate; it bounds which addresses the DMA layer may hand it.</p></details></li>
+<li><p>Does a protocol analyzer show physical addresses for NVMe DMA?</p><details class="answer"><summary>Model answer</summary><p>Only when no translation is in use or with ATS translated requests; otherwise it shows IOVAs.</p></details></li>
+</ol>
+<h3>Intermediate</h3>
+<ol>
+<li><p>Coherent versus streaming mappings?</p><details class="answer"><summary>Model answer</summary><p>Coherent: long-lived, shared by CPU and device without syncs (queues). Streaming: per-I/O, with a direction and explicit sync/unmap points (data buffers).</p></details></li>
+<li><p>What happens when the IOMMU blocks a DMA read? A write?</p><details class="answer"><summary>Model answer</summary><p>Read: an error completion (commonly UR or CA, platform-dependent) and a fault record. Write: dropped and recorded.</p></details></li>
+<li><p>What is an IOMMU group and why does it matter for VFIO?</p><details class="answer"><summary>Model answer</summary><p>The smallest set of functions the platform can isolate; VFIO assigns whole groups.</p></details></li>
+<li><p>Strict versus deferred invalidation?</p><details class="answer"><summary>Model answer</summary><p>Strict invalidates the IOTLB at each unmap; deferred batches invalidations for speed, leaving a short window where stale translations may work.</p></details></li>
+<li><p>Why must the PRP-list page be mapped?</p><details class="answer"><summary>Model answer</summary><p>The controller reads it by DMA like any other memory.</p></details></li>
+</ol>
+<h3>Advanced</h3>
+<ol>
+<li><p>Describe an ATS translation and its invalidation.</p><details class="answer"><summary>Model answer</summary><p>Device sends a translation request (AT=01b), receives the translated address and permissions, caches them in its ATC, issues translated requests (AT=10b). On unmap the host sends Invalidate Request; the device drops the entry and returns Invalidate Completion.</p></details></li>
+<li><p>What do PRI and PASID add?</p><details class="answer"><summary>Model answer</summary><p>PRI lets the device ask the host to make pages present; PASID tags requests with an address-space ID so one function can serve several processes or guests.</p></details></li>
+<li><p>Why is ATS a trust decision?</p><details class="answer"><summary>Model answer</summary><p>Translated requests may bypass full checks; a faulty device ATC could reach memory after it should have lost access.</p></details></li>
+<li><p>Compute IOTLB reach for 128 entries with 2 MiB pages.</p><details class="answer"><summary>Model answer</summary><p>128 × 2 MiB = 256 MiB.</p></details></li>
+<li><p>How would Requester ID aliasing appear in fault logs?</p><details class="answer"><summary>Model answer</summary><p>Faults naming a RID different from the device's BDF, typically the bridge's, on every access.</p></details></li>
+</ol>
+<h3>Senior</h3>
+<ol>
+<li><p>Passthrough (identity) mode for performance: what would you ask?</p><details class="answer"><summary>Model answer</summary><p>What threat model the system has (untrusted devices, hot-plug ports, Thunderbolt-like exposure), how much the measured gain is, and what evidence will exist after a DMA bug without faults.</p></details></li>
+<li><p>A fault names an IOVA. How do you get to the NVMe command?</p><details class="answer"><summary>Model answer</summary><p>Correlate the IOVA with DMA-mapping traces or request logs, then with SQE PRP fields in a capture; use timestamps around the fault.</p></details></li>
+<li><p>Who is at fault when DMA follows a controller disable?</p><details class="answer"><summary>Model answer</summary><p>Depends on timing: before CSTS.RDY = 0 the controller may still DMA, so early unmap is a host bug; after RDY = 0, continued DMA is a controller bug.</p></details></li>
+<li><p>How do you validate an ATS implementation?</p><details class="answer"><summary>Model answer</summary><p>Invalidation latency under load, invalidation during outstanding DMA, ITag handling, behaviour with translations denied, interaction with function reset and power states.</p></details></li>
+<li><p>Why can identity mode turn a loud bug into a silent one?</p><details class="answer"><summary>Model answer</summary><p>Without translation, a late or wild DMA lands in real memory with no fault record.</p></details></li>
+</ol>
+</section>
+
+<section id="quiz">
+<h2>Quiz</h2>
+<ol class="quiz">
+<li><p>AT = 10b on a memory request means:</p><ul class="options" data-answer="3"><li>Untranslated</li><li>Translation request</li><li>Translated</li><li>Reserved</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>10b marks a translated address obtained through ATS.</p></details></li>
+<li><p>Where are IOMMU page tables stored?</p><ul class="options" data-answer="2"><li>In the device</li><li>In host DRAM</li><li>In the Root Port's configuration space</li><li>In the NVMe controller registers</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>Tables live in DRAM; the IOMMU caches them in its IOTLB.</p></details></li>
+<li><p>Which NVMe structure must be mapped in addition to data buffers for a large Read?</p><ul class="options" data-answer="1"><li>The PRP list page</li><li>The doorbell</li><li>The MSI-X table</li><li>CAP</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>The controller fetches the PRP list by DMA.</p></details></li>
+<li><p>Why is a blocked write invisible in a trace?</p><details class="answer"><summary>Model answer</summary><p>Writes are posted; there is no completion to carry an error. The IOMMU drops it and logs a fault on the host.</p></details></li>
+<li><p>What sysfs file tells you whether a group uses deferred invalidation?</p><details class="answer"><summary>Model answer</summary><p><code>/sys/kernel/iommu_groups/&lt;n&gt;/type</code> — "DMA-FQ" indicates the flush-queue (deferred) mode.</p></details></li>
+<li><p>Compute t<sub>avg</sub> for h = 0.9, t<sub>hit</sub> = 20 ns, t<sub>walk</sub> = 400 ns.</p><details class="answer"><summary>Model answer</summary><p>0.9 × 20 + 0.1 × 400 = 18 + 40 = 58 ns.</p></details></li>
+<li><p>Which specification defines IOMMU page-table formats?</p><ul class="options" data-answer="4"><li>NVMe Base</li><li>PCIe Base</li><li>NVMe over PCIe Transport</li><li>The platform's IOMMU architecture specification</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>VT-d, AMD IOMMU or Arm SMMU documents; PCIe defines only ATS-related interfaces.</p></details></li>
+<li><p>In Trace 3, what single change prevents the fault?</p><details class="answer"><summary>Model answer</summary><p>Waiting for CSTS.RDY = 0 (controller disabled) before unmapping the timed-out request's buffers.</p></details></li>
+<li><p>True or false: with ATS enabled, the IOMMU is no longer involved.</p><ul class="options" data-answer="2"><li>True</li><li>False</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>False: the IOMMU still produces translations and invalidations; ATS only caches results in the device.</p></details></li>
+</ol>
+</section>
+
+<section id="teachback">
+<h2>Teach-back</h2>
+<h3>To a child</h3>
+<details class="answer"><summary>Model explanation</summary><p>"The SSD's van is only allowed to use post-box numbers. A gatekeeper turns each number into a real house and stops the van if the number isn't in the book. When we're done, we cross the number out — and we must wait until it's really crossed out before giving it to someone else."</p></details>
+<h3>To a junior engineer</h3>
+<details class="answer"><summary>Model explanation</summary><p>"Your driver never gives the SSD a pointer; it gives it a <code>dma_addr_t</code> from the DMA API. With the IOMMU on, that is an IOVA, translated per page and permission-checked. Map everything the device touches — queues, PRP lists, buffers — and do not unmap until the device can no longer access it. Faults in dmesg name the device, direction and IOVA."</p></details>
+<h3>To a senior engineer</h3>
+<details class="answer"><summary>Model explanation</summary><p>"Translation is a platform service outside both NVMe and PCIe, except for ATS/PRI/PASID interfaces. The trade-offs are isolation versus invalidation cost and IOTLB reach; for NVMe the dangerous cases are lifecycle races during recovery and identity mode hiding them. Every fault is evidence of a mapping-time fact — correlate IOVA, RID and timing before blaming the device."</p></details>
+</section>
+
+<section id="mastery">
+<h2>Mastery gate</h2>
+<aside class="callout mastery">
+<p>Do not consider this module mastered until you can:</p>
+<ul class="checklist">
+<li>explain IOVA, IOMMU domain, group, IOTLB, ATC, ATS, PRI and PASID in one sentence each</li>
+<li>diagram a translated DMA with and without ATS, including invalidation</li>
+<li>identify AT field values, translation requests and a DMA-after-unmap in a trace</li>
+<li>debug an IOMMU fault from log line to NVMe command</li>
+<li>distinguish translation (this module) from routing and ACS (<a href="dd03.html">Module 03</a>), BAR mapping (<a href="dd06.html">Module 06</a>), PRP structure (<a href="dd34.html">Module 34</a>) and SR-IOV (<a href="dd52.html">Module 52</a>)</li>
+<li>cite PCI Express Base Specification (ATS, PRI, PASID), the platform IOMMU specification, NVMe Base 2.4 (PRP/SGL) and Linux DMA API documentation for the right claims</li>
+</ul>
+</aside>
+<p>Next: <a href="dd03.html">Module 03 — PCIe Topology</a>.</p>
+</section>
