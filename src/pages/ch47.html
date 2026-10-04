@@ -275,3 +275,514 @@
     <dt>16. What would a senior engineer suspect when it fails?</dt><dd>Missing evidence (logs not enabled, clocks misaligned, rate-limited messages), a latent earlier fault, or two independent problems.</dd>
   </dl>
 </section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>Correlation is easier when you know which hardware block could have produced each piece of evidence, and which blocks are blind spots.</p>
+  <figure>
+<pre class="diagram">
+  CPU cores ── LAPIC ◄──────────── interrupt delivery (driver/platform evidence: /proc/interrupts)
+     │
+  IOMMU ── DMA remapping + interrupt remapping (evidence: IOMMU fault log)
+     │
+  Root complex / root port 00:01.1 ── AER (RP), DPC, LTSSM (evidence: AER, LnkSta, pciehp)
+     │   ▲ link: PHY + DLL (evidence: RxErr, BadTLP, Rollover, Surprise Down; analyzer)
+     ▼   │
+  SSD 01:00.0 ── PCIe core + AER (evidence: AER at SSD)
+     │
+  NVMe front end (doorbells, SQE fetch) ── evidence: analyzer fetches, CSTS
+  Command processor / firmware ─────────── evidence: CQE status, CFS, telemetry
+  FTL + media back end (NAND, ECC) ─────── evidence: SCT 2h, SMART media errors, latency
+</pre>
+    <figcaption>Where evidence originates along the path from CPU to NAND. Internal controller stages are visible only through NVMe-level outputs.</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Blind spots:</strong> inside the root complex (between root port and memory controller), inside the controller (between front end and media), and any link not covered by the analyzer. Errors there are inferred from the edges.</li>
+    <li><strong>Evidence destroyers:</strong> controller reset (CSTS, queues, volatile logs), link reset (in-flight TLPs), reboot (dmesg ring unless persisted), firmware-first handlers (clear AER), power cycles (controller volatile state, sometimes telemetry).</li>
+  </ul>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>No specification defines "error correlation". It draws on all of them:</p>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — status values, Error Information log, Asynchronous Events, Controller Status, Telemetry log, Timestamp feature</cite></li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4 — queue and doorbell mechanics on PCIe, interrupts</cite></li>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Error Signaling and Logging; AER; Data Link Layer retry; Completion Timeout</cite></li>
+  </ul>
+  <aside class="callout verified"><p>Each piece of evidence used in this chapter has a defined meaning in its specification: NVMe status codes, CSTS.CFS, Error Information log; PCIe error classes, AER status bits, header log, completion status. Those meanings are normative.</p></aside>
+  <aside class="callout derived"><p>Every causal link in this chapter — "this Completion Timeout caused that NVMe timeout" — is derived reasoning. Label it as such in bug reports, with the mechanism stated.</p></aside>
+  <aside class="callout impl"><p>Linux timeout values, retry policies, message formats and recovery sequences; controller logging depth; platform error handling (OS-first vs firmware-first) are implementation-dependent and change the evidence you get.</p></aside>
+  <aside class="callout version"><p>Kernel message formats (e.g. NVMe timeout lines that now include opcode names and request ops), tracepoint fields, and nvme-cli output change across versions; NVMe log pages (telemetry, persistent event log) vary by revision and by what the controller supports.</p></aside>
+  <aside class="callout notsaid"><p>The specifications do not say how long a host should wait before declaring a command lost, which layer to blame, or how errors in one specification map to errors in another — except where the NVMe over PCIe Transport describes NVMe reporting of transport errors. Check that document for your controller's revision.</p></aside>
+  <aside class="callout warn"><p>Never write "root cause: PCIe error" or "root cause: NVMe timeout". Those are evidence categories. A root cause names a mechanism and a component: "riser connector on lane 2 marginal at Gen4 causing replay storms".</p></aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>The expected per-command sequence is the ruler against which you measure everything. For an NVMe READ on PCIe with PRPs and MSI-X (synthetic, lab system):</p>
+  <table>
+    <caption>Expected protocol checkpoints for one READ, with the domain implicated if a checkpoint is missing or wrong</caption>
+    <thead><tr><th>#</th><th>Checkpoint</th><th>Direction</th><th>If missing or wrong, suspect</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>SQE written to host memory</td><td>CPU → memory (invisible on link)</td><td>Driver/software (verify via tracepoint)</td></tr>
+      <tr><td>2</td><td>SQ tail doorbell MWr</td><td>Host → device</td><td>Driver (wrong offset), link (dropped is unlikely — DLL retries)</td></tr>
+      <tr><td>3</td><td>SQE fetch MRd + CplD</td><td>Device → host, host → device</td><td>Firmware (no fetch), PCIe transaction (UR/CmpltTO), IOMMU</td></tr>
+      <tr><td>4</td><td>PRP list fetch (if needed)</td><td>Device → host</td><td>Driver (bad pointer), PCIe transaction</td></tr>
+      <tr><td>5</td><td>Data MWr(s)</td><td>Device → host</td><td>Media/firmware (none or late), PCIe (UR at RP), driver (unmapped)</td></tr>
+      <tr><td>6</td><td>CQE MWr with correct CID, SQ ID, SQ Head, Phase</td><td>Device → host</td><td>Firmware/NVMe protocol (wrong fields), media (error status)</td></tr>
+      <tr><td>7</td><td>MSI-X MWr</td><td>Device → host</td><td>Driver (mask), firmware (not fired), coalescing policy</td></tr>
+      <tr><td>8</td><td>CQ head doorbell MWr</td><td>Host → device</td><td>Driver/platform (interrupt not handled)</td></tr>
+    </tbody>
+  </table>
+  <p>Below these sit the link-level checkpoints: every TLP ACKed, no NAK storms, no Recovery entries, flow-control updates flowing.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>A merged timeline is itself a trace. Here is a synthetic one, combining analyzer rows (A), kernel log (K), tracepoints (T) and register dumps (R) on one kernel-monotonic timebase (analyzer aligned via trace_marker, ε ≈ ±5 µs).</p>
+  <div class="trace" data-kind="synthetic" data-title="Merged timeline: normal READ on QID 2 (all sources)">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Src</th><th>Time (s)</th><th>Event</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td>1</td><td>T</td><td>1200.000000</td><td>nvme_setup_cmd</td><td>qid=2 cid=0x11 opcode=0x02 slba=0x1000 len=7</td><td>Driver built READ (8 blocks)</td></tr>
+        <tr class="dir-down"><td>2</td><td>A</td><td>1200.000001</td><td>MWr32</td><td>Addr=0xFE60_1010</td><td>SQ2 tail doorbell</td></tr>
+        <tr class="dir-up"><td>3</td><td>A</td><td>1200.000002</td><td>MRd64/CplD</td><td>Tag 0x40</td><td>SQE fetch</td></tr>
+        <tr class="dir-up"><td>4</td><td>A</td><td>1200.000061</td><td>MWr64 ×16</td><td>data</td><td>4 KiB data</td></tr>
+        <tr class="dir-up"><td>5</td><td>A</td><td>1200.000063</td><td>MWr64 + MWr32</td><td>CQE status 0; MSI-X vec 2</td><td>Completion + interrupt</td></tr>
+        <tr class="note"><td>6</td><td>T</td><td>1200.000066</td><td>nvme_complete_rq</td><td>qid=2 cid=0x11 status=0x0</td><td>Driver completed it</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="trace" data-kind="synthetic" data-title="Merged timeline: abnormal — which event is first?">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Src</th><th>Time (s)</th><th>Event</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td>1</td><td>T</td><td>3301.400000</td><td>nvme_setup_cmd</td><td>qid=5 cid=0x2A opcode=0x01 len=127</td><td>64 KiB WRITE</td></tr>
+        <tr class="dir-down"><td>2</td><td>A</td><td>3301.400001</td><td>MWr32</td><td>SQ5 doorbell</td><td>OK</td></tr>
+        <tr class="dir-up"><td>3</td><td>A</td><td>3301.400002</td><td>MRd64/CplD</td><td>SQE</td><td>OK</td></tr>
+        <tr class="abnormal"><td>4</td><td>A</td><td>3301.400003</td><td>MRd64</td><td>Tag 0x55 Addr=0x1_5000_2000 Len=32 → Cpl Status=UR</td><td><strong>First abnormal event:</strong> PRP list read rejected</td></tr>
+        <tr class="note"><td>5</td><td>K</td><td>3301.400050</td><td>DMAR fault</td><td>[DMA Read] device 01:00.0 addr 0x150002000</td><td>IOMMU: no mapping (illustrative wording)</td></tr>
+        <tr class="dir-up"><td>6</td><td>A</td><td>3301.400060</td><td>MWr64</td><td>CQE SCT 0h SC 04h</td><td>Data Transfer Error</td></tr>
+        <tr class="note"><td>7</td><td>K</td><td>3301.400090</td><td>AER</td><td>root port UnsupReq, header 20000020 0100552f? …</td><td>Root port logs UR (header names SSD's MRd)</td></tr>
+        <tr class="note"><td>8</td><td>K</td><td>3301.400120</td><td>nvme error</td><td>Write(0x1) … Data Transfer Error (sct 0x0 / sc 0x4)</td><td>Driver reports NVMe status</td></tr>
+        <tr class="note"><td>9</td><td>K</td><td>3301.400130</td><td>blk error</td><td>I/O error, dev nvme0n1, sector …</td><td>Block layer</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> Three layers report errors (IOMMU, AER, NVMe). Only row 4 is a cause candidate: the SSD read a PRP list at an address the host had not mapped. Rows 5–9 are each layer reporting the same event from its own vantage point. The domain is <em>driver</em> (mapping lifetime) even though the evidence lives in the PCIe transaction layer. (Row 7's header is shown abbreviated; decode as in <a href="ch46.html">Chapter 46</a>.)</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Collect before you touch. A minimal incident-capture script (read-only; run as root; writes only to a local directory):</p>
+  <pre class="code" data-kind="read-only" data-lang="sh" data-title="nvme_incident_capture.sh"><code>#!/bin/sh
+# Capture NVMe/PCIe evidence for one SSD and its upstream port. Read-only.
+D=${1:-0000:01:00.0}; OUT=incident-$(date +%s); mkdir -p "$OUT"
+RP=$(basename "$(dirname "$(readlink -f /sys/bus/pci/devices/$D)")")
+cat /proc/uptime                                   &gt; "$OUT/uptime"
+dmesg                                              &gt; "$OUT/dmesg.txt"        # raw monotonic stamps
+lspci -vvv -s "$D"                                 &gt; "$OUT/lspci_dev.txt"
+lspci -vvv -s "$RP"                                &gt; "$OUT/lspci_rp.txt"
+grep . /sys/bus/pci/devices/$D/aer_dev_* 2&gt;/dev/null &gt; "$OUT/aer_counters.txt"
+grep -E 'nvme' /proc/interrupts                    &gt; "$OUT/interrupts.txt"
+CTRL=$(ls /sys/bus/pci/devices/$D/nvme 2&gt;/dev/null | head -1)
+if [ -n "$CTRL" ]; then
+  nvme show-regs /dev/$CTRL -H                     &gt; "$OUT/regs.txt" 2&gt;&amp;1
+  nvme error-log /dev/$CTRL -e 64                  &gt; "$OUT/error_log.txt" 2&gt;&amp;1
+  nvme smart-log /dev/$CTRL                        &gt; "$OUT/smart.txt" 2&gt;&amp;1
+fi
+echo "saved to $OUT"</code></pre>
+  <p>Enable evidence <em>before</em> the next occurrence (tracing is host-side only; it does not touch the device):</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>cd /sys/kernel/tracing
+echo 1 &gt; events/nvme/nvme_setup_cmd/enable
+echo 1 &gt; events/nvme/nvme_complete_rq/enable
+echo 1 &gt; events/nvme/nvme_async_event/enable 2&gt;/dev/null
+echo 1 &gt; events/irq/irq_handler_entry/enable
+echo 'incident-marker-A' &gt; trace_marker          <span class="cm"># alignment marker for an analyzer</span>
+cat trace_pipe &gt; /var/tmp/nvme_trace.txt &amp;</code></pre>
+  <table>
+    <caption>Linux evidence and what it can prove in correlation</caption>
+    <thead><tr><th>Evidence</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>"I/O … QID n timeout, completion polled"</td><td>The CQE was present when the driver looked; notification failed</td><td>Whether the device sent the interrupt</td></tr>
+      <tr><td>"timeout, aborting" then "reset controller"</td><td>Command did not complete; recovery escalated</td><td>Why it did not complete</td></tr>
+      <tr><td>"controller is down; will reset: CSTS=0x3"</td><td>Controller reachable and fatal</td><td>Firmware root cause</td></tr>
+      <tr><td>"CSTS=0xffffffff, PCI_STATUS=0xffff"</td><td>Device unreachable on PCIe</td><td>Link vs power vs device crash</td></tr>
+      <tr><td>AER line preceding timeouts by ~io_timeout</td><td>Consistent with PCIe failure causing the stuck command</td><td>Causation without the header/command match</td></tr>
+      <tr><td>Rate-limited messages ("callbacks suppressed")</td><td>Many events occurred</td><td>Which ones — evidence lost</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <h3>Timeline merger and first-abnormal-event finder</h3>
+  <p>Standard-library Python. It merges events from several sources (each with its own clock offset and uncertainty), sorts them, flags the first abnormal event using simple rules, and applies a miniature version of the master decision tree. The embedded data is a synthetic incident. Run as written.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="correlate.py"><code>#!/usr/bin/env python3
+"""Merge multi-source NVMe/PCIe evidence onto one timeline and find the
+first abnormal event. Synthetic data; rules are deliberately simple."""
+from dataclasses import dataclass
+
+@dataclass
+class Ev:
+    t: float      # seconds on the source's clock
+    src: str      # K=kernel log, T=tracepoint, A=analyzer, B=BMC
+    kind: str
+    text: str
+
+# source -&gt; (offset to kernel-monotonic seconds, uncertainty seconds)
+CLOCKS = {"K": (0.0, 0.0), "T": (0.0, 0.0), "A": (8803.250000, 5e-6), "B": (-3.2, 2.0)}
+
+EVENTS = [
+    Ev(8800.000, "T", "setup",   "qid=3 cid=0x20b opcode=0x01"),
+    Ev(5.103200, "A", "link",    "root port NAK x40, replay; RxErr lane 2"),
+    Ev(5.103900, "A", "link",    "LTSSM Recovery entered (REPLAY_NUM rollover)"),
+    Ev(5.104100, "A", "missing", "SSD MRd tag 0x31 (PRP list): no completion"),
+    Ev(8812.104311, "K", "aer",  "Non-Fatal from 01:00.0: CmpltTO (First)"),
+    Ev(8817.0, "B",  "sel",      "PCIe correctable threshold exceeded, slot 3"),
+    Ev(8842.497120, "K", "nvme", "I/O tag 523 QID 3 timeout, aborting"),
+    Ev(8872.705002, "K", "nvme", "I/O tag 523 QID 3 timeout, reset controller"),
+    Ev(8873.011020, "K", "blk",  "I/O error, dev nvme0n1, op WRITE"),
+]
+
+ABNORMAL = {"link", "missing", "aer", "sel", "nvme", "blk", "iommu", "cfs", "status"}
+DOMAIN_RULES = [  # (kind, keyword, domain)  first match wins, applied to first abnormal
+    ("link", "",          "LINK (signal integrity / training)"),
+    ("missing", "MRd",    "PCIe transaction: completer/path did not answer"),
+    ("iommu", "",         "DRIVER (DMA mapping)"),
+    ("cfs", "",           "FIRMWARE"),
+    ("status", "sct 0x2", "MEDIA"),
+    ("aer", "UnsupReq",   "PCIe transaction (check header: often DRIVER mapping)"),
+    ("aer", "CmpltTO",    "PCIe transaction (victim); look at completer/link"),
+    ("nvme", "polled",    "DRIVER / interrupt path"),
+    ("nvme", "timeout",   "UNKNOWN: a timeout is a symptom; look earlier"),
+]
+
+def merged():
+    out = []
+    for e in EVENTS:
+        off, eps = CLOCKS[e.src]
+        out.append((e.t + off, eps, e))
+    return sorted(out, key=lambda x: x[0])
+
+def classify(e):
+    for kind, kw, dom in DOMAIN_RULES:
+        if e.kind == kind and kw.lower() in e.text.lower():
+            return dom
+    return "UNCLASSIFIED"
+
+def main():
+    tl = merged()
+    first = None
+    print(f"{'time (kernel s)':&gt;16}  {'±':&gt;8}  src  event")
+    for t, eps, e in tl:
+        flag = ""
+        if e.kind in ABNORMAL and first is None:
+            first, flag = (t, eps, e), "  &lt;== FIRST ABNORMAL"
+        print(f"{t:16.6f}  {eps:8.0e}  {e.src:3s}  {e.kind:7s} {e.text}{flag}")
+    if first:
+        t, eps, e = first
+        print("\nfirst abnormal event:", e.text)
+        print("suggested domain   :", classify(e))
+        close = [x for x in tl if x[2] is not e and abs(x[0] - t) &lt;= eps + x[1]]
+        if close:
+            print("warning: events within alignment uncertainty of the anchor:")
+            for x in close:
+                print("   ", x[2].src, x[2].text)
+
+if __name__ == "__main__":
+    main()</code></pre>
+  <p>The BMC event (±2 s) cannot be ordered against kernel events closer than 2 s; the tool warns rather than pretends. Replace <code>EVENTS</code> with parsed real data to use it on your own incidents.</p>
+</section>
+
+<section id="worked">
+  <h2>Worked cases</h2>
+  <p>Seven complete cases, one per failure domain. All are synthetic, built on the lab system, and written in the root-cause template: symptom, evidence collected, timeline, first abnormal event, hypotheses, evidence for and against, root cause, corrective action, regression test, confidence.</p>
+
+  <h3>Case 1 — Link: marginal riser at Gen4</h3>
+  <p><strong>Symptom.</strong> Once or twice a day, a database server logs NVMe timeouts on nvme0, followed by a controller reset; the database stalls for ~60 seconds and then recovers.</p>
+  <p><strong>Evidence collected.</strong> dmesg (raw), AER counters for SSD and root port, lspci link status before and after, BMC SEL, NVMe SMART.</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 1 merged timeline">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Src</th><th>Time (s)</th><th>Event</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td>1</td><td>R</td><td>boot</td><td>LnkSta</td><td>16GT/s x4</td><td>Link trained at Gen4 x4</td></tr>
+        <tr class="note"><td>2</td><td>K</td><td>0 – 8800</td><td>AER (root port)</td><td>Correctable: RxErr, BadTLP every few minutes, accelerating</td><td>Early warning, ignored by monitoring</td></tr>
+        <tr class="abnormal"><td>3</td><td>K</td><td>8812.08</td><td>AER (root port)</td><td>Correctable: Rollover; 312 BadTLP in the last second</td><td><strong>First abnormal event (of the incident):</strong> replay storm and rollover</td></tr>
+        <tr class="note"><td>4</td><td>K</td><td>8812.10</td><td>AER (SSD)</td><td>Non-Fatal: CmpltTO (First)</td><td>SSD's PRP-list read lost during repeated Recovery</td></tr>
+        <tr class="note"><td>5</td><td>K</td><td>8842.50</td><td>nvme</td><td>I/O tag 523 QID 3 timeout, aborting</td><td>io_timeout = 30 s after row 4</td></tr>
+        <tr class="note"><td>6</td><td>K</td><td>8872.71</td><td>nvme</td><td>timeout, reset controller</td><td>Abort did not help</td></tr>
+        <tr class="note"><td>7</td><td>R</td><td>after</td><td>LnkSta</td><td>8GT/s x4 (downgraded)</td><td>Link retrained at a lower speed</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><strong>First abnormal event.</strong> Row 3 for the incident; row 2 shows the condition existed long before. <strong>Hypotheses.</strong> (a) Link signal integrity (riser, connector, retimer); (b) SSD firmware stalling the link; (c) host-side root port defect. <strong>Evidence for (a):</strong> correctable errors logged by the root port's receiver (device→host direction corrupted), rollover, speed downgrade; errors accelerate with temperature in SEL. <strong>Against (b):</strong> CSTS valid after reset, no CFS, SMART clean; NVMe errors only after the link failure. <strong>Against (c):</strong> moving the same drive to a direct-attached slot makes errors stop; a different drive in the riser shows the same errors (fault follows the riser).</p>
+  <p><strong>Root cause.</strong> Marginal signal integrity on the riser at 16 GT/s, worsening with temperature, causing replay storms and rollovers; during repeated Recovery, an upstream completion for the SSD's PRP-list read was lost, producing a Completion Timeout, a stuck WRITE, an NVMe I/O timeout and a controller reset. <strong>Domain:</strong> link.</p>
+  <p><strong>Corrective action.</strong> Replace the riser with a qualified part; monitor correctable error rates per root port with an alert threshold. <strong>Regression test.</strong> 48-hour soak at elevated inlet temperature with fio mixed load; pass criterion: zero rollovers, correctable rate below the platform's baseline, link remains at 16 GT/s x4. <strong>Confidence.</strong> High (fault follows the riser; mechanism explains every row).</p>
+
+  <h3>Case 2 — Driver: interrupt vector left masked after CPU hot-unplug</h3>
+  <p><strong>Symptom.</strong> During a CPU offline/online stress test, occasional 30-second I/O stalls on one queue, logged as timeouts that end with "completion polled". No resets.</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 2 merged timeline">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Src</th><th>Time (s)</th><th>Event</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td>1</td><td>K</td><td>410.002</td><td>cpu</td><td>CPU 7 offline</td><td>Test step</td></tr>
+        <tr class="dir-down"><td>2</td><td>A</td><td>410.002</td><td>MWr32</td><td>BAR0+0x207C Data=1</td><td>Vector 7 masked during affinity change</td></tr>
+        <tr class="dir-down"><td>3</td><td>A</td><td>410.003</td><td>MWr32</td><td>BAR0+0x2070 Data=0xFEE0_6000</td><td>Vector 7 retargeted to CPU 6</td></tr>
+        <tr class="abnormal"><td>4</td><td>A</td><td>410.003 →</td><td>(missing)</td><td>No unmask write to BAR0+0x207C</td><td><strong>First abnormal event:</strong> vector left masked</td></tr>
+        <tr class="dir-up"><td>5</td><td>A</td><td>411.218</td><td>MWr64</td><td>CQE in CQ7, status 0</td><td>Command completed by device</td></tr>
+        <tr class="note"><td>6</td><td>A</td><td>411.218</td><td>(missing)</td><td>No MSI-X write; PBA bit 7 later read as 1</td><td>Device obeyed the mask</td></tr>
+        <tr class="note"><td>7</td><td>K</td><td>441.22</td><td>nvme</td><td>I/O 77 QID 7 timeout, completion polled</td><td>Driver found the CQE on timeout</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><strong>Hypotheses.</strong> (a) Host interrupt-affinity path forgot to unmask; (b) SSD failed to send the interrupt; (c) IOMMU interrupt remapping dropped it. <strong>Evidence.</strong> PBA bit 7 = 1 proves the device wanted to interrupt and was masked — contradicts (b). No MSI-X write on the link — contradicts (c) (remapping acts on writes that exist). The missing unmask is directly observed (row 4). <strong>Root cause.</strong> Race in the host's affinity-change path under concurrent CPU hot-unplug left the MSI-X vector masked. <strong>Domain:</strong> driver/platform interrupt management. <strong>Corrective action.</strong> Kernel fix (or update to a kernel with the fix); as a workaround, avoid hot-unplug of CPUs serving NVMe queues. <strong>Regression test.</strong> Loop CPU offline/online with pinned I/O on every queue for 12 hours; check that no "completion polled" lines appear and that PBA is zero at idle. <strong>Confidence.</strong> High.</p>
+
+  <h3>Case 3 — Firmware: controller fatal during telemetry collection</h3>
+  <p><strong>Symptom.</strong> A fleet agent that collects the host-initiated telemetry log nightly coincides with occasional drive "disappearance" for ~5 seconds.</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 3 merged timeline">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Src</th><th>Time (s)</th><th>Event</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td>1</td><td>T</td><td>7200.000</td><td>nvme_setup_cmd</td><td>qid=0 opcode=0x02 (Get Log Page) telemetry, create bit set</td><td>Agent requests a new telemetry snapshot</td></tr>
+        <tr class="note"><td>2</td><td>T</td><td>7200.000–7200.300</td><td>I/O</td><td>Heavy writes on QIDs 1–8 continue</td><td>Concurrent load</td></tr>
+        <tr class="abnormal"><td>3</td><td>T</td><td>7200.300 →</td><td>(missing)</td><td>No nvme_complete_rq on any QID after 7200.300</td><td><strong>First abnormal event:</strong> all queues stop completing</td></tr>
+        <tr class="note"><td>4</td><td>K</td><td>7230.31</td><td>nvme</td><td>I/O … timeout, aborting / Abort timed out</td><td>Consequence</td></tr>
+        <tr class="note"><td>5</td><td>K</td><td>7260.32</td><td>nvme</td><td>controller is down; will reset: CSTS=0x3, PCI_STATUS=0x10</td><td>CFS set; PCIe alive</td></tr>
+        <tr class="note"><td>6</td><td>K</td><td>7265.10</td><td>nvme</td><td>queues re-created</td><td>Recovery</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><strong>Hypotheses.</strong> (a) Firmware fault triggered by telemetry creation under write load; (b) PCIe failure; (c) power/thermal event. <strong>Evidence.</strong> No AER at either end; CSTS read returns real data with CFS=1 (not all ones) — rules out (b). SMART temperature normal; BMC shows no power event — weakens (c). Reproduced in the lab: telemetry create during ≥ 80% write load → CFS within seconds, 3 of 20 runs; never without load. <strong>Root cause.</strong> Controller firmware defect in the telemetry-snapshot path under concurrent write load (vendor confirmed a deadlock between snapshot and write-buffer flush). <strong>Domain:</strong> firmware. <strong>Corrective action.</strong> Firmware update; interim: collect telemetry only when the drive is idle. <strong>Regression test.</strong> 200 iterations of telemetry create at 90% write load with zero CFS. <strong>Confidence.</strong> High after vendor confirmation; medium before.</p>
+
+  <h3>Case 4 — Media: unrecoverable reads on a cluster of LBAs</h3>
+  <p><strong>Symptom.</strong> A nightly backup fails reading one file; dmesg shows NVMe errors with "Unrecovered Read Error"; the operations team suspects "PCIe problems" because the server recently had a riser replaced.</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 4 merged timeline">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Src</th><th>Time (s)</th><th>Event</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td>1</td><td>T</td><td>20511.000</td><td>nvme_setup_cmd</td><td>qid=4 cid=0x31 READ slba=0x0010_2400 len=7</td><td>Backup read</td></tr>
+        <tr class="abnormal"><td>2</td><td>T</td><td>20511.041</td><td>nvme_complete_rq</td><td>cid=0x31 status=0x2281 (MORE, sct 2, sc 0x81)</td><td><strong>First abnormal event:</strong> media error after 41 ms</td></tr>
+        <tr class="note"><td>3</td><td>K</td><td>20511.041</td><td>nvme</td><td>Read @ LBA 1057792, 8 blocks, Unrecovered Read Error MORE</td><td>Driver log</td></tr>
+        <tr class="note"><td>4</td><td>T</td><td>20511.08 – .25</td><td>retries</td><td>Same CID path retried 4×, same status, ~40 ms each</td><td>DNR=0 retries</td></tr>
+        <tr class="note"><td>5</td><td>R</td><td>after</td><td>error-log</td><td>LBA 0x0010_2403, NSID 1, status SCT 2h/81h</td><td>Precise LBA</td></tr>
+        <tr class="note"><td>6</td><td>R</td><td>after</td><td>smart-log</td><td>media_errors 0 → 5; available spare 100%</td><td>Media errors counted by controller</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><strong>Hypotheses.</strong> (a) Media degradation at those LBAs; (b) PCIe corruption (riser); (c) firmware mapping bug. <strong>Evidence.</strong> The CQE <em>arrived</em> with SCT 2h — PCIe delivered it. AER counters are zero at both ends; link at full speed. Each failure takes ~40 ms (internal read retries), consistent with weak cells rather than a transport problem (a transport problem produces Data Transfer Errors or timeouts, not media status). The same LBA fails every time; other LBAs read fine. No end-to-end protection errors (which would point to mapping). <strong>Root cause.</strong> Uncorrectable data in a small range of NAND pages holding LBA 0x0010_2403 (likely data retention loss in a block not refreshed). <strong>Domain:</strong> media. <strong>Corrective action.</strong> Restore the file from another copy; rewrite the affected LBAs (the controller remaps them); watch SMART media errors and spare; consider a vendor RMA if counts keep rising. <strong>Regression test.</strong> Full-surface read scan (read-only) after rewrite: zero media errors. <strong>Confidence.</strong> High for "media", medium for the specific physical mechanism.</p>
+
+  <h3>Case 5 — Driver, with evidence in the PCIe transaction layer: PRP list use-after-free</h3>
+  <p><strong>Symptom.</strong> Under a new out-of-tree storage module, rare WRITE failures with "Data Transfer Error"; IOMMU fault messages; one AER UR at the root port.</p>
+  <p><strong>Timeline.</strong> As in the abnormal merged timeline in the Trace view above: the SSD's MRd for a PRP list at IOVA 0x1_5000_2000 gets a UR completion (first abnormal event), the IOMMU logs a read fault for that IOVA, the root port logs UR with a header naming the SSD's MRd, the SSD completes the WRITE with SCT 0h SC 04h.</p>
+  <p><strong>Hypotheses.</strong> (a) Host freed/unmapped the PRP-list page before the device fetched it; (b) the SSD computed a wrong PRP-list address; (c) IOMMU hardware fault. <strong>Evidence.</strong> The <code>nvme_setup_cmd</code> tracepoint shows PRP2 = 0x1_5000_2000 for that CID — the SSD used exactly what the host gave it, refuting (b). Kernel debug (DMA API debugging) shows the module unmapped that page on a completion path for a different command that shared the PRP-list pool — supports (a). (c) has no supporting evidence and the fault reproduces on two platforms. <strong>Root cause.</strong> Module returned PRP-list pages to its pool on submission failure of a sibling command, while the original command was still in flight. <strong>Domain:</strong> driver (the PCIe layer is where the symptom appeared). <strong>Corrective action.</strong> Fix reference counting of PRP-list pages; enable DMA-API debugging in CI. <strong>Regression test.</strong> Fault-injection test that forces sibling submission failures under load with IOMMU strict mode; zero IOMMU faults and zero Data Transfer Errors. <strong>Confidence.</strong> High.</p>
+
+  <h3>Case 6 — Software: "slow SSD" that was a cgroup throttle</h3>
+  <p><strong>Symptom.</strong> p99 latency for a service's 4 KiB reads jumped from 0.2 ms to 25 ms after a platform rollout. The team opened a ticket against the SSD vendor.</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 6: split latency by stage">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Src</th><th>Time (ms)</th><th>Event</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td>1</td><td>T</td><td>0.000</td><td>block_bio_queue (Q)</td><td>sector 55001600, 8 sectors</td><td>Request enters block layer</td></tr>
+        <tr class="abnormal"><td>2</td><td>T</td><td>24.810</td><td>block_rq_issue (D)</td><td>same request</td><td><strong>First abnormal event:</strong> 24.8 ms between queue and dispatch</td></tr>
+        <tr class="note"><td>3</td><td>T</td><td>24.812</td><td>nvme_setup_cmd</td><td>qid=2 READ</td><td>Driver submits</td></tr>
+        <tr class="note"><td>4</td><td>T</td><td>24.905</td><td>nvme_complete_rq</td><td>status 0</td><td>Device time 93 µs: normal</td></tr>
+        <tr class="note"><td>5</td><td>T</td><td>24.907</td><td>block_rq_complete (C)</td><td></td><td>Done</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><strong>Hypotheses.</strong> (a) Host-side queuing/throttling; (b) device latency; (c) interrupt delay. <strong>Evidence.</strong> Device time (D→C, rows 2–5) is ~95 µs, normal; interrupt-to-completion is immediate; the 24.8 ms is entirely before dispatch. The rollout introduced a cgroup v2 <code>io.max</code> IOPS limit for the service's slice. No PCIe or NVMe errors anywhere. <strong>Root cause.</strong> Cgroup I/O throttle at a limit below the service's peak IOPS. <strong>Domain:</strong> software (policy). <strong>Corrective action.</strong> Raise the limit or move the service to an appropriate slice; close the vendor ticket with the data. <strong>Regression test.</strong> Latency SLO check at peak IOPS in staging with the production cgroup configuration. <strong>Confidence.</strong> High.</p>
+
+  <h3>Case 7 — NVMe protocol implementation: phase tag not inverted after wrap</h3>
+  <p><strong>Symptom.</strong> On a pre-production drive, exactly after 1024 completions on a freshly created queue (QSIZE 1024), that queue's next command times out; "completion polled" does <em>not</em> appear.</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 7 merged timeline">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Src</th><th>Time</th><th>Event</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>A</td><td>t0</td><td>MWr64</td><td>CQ1 slot 1023, P=1</td><td>Last entry of the first pass</td></tr>
+        <tr class="abnormal"><td>2</td><td>A</td><td>t0+80 µs</td><td>MWr64</td><td>CQ1 slot 0, <strong>P=1</strong>, CID 0x0400, status 0</td><td><strong>First abnormal event:</strong> second pass must use P=0</td></tr>
+        <tr class="dir-up"><td>3</td><td>A</td><td>t0+80 µs</td><td>MWr32</td><td>MSI-X vector 1</td><td>Interrupt correctly sent</td></tr>
+        <tr class="note"><td>4</td><td>K</td><td>+30 s</td><td>nvme</td><td>I/O … QID 1 timeout, aborting</td><td>Driver saw slot 0 with stale-looking phase, ignored it</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><strong>Hypotheses.</strong> (a) Controller failed to invert the Phase Tag on wrap; (b) host initialised the CQ memory wrongly; (c) interrupt problem. <strong>Evidence.</strong> The interrupt arrived (row 3) — refutes (c). The host zeroes CQ memory at creation (P=0 everywhere), so the first pass must use P=1 and the second P=0; row 2 shows P=1 on the second pass — the controller's phase logic is wrong. The driver's polling on timeout also sees P=1 at slot 0 and treats it as old, so no "completion polled". <strong>Root cause.</strong> Firmware failed to toggle its CQ phase on wrap-around for queues whose size equals 1024 (an off-by-one in the wrap check). <strong>Domain:</strong> NVMe protocol implementation in the controller (firmware). <strong>Corrective action.</strong> Firmware fix. <strong>Regression test.</strong> For every supported queue size, run ≥ 3 full wraps of each CQ and check phase alternation in a capture or with a user-space driver. <strong>Confidence.</strong> High. See <a href="ch25.html">Queue Architecture</a> for phase-tag rules.</p>
+
+  <aside class="callout insight" data-title="What the seven cases have in common"><p>In every case the loudest message (timeout, reset, I/O error) was a consequence. In four of seven, the domain where the evidence appeared (PCIe, NVMe) was not the domain of the root cause (link, driver, firmware, software). And in three, the first abnormal event was an <em>absence</em>.</p></aside>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li>Starting from the last, loudest error message.</li>
+    <li>Treating "NVMe timeout" as a root cause.</li>
+    <li>Using <code>dmesg -T</code> wall-clock times to order events against other sources.</li>
+    <li>Ordering events closer together than the alignment uncertainty.</li>
+    <li>Rebooting before capturing AER, NVMe logs and registers.</li>
+    <li>Assuming the component that logged an error caused it.</li>
+    <li>Ignoring absences: missing fetches, completions, interrupts, unmasks.</li>
+    <li>Stopping at the first plausible cause without evidence against the alternatives.</li>
+    <li>Missing a second, independent problem hidden in the cascade.</li>
+    <li>Not writing a regression test: without it, the fix is a hope.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>This chapter <em>is</em> the debugging connection for Part XV. Its method carries forward:</p>
+  <ul>
+    <li><a href="ch48.html">NVMe Reset</a> and <a href="ch49.html">PCIe Reset</a> — what the recovery actions in a cascade do, and what evidence they destroy.</li>
+    <li><a href="debug-method.html">Debugging Methodology</a> — the general method, beyond NVMe/PCIe.</li>
+    <li><a href="failure-library.html">Failure Library</a> — many more cases in this template.</li>
+    <li><a href="me-forensics.html">Root Cause, Ambiguity and Forensic Reporting</a> — writing it up so others can verify it.</li>
+    <li><a href="dd38.html">Deep-Dive: Trace Correlation</a> — command-to-TLP correlation at scale.</li>
+  </ul>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <ul>
+    <li><strong>Evidence first, opinions later.</strong> In an incident call, the first deliverable is the merged timeline, not a theory.</li>
+    <li><strong>Every claim gets a source.</strong> "Link is fine" needs: AER confirmed operating, counters zero, LnkSta at capability, no Recovery in the capture.</li>
+    <li><strong>Name the mechanism.</strong> A root cause that does not explain every row of the timeline is incomplete.</li>
+    <li><strong>Seek disconfirming evidence.</strong> Design the experiment that would prove you wrong. If it doesn't, your confidence goes up honestly.</li>
+    <li><strong>Make evidence automatic.</strong> Tracepoints, persistent journals, incident-capture hooks, correctable-error rate monitoring. The next incident should arrive with its own timeline.</li>
+    <li><strong>Ownership follows root cause, not evidence.</strong> Route the bug to the team that owns the mechanism, with the timeline attached.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Trace Lab 47 — The poisoned write</h3>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Paper/simulation lab: all evidence is provided below as synthetic data. No hardware access needed. Optional: run <code>correlate.py</code> with this data.</p></aside>
+  <h4>Scenario</h4><p>A storage node reports sporadic WRITE failures on nvme0 at night. The application retries succeed. The SSD vendor is blamed.</p>
+  <h4>System configuration</h4><p>Lab system: x86-64, Linux, IOMMU on, OS-first AER. Root port 00:01.1, SSD 01:00.0.</p>
+  <h4>PCIe generation</h4><p>Gen4 (16 GT/s).</p>
+  <h4>Link width</h4><p>x4.</p>
+  <h4>NVMe device</h4><p>Lab SSD, MSI-X 33 vectors, namespace 1 with 512-byte LBAs.</p>
+  <h4>Expected operation</h4><p>WRITE: doorbell → SQE fetch → PRP/data MRd by the SSD → CplD from host with data → CQE status 0 → MSI-X.</p>
+  <h4>Trace</h4>
+  <div class="trace" data-kind="synthetic" data-title="Trace Lab 47: evidence bundle (merged, kernel monotonic seconds)">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Src</th><th>Time (s)</th><th>Event</th><th>Fields</th><th>Meaning (to be filled by you)</th></tr></thead>
+      <tbody>
+        <tr class="note"><td>1</td><td>K</td><td>51020.118</td><td>EDAC</td><td>MC0: 1 UE memory read error on DIMM B2 (illustrative wording)</td><td>?</td></tr>
+        <tr class="note"><td>2</td><td>T</td><td>51020.118</td><td>nvme_setup_cmd</td><td>qid=6 cid=0x81 WRITE slba=0x3_0000 len=15</td><td>?</td></tr>
+        <tr class="dir-up"><td>3</td><td>A</td><td>51020.118</td><td>MRd64</td><td>Req=0x0100 Tag=0x12 Addr=0x2_0450_0000 Len=64</td><td>?</td></tr>
+        <tr class="dir-down"><td>4</td><td>A</td><td>51020.118</td><td>CplD</td><td>Tag=0x12 Status=SC <strong>EP=1</strong> Len=64</td><td>?</td></tr>
+        <tr class="note"><td>5</td><td>K</td><td>51020.119</td><td>AER</td><td>01:00.0 Non-Fatal: [12] TLP (First), TLP Header: 4A004040 00090100 01001200 …</td><td>?</td></tr>
+        <tr class="dir-up"><td>6</td><td>A</td><td>51020.119</td><td>MWr64</td><td>CQE cid=0x81 SCT 0h SC 04h</td><td>?</td></tr>
+        <tr class="note"><td>7</td><td>K</td><td>51020.119</td><td>nvme</td><td>Write(0x1) … Data Transfer Error (sct 0x0 / sc 0x4)</td><td>?</td></tr>
+        <tr class="note"><td>8</td><td>T</td><td>51020.150</td><td>nvme_complete_rq</td><td>retry of cid 0x81 path, status 0</td><td>?</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h4>Timeline</h4><p>Order the events, mark alignment uncertainty (assume ±10 µs for A, 0 for K/T), and mark the first abnormal event.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>What is the first abnormal event?</li>
+    <li>Decode the AER header in row 5 as far as you can. What kind of TLP is it?</li>
+    <li>Why did the retry succeed?</li>
+    <li>Which domain owns the root cause? Is it one of the seven?</li>
+    <li>What evidence would you collect next?</li>
+  </ol>
+  <details class="solution"><summary>First abnormal event, hypotheses, evidence, root cause, corrective action, regression test</summary>
+    <p><strong>First abnormal event.</strong> Row 1 — the EDAC uncorrectable memory error — precedes and explains row 4 (CplD with EP=1). If you only had the analyzer, row 4 would be your first abnormal event.</p>
+    <p><strong>Header decode.</strong> 0x4A00_4040 → Fmt 010, Type 01010 → CplD; EP bit (DW0 bit 14) = 1 → poisoned; Length 0x040 = 64 DW (256 B). DW1 0x0009_0100 → Completer ID 0x0009 (root port/RC), status SC, byte count 0x100. DW2 0x0100_1200 → Requester 0x0100, Tag 0x12. It is exactly row 4.</p>
+    <p><strong>Hypotheses.</strong> (a) Host memory uncorrectable error; (b) SSD fault; (c) link corruption. <strong>Evidence.</strong> Poisoning is applied by the sender who <em>knew</em> the data was bad — the root complex — not by link corruption (that would be a Bad TLP, LCRC). EDAC names a DIMM at the same time. The SSD behaved correctly: logged Poisoned TLP Received, did not commit the data, returned Data Transfer Error. The retry succeeded because the application rewrote the buffer (or the memory controller corrected/retired the location).</p>
+    <p><strong>Root cause.</strong> Uncorrectable error in host DIMM B2; domain: platform memory — outside the seven domains, which is why the method says "look one hop away" rather than "pick from a list". <strong>Corrective action.</strong> Replace DIMM B2; close the SSD vendor ticket. <strong>Regression test.</strong> Memory stress test with EDAC monitoring; 7 days with zero UE events and zero Poisoned TLP at the SSD.</p>
+  </details>
+  <h4>Hints</h4>
+  <details class="hint"><summary>Hint</summary><p>Who sets the EP bit, and why? What is the difference between poisoned and corrupted-on-the-wire?</p></details>
+  <h4>What a senior engineer notices</h4><p>That the vendor was blamed only because the NVMe error appeared in the SSD's log lines; that EDAC and AER timestamps are in the same clock domain and therefore orderable; that the SSD's handling of poison was correct and worth noting in the report.</p>
+  <h4>Failure variants</h4><ul><li>If row 1 were absent (EDAC not loaded), you would conclude "RC sent poisoned data" and ask the platform team for memory logs.</li><li>If the SSD had committed the poisoned data and returned success, that would be a second, serious device bug.</li></ul>
+  <h4>Extension</h4><p>Encode this bundle into <code>correlate.py</code>'s EVENTS list with a new rule for EDAC events, and check that it picks row 1.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Draw the master decision tree from memory and annotate each question with the evidence source that answers it.</li>
+    <li>An analyzer timestamp and a kernel timestamp differ by 3 µs with ε = ±5 µs. Can you say which came first?</li>
+    <li>Give one example each where the evidence domain differs from the root-cause domain.</li>
+    <li>A timeout shows "completion polled" but the analyzer shows an MSI-X write. Where do you look?</li>
+    <li>Write a root-cause statement for Case 1 in three sentences.</li>
+  </ol>
+  <details class="answer"><summary>Model answers</summary>
+    <p>1. See the master tree: CQE? reachable? CFS? CQE in memory? interrupt on link? SQE fetched? data-phase errors? — tracepoints, CSTS read, analyzer, PBA/table, AER.</p>
+    <p>2. No: the difference is within the uncertainty; treat them as simultaneous.</p>
+    <p>3. PCIe UR evidence, driver cause (Case 5); NVMe timeout evidence, link cause (Case 1); NVMe Data Transfer Error evidence, platform memory cause (Trace Lab 47).</p>
+    <p>4. Host side after the write: IOMMU interrupt remapping, the target CPU's state, the IRQ handler mapping (wrong vector/handler), interrupt affinity changes.</p>
+    <p>5. "A marginal riser corrupted device-to-host traffic at 16 GT/s, causing replay storms and repeated link recovery. During recovery a host completion for the SSD's PRP-list read was lost, the WRITE stalled, Linux timed it out after 30 s and reset the controller. Replacing the riser removed the errors in a 48-hour hot soak."</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>The first abnormal event is</p><ul class="options" data-answer="2"><li>The first error message in dmesg</li><li>The earliest observed deviation from expected behaviour, including absences</li><li>The most severe error</li><li>The last event before reboot</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>It is defined against expected behaviour and includes missing events.</p></details></li>
+    <li><p>Linux logs "I/O 77 QID 7 timeout, completion polled". Most likely domain?</p><ul class="options" data-answer="3"><li>Media</li><li>Link</li><li>Interrupt delivery (driver/platform or device not firing)</li><li>NVMe status error</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>The CQE was there; notification failed.</p></details></li>
+    <li><p>CSTS read = 0xFFFF_FFFF during timeout handling suggests</p><ul class="options" data-answer="1"><li>PCIe/link: device unreachable</li><li>Firmware fatal</li><li>Media error</li><li>Software throttling</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>All ones is a failed read, not a CSTS value.</p></details></li>
+    <li><p>Which timestamp source should you use to order kernel events against each other?</p><ul class="options" data-answer="2"><li>dmesg -T wall clock</li><li>Raw monotonic seconds (dmesg default / tracepoints)</li><li>BMC SEL</li><li>Application logs</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>-T conversion can drift; BMC is a different clock.</p></details></li>
+    <li><p>blktrace shows Q→D = 20 ms, D→C = 90 µs. Domain?</p><ul class="options" data-answer="4"><li>Media</li><li>Firmware</li><li>Link</li><li>Software (host-side queuing/throttling)</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>Device time is normal; delay is before dispatch.</p></details></li>
+    <li><p>Which is evidence against a media root cause for a read failure?</p><ul class="options" data-answer="3"><li>SMART media errors rising</li><li>Same LBA fails repeatedly</li><li>Status is Data Transfer Error with an AER Completion Timeout at the SSD</li><li>Long latency before the error</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>Data Transfer Error + PCIe evidence points to transport, not media.</p></details></li>
+    <li><p>Why must you capture AER and NVMe logs before resetting?</p><details class="answer"><summary>Model answer</summary><p>Resets and recovery clear volatile controller state, logs can wrap, firmware-first handlers clear AER, and the link reset loses in-flight evidence. Some AER bits are sticky, but not everything survives.</p></details></li>
+    <li><p>Explain "evidence domain ≠ cause domain" with an example.</p><details class="answer"><summary>Model answer</summary><p>A UR at the root port (PCIe transaction evidence) caused by the driver freeing a PRP list early (driver cause).</p></details></li>
+    <li><p>What makes a root-cause statement complete?</p><details class="answer"><summary>Model answer</summary><p>It names the first abnormal event, the mechanism linking it to every observed symptom, evidence for and against alternatives, confidence, corrective action and a regression test.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> Name the seven failure domains for NVMe on PCIe.</p><details class="answer"><summary>Model answer</summary><p>Software, driver, NVMe protocol, PCIe transaction, link, firmware, media.</p></details></li>
+    <li><p><strong>Beginner:</strong> Why is "NVMe timeout" not a root cause?</p><details class="answer"><summary>Model answer</summary><p>It is a host-side symptom that a command did not complete in time; many mechanisms in any domain can cause it.</p></details></li>
+    <li><p><strong>Intermediate:</strong> How do you align an analyzer capture with dmesg?</p><details class="answer"><summary>Model answer</summary><p>Write a trace_marker and issue a distinctive command at the same moment; trigger the analyzer on it; compute the offset; carry the uncertainty.</p></details></li>
+    <li><p><strong>Intermediate:</strong> A drive "disappears" and comes back. What three readings decide between firmware and link?</p><details class="answer"><summary>Model answer</summary><p>CSTS during the event (CFS vs all ones), AER at root port (Surprise Down / correctable storm vs nothing), link status before/after (downgrade/retrain).</p></details></li>
+    <li><p><strong>Advanced:</strong> Walk through a case where three layers report errors for one event.</p><details class="answer"><summary>Model answer</summary><p>PRP use-after-free: IOMMU fault (platform), AER UR at root port (PCIe), Data Transfer Error (NVMe), block I/O error (software). Cause: driver; the first abnormal event is the MRd to the unmapped IOVA.</p></details></li>
+    <li><p><strong>Senior:</strong> You are given only "nvme timeout, reset controller" lines from a fleet of 10,000 servers. Design the investigation.</p><details class="answer"><summary>Model answer</summary><p>Group by platform, slot, drive model, firmware, kernel; compute rates; check co-occurrence with AER, EDAC, thermal; for top clusters deploy incident-capture hooks and tracepoints; pick representative machines for analyzer capture; build timelines; validate hypotheses with A/B (firmware, riser, kernel). Report by root cause, not by symptom.</p></details></li>
+    <li><p><strong>Senior:</strong> How do you communicate a medium-confidence root cause to a vendor?</p><details class="answer"><summary>Model answer</summary><p>Provide the merged timeline, the first abnormal event, the evidence for and against each hypothesis, the experiments run, the explicit confidence and what would raise it, and the specific data you need from them (telemetry, vendor logs).</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>Child:</strong> the goldfish detective and the very first strange thing.</li>
+    <li><strong>Junior engineer:</strong> explain the master decision tree and walk Case 2 through it.</li>
+    <li><strong>Senior engineer:</strong> argue why evidence location and root-cause ownership must be kept separate, using Cases 1, 5 and Trace Lab 47.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "Make a list of what happened in order and find the first strange thing. The loud things at the end usually happened because of it."</p>
+    <p><strong>Junior:</strong> "Did it get a CQE? No. Is the controller reachable? CSTS is healthy. Is the CQE in memory? Yes — 'completion polled'. Was there an interrupt on the link? No. Was the vector masked? PBA says yes, and the trace shows the unmask never happened → driver."</p>
+    <p><strong>Senior:</strong> "In Case 1 the NVMe layer reported but the link caused it; in Case 5 the PCIe layer reported but the driver caused it; in Trace Lab 47 the SSD reported but host memory caused it. If ownership followed evidence, all three bugs would go to the wrong team."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>Error correlation turns a pile of messages into a root cause. Know the seven domains and their fingerprints; collect evidence before recovery destroys it; align every source onto one timeline with explicit uncertainty; mark the first abnormal event, including absences; treat later events as cascade; walk the decision trees to a domain; run the experiment that would prove you wrong; and write a root-cause statement with mechanism, confidence, fix and regression test. The domain where evidence appears is often not the domain that owns the cause.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>list the seven failure domains with one fingerprint each</li>
+      <li>build a merged timeline from dmesg, tracepoints, AER and a capture, with clock alignment</li>
+      <li>identify the first abnormal event, including an absence</li>
+      <li>recognise the Linux AER → timeout → abort → reset cascade and skip to its start</li>
+      <li>apply the master tree and trees A–C to a new incident</li>
+      <li>choose a disambiguating experiment for any two candidate domains</li>
+      <li>write a complete root-cause statement for one of the seven cases from memory</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — status values, logs, Controller Status</cite>; <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Error Signaling and Logging</cite></li>
+    <li>Linux kernel documentation: tracing (ftrace events), block layer tracing (blktrace), "PCI Error Recovery", DMA API debugging.</li>
+    <li>Course: <a href="debug-method.html">Debugging Methodology</a>, <a href="failure-library.html">Failure Library</a>, <a href="trace-lab.html">Trace Analysis Laboratory</a>, <a href="evidence-debugging.html">Evidence-Based Debugging</a>, <a href="bug-reports.html">Engineering Bug Report Training</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch48.html">Chapter 48 — NVMe Reset</a> opens Part XVI: what each kind of NVMe reset does, what it preserves, and what it destroys.</p>
+</section>
