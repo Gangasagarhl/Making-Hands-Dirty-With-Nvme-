@@ -1,0 +1,937 @@
+<p class="lead">NVMe over RDMA (NVMe/RDMA) carries NVMe capsules over Remote Direct Memory Access networks: RoCE, iWARP and InfiniBand. The target's network adapter moves data directly into and out of host memory that the host has registered and named with a key. This chapter builds the RDMA concepts from the ground up (queue pairs, memory registration, SEND, RDMA READ and RDMA WRITE) and shows how NVMe maps onto them, with keyed SGL descriptors as the bridge.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>RDMA was the first NVMe-oF transport. NVMe over Fabrics 1.0 in 2016 defined RDMA and Fibre Channel bindings, and RDMA is still the choice when the lowest latency and lowest CPU cost per I/O matter. It is also the transport that most confuses engineers coming from PCIe, because it <em>almost</em> looks like PCIe. A device on one side writes directly into memory on the other side, without the remote CPU touching the data.</p>
+  <p>That "almost" is where bugs live. Over PCIe, an NVMe controller can DMA to any address the IOMMU allows. Over RDMA, the target's NIC can touch only memory regions the host explicitly registered, only within their bounds, and only while the key that names them is valid. Over PCIe, a bad address yields an Unsupported Request or an IOMMU fault. Over RDMA, a bad key yields a remote access error that kills the whole queue pair and every command on it.</p>
+  <p>The master prompt asks for this topic to be taught <em>conceptually</em>. You will not program verbs here. You will learn the objects and operations well enough to read an NVMe/RDMA capture, reason about a failure and hold a design discussion.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Explain what RDMA is and why it removes CPU copies from the data path.</li>
+    <li>Distinguish InfiniBand, RoCE v1, RoCE v2 and iWARP by their layering and network requirements.</li>
+    <li>Define the core RDMA objects: protection domain, memory region, local and remote keys, queue pair, completion queue, work request, work completion.</li>
+    <li>Explain the RDMA operations NVMe/RDMA uses (SEND, SEND with Invalidate, RDMA READ, RDMA WRITE) and which side issues each.</li>
+    <li>Decode a Keyed SGL Data Block descriptor and explain how a remote key travels inside an NVMe SQE.</li>
+    <li>Trace an NVMe/RDMA read and write end to end, including memory registration and invalidation.</li>
+    <li>Describe connection establishment with the RDMA Connection Manager and the NVMe/RDMA private data it carries.</li>
+    <li>Diagnose receiver-not-ready, remote access and retry-exceeded failures from a capture.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <ul>
+      <li><a href="ch65.html">NVMe-oF Mental Model</a>: capsules, message-based model, Connect.</li>
+      <li><a href="ch20.html">DMA</a> and <a href="dd02.html">DMA and Address Translation</a>: IOVA, IOMMU, pinning.</li>
+      <li><a href="ch37.html">Scatter Gather Lists</a>: SGL descriptor types, including keyed descriptors.</li>
+      <li><a href="ch66.html">NVMe/TCP</a>: useful for contrast. We will compare constantly.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Remember the library across town? With RDMA, the library has a robot arm that can reach through a special window into the teacher's classroom. But the teacher is careful. She puts the books she wants filled on one particular shelf, locks the shelf, and writes the shelf's number and a secret code on her request slip. The librarian's robot can open only that shelf, only with that code, and only until the teacher changes the lock.</p>
+    <p>When the teacher asks for books, the robot reaches in and puts them on the shelf. When the teacher wants to send books to the library, the robot reaches in and takes them from the shelf. Either way, the teacher does not carry anything. When the job is done, the librarian sends back a note that says "done, and please change the lock now", so the code can never be used again.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>Think of a bank's safe-deposit service. You rent a box (register memory) and receive a box number and a one-time access code (address and remote key). You hand a courier a work order containing the box number and code (the command capsule with a keyed SGL). The courier can open that box, and only that box, to deposit or withdraw items without you being present (RDMA WRITE or READ). When the job finishes, the bank voids the code (invalidation). If the courier shows up with a voided code, the guard refuses entry and also closes the whole branch counter you were using until someone resets it (the queue pair enters the error state).</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What it hides.</strong> Registration is not free. It pins memory so the operating system cannot move it, and loads translations into the NIC. Doing it per I/O costs work requests and NIC cache space. The analogy also hides that the command and completion still travel as messages (SEND). Only the bulk data uses the "reach into the box" path.</p>
+    <p><strong>Where it misleads.</strong> A real safe-deposit box can be opened by its owner at any time. In RDMA, the host CPU must not reuse or free a buffer while the remote side may still access it. That is why invalidation must be complete before the I/O completes to the application. The analogy also suggests one courier per box. In fact many commands share one queue pair, each with its own key.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p><span class="g" data-term="rdma">RDMA</span> lets a network adapter read or write memory on a remote machine without involving the remote machine's CPU in moving the data. The remote side must first <strong>register</strong> that memory. Registration tells its network adapter "this range is allowed", and produces a <span class="g" data-term="rkey">remote key (rkey)</span> that the peer must present.</p>
+  <p>RDMA-capable network adapters (RNICs) communicate through <span class="g" data-term="queue-pair">queue pairs (QPs)</span>. Each QP has a send queue and a receive queue. Software posts work requests to them: "send this message", "write these bytes to that remote address with this key", "read those remote bytes into this local buffer". The RNIC reports finished work on a completion queue. Yes, RDMA has its own queues and completions, completely separate from NVMe's. Keep the two vocabularies apart.</p>
+  <p>NVMe/RDMA maps each NVMe queue pair onto one RDMA queue pair:</p>
+  <ul>
+    <li><strong>Command:</strong> the host posts a SEND carrying the command capsule. The target's RNIC places it in a receive buffer the target posted earlier.</li>
+    <li><strong>Read data:</strong> the target posts an <strong>RDMA WRITE</strong> that puts the data straight into the host's registered buffer, using the address and key from the command's <span class="g" data-term="keyed-sgl">Keyed SGL Data Block descriptor</span>.</li>
+    <li><strong>Write data:</strong> small writes travel in-capsule. Large writes are fetched by the target with an <strong>RDMA READ</strong> from the host's registered buffer.</li>
+    <li><strong>Completion:</strong> the target posts a SEND (often <em>SEND with Invalidate</em>) carrying the response capsule.</li>
+  </ul>
+  <p>Three network technologies provide RDMA:</p>
+  <ul>
+    <li><span class="g" data-term="infiniband">InfiniBand</span>: its own link layer, switches and subnet manager. It was designed for RDMA from the start.</li>
+    <li><span class="g" data-term="roce">RoCE</span> (RDMA over Converged Ethernet): InfiniBand transport packets carried on Ethernet. RoCE v2 encapsulates them in UDP/IP (UDP destination port 4791), so they are routable.</li>
+    <li><span class="g" data-term="iwarp">iWARP</span>: RDMA semantics layered on TCP, defined by the IETF.</li>
+  </ul>
+  <aside class="callout remember">
+    <p>RDMA has queue pairs, completion queues and work requests. NVMe has submission queues, completion queues and commands. In NVMe/RDMA, one NVMe SQ/CQ pair rides on one RDMA QP, and every NVMe command produces several RDMA work requests. When someone says "the CQ", ask "which one?"</p>
+  </aside>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>The RDMA object model</h3>
+  <table>
+    <caption>RDMA verbs objects that matter for NVMe/RDMA</caption>
+    <thead><tr><th>Object</th><th>What it is</th><th>Who creates it</th><th>Role in NVMe/RDMA</th></tr></thead>
+    <tbody>
+      <tr><td>Protection Domain (PD)</td><td>A container that groups QPs and memory regions so only matching pairs interact</td><td>Each side's driver, per device</td><td>Isolation: a key from another PD is useless</td></tr>
+      <tr><td>Memory Region (MR)</td><td>A registered, pinned range of virtual memory, translated by the RNIC</td><td>Host for I/O buffers. Both sides for capsule buffers.</td><td>Defines what the remote RNIC may touch</td></tr>
+      <tr><td>Local key (lkey) / remote key (rkey)</td><td>32-bit handles naming an MR for local use or remote access</td><td>RNIC on registration</td><td>The rkey travels in the Keyed SGL descriptor</td></tr>
+      <tr><td>Queue Pair (QP)</td><td>Send queue + receive queue bound to one remote QP (Reliable Connected service)</td><td>Each side, per NVMe queue</td><td>Carries one NVMe queue pair's capsules and data operations</td></tr>
+      <tr><td>Completion Queue (CQ, verbs)</td><td>Where the RNIC reports finished work requests</td><td>Each side</td><td>Tells software a SEND arrived, or an RDMA READ finished</td></tr>
+      <tr><td>Work Request (WR) / Work Completion (WC)</td><td>An operation posted to a QP / its result</td><td>Software / RNIC</td><td>Every NVMe command = several WRs and WCs</td></tr>
+      <tr><td>Shared Receive Queue (SRQ)</td><td>A pool of receive buffers shared by many QPs</td><td>Target, optionally</td><td>Saves target memory with many queues <span class="badge impl">Implementation-dependent</span></td></tr>
+    </tbody>
+  </table>
+
+  <h3>Transport services and the operations NVMe uses</h3>
+  <p>NVMe/RDMA uses the <strong>Reliable Connected (RC)</strong> service. Each QP is connected to exactly one remote QP. The RNIC guarantees in-order, exactly-once delivery with hardware acknowledgements and retransmission. The operations:</p>
+  <table>
+    <caption>RDMA operations in NVMe/RDMA</caption>
+    <thead><tr><th>Operation</th><th>Semantics</th><th>Issued by</th><th>NVMe use</th><th>Needs remote key?</th></tr></thead>
+    <tbody>
+      <tr><td>SEND</td><td>Message delivered into a receive buffer the peer posted</td><td>Host (command capsules), target (response capsules)</td><td>Capsules</td><td>No. Consumes a posted receive.</td></tr>
+      <tr><td>SEND with Invalidate</td><td>SEND that also invalidates a named rkey at the receiver</td><td>Target</td><td>Response capsule + invalidate the host buffer's key in one step</td><td>Names the key to invalidate</td></tr>
+      <tr><td>RDMA WRITE</td><td>Write local bytes to remote address/key. No receive consumed, no remote CPU involvement.</td><td>Target</td><td>Read data → host buffer</td><td>Yes</td></tr>
+      <tr><td>RDMA READ</td><td>Fetch remote bytes into a local buffer</td><td>Target</td><td>Write data ← host buffer</td><td>Yes</td></tr>
+      <tr><td>Fast registration / local invalidate</td><td>Local WRs that create or revoke an MR mapping on the fly</td><td>Host</td><td>Per-I/O buffer registration and cleanup</td><td>Local only</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout insight" data-title="The target is always the RDMA initiator for data">
+    <p>In NVMe/RDMA, the <em>host</em> never issues RDMA READ or RDMA WRITE for I/O data. The target pulls write data and pushes read data. This mirrors NVMe over PCIe, where the controller is always the DMA bus master. It also means a misbehaving target can only touch buffers the host chose to expose, which is a key security property.</p>
+  </aside>
+
+  <h3>InfiniBand, RoCE and iWARP compared</h3>
+  <table>
+    <caption>RDMA fabrics</caption>
+    <thead><tr><th>Property</th><th>InfiniBand</th><th>RoCE v1</th><th>RoCE v2</th><th>iWARP</th></tr></thead>
+    <tbody>
+      <tr><td>Link layer</td><td>InfiniBand</td><td>Ethernet</td><td>Ethernet</td><td>Ethernet (any IP link)</td></tr>
+      <tr><td>Network layer</td><td>IB (LID routing within a subnet, GRH for routing)</td><td>None (Layer 2 only, EtherType 0x8915)</td><td>IPv4/IPv6 + UDP, destination port 4791</td><td>IP</td></tr>
+      <tr><td>Transport</td><td>IB transport (BTH…)</td><td>IB transport</td><td>IB transport</td><td>TCP + MPA/DDP/RDMAP (IETF RFC 5040–5044)</td></tr>
+      <tr><td>Loss handling</td><td>Credit-based link flow control: effectively lossless</td><td>Needs a lossless Ethernet configuration</td><td>Best with PFC and/or ECN with congestion control. Recovers loss with go-back-N retransmission, at a high latency cost.</td><td>TCP recovers loss, so it tolerates lossy networks</td></tr>
+      <tr><td>Management</td><td>Subnet manager required</td><td>Ethernet</td><td>Ethernet/IP</td><td>Ethernet/IP</td></tr>
+      <tr><td>Typical use</td><td>HPC, AI clusters, some storage</td><td>Legacy</td><td>Most common NVMe/RDMA deployment in data centres</td><td>Less common. Valued for lossy/WAN tolerance.</td></tr>
+    </tbody>
+  </table>
+  <p>For NVMe/RDMA the NVMe-level behaviour is identical on all four. The differences show up in captures, in network configuration and in failure modes. <span class="badge impl">Implementation-dependent</span> RoCE v2 congestion behaviour (DCQCN and similar) depends on the RNIC and the switch configuration.</p>
+
+  <h3>What a RoCE v2 packet looks like</h3>
+  <figure>
+<pre class="diagram">
++----------+---------+--------+----------------------+-------------------+----------+------+
+| Ethernet | IPv4/v6 | UDP    | BTH (12 bytes)       | extended header   | payload  | ICRC |
+| 14 B     | 20/40 B | 8 B    | opcode, dest QP, PSN,| RETH: VA, rkey,   | (capsule | 4 B  |
+|          | DSCP/ECN| dport  | ack-request bit ...  |  DMA length (16 B)|  or data)|      |
+|          |         | 4791   |                      | AETH: ack/NAK (4B)|          |      |
+|          |         |        |                      | IETH: rkey to inv.|          |      |
++----------+---------+--------+----------------------+-------------------+----------+------+
+</pre>
+    <figcaption>RoCE v2 framing (conceptual). BTH = Base Transport Header, RETH = RDMA Extended Transport Header (on RDMA WRITE first/only and RDMA READ requests), AETH = ACK Extended Transport Header (on ACKs, NAKs and read responses), IETH = Invalidate Extended Transport Header (on SEND with Invalidate), ICRC = Invariant CRC. Field layouts are defined by the InfiniBand Architecture Specification and its RoCE v2 annex.</figcaption>
+  </figure>
+  <p>The <strong>Packet Sequence Number (PSN)</strong> in the BTH is how the RNICs detect loss and order. A NAK carrying "PSN sequence error" triggers go-back-N retransmission. A NAK carrying "Remote Access Error" or "Remote Operational Error" is fatal to the QP. A NAK carrying "RNR" (Receiver Not Ready) means "no receive buffer posted, try again later".</p>
+
+  <h3>Memory registration</h3>
+  <p><span class="g" data-term="memory-registration">Memory registration</span> does three things: it <strong>pins</strong> the pages so they cannot be swapped or migrated, it loads the virtual-to-physical (or IOVA) translations into the RNIC's tables, and it assigns access rights (local write, remote read, remote write) and keys.</p>
+  <p>NVMe hosts handle I/O buffers in one of two broad ways:</p>
+  <ul>
+    <li><strong>Per-I/O fast registration</strong>, the default for Linux <code>nvme-rdma</code>. For each I/O, the host posts a registration work request that maps the request's scatterlist into an MR with a fresh key, then sends the command. After completion, the key is invalidated, either remotely by the target's SEND with Invalidate or locally by a Local Invalidate WR. The buffer is exposed only for the lifetime of one command.</li>
+    <li><strong>Pre-registered or global keys.</strong> Registering all memory once with a single rkey avoids per-I/O work but exposes everything to the remote side for as long as the key lives. Linux treats this as unsafe and offers it only as a non-default option (the <code>register_always</code> module parameter). <span class="badge impl">Implementation-dependent</span></li>
+  </ul>
+  <aside class="callout warn">
+    <p>Memory registration interacts with the IOMMU: the RNIC's DMA uses IOVAs, exactly as the Lab SSD's does in <a href="ch20.html">DMA</a>. An RNIC remote access error and an IOMMU fault on the RNIC are different failures with similar symptoms. The first is a key/bounds check in the RNIC. The second is the platform blocking a translation. Check both logs.</p>
+  </aside>
+
+  <h3>The Keyed SGL Data Block descriptor</h3>
+  <p>This is where NVMe and RDMA meet. A 16-byte SGL descriptor of type 4h (Keyed SGL Data Block) carries everything the target needs to reach the host buffer. <span class="badge verified">Verified</span></p>
+  <table>
+    <caption>Keyed SGL Data Block descriptor (16 bytes, little-endian)</caption>
+    <thead><tr><th>Bytes</th><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>0–7</td><td>Address</td><td>Host virtual address (or the base the MR was registered with) of the buffer</td></tr>
+      <tr><td>8–10</td><td>Length</td><td>Data length, 3 bytes (up to 16 MiB − 1 per descriptor)</td></tr>
+      <tr><td>11–14</td><td>Key</td><td>The rkey for the MR</td></tr>
+      <tr><td>15</td><td>SGL Identifier</td><td>Bits 7:4 = type 4h. Bits 3:0 = subtype: 0h Address, Fh Invalidate Key (the host asks the target to invalidate this key with SEND with Invalidate).</td></tr>
+    </tbody>
+  </table>
+  <p>So the identifier byte you will see is <strong>40h</strong> (no remote invalidation requested) or <strong>4Fh</strong> (please invalidate). If a command needs more than one keyed descriptor, it uses an in-capsule SGL Last Segment descriptor pointing at a list of keyed descriptors in the capsule. The number allowed is advertised in Identify Controller as Maximum SGL Data Block Descriptors (MSDBD). <span class="badge impl">Implementation-dependent</span></p>
+  <figure>
+<pre class="diagram">
+SQE bytes 24..39 (DPTR / SGL1), command 1 from the Code section:
+
+  00 80 00 00 00 00 00 00 | 00 10 00 | 00 2b 1a 00 | 4f
+  \_______ Address ______/  \_Length/  \___ Key ___/   \ type 4h, subtype Fh
+     0x0000_0000_0000_8000    0x001000    0x001A2B00      (Keyed, Invalidate Key)
+                              (4096)
+</pre>
+    <figcaption>Decoding a keyed SGL descriptor. Synthetic values.</figcaption>
+  </figure>
+
+  <h3>Connection establishment: the RDMA Connection Manager</h3>
+  <p>NVMe/RDMA uses the <span class="g" data-term="rdma-cm">RDMA Connection Manager (RDMA_CM)</span> to create each RC QP connection. RDMA_CM resolves an IP address to an RDMA device and path, then runs the InfiniBand CM exchange: REQ (request), REP (reply), RTU (ready to use), or REJ (reject). On RoCE, these are management datagrams to the special QP1. On iWARP, the equivalent is the MPA exchange over TCP.</p>
+  <p>NVMe/RDMA puts its own <strong>private data</strong> into these messages, as defined by the RDMA Transport specification:</p>
+  <table>
+    <caption>NVMe/RDMA CM private data (fields by name; confirm layouts in RDMA Transport 1.3)</caption>
+    <thead><tr><th>Message</th><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>REQ (host → target)</td><td>RECFMT</td><td>Record format version</td></tr>
+      <tr><td>REQ</td><td>QID</td><td>Which NVMe queue this QP will carry (0 = admin)</td></tr>
+      <tr><td>REQ</td><td>HRQSIZE</td><td>Host receive queue size: how many response capsules the host can accept</td></tr>
+      <tr><td>REQ</td><td>HSQSIZE</td><td>Host send queue size: the NVMe SQ depth the host intends</td></tr>
+      <tr><td>REP (target → host)</td><td>CRQSIZE</td><td>Controller receive queue size: command capsule buffers the target posted</td></tr>
+      <tr><td>REJ (target → host)</td><td>Status</td><td>Why: invalid length, record format, QID, queue sizes, or no resources <span class="badge uncertain">Confirm values</span></td></tr>
+    </tbody>
+  </table>
+  <p>After the RDMA connection is up, the NVMe Connect command still follows as a SEND. The RDMA_CM exchange sets up the pipe, and Connect sets up the NVMe queue and association, exactly as ICReq/Connect do on TCP.</p>
+  <aside class="callout insight">
+    <p>NVMe/RDMA has no equivalent of TCP's ICReq/ICResp PDU. RDMA_CM private data plays that role. There are no header or data digests, because the RDMA transport's ICRC (RoCE/IB) or MPA CRC (iWARP) already protects every packet end to end between RNICs.</p>
+  </aside>
+
+  <h3>Receive buffers, credits and RNR</h3>
+  <p>SEND only works if the receiver has posted a receive work request with a buffer large enough for the incoming capsule. The target posts receives on each QP or on an SRQ, each sized for a command capsule including in-capsule data. The host posts receives sized for response capsules. If a SEND arrives with no receive posted, the receiving RNIC answers with an <strong>RNR NAK</strong>, and the sender retries after a timer. With RNR retries exhausted, the QP fails. NVMe's queue sizes keep this from happening in a correct implementation: the host never has more commands outstanding than the target has receive buffers (CRQSIZE). An RNR in a trace is therefore a strong sign of a sizing or reposting bug, or of severe CPU starvation on the receiver.</p>
+
+  <h3>In-capsule data on RDMA</h3>
+  <p>Exactly as on TCP, small writes can ride inside the command capsule (the SEND payload), bounded by IOCCSZ. The SGL is then a Data Block/Offset descriptor (identifier 01h), not a keyed descriptor. This saves an RDMA READ round trip. Linux <code>nvmet-rdma</code> exposes the in-capsule size as a per-port configuration attribute. <span class="badge impl">Implementation-dependent</span></p>
+
+  <h3>The central concept on the ladder: data movement with registered memory</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>A locked shelf in the classroom, a secret code on the request slip, a robot arm from the library that can open only that shelf, and a "change the lock" note at the end.</p></div>
+    <div class="rung" data-rung="B"><p>The host registers the I/O buffer, getting an rkey, and puts address + length + rkey in a Keyed SGL descriptor in the SQE. The target RDMA WRITEs read data into it or RDMA READs write data from it, then sends the response capsule, invalidating the key.</p></div>
+    <div class="rung" data-rung="C"><p>The host RNIC holds translation and protection tables for the MR. The target's RDMA WRITE arrives as packets. The host RNIC checks the key, bounds and access rights, translates to IOVA and emits PCIe Memory Writes into host memory. No host CPU involvement until the final SEND completes.</p></div>
+    <div class="rung" data-rung="D"><p>The NVMe over RDMA Transport Specification, Revision 1.3 defines the binding: RC QPs, capsules via SEND, keyed SGLs, RDMA_CM private data. The Base 2.4 specification defines Keyed SGL Data Block descriptors and capsules. RDMA semantics come from the InfiniBand Architecture Specification (IBTA) and the IETF iWARP RFCs.</p></div>
+    <div class="rung" data-rung="E"><p>Read: SEND(capsule) → RDMA WRITE(data) → SEND with Invalidate(response). Write: SEND(capsule) → RDMA READ request → RDMA READ response(data) → SEND with Invalidate(response). RNIC ACKs and NAKs flow underneath.</p></div>
+    <div class="rung" data-rung="F"><p>A RoCE v2 capture shows UDP/4791 packets decoded as InfiniBand: "RC Send Only" with an NVMe-oF capsule inside, "RC RDMA Write Only" with RETH (VA, R_key, length), "RC Acknowledge", and "RC Send Only with Invalidate". On the host's PCIe link, the RDMA WRITE appears as RNIC MWr TLPs into the buffer.</p></div>
+    <div class="rung" data-rung="G"><p>A NAK with Remote Access Error points to a key, bounds or permission mismatch: stale key, wrong PD, buffer too small. RNR NAKs point to receive-buffer starvation. Retry-exceeded errors point to network loss or a dead peer. Each kills the QP, so check whether all commands on that queue failed together.</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for the remote key</h3>
+  <table>
+    <caption>Remote key (rkey): sixteen questions</caption>
+    <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>What is it?</td><td>A 32-bit handle naming a registered memory region that a remote RNIC may access.</td></tr>
+      <tr><td>Why was it created?</td><td>To let remote hardware access local memory safely, without involving the CPU per access.</td></tr>
+      <tr><td>What problem does it solve?</td><td>It gives zero-copy, CPU-free data movement while preventing access to unregistered memory.</td></tr>
+      <tr><td>What existed before it?</td><td>Copy-based networking (socket buffers), and on PCIe, IOMMU-mediated DMA within one machine.</td></tr>
+      <tr><td>Why is the current design better?</td><td>Fine-grained, revocable, per-buffer permissions with hardware enforcement at line rate.</td></tr>
+      <tr><td>Who creates it?</td><td>The host's RNIC, when the host driver registers (or fast-registers) a buffer.</td></tr>
+      <tr><td>Who consumes it?</td><td>The target's RNIC, which places it in the RETH of RDMA READ/WRITE packets. The host RNIC validates it.</td></tr>
+      <tr><td>Where does it live?</td><td>In the host RNIC's protection tables, and inside the Keyed SGL descriptor in the SQE while the command is in flight.</td></tr>
+      <tr><td>What memory/registers are involved?</td><td>Pinned host pages, RNIC translation/protection tables, the SQE's DPTR field.</td></tr>
+      <tr><td>What happens before it?</td><td>Buffer allocation, then a registration WR (fast registration) on the host QP.</td></tr>
+      <tr><td>What happens after it?</td><td>Data transfer, then invalidation (remote via SEND with Invalidate, or local) before the buffer returns to the application.</td></tr>
+      <tr><td>What happens if it is wrong?</td><td>NAK Remote Access Error. The QP transitions to the error state, and all outstanding work on it is flushed with errors.</td></tr>
+      <tr><td>What does the protocol analyzer show?</td><td>The R_key field in the RETH of RDMA READ/WRITE packets, and in the IETH of SEND with Invalidate. The same value appears in the SQE's keyed SGL.</td></tr>
+      <tr><td>What does Linux show?</td><td>Not keys directly by default. <code>rdma resource show mr</code> lists registered MRs (with privileges). dmesg shows QP errors, and the nvme-rdma driver logs reconnects.</td></tr>
+      <tr><td>What would a validation engineer test?</td><td>Access after invalidation, access beyond MR bounds, wrong access rights (read vs write), keys from another PD, and invalidation of unknown keys.</td></tr>
+      <tr><td>What would a senior engineer suspect when it fails?</td><td>Use-after-invalidate races, buffers completed to the application before the target finished, a scatterlist mapping larger than the MR, or IOMMU interaction.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>In NVMe/RDMA, the RNIC does much of the work that host and target CPUs do in NVMe/TCP. It segments and reassembles messages, acknowledges and retransmits, checks keys and bounds, and DMAs payloads directly to their final buffers.</p>
+  <figure>
+<pre class="diagram">
+ HOST                                                       TARGET
+ +-------------------------------+                          +-------------------------------+
+ | nvme-rdma driver              |                          | nvmet-rdma (or array firmware)|
+ |  - posts SEND (capsule)       |                          |  - posts RECVs for capsules   |
+ |  - fast-registers I/O buffers |                          |  - posts RDMA READ / WRITE    |
+ |  - posts RECVs for responses  |                          |  - posts SEND w/ Invalidate   |
+ +---------------+---------------+                          +---------------+---------------+
+                 | verbs (WRs, WCs)                                         |
+ +---------------v---------------+       RoCE v2 / IB /     +---------------v---------------+
+ | Host RNIC (0000:41:00.0)      |       iWARP packets      | Target RNIC                   |
+ |  QP 0x00011A  &lt;--------------------------------------&gt;  |  QP 0x000233                  |
+ |  MR table: rkey -&gt; IOVA range |   RC: ACK/NAK, PSN,      |  RDMA READ/WRITE engines      |
+ |  checks key, bounds, rights   |   retransmission in HW   |                               |
+ +---------------+---------------+                          +---------------+---------------+
+                 | PCIe MWr/MRd (IOVA, via IOMMU)                           | PCIe
+ +---------------v---------------+                          +---------------v---------------+
+ | Host memory: I/O buffers,     |                          | Target memory / CMB, then     |
+ | capsule and response buffers  |                          | Lab SSD 0000:01:00.0 (PCIe)   |
+ +-------------------------------+                          +-------------------------------+
+</pre>
+    <figcaption>NVMe/RDMA hardware view. The host RNIC enforces the target's access to host memory. Synthetic example for teaching. The RNIC address is invented for this chapter.</figcaption>
+  </figure>
+  <table>
+    <caption>Must, may, observable, unobservable</caption>
+    <thead><tr><th>Category</th><th>Items</th></tr></thead>
+    <tbody>
+      <tr><td>Must participate</td><td>RNICs on both sides. An RDMA-capable network (IB fabric, or Ethernet configured for RoCE, or any IP network for iWARP). Host and target drivers.</td></tr>
+      <tr><td>May participate</td><td>Switch PFC/ECN for RoCE, an InfiniBand subnet manager, an SRQ on the target, peer-to-peer DMA between target RNIC and SSD (CMB), RNIC on-chip caches for translation tables.</td></tr>
+      <tr><td>Observable</td><td>Packets on the wire (tap or mirror port; software capture sees RDMA traffic only in special cases). RNIC counters (retransmits, out-of-sequence, RNR, CNPs). PCIe TLPs between RNIC and host memory.</td></tr>
+      <tr><td>Internal / unobservable</td><td>RNIC scheduling, translation cache hits and misses, internal retransmission timers, how the target maps capsules to SSD commands.</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw" data-title="Why tcpdump usually sees nothing">
+    <p>With a hardware RNIC, RDMA traffic bypasses the kernel network stack entirely. The RNIC sends and receives it directly to and from registered memory, so <code>tcpdump</code> on the Ethernet interface normally shows none of it. Capturing needs a network tap or switch mirror port, or an RNIC/driver feature that mirrors RDMA traffic to a capture interface. <span class="badge impl">Implementation-dependent</span> With Soft-RoCE (the <code>rxe</code> driver), packets do go through the kernel stack and <em>are</em> visible, which makes it ideal for learning.</p>
+  </aside>
+  <h3>The PCIe side of an RDMA WRITE</h3>
+  <p>This is the part PCIe engineers find satisfying. When the target RDMA WRITEs 4 KiB into a host buffer, the host RNIC turns it into PCIe Memory Write TLPs, just as the Lab SSD does for a local read. The requester is now the RNIC, and the completion signal is a <em>verbs</em> completion entry plus an MSI-X interrupt, not an NVMe CQE. The NVMe completion arrives later, as a SEND payload written into a receive buffer.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>The binding is normative in the <cite class="spec">NVMe over RDMA Transport Specification, Revision 1.3</cite>. Capsules, Fabrics commands and SGL descriptor formats, including the Keyed SGL Data Block, are in the <cite class="spec">NVM Express Base Specification, Revision 2.4</cite>. RDMA semantics come from outside NVM Express: the InfiniBand Architecture Specification (IBTA), including the RoCE and RoCE v2 annexes, and the IETF iWARP RFCs (RFC 5040 RDMAP, RFC 5041 DDP, RFC 5044 MPA).</p>
+  <aside class="callout verified">
+    <ul>
+      <li>NVMe/RDMA uses Reliable Connected QPs, one per NVMe queue pair.</li>
+      <li>Command and response capsules are carried by RDMA SEND (the response optionally by SEND with Invalidate).</li>
+      <li>Host data buffers are described with Keyed SGL Data Block descriptors (type 4h) carrying address, length and key. Subtype Fh requests remote invalidation.</li>
+      <li>Connection setup uses RDMA_CM with NVMe-specific private data (record format, QID, host receive/send queue sizes in REQ, controller receive queue size in REP).</li>
+      <li>NVMe/RDMA uses port 4420 by convention, in the RDMA_CM port space.</li>
+    </ul>
+  </aside>
+  <aside class="callout derived">
+    <ul>
+      <li>Because RC delivers in order and the RNIC ACKs the RDMA WRITE before the following SEND is delivered, the host can safely consume read data when it sees the response capsule. No extra fence is needed.</li>
+      <li>Because the target initiates all data operations, the host's exposure is limited to the buffers named in outstanding commands, provided keys are invalidated on completion.</li>
+      <li>Because any fatal QP error flushes the QP, a single bad key fails every outstanding command on that NVMe queue, not just one.</li>
+    </ul>
+  </aside>
+  <aside class="callout impl">
+    <ul>
+      <li>Per-I/O fast registration versus pre-registered memory, and whether remote invalidation is requested.</li>
+      <li>SRQ use, receive buffer counts and in-capsule data size on the target.</li>
+      <li>RDMA READ depth (initiator depth and responder resources negotiated by RDMA_CM).</li>
+      <li>RoCE congestion control (DCQCN or vendor equivalents), PFC priorities, DSCP marking.</li>
+      <li>RNR and transport retry counts and timeouts.</li>
+    </ul>
+  </aside>
+  <aside class="callout version">
+    <ul>
+      <li>NVMe/RDMA was defined in NVMe over Fabrics 1.0 (2016) and became a standalone transport specification in the 2.0 restructuring. The 2.4 set includes RDMA Transport 1.3.</li>
+      <li>Later revisions added fields to the CM private data (for example a controller ID in REQ). Older targets ignore them. <span class="badge uncertain">Confirm in spec</span></li>
+      <li>RoCE v2 is an IBTA annex, revised independently of NVMe.</li>
+    </ul>
+  </aside>
+  <aside class="callout notsaid">
+    <ul>
+      <li>The NVMe specifications do not define RDMA packet formats, ACK/NAK codes or RNR timer encodings. Those belong to IBTA and the IETF.</li>
+      <li>They do not require a lossless network, nor specify PFC/ECN configuration.</li>
+      <li>They do not say how a host should register memory, only what the keyed descriptor carries.</li>
+      <li>Numeric REJ status values and exact private-data offsets must be read from RDMA Transport 1.3.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn">
+    <ul>
+      <li>Never assume an rkey is valid after the command completes.</li>
+      <li>Never assume a missing response capsule means the target did not run the command. A QP error can flush the response after the data was written.</li>
+      <li>Never assume RoCE "works" on a network just because ping works. Lossless or congestion configuration is invisible to ping.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <h3>Connection setup for one queue</h3>
+  <figure>
+    <ol class="seq" data-actors="Host nvme-rdma|Host RNIC|Target RNIC|Target nvmet-rdma">
+      <li data-from="Host nvme-rdma" data-to="Host RNIC">resolve addr/route, create QP</li>
+      <li data-from="Host RNIC" data-to="Target RNIC">CM REQ (QID, HRQSIZE, HSQSIZE)</li>
+      <li data-from="Target RNIC" data-to="Target nvmet-rdma">connect request event</li>
+      <li data-note="Target nvmet-rdma">create QP, post RECVs</li>
+      <li data-from="Target RNIC" data-to="Host RNIC" class="dashed">CM REP (CRQSIZE)</li>
+      <li data-from="Host RNIC" data-to="Target RNIC">CM RTU</li>
+      <li data-from="Host RNIC" data-to="Target RNIC">SEND: Connect capsule (QID n)</li>
+      <li data-from="Target RNIC" data-to="Host RNIC" class="dashed">SEND: Connect response (CNTLID)</li>
+    </ol>
+    <figcaption>RDMA_CM, then NVMe Connect. Synthetic example for teaching.</figcaption>
+  </figure>
+  <h3>4 KiB read</h3>
+  <figure>
+    <ol class="seq" data-actors="Host nvme-rdma|Host RNIC|Target RNIC|Target nvmet-rdma">
+      <li data-from="Host nvme-rdma" data-to="Host RNIC">REG_MR WR: buffer → rkey 0x0001A2B3</li>
+      <li data-from="Host nvme-rdma" data-to="Host RNIC">SEND WR: capsule (keyed SGL 4Fh)</li>
+      <li data-from="Host RNIC" data-to="Target RNIC">RC SEND Only</li>
+      <li data-from="Target RNIC" data-to="Host RNIC" class="dashed">ACK</li>
+      <li data-from="Target RNIC" data-to="Target nvmet-rdma">RECV completion: capsule</li>
+      <li data-note="Target nvmet-rdma">read from Lab SSD</li>
+      <li data-from="Target RNIC" data-to="Host RNIC">RC RDMA WRITE Only (RETH)</li>
+      <li data-from="Target RNIC" data-to="Host RNIC">RC SEND w/ Invalidate (CQE)</li>
+      <li data-from="Host RNIC" data-to="Target RNIC" class="dashed">ACK</li>
+      <li data-from="Host RNIC" data-to="Host nvme-rdma">RECV completion, rkey invalidated</li>
+    </ol>
+    <figcaption>The host CPU is involved only at submission and at the final RECV completion. Synthetic example for teaching.</figcaption>
+  </figure>
+  <h3>128 KiB write</h3>
+  <figure>
+    <ol class="seq" data-actors="Host RNIC|Target RNIC|Target nvmet-rdma">
+      <li data-from="Host RNIC" data-to="Target RNIC">RC SEND Only: Write capsule, keyed SGL 128 KiB</li>
+      <li data-from="Target RNIC" data-to="Target nvmet-rdma">RECV completion</li>
+      <li data-from="Target nvmet-rdma" data-to="Target RNIC">post RDMA READ WR (128 KiB)</li>
+      <li data-from="Target RNIC" data-to="Host RNIC">RC RDMA READ Request (RETH)</li>
+      <li data-from="Host RNIC" data-to="Target RNIC" class="dashed">READ Response First…Last (32 × 4 KiB)</li>
+      <li data-from="Target RNIC" data-to="Target nvmet-rdma">READ completion</li>
+      <li data-note="Target nvmet-rdma">write to Lab SSD</li>
+      <li data-from="Target RNIC" data-to="Host RNIC">RC SEND w/ Invalidate (CQE)</li>
+    </ol>
+    <figcaption>The RDMA READ is the RDMA counterpart of NVMe/TCP's R2T + H2CData. It costs one round trip too, but the host CPU does nothing during it. Path MTU 4096 assumed.</figcaption>
+  </figure>
+  <h3>Ordering</h3>
+  <ul>
+    <li>Within one RC QP, operations execute in order. An RDMA WRITE posted before a SEND is placed in host memory before the SEND's receive completes. This is why the response capsule can safely follow the data without an extra handshake.</li>
+    <li>RDMA READ is the exception that needs care. A later SEND may overtake an earlier RDMA READ's <em>completion</em> unless the target waits for the READ to complete (or uses a fence) before posting dependent work. Targets always wait for the READ completion before executing the write, so this is natural in NVMe.</li>
+    <li>Across QPs (NVMe queues), there is no ordering, as on PCIe and TCP.</li>
+  </ul>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic setup: RoCE v2 over IPv4, host 192.0.2.10 (host QPN 0x00011A on the I/O queue), target 192.0.2.20 (target QPN 0x000233), path MTU 4096, capture from a switch mirror port. Columns approximate Wireshark's: it shows RoCE v2 as "RRoCE" (Routable RoCE) and decodes NVMe capsules inside SENDs. Frame lengths exclude the FCS: 14 Ethernet + 20 IPv4 + 8 UDP + 12 BTH + 4 ICRC = 58 bytes, plus any extended headers and payload.</p>
+  <h3>Normal: 4 KiB read, with the host PCIe side</h3>
+  <div class="trace" data-kind="synthetic" data-title="NVMe/RDMA (RoCE v2) 4 KiB read, wire view">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time (µs)</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Length</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>0.0</td><td>192.0.2.10</td><td>192.0.2.20</td><td>NVMe/RDMA</td><td>122</td><td>RC Send Only, QP 0x000233, PSN 0x0A1001; NVMe Read CID 0x0042 NSID 1 SLBA 0x1000 NLB 7; SGL Keyed 4Fh VA 0x2_0000_0000 len 4096 key 0x0001A2B3</td><td>Command capsule (64-byte payload)</td></tr>
+        <tr class="dir-up"><td>2</td><td>1.6</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RRoCE</td><td>62</td><td>RC Acknowledge, QP 0x00011A, PSN 0x0A1001, AETH ACK</td><td>Target RNIC ACK (hardware)</td></tr>
+        <tr class="dir-up"><td>3</td><td>71.4</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RRoCE</td><td>4170</td><td>RC RDMA Write Only, QP 0x00011A, PSN 0x5C3000, RETH VA 0x2_0000_0000 R_key 0x0001A2B3 len 4096</td><td>Read data straight into the host buffer</td></tr>
+        <tr class="dir-up"><td>4</td><td>71.9</td><td>192.0.2.20</td><td>192.0.2.10</td><td>NVMe/RDMA</td><td>78</td><td>RC Send Only with Invalidate, PSN 0x5C3001, IETH R_key 0x0001A2B3; NVMe CQE CID 0x0042 Success</td><td>Response capsule + invalidate key</td></tr>
+        <tr class="dir-down"><td>5</td><td>73.2</td><td>192.0.2.10</td><td>192.0.2.20</td><td>RRoCE</td><td>62</td><td>RC Acknowledge, QP 0x000233, PSN 0x5C3001</td><td>Host RNIC coalesced ACK for frames 3–4</td></tr>
+      </tbody>
+    </table>
+    <p>Command to response in about 72 µs, of which about 66 µs is the Lab SSD (see the target-side PCIe trace in <a href="ch65.html#trace">Chapter 65</a>). Compared with the NVMe/TCP read there, the fabric overhead dropped from about 30 µs to about 6 µs in this synthetic example. Real numbers are implementation- and platform-dependent.</p>
+  </div>
+  <div class="trace" data-kind="synthetic" data-title="Same read, host PCIe link between root port and host RNIC (Gen4 x16)">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>RC→RNIC</td><td>−0.6</td><td>MWr32</td><td>RNIC doorbell BAR offset (vendor-specific)</td><td>Driver rings the <em>RNIC's</em> send-queue doorbell, not an NVMe doorbell</td></tr>
+        <tr class="dir-up"><td>2</td><td>RNIC→RC</td><td>−0.3</td><td>MRd64</td><td>ReqID 0x4100, descriptor + 64-byte capsule</td><td>RNIC fetches the SEND WR and capsule (some RNICs take them inline with the doorbell)</td></tr>
+        <tr class="dir-up"><td>3</td><td>RNIC→RC</td><td>71.6–72.1</td><td>MWr64 ×16</td><td>Addr 0x2_0000_0000 … Len 64 DW (256 B, MPS) each</td><td>RDMA WRITE payload into the I/O buffer: 4 KiB</td></tr>
+        <tr class="dir-up"><td>4</td><td>RNIC→RC</td><td>72.3</td><td>MWr64</td><td>Receive buffer address, 16-byte CQE payload</td><td>SEND payload (NVMe CQE) lands in a posted receive buffer</td></tr>
+        <tr class="dir-up"><td>5</td><td>RNIC→RC</td><td>72.4</td><td>MWr64</td><td>RNIC verbs CQ entry</td><td>Verbs work completion: RECV, with invalidated rkey reported</td></tr>
+        <tr class="dir-up"><td>6</td><td>RNIC→RC</td><td>72.5</td><td>MWr32</td><td>0xFEE0_xxxx</td><td>MSI-X to the host CPU</td></tr>
+      </tbody>
+    </table>
+    <p>Rows 3–6 look almost exactly like a local NVMe read's data, CQE and MSI-X writes. The difference is the requester (the RNIC, ReqID 0x4100) and what the "CQE" is: a verbs completion, with the NVMe CQE inside the receive buffer.</p>
+  </div>
+
+  <h3>Slow: RNR NAK delays a completion</h3>
+  <div class="trace" data-kind="synthetic" data-title="NVMe/RDMA response delayed by Receiver Not Ready">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time (µs)</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Length</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>0.0</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RRoCE</td><td>4170</td><td>RC RDMA Write Only, PSN 0x5C3410, R_key 0x0001B004</td><td>Read data for CID 0x0077</td></tr>
+        <tr class="dir-up"><td>2</td><td>0.5</td><td>192.0.2.20</td><td>192.0.2.10</td><td>NVMe/RDMA</td><td>78</td><td>RC Send Only with Invalidate, PSN 0x5C3411; CQE CID 0x0077</td><td>Response capsule</td></tr>
+        <tr class="abnormal"><td>3</td><td>1.8</td><td>192.0.2.10</td><td>192.0.2.20</td><td>RRoCE</td><td>62</td><td>RC Acknowledge, PSN 0x5C3411, AETH: RNR NAK (timer)</td><td><strong>First abnormal event</strong>: host has no receive posted</td></tr>
+        <tr class="dir-up"><td>4</td><td>322.0</td><td>192.0.2.20</td><td>192.0.2.10</td><td>NVMe/RDMA</td><td>78</td><td>RC Send Only with Invalidate, PSN 0x5C3411 (retry)</td><td>Target RNIC retries after the RNR timer</td></tr>
+        <tr class="dir-down"><td>5</td><td>323.1</td><td>192.0.2.10</td><td>192.0.2.20</td><td>RRoCE</td><td>62</td><td>RC Acknowledge, PSN 0x5C3411, ACK</td><td>Delivered 320 µs late</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The data arrived promptly, but the host had not reposted a receive buffer for response capsules, so the host RNIC answered RNR. Every following SEND on this QP is also held behind the retry. Possible causes: the host's completion-handling CPU is starved (receives are reposted in the completion path), or the host posted fewer receives than its queue depth. Check the HRQSIZE the host advertised in CM REQ against the number of commands it allows outstanding, and check CPU time in the nvme-rdma completion context. RNR retries that run out would turn this slow trace into a failed one.</p>
+  </div>
+
+  <h3>Abnormal: Remote Access Error kills the queue</h3>
+  <div class="trace" data-kind="synthetic" data-title="NVMe/RDMA 8 KiB read into a 4 KiB registration">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time (µs)</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Length</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>0.0</td><td>192.0.2.10</td><td>192.0.2.20</td><td>NVMe/RDMA</td><td>122</td><td>RC Send Only; NVMe Read CID 0x0090 NLB 15 (8 KiB); SGL Keyed 4Fh VA 0x2_0001_0000 len 8192 key 0x0001C3D4</td><td>Asks for 8 KiB</td></tr>
+        <tr class="dir-down"><td>2</td><td>0.4</td><td>192.0.2.10</td><td>192.0.2.20</td><td>NVMe/RDMA</td><td>122</td><td>RC Send Only; NVMe Read CID 0x0091 …</td><td>Another command on the same QP</td></tr>
+        <tr class="dir-up"><td>3</td><td>70.2</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RRoCE</td><td>4170</td><td>RC RDMA Write First, PSN 0x5C3500, RETH VA 0x2_0001_0000 R_key 0x0001C3D4 len 8192</td><td>First 4 KiB of the data</td></tr>
+        <tr class="dir-up"><td>4</td><td>70.6</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RRoCE</td><td>4154</td><td>RC RDMA Write Last, PSN 0x5C3501</td><td>Second 4 KiB</td></tr>
+        <tr class="abnormal"><td>5</td><td>71.5</td><td>192.0.2.10</td><td>192.0.2.20</td><td>RRoCE</td><td>62</td><td>RC Acknowledge, PSN 0x5C3500, AETH: NAK Remote Access Error</td><td><strong>First abnormal event</strong>: host RNIC rejects the access</td></tr>
+        <tr class="note"><td colspan="8">Target RNIC: the RDMA WRITE work request completes with a remote access error, and the target QP enters the Error state. All posted work is flushed. No response capsule is sent for CID 0x0090 or 0x0091.</td></tr>
+        <tr class="dir-up"><td>6</td><td>~ms</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RRoCE</td><td>…</td><td>CM DREQ (disconnect request)</td><td>Target tears down the connection</td></tr>
+        <tr class="note"><td colspan="8">Host (illustrative): nvme-rdma reports a QP or connection error, starts error recovery, fails or requeues outstanding I/O, and reconnects all queues of the controller.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h4>Reasoning</h4>
+  <ol>
+    <li><strong>Layer.</strong> No PSN gaps or retransmissions occurred, so the network is fine. The NAK type, Remote Access Error, is a protection check: key, bounds or rights.</li>
+    <li><strong>Which check failed?</strong> The rkey 0x0001C3D4 in the RETH matches the one in the SQE, so the target used the key it was given. The VA matches. The NAK PSN is 0x5C3500, the start of the WRITE message. The responder rejects the whole message, so the PSN alone does not show which part was out of bounds.</li>
+    <li><strong>Hypotheses.</strong> (a) The host registered fewer bytes than it advertised (MR 4 KiB, SGL 8 KiB). (b) The key was invalidated before use, for example by a host-side timeout path. (c) The MR lacked remote-write permission.</li>
+    <li><strong>Evidence.</strong> Host-side driver tracing of the registration WR for this request (mapped length), and <code>rdma resource show mr</code> during a reproduction. A host-side abort or timeout for CID 0x0090 before frame 3 would support (b). Nothing like that appears here.</li>
+    <li><strong>Likely conclusion</strong> (synthetic case): the host built the keyed SGL from the request length but mapped only the first scatterlist segment into the MR. This is a host driver bug in partial-mapping handling. Fix: fail or split the request when the MR mapping returns fewer bytes than requested. Regression test: I/O with highly fragmented buffers that exceed the MR's page-list capacity.</li>
+  </ol>
+  <aside class="callout debug">
+    <p>The collateral damage is the lesson. CID 0x0091 was innocent, but it failed too because it shared the QP. On PCIe, one bad PRP fails one command. On RDMA, one bad key fails a whole NVMe queue and triggers a controller-wide reconnect. Correlated failures across all commands on one queue are an RDMA signature.</p>
+  </aside>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> for the inspection commands below. They only read state.</p></aside>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># RDMA devices and their state (rdma-core / iproute2 tools)</span>
+ibv_devices
+ibv_devinfo -v | grep -E 'hca_id|transport|state|active_mtu|link_layer'
+rdma link show                         <span class="cm"># link state, netdev for RoCE ports</span>
+
+<span class="cm"># RoCE GIDs and their types (RoCE v1 vs v2)</span>
+for g in /sys/class/infiniband/*/ports/1/gid_attrs/types/*; do
+  t=$(cat $g 2&gt;/dev/null) &amp;&amp; [ -n "$t" ] &amp;&amp; echo "$g: $t"
+done
+
+<span class="cm"># Live RDMA resources: QPs (one per NVMe queue) and MRs</span>
+rdma resource show qp
+rdma resource show mr
+
+<span class="cm"># Hardware counters: retransmissions, RNR, out-of-sequence (names are driver-specific)</span>
+rdma statistic show
+
+<span class="cm"># NVMe controllers using RDMA</span>
+grep -l rdma /sys/class/nvme/nvme*/transport 2&gt;/dev/null</code></pre>
+  <table>
+    <caption>What each output proves</caption>
+    <thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>ibv_devinfo</code> state PORT_ACTIVE, link_layer Ethernet</td><td>The RoCE port is up</td><td>That PFC/ECN are configured, or that RoCE traffic flows</td></tr>
+      <tr><td><code>rdma resource show qp</code> lists QPs in RTS state</td><td>Connections exist and are ready to send</td><td>That they carry NVMe I/O right now</td></tr>
+      <tr><td>Rising retransmission or out-of-sequence counters</td><td>Packet loss or reordering on RDMA traffic</td><td>Which application caused it</td></tr>
+      <tr><td>Rising RNR counters</td><td>Receivers ran out of posted buffers</td><td>Which side's software is slow without a capture</td></tr>
+      <tr><td>nvme transport <code>rdma</code></td><td>The NVMe host uses the RDMA binding</td><td>Whether it is RoCE, iWARP or IB (check <code>ibv_devinfo</code>)</td></tr>
+    </tbody>
+  </table>
+  <p>Exact counter names differ between RNIC drivers, and command output formats differ between rdma-core versions. This chapter does not reproduce them.</p>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>The simulation below models what matters for reasoning about NVMe/RDMA without real verbs. A host has memory and a table of registered regions keyed by rkey. A target can only RDMA READ or WRITE through those keys. Keyed SGL descriptors are encoded byte-exactly, and SEND with Invalidate revokes keys. Case 3 reproduces the stale-key failure. Standard library only, runs as written.</p>
+  <pre class="code" data-kind="simulation" data-lang="python" data-title="nvme_rdma_sim.py"><code>#!/usr/bin/env python3
+"""nvme_rdma_sim.py - a toy model of NVMe/RDMA data movement (simulation, not real verbs).
+Shows keyed SGL descriptors, memory registration, RDMA READ/WRITE against registered
+regions, SEND with Invalidate, and what a stale remote key does."""
+import struct, itertools
+
+def keyed_sgl(addr, length, key, invalidate):
+    """Keyed SGL Data Block descriptor: type 4h, subtype 0h (address) or Fh (invalidate key)."""
+    ident = (0x4 &lt;&lt; 4) | (0xF if invalidate else 0x0)
+    return struct.pack("&lt;Q", addr) + length.to_bytes(3, "little") + struct.pack("&lt;I", key) + bytes([ident])
+
+def parse_keyed_sgl(d):
+    addr, = struct.unpack_from("&lt;Q", d, 0)
+    length = int.from_bytes(d[8:11], "little")
+    key, = struct.unpack_from("&lt;I", d, 11)
+    return addr, length, key, d[15]
+
+class RemoteAccessError(Exception):
+    pass
+
+class HostMemory:
+    """Host side: buffers and the RNIC's table of registered regions (rkey -&gt; window)."""
+    def __init__(self):
+        self.mem = bytearray(1 &lt;&lt; 20)
+        self.regions = {}
+        self._keys = itertools.count(0x1A2B00)
+
+    def register(self, addr, length):              # like a fast-registration work request
+        key = next(self._keys)
+        self.regions[key] = (addr, length)
+        return key
+
+    def invalidate(self, key):                     # local invalidate or remote SEND w/ Invalidate
+        self.regions.pop(key, None)
+
+    def check(self, key, addr, length):
+        win = self.regions.get(key)
+        if not win or addr &lt; win[0] or addr + length &gt; win[0] + win[1]:
+            raise RemoteAccessError(f"NAK Remote Access Error (rkey 0x{key:06X}, addr 0x{addr:X}, len {length})")
+
+    # what the target's RNIC can do to host memory, and nothing else:
+    def rdma_write(self, key, addr, data):
+        self.check(key, addr, len(data)); self.mem[addr:addr + len(data)] = data
+
+    def rdma_read(self, key, addr, length):
+        self.check(key, addr, length); return bytes(self.mem[addr:addr + length])
+
+class Target:
+    def __init__(self, host):
+        self.host, self.media = host, bytearray(1 &lt;&lt; 20)
+
+    def on_send(self, capsule):                    # a SEND carrying a command capsule arrived
+        opc, cid = capsule[0], struct.unpack_from("&lt;H", capsule, 2)[0]
+        addr, length, key, ident = parse_keyed_sgl(capsule[24:40])
+        slba, = struct.unpack_from("&lt;Q", capsule, 40)
+        off = slba * 512
+        log = [f"  target: SEND received, opcode {opc:02X}h CID 0x{cid:04X}, keyed SGL id {ident:02X}h addr 0x{addr:X} len {length} key 0x{key:06X}"]
+        try:
+            if opc == 0x02:                         # Read: media -&gt; RDMA WRITE into host buffer
+                self.host.rdma_write(key, addr, self.media[off:off + length])
+                log.append(f"  target: RDMA WRITE {length} B -&gt; host 0x{addr:X}")
+            elif opc == 0x01:                       # Write: RDMA READ from host buffer -&gt; media
+                self.media[off:off + length] = self.host.rdma_read(key, addr, length)
+                log.append(f"  target: RDMA READ {length} B &lt;- host 0x{addr:X}")
+            status = 0
+        except RemoteAccessError as e:
+            log.append(f"  host RNIC rejects the access: {e}; the QP moves to Error, outstanding work is flushed")
+            return log, None
+        if ident &amp; 0xF == 0xF:
+            self.host.invalidate(key)
+            log.append(f"  target: SEND with Invalidate (rkey 0x{key:06X}) carrying response capsule")
+        else:
+            log.append("  target: SEND carrying response capsule")
+        return log, status
+
+def sqe(opc, cid, slba, sgl):
+    s = bytearray(64)
+    struct.pack_into("&lt;BBHI", s, 0, opc, 0x40, cid, 1)     # PSDT=SGL, NSID 1
+    s[24:40] = sgl
+    struct.pack_into("&lt;Q", s, 40, slba)
+    return bytes(s)
+
+if __name__ == "__main__":
+    host = HostMemory(); tgt = Target(host)
+    tgt.media[0x10 * 512:0x10 * 512 + 4096] = b"NVMe-oF!" * 512
+
+    print("1) 4 KiB Read, host registers its buffer and asks for remote invalidation")
+    k = host.register(0x8000, 4096)
+    log, st = tgt.on_send(sqe(0x02, 0x0042, 0x10, keyed_sgl(0x8000, 4096, k, True)))
+    print("\n".join(log)); print(f"  host: completion status {st}, data starts {bytes(host.mem[0x8000:0x8008])}, rkey still valid? {k in host.regions}")
+
+    print("\n2) 4 KiB Write, data pulled by the target with RDMA READ")
+    host.mem[0x9000:0x9000 + 4096] = b"\xA5" * 4096
+    k2 = host.register(0x9000, 4096)
+    log, st = tgt.on_send(sqe(0x01, 0x0043, 0x20, keyed_sgl(0x9000, 4096, k2, True)))
+    print("\n".join(log)); print(f"  host: completion status {st}, media updated? {tgt.media[0x20 * 512] == 0xA5}")
+
+    print("\n3) Buggy host reuses the rkey that command 1 already invalidated")
+    log, st = tgt.on_send(sqe(0x02, 0x0044, 0x10, keyed_sgl(0x8000, 4096, k, True)))
+    print("\n".join(log)); print(f"  host: no response capsule (status {st}); the driver sees the QP error, fails over or reconnects")
+
+    print("\n4) Keyed SGL descriptor bytes for command 1:", keyed_sgl(0x8000, 4096, k, True).hex(" "))
+</code></pre>
+  <p>Output:</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>1) 4 KiB Read, host registers its buffer and asks for remote invalidation
+  target: SEND received, opcode 02h CID 0x0042, keyed SGL id 4Fh addr 0x8000 len 4096 key 0x1A2B00
+  target: RDMA WRITE 4096 B -&gt; host 0x8000
+  target: SEND with Invalidate (rkey 0x1A2B00) carrying response capsule
+  host: completion status 0, data starts b'NVMe-oF!', rkey still valid? False
+
+2) 4 KiB Write, data pulled by the target with RDMA READ
+  target: SEND received, opcode 01h CID 0x0043, keyed SGL id 4Fh addr 0x9000 len 4096 key 0x1A2B01
+  target: RDMA READ 4096 B &lt;- host 0x9000
+  target: SEND with Invalidate (rkey 0x1A2B01) carrying response capsule
+  host: completion status 0, media updated? True
+
+3) Buggy host reuses the rkey that command 1 already invalidated
+  target: SEND received, opcode 02h CID 0x0044, keyed SGL id 4Fh addr 0x8000 len 4096 key 0x1A2B00
+  host RNIC rejects the access: NAK Remote Access Error (rkey 0x1A2B00, addr 0x8000, len 4096); the QP moves to Error, outstanding work is flushed
+  host: no response capsule (status None); the driver sees the QP error, fails over or reconnects
+
+4) Keyed SGL descriptor bytes for command 1: 00 80 00 00 00 00 00 00 00 10 00 00 2b 1a 00 4f</code></pre>
+  <h4>What to notice</h4>
+  <ul>
+    <li>The SGL identifier is 4Fh: Keyed Data Block (4h) with the Invalidate Key subtype (Fh). The key bytes <code>00 2b 1a 00</code> are little-endian for 0x001A2B00.</li>
+    <li>For the write, the target pulls the data. The host does nothing between sending the capsule and receiving the response.</li>
+    <li>After SEND with Invalidate, the key is gone. Case 3 shows that reuse is caught by the host-side check, and that the failure is a connection-level event with no response capsule, not an NVMe status.</li>
+  </ul>
+  <h4>Pseudocode: host submission path (Linux-like, simplified)</h4>
+  <pre class="code" data-kind="pseudocode" data-lang="text"><code>submit(request):
+    if request.is_write and request.length &lt;= inline_capacity:
+        sgl = DataBlockOffset(len = request.length); payload = request.data   # in-capsule
+    else:
+        mr = get_mr_from_pool(queue)
+        mapped = map_scatterlist(mr, request.sg)                # fast registration WR
+        if mapped &lt; request.length: fail(request)                # never advertise more than mapped
+        sgl = KeyedDataBlock(addr = mr.iova, len = request.length, key = mr.rkey,
+                             subtype = INVALIDATE_KEY)          # 4Fh
+    post_send(queue.qp, [REG_MR(mr)] if mr else [], SEND(capsule(sqe(request, sgl), payload)))
+
+on_recv_completion(wc):
+    cqe = wc.buffer[0:16]
+    req = lookup(cqe.cid)
+    if req.mr and wc.invalidated_rkey != req.mr.rkey:
+        post_local_invalidate(req.mr)                           # wait for it before completing
+    repost_recv(wc.buffer)                                      # or RNR will follow
+    complete(req, cqe.status)</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Problem.</strong> Compare a 128 KiB write over NVMe/RDMA (RoCE v2, path MTU 4096, 25 Gb/s) and over NVMe/TCP (MTU 9000) on the same network, where the one-way propagation and switching delay is 5 µs. Count round trips and estimate the wire time for the data phase.</p>
+  <h4>Round trips</h4>
+  <ul>
+    <li><strong>RDMA:</strong> SEND(capsule) → target posts RDMA READ request → host RNIC streams READ responses → target writes to media → SEND(response). Network legs: capsule (1), READ request (2), READ response (3), response capsule (4). That is two round trips.</li>
+    <li><strong>TCP:</strong> CapsuleCmd → R2T → H2CData → CapsuleResp. Also four legs, two round trips.</li>
+  </ul>
+  <p>Same round-trip count. RDMA's advantage is not fewer round trips. It is that the host CPU does no copying and no per-packet processing, and that each leg is processed by hardware with less latency jitter.</p>
+  <h4>Wire time for 128 KiB of data at 25 Gb/s</h4>
+  <div class="formula">
+    <div class="eq"><var>T</var> = 8 × (<var>D</var> + <var>N</var> × <var>H</var>) / <var>R</var></div>
+    <dl class="vars">
+      <dt>T</dt><dd>serialization time of the data phase, in seconds</dd>
+      <dt>D</dt><dd>data bytes (131,072)</dd>
+      <dt>N</dt><dd>number of packets carrying the data</dd>
+      <dt>H</dt><dd>per-packet overhead in bytes, including Ethernet preamble, start delimiter, FCS and inter-frame gap (24 bytes)</dd>
+      <dt>R</dt><dd>link rate in bits per second (25 × 10<sup>9</sup>)</dd>
+    </dl>
+  </div>
+  <p><strong>RoCE v2:</strong> 32 READ response packets of 4096 bytes. H = 58 (headers incl. ICRC) + 4 (AETH on first/last/only responses; ignore for middle packets) + 24 ≈ 84. T ≈ 8 × (131,072 + 32 × 84) / 25e9 ≈ 8 × 133,760 / 25e9 ≈ <strong>42.8 µs</strong>.</p>
+  <p><strong>NVMe/TCP, jumbo frames:</strong> one H2CData PDU of 131,096 bytes (no digests) in ⌈131,096 / 8,948⌉ = 15 segments. H = 66 + 24 = 90. T ≈ 8 × (131,096 + 15 × 90) / 25e9 ≈ 8 × 132,446 / 25e9 ≈ <strong>42.4 µs</strong>.</p>
+  <p>On the wire they are essentially equal. The difference between transports is end-host processing: CPU cycles, copies, interrupt handling and scheduling jitter. RDMA wins those by a wide margin, and that is where its latency and efficiency advantage comes from. <span class="badge derived">Derived</span></p>
+  <aside class="callout insight">
+    <p>When someone claims "RDMA is faster because it is RDMA", ask "faster at what?" On the wire, no. In host CPU per I/O and tail latency under load, usually yes. In tolerance of lossy networks, no: RoCE suffers badly from loss, while TCP and iWARP cope.</p>
+  </aside>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <table>
+    <caption>NVMe/RDMA misconceptions</caption>
+    <thead><tr><th>Mistake</th><th>Why it is wrong</th><th>Correct view</th></tr></thead>
+    <tbody>
+      <tr><td>"RDMA means the target can access host memory."</td><td>Only registered regions, by key, within bounds, with matching rights, while the key is valid</td><td>Access is a revocable capability, not an address space</td></tr>
+      <tr><td>Confusing RDMA CQs with NVMe CQs</td><td>They are different queues in different layers</td><td>Verbs CQ entries report work requests. NVMe CQEs travel inside SEND payloads.</td></tr>
+      <tr><td>Expecting the host to issue RDMA WRITE for write data</td><td>The target pulls write data with RDMA READ</td><td>The target initiates all data operations</td></tr>
+      <tr><td>Looking for NVMe/RDMA in <code>tcpdump</code> on a hardware RNIC</td><td>RDMA traffic bypasses the kernel stack</td><td>Use a mirror port or tap, or Soft-RoCE in labs</td></tr>
+      <tr><td>Treating RoCE v2 like TCP on lossy networks</td><td>Go-back-N retransmission makes loss very expensive</td><td>Engineer the network: PFC/ECN, congestion control, or choose TCP/iWARP</td></tr>
+      <tr><td>Assuming a failed command failed alone</td><td>QP errors flush every outstanding WR on the QP</td><td>Look at all CIDs on the queue</td></tr>
+      <tr><td>Using a global rkey "for performance" without considering exposure</td><td>Any target bug or compromise can then read or write all registered host memory</td><td>Per-I/O registration with invalidation</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>Five NVMe/RDMA failure patterns, in the root-cause format used throughout the course:</p>
+  <table>
+    <caption>NVMe/RDMA failure patterns</caption>
+    <thead><tr><th>Pattern</th><th>Symptom</th><th>Evidence</th><th>First check</th><th>Disambiguating experiment</th><th>Likely conclusion (confidence)</th></tr></thead>
+    <tbody>
+      <tr><td>Connect rejected</td><td><code>nvme connect -t rdma</code> fails quickly</td><td>CM REJ with NVMe/RDMA private-data status, or an NVMe Connect status</td><td>Which message rejected: CM REJ or Connect response?</td><td>Retry with smaller queue size/count</td><td>Queue-size limits or target resources if CM REJ. Host NQN/subsystem config if Connect status. (High)</td></tr>
+      <tr><td>Address resolution failure</td><td>Connect hangs, then times out</td><td>No CM REQ on the wire. Host RDMA_CM route/address errors in logs.</td><td>Is the RoCE netdev up with an IP? Correct GID type?</td><td><code>rping</code> or <code>ib_send_lat</code> between the same endpoints</td><td>Routing/GID/VLAN configuration (Medium–High)</td></tr>
+      <tr><td>Remote access error</td><td>All I/O on one queue fails, then the controller reconnects</td><td>NAK Remote Access Error. Verbs WC error on target.</td><td>Compare SQE keyed SGL to RETH (key, VA, length)</td><td>Reproduce with fragmented buffers. Enable driver debug on registration.</td><td>Host mapping/registration bug or use-after-invalidate (Medium)</td></tr>
+      <tr><td>RNR storms</td><td>Latency spikes in multiples of the RNR timer</td><td>RNR NAKs, RNR counters rising</td><td>Which side NAKs? Compare HRQSIZE/CRQSIZE with queue depth.</td><td>Pin completion handling to idle CPUs</td><td>Receive reposting starved by CPU, or under-sized receive queues (Medium)</td></tr>
+      <tr><td>Retry exceeded</td><td>Queue errors under load, reconnects</td><td>Retransmissions, PSN sequence NAKs, then a transport retry-exceeded WC error</td><td>Switch drops and pause counters, ECN marking</td><td>Reduce load. Enable or verify PFC/ECN on the priority used for RoCE.</td><td>Lossy network for RoCE, misconfigured priority/DSCP mapping (High)</td></tr>
+      <tr><td>Pause storm / head-of-line blocking</td><td>Many unrelated flows slow down together</td><td>PFC pause frames on many ports, rising pause duration</td><td>Find the port originating pauses</td><td>Isolate the slow receiver (often a stuck host)</td><td>One slow endpoint back-pressuring the fabric through PFC (Medium)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight" data-title="RDMA turns correctness bugs into availability incidents">
+    <p>Because a protection error or retry exhaustion takes down the whole QP, and NVMe recovery resets the whole controller association, a single malformed I/O can stall every application using that path for the reconnect time. With native NVMe multipathing (see <a href="ch68.html">Fabric Architecture</a>) I/O fails over, but the root cause is often hidden behind "path flapped". Senior engineers keep the first QP error event with its WC status, because that is the evidence that survives the reconnect.</p>
+  </aside>
+  <aside class="callout insight" data-title="The network is part of the storage system">
+    <p>RoCE deployments succeed or fail on network engineering: priority mapping, PFC on exactly one priority, ECN thresholds, congestion control tuning, and buffer headroom. Storage teams that treat the network as "someone else's problem" see unexplained latency tails. Bring network counters into every storage incident review.</p>
+  </aside>
+  <aside class="callout insight" data-title="Registration is a security boundary">
+    <p>Per-I/O keys with remote invalidation give each command a capability that dies with it. Design reviews of NVMe/RDMA hosts should ask: what memory is exposed, to whom, for how long, and what happens on timeout paths where the host gives up on a command but the target may still write?</p>
+  </aside>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab: NVMe/RDMA on Soft-RoCE, captured and decoded</h3>
+  <h4>Objective</h4>
+  <p>Run NVMe/RDMA end to end inside one Linux VM using Soft-RoCE (<code>rxe</code>) and the in-kernel <code>nvmet-rdma</code> target. Capture the RoCE v2 traffic, identify the RDMA_CM exchange, the Connect capsules, keyed SGL descriptors, RDMA WRITE for reads and RDMA READ for writes, and SEND with Invalidate.</p>
+  <h4>Skills</h4>
+  <ul><li>Soft-RoCE setup</li><li>nvmet RDMA port configuration</li><li>RoCE v2 capture decoding</li><li>Matching SQE keyed SGL to RETH fields</li></ul>
+  <h4>Safety</h4>
+  <aside class="callout safety">
+    <p><span class="badge caution">Caution lab</span> Requires root, loads kernel modules and adds an RDMA link. Use a <strong>disposable VM</strong>. Back the namespace with a file created for the lab. Never use a real disk. Soft-RoCE is for learning and functional testing, not performance measurement.</p>
+  </aside>
+  <h4>Hardware required</h4>
+  <p>A Linux VM (2+ vCPUs, 2 GiB RAM) with one Ethernet interface, here <code>eth0</code> with an IPv4 address. No RNIC is needed.</p>
+  <h4>Software required</h4>
+  <p>Kernel modules <code>rdma_rxe</code>, <code>nvmet</code>, <code>nvmet-rdma</code>, <code>nvme-rdma</code>; <code>rdma-core</code> utilities; <code>iproute2</code> (the <code>rdma</code> tool); <code>nvme-cli</code>; <code>tcpdump</code>; Wireshark.</p>
+  <h4>Input</h4>
+  <p>Subsystem <code>nqn.2026-10.org.example:lab-ssd</code>, a 1 GiB backing file, and the VM's own IP address (here 192.0.2.10) as both target and host address.</p>
+  <h4>Expected output</h4>
+  <p>A pcap of UDP port 4791 traffic in which you annotate each RDMA operation type and the NVMe content inside SENDs.</p>
+  <h4>Background</h4>
+  <p>Soft-RoCE implements RoCE v2 in software on top of a normal netdev. Its packets travel through the kernel network stack, so <code>tcpdump</code> can capture them, unlike a hardware RNIC.</p>
+  <h4>Step 1: create the Soft-RoCE device and the target</h4>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code><span class="cm"># Caution: disposable VM only, as root.</span>
+modprobe rdma_rxe
+rdma link add rxe0 type rxe netdev eth0
+rdma link show                                   <span class="cm"># expect rxe0 state ACTIVE</span>
+
+modprobe nvmet nvmet-rdma nvme-rdma
+NQN=nqn.2026-10.org.example:lab-ssd; CFG=/sys/kernel/config/nvmet; IP=192.0.2.10
+truncate -s 1G /var/tmp/nvmet-rdma-lab.img
+mkdir $CFG/subsystems/$NQN
+echo 1 &gt; $CFG/subsystems/$NQN/attr_allow_any_host
+mkdir $CFG/subsystems/$NQN/namespaces/1
+echo -n /var/tmp/nvmet-rdma-lab.img &gt; $CFG/subsystems/$NQN/namespaces/1/device_path
+echo 1 &gt; $CFG/subsystems/$NQN/namespaces/1/enable
+mkdir $CFG/ports/2
+echo rdma &gt; $CFG/ports/2/addr_trtype
+echo ipv4 &gt; $CFG/ports/2/addr_adrfam
+echo $IP  &gt; $CFG/ports/2/addr_traddr
+echo 4420 &gt; $CFG/ports/2/addr_trsvcid
+ln -s $CFG/subsystems/$NQN $CFG/ports/2/subsystems/$NQN</code></pre>
+  <h4>Step 2: capture connect, read and write</h4>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code>tcpdump -i eth0 -s 0 -w /var/tmp/nvme_rdma_lab.pcap 'udp port 4791' &amp;
+sleep 1
+nvme connect -t rdma -a $IP -s 4420 -n $NQN --nr-io-queues=1
+DEV=/dev/nvme1n1                                 <span class="cm"># adjust to nvme list output</span>
+dd if=$DEV of=/dev/null bs=4k count=1 iflag=direct
+dd if=/dev/urandom of=$DEV bs=64k count=1 seek=4 oflag=direct
+nvme disconnect -n $NQN
+kill %1</code></pre>
+  <p>Soft-RoCE sends to its own IP address over loopback routing in some configurations. If the pcap is empty, capture on <code>lo</code> as well. <span class="badge impl">Implementation-dependent</span></p>
+  <h4>Step 3: decode, then tear down</h4>
+  <p>Open the pcap in Wireshark. RoCE v2 on UDP 4791 is decoded as InfiniBand, and NVMe capsules in SENDs are decoded as NVMe-oF over RDMA where the dissector recognises them. Use the display filter <code>infiniband</code>. Then tear everything down:</p>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code>rm $CFG/ports/2/subsystems/$NQN; rmdir $CFG/ports/2
+echo 0 &gt; $CFG/subsystems/$NQN/namespaces/1/enable
+rmdir $CFG/subsystems/$NQN/namespaces/1; rmdir $CFG/subsystems/$NQN
+rm /var/tmp/nvmet-rdma-lab.img
+rdma link delete rxe0</code></pre>
+  <h4>Observation</h4>
+  <p>For each queue: the CM REQ/REP/RTU messages and their private data (QID, HRQSIZE, HSQSIZE, CRQSIZE). For the read: the keyed SGL in the SQE, and the matching RETH in the RDMA WRITE. For the write: whether it was in-capsule or used an RDMA READ.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Which QP numbers did the admin and I/O queues use on each side?</li>
+    <li>Does the R_key in the RDMA WRITE's RETH equal the key in the read command's keyed SGL? Is the SGL identifier 40h or 4Fh?</li>
+    <li>Was the response a plain SEND or a SEND with Invalidate? What does that tell you about the host's choice?</li>
+    <li>For the 64 KiB write, how many RDMA READ response packets did you see, and what path MTU does that imply?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Find the Property Get/Set commands on the admin queue and list their offsets. Then compare the total number of frames for the 4 KiB read here with the NVMe/TCP lab in <a href="ch66.html#lab">Chapter 66</a>, and explain the difference.</p>
+  <details class="hint"><summary>Hint</summary><p>Look for "RDMA Write" and "RDMA Read Request" in the Info column, then follow the PSNs. The CM messages are on destination QP 1 (the General Services Interface QP).</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <ol>
+      <li>Each RC connection has its own QP number on each side. Expect two pairs: admin and I/O. Numbers are assigned by rxe and vary per run.</li>
+      <li>Yes. The RETH R_key equals the keyed SGL Key field. Linux nvme-rdma normally requests remote invalidation, so expect 4Fh. <span class="badge impl">Implementation-dependent</span></li>
+      <li>Usually SEND with Invalidate (IETH present, carrying the same key). That shows the host asked for remote invalidation and the target honoured it.</li>
+      <li>64 KiB / path MTU. With an active MTU of 1024 (common for rxe on a 1,500-byte netdev), expect 64 response packets (First, 62 Middle, Last). With 4096, expect 16. Note: Linux nvmet may receive small writes in-capsule, but 64 KiB normally exceeds that.</li>
+    </ol>
+    <p>Challenge: Property Get CAP (00h), VS (08h), Property Set CC (14h), Property Get CSTS (1Ch), as in the TCP lab. The 4 KiB read uses SEND, ACK, RDMA WRITE (one or several packets depending on MTU), SEND with Invalidate and ACK. TCP uses CapsuleCmd, C2HData, CapsuleResp and TCP ACKs. Frame counts are similar, and the differences come from MTU and ACK coalescing.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>The ACKs. In RoCE they are generated by the RNIC (here, rxe in software) and coalesced. Their timing tells you about the <em>receiver's transport layer</em>, not about NVMe processing. An ACK that arrives promptly while the response capsule arrives late means the target received the command fine and was slow to process it.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li><code>rdma link add</code> fails: the <code>rdma_rxe</code> module is not available in this kernel. Use a distribution kernel that includes it.</li>
+    <li><code>nvme connect</code> fails with an address error: the port's <code>addr_traddr</code> does not match an IP on the rxe-backed netdev.</li>
+    <li>Writing <code>enable</code> on the port's subsystem link fails: <code>nvmet-rdma</code> is not loaded, so the RDMA transport is not registered.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Repeat with two VMs on a virtual network, one as host and one as target, so CM and data traffic cross a real (virtual) link. Then add <code>tc netem loss 0.1%</code> on the target's interface (Caution) and observe PSN sequence NAKs and go-back-N retransmission compared with TCP's selective recovery.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Decode this keyed SGL descriptor: <code>00 00 01 00 02 00 00 00 | 00 00 02 | 77 66 55 00 | 40</code>.</li>
+    <li>List the RDMA operations, in order, for a 16 KiB write with in-capsule size 4 KiB.</li>
+    <li>Why does NVMe/RDMA not need NVMe/TCP's header and data digests?</li>
+    <li>Explain RNR to a colleague who knows NVMe over PCIe but not RDMA, using a PCIe analogy and its limits.</li>
+    <li>A host advertises HRQSIZE = 32 but allows 128 outstanding commands per queue. Predict the symptom.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <ol>
+      <li>Address 0x0000_0002_0001_0000. Length 0x020000 = 131,072 (128 KiB). Key 0x00556677. Identifier 40h: Keyed Data Block, Address subtype (no remote invalidation requested).</li>
+      <li>16 KiB &gt; 4 KiB, so not in-capsule. Host: [REG_MR] + SEND(capsule, keyed SGL). Target: RDMA READ request → READ responses (4 at PMTU 4096). Target writes to media → SEND with Invalidate (response). Plus RNIC ACKs.</li>
+      <li>The RDMA transport protects every packet end to end between RNICs with the ICRC (RoCE/IB) or MPA CRC (iWARP), and the RC service guarantees delivery. Corruption inside the endpoints is still possible, but the network path is already covered.</li>
+      <li>Over PCIe, a receiver that cannot accept a posted write withholds flow-control credits, and the sender simply waits. RNR is similar in spirit: "no receive buffer, try later". But it is a NAK followed by a timer-based retry, and it consumes a retry budget. Exhaust it and the QP fails, which never happens to PCIe credit waits.</li>
+      <li>Under load, more response capsules than posted receives can arrive. Expect RNR NAKs on the host side, latency spikes in multiples of the RNR timer, and possibly QP failure when RNR retries are exhausted. A correct host never allows more outstanding commands than it has receives.</li>
+    </ol>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>Which RDMA operation carries a command capsule?</p>
+      <ul class="options" data-answer="1"><li>SEND</li><li>RDMA WRITE</li><li>RDMA READ</li><li>Atomic Compare-and-Swap</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Capsules are messages delivered into posted receive buffers via SEND.</p></details></li>
+    <li><p>Who issues the RDMA READ that fetches write data?</p>
+      <ul class="options" data-answer="2"><li>The host</li><li>The target</li><li>The switch</li><li>The subnet manager</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The target initiates all data operations, mirroring the PCIe controller's role as DMA master.</p></details></li>
+    <li><p>SGL identifier 4Fh means:</p>
+      <ul class="options" data-answer="3"><li>Data Block, Offset</li><li>Transport Data Block</li><li>Keyed Data Block, Invalidate Key</li><li>Last Segment</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Type 4h (Keyed SGL Data Block), subtype Fh (Invalidate Key).</p></details></li>
+    <li><p>Which RDMA transport service does NVMe/RDMA use?</p>
+      <ul class="options" data-answer="4"><li>Unreliable Datagram</li><li>Unreliable Connected</li><li>Reliable Datagram</li><li>Reliable Connected</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>RC: connected, reliable, in order. One QP per NVMe queue pair.</p></details></li>
+    <li><p>RoCE v2 packets are identified on the wire by:</p>
+      <ul class="options" data-answer="2"><li>TCP port 4420</li><li>UDP destination port 4791</li><li>EtherType 0x8915 only</li><li>TCP port 8009</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>RoCE v2 uses UDP/IP with destination port 4791. EtherType 0x8915 is RoCE v1. 4420 is the NVMe-oF service port in the RDMA_CM port space and for TCP.</p></details></li>
+    <li><p>A NAK with Remote Access Error causes:</p>
+      <ul class="options" data-answer="3"><li>A retry of the same packet</li><li>An NVMe status in the response capsule</li><li>The QP to enter the error state, flushing outstanding work</li><li>Nothing: it is informational</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Protection errors are fatal to the QP. The NVMe host must recover the queue (usually the whole controller).</p></details></li>
+    <li><p>What carries the NVMe queue ID during NVMe/RDMA connection setup, before the Connect command?</p>
+      <ul class="options" data-answer="1"><li>RDMA_CM REQ private data</li><li>ICReq PDU</li><li>The BTH</li><li>The Discovery Log Page</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>NVMe/RDMA defines CM private data (RECFMT, QID, HRQSIZE, HSQSIZE). ICReq is NVMe/TCP.</p></details></li>
+    <li><p>Why can't <code>tcpdump</code> normally see NVMe/RDMA traffic on a hardware RNIC?</p>
+      <ul class="options" data-answer="4"><li>It is encrypted</li><li>It uses a different MAC address</li><li>It uses IPv6 only</li><li>The RNIC sends and receives it without the kernel network stack</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Kernel bypass is the point of RDMA. Use taps or mirror ports, vendor sniffer features, or Soft-RoCE.</p></details></li>
+    <li><p>Open: why does NVMe/RDMA's write path have the same round-trip count as NVMe/TCP's R2T path, and where is the advantage?</p>
+      <details class="answer"><summary>Model answer</summary><p>Both require the target to solicit data (RDMA READ request vs R2T) and the host side to deliver it, then a response: two round trips. RDMA's advantage is that the host RNIC serves the READ without host CPU involvement or copies, giving lower CPU cost and less latency variance.</p></details></li>
+    <li><p>Open: what is the risk of a host completing an I/O to the application before the rkey is invalidated?</p>
+      <details class="answer"><summary>Model answer</summary><p>The buffer may be reused for other data while the remote target still holds a valid key. A delayed or buggy RDMA WRITE could then corrupt unrelated data, or a READ could leak it. The host must ensure invalidation, remote or local, completes first.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> What is RDMA in one paragraph?</p>
+      <details class="answer"><summary>Model answer</summary><p>A networking model in which an adapter reads and writes memory on a remote machine, within regions the remote side registered and named with keys, without the remote CPU copying data. It relies on queue pairs, work requests and completion queues managed by RDMA-capable NICs, over InfiniBand, RoCE or iWARP.</p></details></li>
+    <li><p><strong>Beginner:</strong> How does NVMe map onto RDMA?</p>
+      <details class="answer"><summary>Model answer</summary><p>One RC QP per NVMe queue pair. Command and response capsules travel by SEND. Read data goes by target RDMA WRITE, and write data by target RDMA READ (or in-capsule). Host buffers are described by Keyed SGL descriptors with address, length and rkey.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Explain memory registration and why per-I/O registration is preferred.</p>
+      <details class="answer"><summary>Model answer</summary><p>Registration pins pages, loads translations into the RNIC and creates keys with access rights. Per-I/O fast registration limits exposure to the buffers of in-flight commands and invalidates keys at completion. Global registration exposes all memory permanently, which is a security and fault-containment risk.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Compare RoCE v2 and iWARP for NVMe/RDMA.</p>
+      <details class="answer"><summary>Model answer</summary><p>RoCE v2 runs IB transport over UDP/IP, needs well-engineered (often lossless or ECN-managed) Ethernet, and offers low latency with go-back-N loss recovery. iWARP runs RDMA over TCP, tolerates lossy and routed networks, and has historically had less vendor adoption. NVMe-level behaviour is identical.</p></details></li>
+    <li><p><strong>Advanced:</strong> All commands on one I/O queue failed at once, followed by a reconnect. What do you suspect and how do you prove it?</p>
+      <details class="answer"><summary>Model answer</summary><p>A QP-fatal event: remote access error, retry exceeded, RNR retries exceeded, or local protection error. Get the first verbs WC error status from host and target logs, capture the NAK type if possible, and compare the keyed SGL with the RETH. Check network counters for loss. The first WC error identifies the class.</p></details></li>
+    <li><p><strong>Advanced:</strong> Why does SEND with Invalidate exist, and what does it save?</p>
+      <details class="answer"><summary>Model answer</summary><p>It combines delivering the response capsule with invalidating the host's rkey, saving the host a Local Invalidate work request and its completion per I/O. This reduces latency and CPU, and closes the exposure window at the moment the target declares completion.</p></details></li>
+    <li><p><strong>Senior:</strong> Design the network requirements for a RoCE v2 NVMe/RDMA deployment.</p>
+      <details class="answer"><summary>Model answer</summary><p>A dedicated traffic class for RoCE with consistent DSCP/PCP mapping. PFC enabled only on that priority with sufficient headroom, or ECN-based congestion control (DCQCN-like) with correctly tuned marking thresholds. Consistent MTU, pause-storm protection (watchdogs), monitoring of CNPs, pauses and drops, and failure-domain separation with multipathing across two fabrics.</p></details></li>
+    <li><p><strong>Senior:</strong> What would you validate in an NVMe/RDMA target before shipping?</p>
+      <details class="answer"><summary>Model answer</summary><p>Correct use of keys (never beyond SGL length, never after completion), handling of multiple keyed descriptors up to MSDBD, in-capsule boundaries, CM private-data validation and REJ reasons, behaviour on QP errors (cleanup, no leaks), RNR avoidance under maximum queue depth, interoperability across RoCE v2, iWARP and IB, and recovery during network loss and congestion.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain the locked shelf, the secret code, and why the lock is changed after each job.</li>
+    <li><strong>To a junior engineer:</strong> walk through a 4 KiB read, naming every RDMA operation and who issues it.</li>
+    <li><strong>To a senior engineer:</strong> explain why a single invalid key causes a controller-wide reconnect, and propose a mitigation.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "The library's robot can reach into our classroom, but only into the one shelf we unlocked for it, and only with today's code. When it is done, we change the code so nobody can sneak in later."</p>
+    <p><strong>Junior:</strong> "The host registers the buffer, gets an rkey, puts address + length + key in the SQE, and SENDs the capsule. The target reads from its SSD, does an RDMA WRITE of 4 KiB to that address with that key, then a SEND with Invalidate carrying the CQE. The host RNIC places the data, invalidates the key, and the host completes the request."</p>
+    <p><strong>Senior:</strong> "Protection errors are fatal to an RC QP, so all its outstanding work is flushed. NVMe hosts recover by resetting the controller association, which tears down every queue. Mitigations: validate mappings before advertising keys, keep per-I/O keys so stale-key bugs are caught rather than silently corrupting, use multipathing so I/O fails over during reconnect, and log the first WC error for root cause."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <ul>
+    <li>RDMA lets RNICs move data directly between registered memory regions, protected by keys, without CPU copies.</li>
+    <li>NVMe/RDMA maps each NVMe queue pair to one Reliable Connected QP. Capsules travel by SEND. The target moves data with RDMA WRITE (reads) and RDMA READ (writes).</li>
+    <li>Keyed SGL Data Block descriptors (40h, or 4Fh with Invalidate Key) carry address, length and rkey inside the SQE.</li>
+    <li>RDMA_CM, with NVMe private data (QID, queue sizes), establishes each QP before the NVMe Connect.</li>
+    <li>InfiniBand, RoCE v2 and iWARP differ in layering and loss handling, not in NVMe behaviour.</li>
+    <li>QP-fatal errors (remote access, retry exceeded, RNR exhausted) fail all commands on the queue and trigger reconnect.</li>
+  </ul>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>name the RDMA objects and say which side creates each</li>
+      <li>draw NVMe/RDMA read and write sequences with RDMA operations and initiators</li>
+      <li>decode a keyed SGL descriptor and match it to a RETH in a capture</li>
+      <li>explain memory registration, invalidation and their security role</li>
+      <li>distinguish InfiniBand, RoCE v1, RoCE v2 and iWARP</li>
+      <li>classify RNR, remote access and retry-exceeded failures and their blast radius</li>
+      <li>set up and tear down a Soft-RoCE NVMe/RDMA lab safely</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVMe over RDMA Transport Specification, Revision 1.3</cite></li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — SGL descriptors (Keyed SGL Data Block), capsules, Fabrics commands</cite></li>
+    <li>InfiniBand Trade Association: InfiniBand Architecture Specification, Volume 1, and the RoCE v2 annex</li>
+    <li>IETF RFC 5040 (RDMAP), RFC 5041 (DDP), RFC 5044 (MPA) for iWARP</li>
+    <li>Linux: <code>drivers/nvme/host/rdma.c</code>, <code>drivers/nvme/target/rdma.c</code>, <code>drivers/infiniband/sw/rxe/</code>, rdma-core documentation (reference implementation, not normative)</li>
+  </ul>
+  <p>Deep dive: <a href="dd51.html">NVMe/RDMA module</a>. Compare with <a href="ch66.html">NVMe/TCP</a>.</p>
+  <p><strong>Next:</strong> <a href="ch68.html">Fabric Architecture</a>. We zoom out from one connection to the whole system: host, fabric, target, subsystem, controller, namespace, with discovery, NQNs, multipathing and keep alive.</p>
+</section>

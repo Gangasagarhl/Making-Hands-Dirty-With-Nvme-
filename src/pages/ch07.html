@@ -1,0 +1,748 @@
+<p class="lead">PCI Express is built in three layers: the Transaction Layer says <em>what</em> to do, the Data Link Layer makes sure it arrives <em>intact and in order</em> across one link, and the Physical Layer turns it into <em>signals</em>. Knowing exactly which layer owns which job, which packet and which error is the single most useful skill in reading PCIe traces and error logs.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>When an NVMe SSD reports a problem, the evidence arrives labelled by layer even if nobody says so. "Receiver Error" is a Physical Layer complaint. "Bad TLP" and "Replay Timer Timeout" are Data Link Layer complaints. "Unsupported Request" and "Completion Timeout" are Transaction Layer complaints. Each points to different causes and different owners. Engineers who do not know the layer model chase signal integrity when the bug is a driver writing to an unmapped address, or chase driver bugs when a connector is dirty.</p>
+  <p>This chapter is the map. <a href="ch10.html">Part V</a> then dives into the Transaction Layer, <a href="ch15.html">Part VI</a> into the Data Link Layer, and <a href="ch08.html">Chapters 8</a>–<a href="ch09.html">9</a> into the Physical Layer's state machine.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Name the three PCIe layers and state each layer's purpose and main responsibilities.</li>
+    <li>Follow one NVMe doorbell write down the transmitter's layers and up the receiver's, naming what each layer adds and checks.</li>
+    <li>Recognise the basic structures: TLP header DW0, DLLP format, physical framing and ordered sets.</li>
+    <li>Classify a PCIe error by layer and by severity (correctable, non-fatal, fatal).</li>
+    <li>Say what each layer's activity looks like in an analyzer trace and what (little) Linux can see of it.</li>
+    <li>Explain hop-by-hop (link-local) versus end-to-end mechanisms.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>Topology and routing from <a href="ch04.html">Chapter 4</a>; lanes, striping and ordered sets from <a href="ch05.html">Chapter 5</a>; encodings and Flit Mode from <a href="ch06.html">Chapter 6</a>. If "posted" versus "non-posted" is new, that is fine: <a href="ch12.html">Chapter 12</a> covers it.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Think of sending a parcel through a chain of post offices.</p>
+    <ul>
+      <li><strong>You</strong> write the letter and the address: "Please put these 4 numbers in drawer 1008 at the SSD's house." That is the <em>Transaction Layer</em>. It decides what the message means and where it goes.</li>
+      <li>At each post office counter, a clerk puts the letter in an envelope, writes a <strong>ticket number</strong> on it, and seals it with a special sticker that shows if anyone tore it. The clerk keeps a photocopy until the next counter says "got ticket 26, all fine". If the next counter says "ticket 26 was torn", the clerk sends the photocopy again. That is the <em>Data Link Layer</em>. It only cares about getting from this counter to the next one.</li>
+      <li>The <strong>delivery van</strong> drives the envelope along the road, at whatever speed the road allows, in whatever lanes are open. That is the <em>Physical Layer</em>.</li>
+    </ul>
+  </aside>
+  <aside class="callout analogy">
+    <p>Network engineers will recognise the shape from TCP/IP over Ethernet: an application request (Transaction Layer), a reliable delivery mechanism with sequence numbers and acknowledgements (Data Link Layer), and framing plus signalling on a cable (Physical Layer). The PCIe layers are a compressed, hardware-implemented version of that stack.</p>
+  </aside>
+  <aside class="callout breaks">
+    <ul>
+      <li><strong>Reliability is per hop, not end to end.</strong> TCP's acknowledgements are end to end. PCIe's Ack/Nak works only between the two ports of one link. Across a Switch, each link has its own sequence numbers and its own retries; the Switch could, in principle, corrupt a packet internally after a successful link-level check. End-to-end protection exists only as the optional End-to-end CRC (ECRC) and data poisoning.</li>
+      <li><strong>No routing at the link layer.</strong> In networking, layer 2 has addresses. The PCIe Data Link Layer has none; it talks only to its single neighbour. Routing information lives in the TLP header.</li>
+      <li><strong>Everything is hardware and fast.</strong> Retries complete in hundreds of nanoseconds to microseconds, without software.</li>
+      <li><strong>The post office never loses envelopes silently.</strong> A PCIe link that cannot deliver retrains and, if that fails, goes down; software is told.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>Each PCIe port contains the same three layers, stacked:</p>
+  <div class="flow">
+    <div>Device core / software<small>NVMe controller logic; CPU and driver on the host side</small></div>
+    <div class="hl">Transaction Layer<small>builds and checks TLPs: reads, writes, completions, messages; flow-control credits; ordering</small></div>
+    <div class="hl">Data Link Layer<small>sequence numbers, LCRC, Ack/Nak, replay; DLLPs</small></div>
+    <div class="hl">Physical Layer<small>framing, scrambling/encoding, lanes, LTSSM, SerDes</small></div>
+    <div>The link<small>copper, connectors, retimers</small></div>
+  </div>
+  <p>When the CPU writes an NVMe doorbell, the Root Port's Transaction Layer builds a Transaction Layer Packet (<span class="g" data-term="tlp">TLP</span>) that says "memory write, address 0xFE60_1008, 4 bytes, value 6". The Data Link Layer gives it a sequence number and a checksum (the Link CRC, <span class="g" data-term="lcrc">LCRC</span>). The Physical Layer frames it and sends it across the lanes.</p>
+  <p>At the SSD, the layers run in reverse. The Physical Layer recovers the bytes. The Data Link Layer checks the LCRC and sequence number, sends back a small acknowledgement (a Data Link Layer Packet, <span class="g" data-term="dllp">DLLP</span>, of type Ack), and passes the TLP up. The Transaction Layer reads the header and delivers the write to the NVMe controller's doorbell register.</p>
+  <p>Three kinds of things therefore travel on a link: TLPs (meaningful work), DLLPs (link housekeeping), and ordered sets (physical housekeeping).</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+  <p>First the whole journey, then each layer in depth.</p>
+  <figure>
+    <ol class="seq" data-actors="RP Transaction|RP Data Link|RP Physical|SSD Physical|SSD Data Link|SSD Transaction">
+      <li data-note="RP Transaction">build MWr header + 4 B data</li>
+      <li data-from="RP Transaction" data-to="RP Data Link">TLP (needs PH+PD credits)</li>
+      <li data-note="RP Data Link">add Seq 0x01A + LCRC; keep copy</li>
+      <li data-from="RP Data Link" data-to="RP Physical">sequenced TLP</li>
+      <li data-from="RP Physical" data-to="SSD Physical">framed, scrambled, striped x4</li>
+      <li data-from="SSD Physical" data-to="SSD Data Link">recovered bytes</li>
+      <li data-note="SSD Data Link">check LCRC and Seq: OK</li>
+      <li data-from="SSD Data Link" data-to="SSD Transaction">TLP to receive buffer</li>
+      <li data-from="SSD Data Link" data-to="RP Data Link" class="dashed">Ack DLLP Seq 0x01A</li>
+      <li data-note="RP Data Link">purge copy from replay buffer</li>
+      <li data-note="SSD Transaction">decode, route to doorbell</li>
+      <li data-from="SSD Transaction" data-to="RP Transaction" class="dashed">UpdateFC DLLP (credits)</li>
+    </ol>
+    <figcaption>One posted Memory Write (the SQ1 tail doorbell) through all three layers on both sides. Ack and UpdateFC are DLLPs: generated and consumed by the Data Link Layers (UpdateFC reports Transaction Layer buffer space). Conceptual; lab system values; synthetic example for teaching.</figcaption>
+  </figure>
+
+  <h3>Physical Layer</h3>
+  <aside class="callout kid"><p>The Physical Layer is the delivery van and the road. It does not read the letter. It just makes sure envelopes get onto the road, in the right lanes, at a speed the road can handle, and that the van at the other end knows where each envelope starts and stops.</p></aside>
+  <h4>Purpose</h4>
+  <p>Move bytes between two ports reliably enough for the Data Link Layer to do the rest, and manage the link itself.</p>
+  <h4>Responsibilities</h4>
+  <p>The specification divides it into a <strong>logical sub-block</strong> and an <strong>electrical sub-block</strong>.</p>
+  <ul>
+    <li><strong>Framing:</strong> marking the start and end of each TLP and DLLP (K-code symbols at 8b/10b; tokens at 128b/130b; flit structure in Flit Mode).</li>
+    <li><strong>Byte striping</strong> across lanes and <strong>deskew</strong> at the receiver.</li>
+    <li><strong>Scrambling and encoding</strong> (8b/10b; 128b/130b with sync headers; PAM4 and FEC in Flit Mode).</li>
+    <li><strong>Ordered sets:</strong> TS1/TS2 (training), SKP (clock compensation), EIOS/EIEOS (electrical idle entry/exit), FTS (L0s exit), SDS (start of data stream).</li>
+    <li><strong>The Link Training and Status State Machine (<span class="g" data-term="ltssm">LTSSM</span>)</strong>: detect, train, set width and speed, equalise, recover, enter and leave low-power states (<a href="ch08.html">Chapter 8</a>).</li>
+    <li><strong>Electrical:</strong> transmitters, receivers, equalisation, clock recovery, receiver detection, electrical idle (<a href="ch05.html">Chapter 5</a>).</li>
+  </ul>
+  <h4>Packet structures</h4>
+  <table>
+    <caption>Physical Layer framing of a TLP in non-flit modes (overview; confirm details in the Base Specification)</caption>
+    <thead><tr><th>Mode</th><th>Before the TLP</th><th>After the TLP</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>8b/10b (2.5, 5.0 GT/s)</td><td>STP control symbol (K27.7)</td><td>END control symbol (K29.7), or EDB (K30.7) to nullify</td><td>DLLPs framed by SDP (K28.2) … END</td></tr>
+      <tr><td>128b/130b (8.0–32.0 GT/s)</td><td>STP token (4 bytes, including the TLP length and its own check bits)</td><td>No end token; the length field marks the end</td><td>DLLPs framed by an SDP token; EDS token ends a data stream; IDL tokens fill idle time</td></tr>
+      <tr><td>Flit Mode (all rates when enabled; mandatory at 64 and 128 GT/s)</td><td colspan="2">TLPs packed into the TLP bytes of 256-byte flits; no per-TLP framing token or LCRC</td><td>Flit-level CRC, FEC and sequence/Ack information</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>Ordered sets you will see in traces</caption>
+    <thead><tr><th>Ordered set</th><th>When</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="ts1">TS1</span> / <span class="g" data-term="ts2">TS2</span></td><td>Polling, Configuration, Recovery</td><td>Training: link/lane numbers, data rates, control bits, equalisation information</td></tr>
+      <tr><td><span class="g" data-term="skp">SKP</span></td><td>Periodically in L0 (and during training)</td><td>Clock compensation: receivers add or drop SKP symbols in the elastic buffer</td></tr>
+      <tr><td><span class="g" data-term="eios">EIOS</span></td><td>Before entering Electrical Idle</td><td>Tells the partner "I am going quiet"</td></tr>
+      <tr><td><span class="g" data-term="eieos">EIEOS</span></td><td>Leaving Electrical Idle at 8 GT/s and above; periodically during training</td><td>Exit indication; block alignment pattern</td></tr>
+      <tr><td><span class="g" data-term="fts">FTS</span></td><td>Leaving L0s</td><td>Quick re-lock without full training</td></tr>
+      <tr><td><span class="g" data-term="sds">SDS</span></td><td>At 128b/130b rates, before data in L0</td><td>Marks start of a data stream after ordered sets</td></tr>
+    </tbody>
+  </table>
+  <h4>Errors</h4>
+  <ul>
+    <li><strong>Receiver Error</strong> (correctable): an umbrella for physical problems such as 8b/10b invalid symbols or disparity errors, 128b/130b sync header errors, framing errors, elastic buffer over/underflow, and lock loss. Precisely which events are counted is defined in the specification and partly implementation-dependent.</li>
+    <li><strong>Training failures:</strong> not an AER error class; visible as a link that never reaches L0, reduced width/speed, or repeated Recovery.</li>
+    <li><strong>Surprise Down</strong>: the link went down without software asking; reported by the Data Link Layer of a downstream port that supports it.</li>
+  </ul>
+  <h4>Trace visibility</h4>
+  <p>Fully visible to a protocol analyzer: ordered sets, LTSSM state transitions (analyzers infer them), per-lane symbol errors, electrical idle periods, data rate changes. An oscilloscope or the receiver's margining capability sees the analog layer. Linux sees only the results: Link Status, correctable Receiver Error counts, link-bandwidth notifications.</p>
+
+  <h3>Data Link Layer</h3>
+  <aside class="callout kid"><p>The Data Link Layer is the counter clerk who numbers every envelope, seals it with a tamper sticker, keeps a photocopy, and resends it if the next counter says it arrived torn. The clerk only ever talks to the next counter, never to the final address.</p></aside>
+  <h4>Purpose</h4>
+  <p>Provide a reliable, ordered TLP delivery service across <em>one link</em>, and exchange link-management information.</p>
+  <h4>Responsibilities</h4>
+  <ul>
+    <li><strong>Link initialisation:</strong> after the Physical Layer reports link up, the Data Link Layer moves from DL_Inactive through DL_Init (exchanging InitFC1 and InitFC2 DLLPs to advertise initial flow-control credits) to DL_Active. Only then can TLPs flow.</li>
+    <li><strong>Sequence numbers:</strong> a 12-bit sequence number on every TLP, incremented per TLP, wrapping at 4096.</li>
+    <li><strong>LCRC:</strong> a 32-bit Link CRC over the sequence number and TLP, checked by the receiver.</li>
+    <li><strong><span class="g" data-term="ack-nak">Ack/Nak protocol</span>:</strong> the receiver acknowledges good TLPs (Ack DLLP with the latest good sequence number, cumulative) or requests replay (Nak). The transmitter keeps every TLP in a <span class="g" data-term="replay-buffer">replay buffer</span> until acknowledged.</li>
+    <li><strong>Replay timer and REPLAY_NUM:</strong> if no Ack arrives in time, the transmitter replays. A small counter tracks consecutive replays; when it rolls over, the Data Link Layer asks the Physical Layer to retrain the link (enter Recovery).</li>
+    <li><strong>Flow-control credit exchange:</strong> carries the Transaction Layer's credit information in InitFC and UpdateFC DLLPs.</li>
+    <li><strong>Power management handshakes:</strong> PM DLLPs for entering L1 and L2/L3 Ready.</li>
+    <li><strong>Data Link Features exchange</strong> (Revision 4.0 and later): optional capabilities such as scaled flow control are negotiated with a Data Link Feature DLLP. <span class="badge version">Version-dependent</span></li>
+  </ul>
+  <h4>Packet structures</h4>
+  <p>What the Data Link Layer adds to a TLP in non-flit mode:</p>
+  <figure>
+    <pre class="diagram">
+  +----------+-----------+------------------------+--------+--------+---------+
+  | framing  |  Seq Num  |   TLP header (3-4 DW)  |  data  | ECRC   |  LCRC   |
+  | (PHY)    | 12 bits*  |  (Transaction Layer)   | 0-1024 | (opt,  | 32 bits |
+  |          |  (DLL)    |                        |  DW    |  TL)   |  (DLL)  |
+  +----------+-----------+------------------------+--------+--------+---------+
+   * carried in a 2-byte field at 8b/10b, inside the STP token at 128b/130b
+    </pre>
+    <figcaption>Layer ownership of the bytes of one TLP on the wire in non-flit mode. The Transaction Layer owns the header, data and optional ECRC; the Data Link Layer adds the sequence number and LCRC; the Physical Layer adds framing. Conceptual diagram.</figcaption>
+  </figure>
+  <p>A DLLP is small and fixed-size: 4 bytes of content plus a 16-bit CRC, framed by the Physical Layer. The first byte is the DLLP type.</p>
+  <table class="packet">
+    <thead><tr><th class="row-label">Byte</th><th colspan="8">0</th><th colspan="8">1</th><th colspan="8">2</th><th colspan="8">3</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">Ack/Nak</td><td colspan="8" class="hl">DLLP Type (00h Ack, 10h Nak)</td><td colspan="8" class="rsvd">Reserved</td><td colspan="4" class="rsvd">Rsvd</td><td colspan="12">AckNak_Seq_Num (12 bits)</td></tr>
+      <tr><td class="row-label">FC DLLP</td><td colspan="4" class="hl">Type</td><td colspan="1" class="rsvd">0</td><td colspan="3">VC ID</td><td colspan="2" class="rsvd">*</td><td colspan="8">HdrFC</td><td colspan="2" class="rsvd">*</td><td colspan="12">DataFC</td></tr>
+      <tr><td class="row-label">+2 bytes</td><td colspan="32">16-bit DLLP CRC follows the 4 content bytes</td></tr>
+    </tbody>
+  </table>
+  <p>Fields marked * hold scale information in revisions that support scaled flow control, and are reserved otherwise. <span class="badge version">Version-dependent</span> Confirm bit placement of HdrFC/DataFC in the Base Specification's DLLP format figures.</p>
+  <table>
+    <caption>DLLP types (encodings of the first byte)</caption>
+    <thead><tr><th>DLLP</th><th>Type encoding</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td>Ack</td><td>0000 0000b (00h)</td><td>Acknowledge TLPs up to AckNak_Seq_Num</td></tr>
+      <tr><td>Nak</td><td>0001 0000b (10h)</td><td>Request replay of TLPs after AckNak_Seq_Num</td></tr>
+      <tr><td>PM_Enter_L1</td><td>0010 0000b (20h)</td><td>Request L1 entry (software-directed PM)</td></tr>
+      <tr><td>PM_Enter_L23</td><td>0010 0001b (21h)</td><td>Prepare for L2/L3 Ready</td></tr>
+      <tr><td>PM_Active_State_Request_L1</td><td>0010 0011b (23h)</td><td>ASPM L1 entry request</td></tr>
+      <tr><td>PM_Request_Ack</td><td>0010 0100b (24h)</td><td>Acknowledge a PM request</td></tr>
+      <tr><td>Vendor-specific</td><td>0011 0000b (30h)</td><td>Implementation-defined</td></tr>
+      <tr><td>InitFC1-P / NP / Cpl</td><td>0100 0vvvb / 0101 0vvvb / 0110 0vvvb</td><td>Initial credit advertisement, phase 1 (vvv = VC ID)</td></tr>
+      <tr><td>InitFC2-P / NP / Cpl</td><td>1100 0vvvb / 1101 0vvvb / 1110 0vvvb</td><td>Initial credit advertisement, phase 2</td></tr>
+      <tr><td>UpdateFC-P / NP / Cpl</td><td>1000 0vvvb / 1001 0vvvb / 1010 0vvvb</td><td>Return credits as receive buffers free up</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout version"><p>Newer revisions add DLLP types (for example the Data Link Feature DLLP in Revision 4.0 and later). In Flit Mode, much Ack/Nak and credit information moves into the flit's Data Link Layer payload bytes. Check the DLLP type table of your revision.</p></aside>
+  <h4>Errors</h4>
+  <table>
+    <caption>Data Link Layer errors (AER names)</caption>
+    <thead><tr><th>Error</th><th>Default severity</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>Bad TLP</td><td>Correctable</td><td>Received TLP with bad LCRC or wrong sequence number; Nak sent</td></tr>
+      <tr><td>Bad DLLP</td><td>Correctable</td><td>Received DLLP failed its CRC; discarded</td></tr>
+      <tr><td>Replay Timer Timeout</td><td>Correctable</td><td>No Ack arrived in time; transmitter replayed</td></tr>
+      <tr><td>REPLAY_NUM Rollover</td><td>Correctable</td><td>Too many consecutive replays; link retrained</td></tr>
+      <tr><td>Data Link Protocol Error</td><td>Uncorrectable (fatal by default)</td><td>For example an Ack/Nak for a sequence number that was never sent</td></tr>
+      <tr><td>Surprise Down</td><td>Uncorrectable (fatal by default)</td><td>Link went down unexpectedly (reported by capable downstream ports)</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout spec"><p>Default severities shown are the usual defaults of the AER Uncorrectable Error Severity register; software can change severities. Confirm defaults for your revision in the Advanced Error Reporting Capability description.</p></aside>
+  <h4>Trace visibility</h4>
+  <p>Analyzers show sequence numbers on TLPs, Ack/Nak DLLPs, replays (a TLP with a sequence number already seen), UpdateFC DLLPs and credit values, and PM DLLPs. Many analyzers can compute "Ack latency" and flag replays automatically. Linux sees AER correctable counts (Bad TLP, Bad DLLP, Replay Timer Timeout, REPLAY_NUM Rollover) and, for uncorrectable errors, AER logs.</p>
+
+  <h3>Transaction Layer</h3>
+  <aside class="callout kid"><p>The Transaction Layer is the letter writer. It decides what the message says ("write these numbers into drawer 1008", "please send me the 64 bytes at shelf 0x1_2340_0140", "here are the bytes you asked for"), who it is from, and where it goes. It also keeps track of how much space the other side has left in its mailbox, so it never sends more letters than fit.</p></aside>
+  <h4>Purpose</h4>
+  <p>Carry requests and completions between requesters and completers anywhere in the hierarchy, with routing, ordering, flow control and quality-of-service information.</p>
+  <h4>Responsibilities</h4>
+  <ul>
+    <li><strong>Building and decoding TLPs:</strong> memory, I/O and configuration requests; completions; messages (interrupts INTx emulation, error messages, power management, vendor-defined); atomic operations.</li>
+    <li><strong>Routing information:</strong> address, ID or implicit routing (<a href="ch04.html">Chapter 4</a>).</li>
+    <li><strong>Split transactions:</strong> non-posted requests carry a Requester ID and Tag; completions return them (<a href="ch13.html">Chapter 13</a>).</li>
+    <li><strong><span class="g" data-term="flow-control">Flow control</span>:</strong> credit-based, per type (Posted, Non-Posted, Completion), separately for headers and data (data credits in units of 16 bytes). A transmitter must not send a TLP unless the receiver has advertised enough credits (<a href="ch16.html">Chapter 16</a>).</li>
+    <li><strong>Ordering rules</strong> (<a href="ch14.html">Chapter 14</a>), traffic classes and virtual channels.</li>
+    <li><strong>End-to-end integrity:</strong> optional ECRC; data poisoning (the EP bit).</li>
+    <li><strong>Completion timeout</strong> tracking for non-posted requests.</li>
+  </ul>
+  <h4>Packet structures</h4>
+  <p>Every non-flit TLP begins with a header whose first DWORD carries format and type. Header anatomy is the subject of <a href="ch11.html">Chapter 11</a>; here is DW0 for orientation:</p>
+  <table class="packet">
+    <thead><tr><th class="row-label">DW</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">DW0</td><td colspan="3" class="hl">Fmt</td><td colspan="5" class="hl">Type</td><td>T9</td><td colspan="3">TC</td><td>T8</td><td>Attr</td><td>LN</td><td>TH</td><td>TD</td><td>EP</td><td colspan="2">Attr</td><td colspan="2">AT</td><td colspan="10" class="hl">Length (DW)</td></tr>
+    </tbody>
+  </table>
+  <p>T9/T8 are tag extension bits for 10-bit tags (reserved in older revisions); LN is Lightweight Notification; TH indicates TLP Processing Hints; TD indicates a TLP digest (ECRC) is present; EP marks poisoned data; AT is Address Type for address translation services. <span class="badge version">Version-dependent</span></p>
+  <table>
+    <caption>Common non-flit Fmt/Type encodings you will see with NVMe</caption>
+    <thead><tr><th>TLP</th><th>Fmt</th><th>Type</th><th>Header</th><th>NVMe example</th></tr></thead>
+    <tbody>
+      <tr><td>MRd (32-bit address)</td><td>000b</td><td>0 0000b</td><td>3 DW, no data</td><td>CPU reads CSTS register</td></tr>
+      <tr><td>MRd (64-bit address)</td><td>001b</td><td>0 0000b</td><td>4 DW, no data</td><td>SSD fetches an SQ entry from host memory</td></tr>
+      <tr><td>MWr (32-bit)</td><td>010b</td><td>0 0000b</td><td>3 DW + data</td><td>Doorbell write to BAR0 below 4 GiB</td></tr>
+      <tr><td>MWr (64-bit)</td><td>011b</td><td>0 0000b</td><td>4 DW + data</td><td>SSD writes read data or a CQ entry; MSI-X interrupt write</td></tr>
+      <tr><td>CfgRd0 / CfgWr0</td><td>000b / 010b</td><td>0 0100b</td><td>3 DW</td><td>Enumeration reads the SSD's Vendor ID</td></tr>
+      <tr><td>Cpl (no data)</td><td>000b</td><td>0 1010b</td><td>3 DW</td><td>Completion for a configuration write, or an error completion (UR/CA)</td></tr>
+      <tr><td>CplD (with data)</td><td>010b</td><td>0 1010b</td><td>3 DW + data</td><td>Host memory returns SQ entry bytes to the SSD</td></tr>
+      <tr><td>Msg / MsgD</td><td>001b / 011b</td><td>1 0rrrb</td><td>4 DW</td><td>ERR_COR/ERR_NONFATAL/ERR_FATAL error messages to the Root Complex</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout version"><p>Flit Mode (Revision 6.0 and later) uses a different TLP header format with different field encodings. The non-flit encodings above apply to links not in Flit Mode. <a href="ch11.html">Chapter 11</a> covers both.</p></aside>
+  <h4>Errors</h4>
+  <table>
+    <caption>Transaction Layer errors (AER names, usual default severity)</caption>
+    <thead><tr><th>Error</th><th>Default severity</th><th>Typical NVMe-world cause</th></tr></thead>
+    <tbody>
+      <tr><td>Unsupported Request (UR)</td><td>Uncorrectable non-fatal</td><td>Access to an address no function claims, or a request type the completer does not support</td></tr>
+      <tr><td>Completer Abort (CA)</td><td>Uncorrectable non-fatal</td><td>Completer refused a request it understood (implementation-specific reasons)</td></tr>
+      <tr><td>Completion Timeout</td><td>Uncorrectable non-fatal</td><td>A non-posted request's completion never arrived (device hung, link down, lost TLP across a Switch)</td></tr>
+      <tr><td>Unexpected Completion</td><td>Uncorrectable non-fatal</td><td>Completion arrived matching no outstanding request (often a late completion after a timeout)</td></tr>
+      <tr><td>Poisoned TLP Received</td><td>Uncorrectable non-fatal</td><td>Data marked bad (EP=1), for example from an uncorrectable memory error</td></tr>
+      <tr><td>ECRC Error</td><td>Uncorrectable non-fatal</td><td>End-to-end CRC mismatch (only when ECRC is generated and checked)</td></tr>
+      <tr><td>Malformed TLP</td><td>Uncorrectable fatal</td><td>Header fields violate format rules (e.g., length exceeds MPS)</td></tr>
+      <tr><td>Receiver Overflow</td><td>Uncorrectable fatal</td><td>TLP received without available credits</td></tr>
+      <tr><td>Flow Control Protocol Error</td><td>Uncorrectable fatal</td><td>Credit advertisement rules violated</td></tr>
+      <tr><td>Advisory Non-Fatal</td><td>Correctable (reported)</td><td>Certain non-fatal errors that the specification lets a device report as advisory</td></tr>
+    </tbody>
+  </table>
+  <h4>Trace visibility</h4>
+  <p>Fully decoded by analyzers: headers, addresses, lengths, Requester IDs, tags, completion status, data payloads, and transaction pairing (request ↔ completion latency). Linux sees the consequences: AER uncorrectable status and logged headers (the TLP Header Log), driver timeouts, and NVMe-level errors.</p>
+
+  <h3>Hop-by-hop versus end-to-end</h3>
+  <table>
+    <caption>Which mechanisms span one link and which span the whole path</caption>
+    <thead><tr><th>Mechanism</th><th>Scope</th><th>Layer</th></tr></thead>
+    <tbody>
+      <tr><td>Sequence number, LCRC, Ack/Nak, replay</td><td>One link</td><td>Data Link</td></tr>
+      <tr><td>Flow-control credits</td><td>One link</td><td>Transaction (exchanged by Data Link)</td></tr>
+      <tr><td>Training, speed, width, ordered sets</td><td>One link</td><td>Physical</td></tr>
+      <tr><td>Address/ID routing, Requester ID, Tag</td><td>End to end</td><td>Transaction</td></tr>
+      <tr><td>ECRC, poisoning (EP)</td><td>End to end</td><td>Transaction</td></tr>
+      <tr><td>Completion timeout</td><td>End to end (requester's view)</td><td>Transaction</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The central concept on the ladder: layered responsibility</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>The letter writer decides what to say, the counter clerk numbers and seals envelopes and resends torn ones, the van drives them.</p></div>
+    <div class="rung" data-rung="B"><p>Transaction Layer = what and where; Data Link Layer = reliable delivery across one link; Physical Layer = framing and signalling.</p></div>
+    <div class="rung" data-rung="C"><p>In a port, the Transaction Layer has request/completion queues and credit counters; the Data Link Layer has a replay buffer, sequence counters, LCRC generators/checkers and timers; the Physical Layer has the LTSSM, scramblers, encoders, and SerDes.</p></div>
+    <div class="rung" data-rung="D"><p>The Base Specification has separate chapters for each layer, and AER classifies errors by the layer that detects them.</p></div>
+    <div class="rung" data-rung="E"><p>TLPs carry work end to end (hop by hop through Switches); DLLPs and ordered sets are link-local.</p></div>
+    <div class="rung" data-rung="F"><p>An analyzer view groups these: ordered sets and LTSSM in one pane, DLLPs (Ack/Nak/FC) in another, TLPs and transactions in a third. A replay shows as a repeated sequence number after a Nak.</p></div>
+    <div class="rung" data-rung="G"><p>Classify the first error by layer: physical errors point to the channel, Data Link errors to link integrity or retry tuning, Transaction errors to addressing, software, device state or timeouts.</p></div>
+  </div>
+
+  <h3>The sixteen questions for "the Data Link Layer's Ack/Nak protocol"</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>A link-level retransmission protocol using 12-bit sequence numbers, LCRC, Ack/Nak DLLPs and a replay buffer.</dd>
+    <dt>2. Why was it created?</dt><dd>So that bit errors on a high-speed serial link are corrected in hardware without involving software.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Makes the link appear lossless to the Transaction Layer despite occasional corruption.</dd>
+    <dt>4. What existed before it?</dt><dd>Parallel PCI had parity, reported to software, but no automatic link-level retry.</dd>
+    <dt>5. Why is the current design better?</dt><dd>Errors are corrected in microseconds, invisibly, and counted for diagnosis.</dd>
+    <dt>6. Who creates it?</dt><dd>The transmitting port's Data Link Layer assigns sequence numbers and LCRC; the receiving port's Data Link Layer generates Ack/Nak.</dd>
+    <dt>7. Who consumes it?</dt><dd>The transmitting Data Link Layer consumes Ack/Nak to purge or replay its buffer.</dd>
+    <dt>8. Where does it live?</dt><dd>In each port's Data Link Layer hardware; per link.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>The replay buffer (internal memory), NEXT_TRANSMIT_SEQ, ACKD_SEQ, NEXT_RCV_SEQ counters, REPLAY_TIMER, REPLAY_NUM (internal); AER correctable status/mask registers expose the outcomes.</dd>
+    <dt>10. What happens before it?</dt><dd>Link reaches L0 and Data Link initialisation (InitFC) completes: DL_Active.</dd>
+    <dt>11. What happens after it?</dt><dd>Good TLPs pass to the Transaction Layer in order; credits are returned with UpdateFC.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Replays, Replay Timer Timeouts, REPLAY_NUM rollover leading to Recovery; protocol errors (fatal) if sequence numbers are inconsistent.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>Sequence numbers, Ack/Nak DLLPs, replayed TLPs, Ack latency.</dd>
+    <dt>14. What does Linux show?</dt><dd>AER correctable counters in sysfs and kernel log lines naming Bad TLP, Bad DLLP, Replay Timer Timeout, REPLAY_NUM Rollover.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>Error injection (corrupt LCRC, drop Acks), replay timer behaviour, sequence wrap, rollover-triggered retraining.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>Marginal signal integrity (most common), a receiver buffer or Ack scheduling bug, or retimer misbehaviour.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>Inside an NVMe SSD controller ASIC, the three layers map onto distinct hardware blocks, often from different design teams or IP vendors:</p>
+  <table>
+    <caption>Where each layer lives in a typical NVMe SSD controller (implementation-dependent)</caption>
+    <thead><tr><th>Layer</th><th>Hardware block</th><th>Notable resources</th></tr></thead>
+    <tbody>
+      <tr><td>Physical (electrical)</td><td>SerDes PHY macro (analog/mixed-signal)</td><td>Equalisers, CDR, PLLs, receiver detect; firmware-tunable settings</td></tr>
+      <tr><td>Physical (logical)</td><td>PCIe controller core: PCS (physical coding sublayer) and LTSSM logic</td><td>Scramblers, encoders, elastic buffers, ordered-set generators, deskew FIFOs</td></tr>
+      <tr><td>Data Link</td><td>PCIe controller core: link layer</td><td>Replay buffer (SRAM sized for the round trip at full rate), LCRC engines, timers</td></tr>
+      <tr><td>Transaction</td><td>PCIe controller core: transaction layer and application interface</td><td>Receive buffers per credit type, completion tracking (tags), configuration space, AER registers</td></tr>
+      <tr><td>Above</td><td>NVMe front end: doorbell registers, DMA engines, queue managers</td><td>Turns doorbell writes into command fetches; issues MRd/MWr through the transaction layer</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw">
+    <p>Replay buffer sizing is a real design constraint: the buffer must hold every TLP sent but not yet acknowledged, which is roughly link bandwidth × Ack round-trip time. Doubling the generation doubles the bytes in flight for the same round-trip time. Receive buffer (credit) sizing similarly determines whether a port can sustain line rate: too few advertised credits and the transmitter stalls waiting for UpdateFC.</p>
+  </aside>
+  <p>On the host side the same blocks exist in the Root Port. In a Switch, each port has its own Physical and Data Link Layers, and the Switch core routes TLPs between ports' Transaction Layer buffers.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>The <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0</cite> devotes separate chapters to the <cite class="spec">Transaction Layer Specification</cite>, the <cite class="spec">Data Link Layer Specification</cite> and the <cite class="spec">Physical Layer Logical Block</cite> / <cite class="spec">Electrical Sub-Block</cite>, plus <cite class="spec">Error Signalling and Logging</cite> and <cite class="spec">Advanced Error Reporting Capability</cite> for the error model. Layering is normative in the sense that each layer's required behaviour is specified; how a design partitions logic internally is not.</p>
+  <aside class="callout verified">
+    <ul>
+      <li>Three layers: Transaction, Data Link, Physical (with logical and electrical sub-blocks).</li>
+      <li>TLP sequence numbers are 12 bits; LCRC is 32 bits; DLLPs carry a 16-bit CRC.</li>
+      <li>DLLP type encodings: Ack 00h, Nak 10h, PM_Enter_L1 20h, PM_Enter_L23 21h, PM_Active_State_Request_L1 23h, PM_Request_Ack 24h, InitFC1/InitFC2/UpdateFC for P, NP, Cpl as tabulated.</li>
+      <li>Flow control uses header and data credits per type; one data credit is 16 bytes (4 DW).</li>
+      <li>Errors are classed as correctable or uncorrectable; uncorrectable as non-fatal or fatal, with severity programmable in AER.</li>
+    </ul>
+  </aside>
+  <aside class="callout derived">
+    <p>Because Ack/Nak is per link, a TLP crossing a Switch is protected by two independent LCRCs, and nothing at the Data Link Layer protects it while inside the Switch. That is the reason ECRC exists and why it matters more in multi-hop topologies.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>Replay buffer and receive buffer sizes; Ack coalescing policy (how many TLPs per Ack); UpdateFC frequency; exactly which physical events a port counts as Receiver Errors beyond those required; whether ECRC is supported.</p>
+  </aside>
+  <aside class="callout version">
+    <p>Flit Mode (Revision 6.0+) reorganises the Data Link Layer: per-TLP sequence numbers and LCRC give way to flit-level sequence, CRC and FEC, and a new TLP header format is used. 10-bit tags, Data Link Features, scaled flow control and some DLLP types were added in later revisions (4.0+). This chapter's packet layouts are non-flit unless stated.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <ul>
+      <li>The specification does not say how long a replay or Recovery takes in a given product.</li>
+      <li>It does not say that a correctable error rate of N per hour is acceptable; that is a platform or customer policy.</li>
+      <li>Confirm in the specification: the replay timer formula and its dependence on width, MPS and rate; the precise events counted as Receiver Errors; the Flit Mode TLP header layout.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume that a correctable error is harmless (each replay costs bandwidth and latency, and a rising rate predicts failure); never assume an Ack means the data reached its final destination (it means the next port received it); never decode a Flit Mode trace with non-flit header layouts.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>Directions and interactions of the three traffic classes on one link:</p>
+  <table>
+    <caption>Traffic on a single link, by layer and direction</caption>
+    <thead><tr><th>Item</th><th>Generated by</th><th>Consumed by</th><th>Direction relationship</th></tr></thead>
+    <tbody>
+      <tr><td>TLP</td><td>Transaction Layer (or forwarded by a Switch)</td><td>Next port's Transaction Layer (and onward)</td><td>Either direction; requests and completions travel in opposite directions</td></tr>
+      <tr><td>Ack/Nak DLLP</td><td>Receiver's Data Link Layer</td><td>Transmitter's Data Link Layer</td><td>Opposite to the TLPs being acknowledged</td></tr>
+      <tr><td>UpdateFC DLLP</td><td>Receiver (credit information from its Transaction Layer)</td><td>Transmitter</td><td>Opposite to the TLPs consuming credits</td></tr>
+      <tr><td>Ordered sets</td><td>Physical Layer</td><td>Partner Physical Layer (and retimers)</td><td>Both directions; training is a conversation</td></tr>
+    </tbody>
+  </table>
+  <p>The consequence for an NVMe read: data flows device→host as MWr TLPs; the Ack and UpdateFC DLLPs for those TLPs flow host→device, sharing the host→device direction with doorbells and completions for the device's command fetches. Heavy traffic in one direction always creates light traffic in the other.</p>
+  <figure>
+    <ol class="seq" data-actors="Root Port DLL|SSD DLL">
+      <li data-from="Root Port DLL" data-to="SSD DLL">TLP Seq 0x01A (MWr doorbell)</li>
+      <li data-from="Root Port DLL" data-to="SSD DLL" class="bad">TLP Seq 0x01B (corrupted on wire)</li>
+      <li data-from="Root Port DLL" data-to="SSD DLL">TLP Seq 0x01C</li>
+      <li data-note="SSD DLL">0x01B: LCRC bad → Bad TLP; 0x01C out of sequence → discard</li>
+      <li data-from="SSD DLL" data-to="Root Port DLL" class="dashed">Nak Seq 0x01A</li>
+      <li data-note="Root Port DLL">replay all after 0x01A</li>
+      <li data-from="Root Port DLL" data-to="SSD DLL">TLP Seq 0x01B (replay)</li>
+      <li data-from="Root Port DLL" data-to="SSD DLL">TLP Seq 0x01C (replay)</li>
+      <li data-from="SSD DLL" data-to="Root Port DLL" class="dashed">Ack Seq 0x01C</li>
+    </ol>
+    <figcaption>Nak and replay. The Nak names the last good sequence number; the transmitter replays everything after it, in order. Conceptual; synthetic example for teaching.</figcaption>
+  </figure>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <div class="trace" data-kind="synthetic" data-title="Normal: doorbell, command fetch and completion with link-layer traffic (Gen4 x4)">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Layer</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Down</td><td>0</td><td>TL</td><td>MWr32</td><td>Seq=0x01A Addr=0xFE60_1008 Len=1 Data=0x0000_0006 Req=RC</td><td>SQ1 tail doorbell = 6</td></tr>
+        <tr class="dir-up"><td>2</td><td>Up</td><td>170</td><td>DLL</td><td>Ack</td><td>AckNak_Seq=0x01A</td><td>SSD's link layer accepted it</td></tr>
+        <tr class="dir-up"><td>3</td><td>Up</td><td>240</td><td>DLL</td><td>UpdateFC-P</td><td>VC0 HdrFC=… DataFC=…</td><td>SSD returns the posted credits the doorbell used</td></tr>
+        <tr class="dir-up"><td>4</td><td>Up</td><td>810</td><td>TL</td><td>MRd64</td><td>Seq=0x3C1 Addr=0x1_2340_0140 Len=16 Tag=0x22 Req=0x0100</td><td>Fetch SQ1 entry 5 (64 bytes)</td></tr>
+        <tr class="dir-down"><td>5</td><td>Down</td><td>960</td><td>DLL</td><td>Ack</td><td>AckNak_Seq=0x3C1</td><td>Root Port accepted the read request</td></tr>
+        <tr class="dir-down"><td>6</td><td>Down</td><td>1,620</td><td>TL</td><td>CplD</td><td>Seq=0x01B Req=0x0100 Tag=0x22 Len=16 Status=SC Cpl=RC</td><td>64-byte command returned</td></tr>
+        <tr class="dir-up"><td>7</td><td>Up</td><td>1,790</td><td>DLL</td><td>Ack</td><td>AckNak_Seq=0x01B</td><td>Accepted</td></tr>
+        <tr class="dir-down"><td>8</td><td>Down</td><td>5,000</td><td>PHY</td><td>SKP OS</td><td>all lanes</td><td>Periodic clock compensation</td></tr>
+      </tbody>
+    </table>
+    <p>Synthetic example for teaching; lab system addresses; timings illustrative. Two independent sequence-number spaces exist, one per direction (0x01A, 0x01B downstream; 0x3C1 upstream).</p>
+  </div>
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: physical error, link-layer replay, then a Transaction Layer error">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Layer</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Down</td><td>0</td><td>TL</td><td>MWr32</td><td>Seq=0x040 Addr=0xFE60_1008 Data=0x0000_0007</td><td>Doorbell</td></tr>
+        <tr class="abnormal"><td>2</td><td>Down</td><td>40</td><td>PHY</td><td>Symbol error</td><td>Lane 2: invalid sync header in block</td><td>First abnormal event: physical corruption on lane 2 while TLP 0x041 is in flight</td></tr>
+        <tr class="dir-up"><td>3</td><td>Up</td><td>190</td><td>DLL</td><td>Nak</td><td>AckNak_Seq=0x040</td><td>SSD: 0x040 good, 0x041 bad → Bad TLP (correctable) at SSD; Receiver Error logged too</td></tr>
+        <tr class="dir-down"><td>4</td><td>Down</td><td>260</td><td>TL</td><td>MWr32 (replay)</td><td>Seq=0x041 Addr=0xFE60_100C Data=0x0000_0003</td><td>Replay: CQ1 head doorbell = 3; arrives intact</td></tr>
+        <tr class="dir-up"><td>5</td><td>Up</td><td>420</td><td>DLL</td><td>Ack</td><td>AckNak_Seq=0x041</td><td>Recovered; software saw nothing except correctable counters</td></tr>
+        <tr class="note"><td colspan="7">… 2 ms later, a separate event …</td></tr>
+        <tr class="dir-down"><td>6</td><td>Down</td><td>2,000,000</td><td>TL</td><td>MRd32</td><td>Seq=0x0A0 Addr=0xFE60_5000 Len=1 Tag=0x05 Req=RC</td><td>CPU reads BAR0 + 0x5000, beyond the 16 KiB BAR (0x0000–0x3FFF)</td></tr>
+        <tr class="dir-up"><td>7</td><td>Up</td><td>2,000,150</td><td>DLL</td><td>Ack</td><td>AckNak_Seq=0x0A0</td><td>Link layer is fine: the TLP arrived intact</td></tr>
+        <tr class="abnormal"><td>8</td><td>Up</td><td>2,000,700</td><td>TL</td><td>Cpl</td><td>Req=RC Tag=0x05 Status=UR</td><td>Unsupported Request completion: the SSD claims no such address. A Transaction Layer error caused by software, not the link.</td></tr>
+      </tbody>
+    </table>
+    <p>Synthetic example for teaching. Whether the SSD's Root Port window would even forward an address outside the device's BAR depends on window sizing; the example assumes the window covers it.</p>
+  </div>
+  <h4>Reasoning</h4>
+  <ol>
+    <li>Two unrelated problems at two layers. Treat them separately.</li>
+    <li>Rows 2–5: a physical error on lane 2 produced a Data Link replay. The fix belongs to signal integrity if it repeats. One isolated event is within normal life; a rising rate is not.</li>
+    <li>Rows 6–8: a perfectly delivered request for an address the device does not implement. The Data Link Layer Acked it (row 7): delivery was fine. The Transaction Layer answered UR (row 8). Look for a driver or tool reading beyond the BAR (for example, a debug script), not at the link.</li>
+    <li>Layer classification turned one confusing trace into two clear investigations with different owners.</li>
+  </ol>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># AER status registers (decoded) for the SSD and its Root Port</span>
+sudo lspci -vvv -s 01:00.0 | sed -n '/Advanced Error Reporting/,/HeaderLog/p'
+sudo lspci -vvv -s 00:01.1 | sed -n '/Advanced Error Reporting/,/HeaderLog/p'
+
+<span class="cm"># Per-device AER counters kept by the kernel (since Linux 4.19-era kernels)</span>
+cat /sys/bus/pci/devices/0000:01:00.0/aer_dev_correctable
+cat /sys/bus/pci/devices/0000:01:00.0/aer_dev_nonfatal
+cat /sys/bus/pci/devices/0000:01:00.0/aer_dev_fatal
+
+<span class="cm"># Kernel log entries from the AER driver</span>
+sudo dmesg | grep -iE "AER|PCIe Bus Error"</code></pre>
+  <p>In <code>lspci -vvv</code>, the AER section shows <code>UESta</code> (uncorrectable status), <code>UEMsk</code>, <code>UESvrt</code> (severity), <code>CESta</code> (correctable status) and <code>CEMsk</code>, each as a list of named bits with <code>+</code> or <code>-</code>, for example <code>CESta: RxErr- BadTLP+ BadDLLP- Rollover- Timeout- AdvNonFatalErr-</code>. The names map directly to the layer tables above: RxErr (Physical), BadTLP/BadDLLP/Rollover/Timeout (Data Link), UnsupReq/CmpltTO/UnxCmplt/MalfTLP (Transaction).</p>
+  <p>Kernel AER log lines have the shape "PCIe Bus Error: severity=Corrected, type=Physical Layer, (Receiver ID)" or "type=Data Link Layer" or "type=Transaction Layer", followed by the device and the error bits. The kernel itself classifies by layer. <span class="badge version">Version-dependent</span> wording varies across kernel versions.</p>
+  <aside class="callout linux">
+    <p>What Linux cannot show: individual TLPs, DLLPs, sequence numbers, the time of each replay, or the LTSSM path. Status bits are sticky flags, not event logs; counters in sysfs are totals since boot. AER may be owned by platform firmware (firmware-first error handling) rather than the OS, in which case Linux sees fewer details.</p>
+  </aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>The following simulation implements the Data Link Layer's Ack/Nak and replay logic for one direction of one link, with a channel that corrupts TLPs at a chosen probability. It is a teaching model, not a conformant implementation: a burst that makes no progress stands in for the replay timer, every good TLP is acknowledged individually (no Ack coalescing), and sequence wrap edge cases are simplified. It uses <code>zlib.crc32</code> as a stand-in for LCRC; the real LCRC uses the same CRC-32 polynomial but specific bit ordering and coverage rules you must take from the specification.</p>
+  <pre class="code" data-kind="simulation" data-lang="python" data-title="acknak_sim.py"><code>#!/usr/bin/env python3
+"""Toy model of PCIe Data Link Layer Ack/Nak replay (one direction, one link)."""
+import random, zlib
+
+SEQ_MOD = 4096                     # 12-bit sequence numbers
+
+class Transmitter:
+    def __init__(self):
+        self.next_seq = 0
+        self.replay = []               # list of (seq, payload, lcrc) awaiting Ack
+    def send(self, payload: bytes):
+        seq = self.next_seq
+        self.next_seq = (self.next_seq + 1) % SEQ_MOD
+        frame = (seq, payload, zlib.crc32(seq.to_bytes(2, "big") + payload))
+        self.replay.append(frame)
+        return frame
+    def on_ack(self, seq):
+        self.replay = [f for f in self.replay if (seq - f[0]) % SEQ_MOD &gt;= SEQ_MOD // 2]
+    def on_nak(self, seq):
+        self.on_ack(seq)               # everything up to seq is acknowledged
+        return list(self.replay)       # replay the rest, in order
+
+class Receiver:
+    def __init__(self):
+        self.next_rcv = 0
+        self.delivered, self.bad = [], 0
+        self.nak_pending = False
+    def receive(self, frame):
+        seq, payload, lcrc = frame
+        if zlib.crc32(seq.to_bytes(2, "big") + payload) != lcrc:
+            self.bad += 1              # "Bad TLP": discard, schedule Nak once
+            if not self.nak_pending:
+                self.nak_pending = True
+                return ("NAK", (self.next_rcv - 1) % SEQ_MOD)
+            return None
+        if seq != self.next_rcv:       # out of sequence after a lost TLP: discard
+            return None
+        self.delivered.append(payload)
+        self.next_rcv = (self.next_rcv + 1) % SEQ_MOD
+        self.nak_pending = False
+        return ("ACK", seq)
+
+def channel(frame, p_err, rng):
+    seq, payload, lcrc = frame
+    if rng.random() &lt; p_err:
+        payload = bytes([payload[0] ^ 0x01]) + payload[1:]    # flip one bit
+    return (seq, payload, lcrc)
+
+def run(n=2000, p_err=0.01, window=8, seed=1):
+    """Send n TLPs with at most 'window' unacknowledged. A Nak, or a burst that makes no
+    progress (standing in for the replay timer), replays every unacknowledged TLP in order."""
+    rng, tx, rx = random.Random(seed), Transmitter(), Receiver()
+    next_new, transmissions, replayed, naks, timeouts = 0, 0, 0, 0, 0
+    resend = []
+    while len(rx.delivered) &lt; n:
+        burst, resend = resend, []
+        while len(tx.replay) &lt; window and next_new &lt; n:
+            burst.append(tx.send(next_new.to_bytes(4, "big")))
+            next_new += 1
+        progress, nak_seen = False, False
+        for frame in burst:
+            transmissions += 1
+            reply = rx.receive(channel(frame, p_err, rng))
+            if reply and reply[0] == "ACK":
+                tx.on_ack(reply[1])
+                progress = True
+            elif reply and reply[0] == "NAK":
+                tx.on_ack(reply[1])        # a Nak also acknowledges up to its sequence number
+                nak_seen = True
+        if nak_seen or (not progress and tx.replay):
+            naks += nak_seen
+            timeouts += not nak_seen
+            resend = list(tx.replay)
+            replayed += len(resend)
+    ok = rx.delivered == [i.to_bytes(4, "big") for i in range(n)]
+    print(f"p_err={p_err:&lt;6} TLPs={n} transmissions={transmissions} "
+          f"overhead={transmissions / n - 1:6.1%} replayed={replayed} naks={naks} "
+          f"timeouts={timeouts} bad_tlp={rx.bad} in-order-and-complete={ok}")
+
+if __name__ == "__main__":
+    for p in (0.0, 0.001, 0.01, 0.05):
+        run(p_err=p)</code></pre>
+  <p>Run it and watch the cost of errors: transmissions grow faster than the error rate because every Nak replays all unacknowledged TLPs after the bad one. Delivery stays complete and in order. That is the Data Link Layer's promise.</p>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Scenario.</strong> A validation engineer reports: "Under heavy write load, the lab SSD occasionally logs AER correctable errors: BadTLP and Rollover, at the SSD; RxErr at the SSD. Throughput dips by 30 % for a few milliseconds each time. No NVMe errors."</p>
+  <ol>
+    <li><strong>Classify by layer.</strong> RxErr: Physical. BadTLP and Rollover: Data Link. Detected <em>at the SSD</em>: the SSD's receiver saw bad data, so the problem is on the host→device direction of the link.</li>
+    <li><strong>Interpret Rollover.</strong> Several consecutive replays failed, so the Root Port's Data Link Layer forced the link into Recovery: that explains milliseconds of reduced throughput.</li>
+    <li><strong>Why heavy write load?</strong> Writes mean the SSD fetches lots of data from host memory: the host→device direction carries large completions (CplD), saturating that direction. More bits on the marginal direction, more chances for error, and possibly more crosstalk or supply noise.</li>
+    <li><strong>Where next?</strong> Physical evidence for the downstream direction: which lane (Lane Error Status if implemented, or an analyzer with per-lane error reporting), lane margining from the SSD's receiver, Root Port transmitter equalisation settings, the connector.</li>
+    <li><strong>What not to do.</strong> Do not open an NVMe firmware bug: NVMe never saw an error; the link layer did its job.</li>
+  </ol>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li>Calling DLLPs "small TLPs". They are a different layer's packets and never leave the link.</li>
+    <li>Believing an Ack confirms end-to-end delivery. It confirms delivery to the neighbour port.</li>
+    <li>Assuming Unsupported Request is a link problem. It is a Transaction Layer response to an address or request type.</li>
+    <li>Ignoring which side detected an error. The detecting receiver identifies the bad direction.</li>
+    <li>Mixing sequence numbers of the two directions in trace analysis.</li>
+    <li>Thinking credits are end to end. They are per link (a Switch has its own credits on each port).</li>
+    <li>Decoding a Flit Mode capture with non-flit framing expectations.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>Layer-first triage of PCIe evidence</caption>
+    <thead><tr><th>Evidence</th><th>Layer</th><th>First hypothesis</th><th>First check</th></tr></thead>
+    <tbody>
+      <tr><td>RxErr rising</td><td>Physical</td><td>Signal integrity, clocking</td><td>Which side detects; per-lane errors; temperature correlation</td></tr>
+      <tr><td>BadTLP / BadDLLP</td><td>Data Link (caused by physical corruption)</td><td>Same as above</td><td>Correlate with RxErr; direction</td></tr>
+      <tr><td>Replay Timer Timeout</td><td>Data Link</td><td>Acks lost or delayed; partner overloaded; asymmetric errors</td><td>Errors on the opposite direction (Acks travel there)</td></tr>
+      <tr><td>Rollover</td><td>Data Link → Physical Recovery</td><td>Persistent errors</td><td>Recovery counts, LnkSta changes</td></tr>
+      <tr><td>UR, CA</td><td>Transaction</td><td>Bad address, disabled function, unsupported request</td><td>TLP Header Log in AER; who issued it</td></tr>
+      <tr><td>Completion Timeout</td><td>Transaction (end to end)</td><td>Completer hung, link down, lost in a Switch</td><td>Link state at the time; device health; whether other requests completed</td></tr>
+      <tr><td>Malformed TLP, Receiver Overflow, FC Protocol Error</td><td>Transaction (fatal)</td><td>Implementation bug in a port</td><td>TLP Header Log; analyzer capture</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout debug">
+    <p>Errors cascade upward: physical corruption creates Data Link replays; persistent replays create Recovery; a long Recovery or link-down creates Transaction Layer Completion Timeouts; those create NVMe command timeouts and driver resets. The first error in time is usually the lowest layer. Find it before reasoning about the rest (<a href="ch47.html">Chapter 47</a>).</p>
+  </aside>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <p>A senior engineer reads an error report and immediately annotates each line with a layer and a direction. "BadTLP at the Root Port" means the device→host direction is corrupting; "BadTLP at the SSD" means host→device. Two reports that look identical can point in opposite directions.</p>
+  <p>They also treat correctable errors as early warnings, not noise. Each replay costs bandwidth and adds latency jitter to NVMe commands; a slowly rising rate on a fleet is how connectors, retimers and boards fail months before they fail outright. Good fleets trend AER correctable counters per link.</p>
+  <p>Finally, they remember that the layers are a model. Some failures straddle them: an elastic buffer overflow due to clocking mismatch is physical but surfaces as Bad TLPs; a credit leak is Transaction Layer but looks like a link stall. The model tells you where to start, not where to stop.</p>
+</section>
+
+<section id="lab">
+  <h2>Lab: Classify PCIe evidence by layer</h2>
+  <h3>Objective</h3>
+  <p>Use the Ack/Nak simulator and real AER data to practise attributing every observation to a layer and a direction.</p>
+  <h3>Skills</h3>
+  <p>Reading AER status and counters; reasoning about replay cost; layer classification.</p>
+  <h3>Safety</h3>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Simulation and read-only inspection. Do not use error-injection tools on production machines.</p></aside>
+  <h3>Hardware required</h3>
+  <p>Any computer for the simulation; a Linux machine with PCIe devices for the AER part.</p>
+  <h3>Software required</h3>
+  <p>Python 3 (<code>acknak_sim.py</code>), pciutils.</p>
+  <h3>Input</h3>
+  <p>Simulation parameters; your system's AER registers and counters.</p>
+  <h3>Expected output</h3>
+  <p>A table of transmissions versus error rate from the simulator, and a layer-annotated list of any non-zero AER bits on your system.</p>
+  <h3>Background</h3>
+  <p>AER bits and counters are named for the error, which maps to a layer (tables in this chapter). The detecting port tells you the direction.</p>
+  <h3>Step 1 — Simulate</h3>
+  <p>Run <code>acknak_sim.py</code>. Record transmissions for error rates 0, 0.1 %, 1 % and 5 %. Compute the overhead (transmissions ÷ TLPs − 1).</p>
+  <h3>Step 2 — Inspect</h3>
+  <p>For each PCIe device and port with AER, read <code>aer_dev_correctable</code>, <code>aer_dev_nonfatal</code> and <code>aer_dev_fatal</code> and the <code>lspci -vvv</code> AER section.</p>
+  <h3>Step 3 — Classify</h3>
+  <p>For each non-zero counter or set status bit, write: layer, detecting port, direction of the affected traffic, first hypothesis.</p>
+  <h3>Observation</h3>
+  <p>Note whether counts cluster on one link or spread across many, and whether the same link shows both RxErr and BadTLP.</p>
+  <h3>Questions</h3>
+  <ol>
+    <li>In the simulation, why does overhead grow faster than the error probability?</li>
+    <li>If RxErr is non-zero but BadTLP is zero on a port, what could that mean?</li>
+    <li>Which counter would you expect to rise on the Root Port if only the device→host direction is marginal?</li>
+  </ol>
+  <h3>Challenge</h3>
+  <p>Modify the simulator so the receiver sends one Ack per 4 good TLPs (Ack coalescing). How does the replay count change at 1 % errors? Why do real implementations coalesce Acks anyway?</p>
+  <details class="hint"><summary>Hint</summary><p>A Nak replays everything not yet acknowledged; with coalescing, more TLPs are unacknowledged at any moment.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>1: Each Nak replays every TLP after the last good one, so one corruption costs several transmissions; and replays can themselves be corrupted. 2: Physical errors occurred outside TLPs (for example during DLLPs, idle, or ordered sets), or were corrected before affecting a TLP; or the port counts additional events as Receiver Errors (implementation-dependent). 3: The Root Port receives device→host traffic, so its RxErr and BadTLP counters rise; the SSD would see Replay Timer Timeouts only if Acks were lost, which is the other direction. Challenge: replays per error rise with coalescing; implementations coalesce because Acks consume bandwidth in the opposite direction and the specification lets a receiver acknowledge cumulatively within timing limits.</p>
+  </details>
+  <h3>What a senior engineer notices</h3>
+  <ul>
+    <li>Whether correctable errors are masked (CEMsk) so that counters stay at zero even though errors occur.</li>
+    <li>Whether firmware-first error handling hides details from the OS.</li>
+    <li>Whether counts correlate with a particular boot, workload or time of day.</li>
+  </ul>
+  <h3>Failure variants</h3>
+  <ul>
+    <li>No AER capability on a device: older or simple devices; rely on the parent port.</li>
+    <li>Counters always zero although the kernel log shows AER messages: counters exist only on newer kernels or for certain ports.</li>
+    <li>Fatal errors present: the device may have been reset; correlate with the kernel log before drawing conclusions.</li>
+  </ul>
+  <h3>Extension</h3>
+  <p>Extend the simulator with a second link and a Switch that forwards TLPs, each link with its own sequence numbers, and show that a corruption on link 2 never causes a replay on link 1.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>For each of these, name the layer that creates it and the layer that consumes it: MWr TLP, Ack DLLP, UpdateFC DLLP, TS1 ordered set, SKP ordered set, CplD TLP, PM_Enter_L1 DLLP.</li>
+    <li>A TLP crosses a Switch. How many LCRC computations and checks occur end to end? How many ECRC checks, if ECRC is enabled and checked at the final receiver?</li>
+    <li>Why does the Nak carry the sequence number of the last <em>good</em> TLP rather than the bad one?</li>
+    <li>Classify: Completion Timeout; Receiver Error; Malformed TLP; Surprise Down; Poisoned TLP Received.</li>
+    <li>Explain why heavy NVMe reads can expose errors in the host→device direction even though data flows device→host.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p>1: MWr – Transaction/Transaction; Ack – Data Link/Data Link; UpdateFC – Data Link (with Transaction Layer credit information)/Data Link → Transaction credit counters; TS1 – Physical/Physical; SKP – Physical/Physical; CplD – Transaction/Transaction; PM_Enter_L1 – Data Link (on behalf of power management)/Data Link. 2: Two links, so two LCRC generations and two checks; one ECRC generation at the requester and one check at the final completer. 3: The bad TLP's sequence number might itself be corrupted, and the cumulative "last good" number tells the transmitter exactly where to restart. 4: Transaction; Physical; Transaction; Data Link (link down); Transaction. 5: Acks and UpdateFCs for the data travel host→device, and the device's read requests' completions do not, but doorbells, command fetch completions and those DLLPs do; a marginal host→device direction causes lost Acks (Replay Timer Timeouts at the SSD) and replays of host TLPs.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>Which layer assigns TLP sequence numbers?</p>
+      <ul class="options" data-answer="2"><li>Transaction</li><li>Data Link</li><li>Physical</li><li>The NVMe driver</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The Data Link Layer, along with the LCRC.</p></details></li>
+    <li><p>How far does an Ack DLLP travel?</p>
+      <ul class="options" data-answer="1"><li>Only across one link</li><li>To the Root Complex</li><li>To the original requester</li><li>It is broadcast</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>DLLPs are link-local.</p></details></li>
+    <li><p>An Unsupported Request completion is a symptom at which layer?</p>
+      <ul class="options" data-answer="3"><li>Physical</li><li>Data Link</li><li>Transaction</li><li>None; it is an NVMe status</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Transaction Layer: the completer could not service the request.</p></details></li>
+    <li><p>What is the size of a PCIe data flow-control credit?</p>
+      <ul class="options" data-answer="2"><li>1 byte</li><li>16 bytes (4 DW)</li><li>64 bytes</li><li>One TLP</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>One data credit = 4 DW = 16 bytes; header credits count headers.</p></details></li>
+    <li><p>REPLAY_NUM rollover causes:</p>
+      <ul class="options" data-answer="4"><li>A fatal error and link-down</li><li>A software interrupt to the NVMe driver</li><li>Dropping the TLP</li><li>The link to be retrained (Recovery), reported as a correctable error</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The Data Link Layer requests retraining; AER reports REPLAY_NUM Rollover as correctable.</p></details></li>
+    <li><p>What does the Fmt/Type pair 011b / 0 0000b denote in non-flit mode?</p>
+      <ul class="options" data-answer="1"><li>MWr with 4 DW header (64-bit address)</li><li>MRd with 3 DW header</li><li>CplD</li><li>CfgWr0</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Fmt 011b = 4 DW header with data; Type 0 0000b = memory request: MWr64.</p></details></li>
+    <li><p>Why is ECRC more important in a topology with Switches?</p>
+      <details class="answer"><summary>Model answer</summary><p>LCRC protects each link separately; inside a Switch the TLP is unprotected by the link layer. ECRC covers the TLP from requester to completer across all hops.</p></details></li>
+    <li><p>BadTLP is logged at the Root Port. Which direction of the link is suspect?</p>
+      <details class="answer"><summary>Model answer</summary><p>Device→host (upstream): the Root Port's receiver detected the corruption.</p></details></li>
+    <li><p>Name the three main jobs of the Physical Layer's logical sub-block.</p>
+      <details class="answer"><summary>Model answer</summary><p>Any three of: framing, byte striping and deskew, scrambling/encoding, ordered sets, the LTSSM (training, speed/width, power states).</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>(Beginner)</strong> Name the three PCIe layers and one job of each.</p>
+      <details class="answer"><summary>Model answer</summary><p>Transaction: build/route TLPs and manage credits. Data Link: sequence numbers, LCRC and Ack/Nak replay. Physical: framing, encoding and link training.</p></details></li>
+    <li><p><strong>(Beginner)</strong> What is the difference between a TLP and a DLLP?</p>
+      <details class="answer"><summary>Model answer</summary><p>A TLP carries a transaction (request, completion, message) and can be routed across many links; a DLLP carries link management (Ack/Nak, credits, PM) and is consumed by the neighbour port.</p></details></li>
+    <li><p><strong>(Intermediate)</strong> Walk through what happens when a TLP is corrupted on the wire.</p>
+      <details class="answer"><summary>Model answer</summary><p>Receiver's LCRC check fails → Bad TLP, discard, Nak with last good sequence; transmitter replays from its buffer all TLPs after that number; receiver accepts and Acks. If no Ack/Nak arrives, the replay timer forces a replay. After repeated replays, REPLAY_NUM rolls over and the link retrains.</p></details></li>
+    <li><p><strong>(Intermediate)</strong> Why must credits be advertised before TLPs flow?</p>
+      <details class="answer"><summary>Model answer</summary><p>PCIe is lossless: a receiver must never be sent a TLP it cannot buffer. InitFC exchange tells each transmitter how much buffer space exists per type; UpdateFC replenishes as buffers drain. Without credits, sending would risk Receiver Overflow, a fatal error.</p></details></li>
+    <li><p><strong>(Senior)</strong> Completion Timeouts appear on the Root Port for an SSD, with no correctable errors anywhere. What do you consider?</p>
+      <details class="answer"><summary>Model answer</summary><p>The link delivered requests (no link-layer errors), so the completer did not respond in time: device firmware hang, device internally reset, a function-level reset in progress, a Switch internal drop, power-state exit delays exceeding the timeout, or a completion timeout value set too short. Check device state (NVMe CSTS, whether config reads succeed), link state at the time, completion timeout configuration (Device Control 2), and capture to see whether completions arrive late (then Unexpected Completion) or never.</p></details></li>
+    <li><p><strong>(Senior)</strong> How does Flit Mode change your trace analysis habits?</p>
+      <details class="answer"><summary>Model answer</summary><p>Retry is per flit, not per TLP, so a single error may replay several small TLPs at once; there are no per-TLP LCRC or framing tokens; TLP headers use a different format; Ack/credit information is embedded in flits; FEC corrections occur silently and may only appear in counters. Analyzer decoding must be set for Flit Mode, and error accounting should consider FEC-corrected versus CRC-failed flits.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>Child:</strong> Explain the letter writer, the counter clerk and the van.</li>
+    <li><strong>Junior engineer:</strong> Using the lab system, trace one doorbell write through all six layer instances (three per port), naming what is added and checked.</li>
+    <li><strong>Senior engineer:</strong> Explain why a rising rate of BadTLP at the SSD with no NVMe errors is still worth an engineering investigation, and which data you would gather.</li>
+  </ul>
+  <details class="answer"><summary>Model explanation (senior engineer)</summary><p>Every BadTLP is a replay: lost bandwidth and added latency on the host→device direction, which carries doorbells and command/data completions, so it directly adds jitter to NVMe command latency. A rising rate signals degrading margin (connector wear, contamination, retimer drift, thermal effects) that will eventually escalate to REPLAY_NUM rollovers, Recovery and possibly link-down with Completion Timeouts and NVMe resets. Gather per-link AER counters over time, correlation with temperature/workload, per-lane error data and margining, and Root Port transmitter settings; compare with sibling slots.</p></details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <ul>
+    <li>Transaction Layer: TLPs, routing, split transactions, credits, ordering, end-to-end integrity, completion timeouts.</li>
+    <li>Data Link Layer: sequence numbers, LCRC, Ack/Nak replay, DLLPs, link initialisation; scope is one link.</li>
+    <li>Physical Layer: framing, striping, encoding/scrambling, ordered sets, LTSSM, SerDes.</li>
+    <li>Errors carry their layer: RxErr (Physical); BadTLP, BadDLLP, Replay Timer Timeout, Rollover, DL Protocol Error, Surprise Down (Data Link); UR, CA, Completion Timeout, Malformed TLP and others (Transaction).</li>
+    <li>The detecting port tells you the failing direction; the first error in time is usually the lowest layer.</li>
+    <li>Flit Mode reshapes the Data Link and framing for Gen6 and beyond.</li>
+  </ul>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>draw the three layers in two ports and the path of one TLP through them;</li>
+      <li>list what each layer adds to a TLP on the wire;</li>
+      <li>explain Ack/Nak replay with sequence numbers;</li>
+      <li>classify ten AER error names by layer;</li>
+      <li>identify the suspect direction from which port detected an error;</li>
+      <li>say which mechanisms are link-local and which are end to end.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Transaction Layer Specification</cite>, <cite class="spec">— Data Link Layer Specification</cite>, <cite class="spec">— Physical Layer Logical Block</cite>, <cite class="spec">— Error Signalling and Logging</cite>.</li>
+    <li>Linux kernel documentation: "The PCI Express Advanced Error Reporting Driver Guide".</li>
+    <li>Deep dives: <a href="dd10.html">Module 10 — PCIe Transaction Layer</a>, <a href="dd15.html">Module 15 — PCIe Data Link Layer</a>, <a href="dd16.html">Module 16 — DLLP and Replay</a>, <a href="dd07.html">Module 07 — PCIe Physical Layer</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch08.html">Chapter 8 — PCIe LTSSM</a> opens the Physical Layer's state machine that brings a link up, changes its speed, saves power and recovers from errors.</p>
+</section>

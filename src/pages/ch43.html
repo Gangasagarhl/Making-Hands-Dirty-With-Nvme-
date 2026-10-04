@@ -1,0 +1,641 @@
+<p class="lead">MSI-X turns "the device needs attention" into an ordinary PCIe Memory Write whose address and data the operating system chose in advance, one entry per vector. This chapter opens the MSI-X capability, the vector table and the Pending Bit Array field by field, shows how NVMe binds completion queues to vectors, and teaches you to find every step in a trace and in Linux.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p><a href="ch42.html">Chapter 42</a> compared the three interrupt mechanisms and argued that NVMe needs Message Signaled Interrupts eXtended (MSI-X). This chapter is the mechanics: where the MSI-X structures live, who writes each field, what the controller does when a completion queue needs attention, and what an interrupt looks like as a Transaction Layer Packet (TLP). Engineers who can decode an MSI-X table entry by eye can answer "where did that interrupt go?" in minutes instead of days.</p>
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Locate the MSI-X capability in configuration space and decode Message Control (Table Size, Function Mask, MSI-X Enable), Table Offset/BIR and PBA Offset/BIR.</li>
+    <li>Find the MSI-X table and Pending Bit Array (PBA) in a Base Address Register (BAR) region and decode a 16-byte table entry (Message Address, Message Upper Address, Message Data, Vector Control).</li>
+    <li>Explain the masking and pending rules: what the device does when a vector is masked, and what happens on unmask.</li>
+    <li>Explain how NVMe maps completion queues to vectors (Create I/O Completion Queue IV and IEN; admin CQ on vector 0) and how Linux chooses the mapping.</li>
+    <li>Identify the interrupt as a posted Memory Write (MWr) TLP in a trace, with its Requester ID, address, data and ordering position.</li>
+    <li>Read MSI-X state in Linux: <code>lspci -vvv</code>, <code>/proc/interrupts</code>, <code>msi_irqs</code>, IRQ affinity.</li>
+    <li>Debug masked, misrouted, stale and missing MSI-X interrupts.</li>
+  </ul>
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq"><p>Read <a href="ch42.html">Interrupt Architecture</a> first. You also need <a href="ch18.html">Configuration Space</a> (capability lists), <a href="ch19.html">BARs and MMIO</a> (how a BAR region is addressed), <a href="ch11.html">TLP Header Anatomy</a> (MWr fields), <a href="ch12.html">Posted vs Non-Posted</a>, and <a href="ch27.html">I/O Queues</a> (Create I/O Completion Queue).</p></aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>The librarian has a clipboard. On it is a list with one line per "done basket". Each line has three things: a room number, a secret word, and a little red flag. When a book lands in basket 3, the librarian looks at line 3. If the red flag is down, she walks to that room and says the secret word — and the teacher there knows exactly what to do. If the red flag is up, she does not walk; she puts a tick next to line 3 on a second sheet called "waiting". When the teacher lowers the flag later, the librarian sees the tick and goes straight away.</p>
+    <p>The teachers write the clipboard, not the librarian. The librarian only reads it.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>MSI-X is like a hotel's guest-paging system. Each guest (CPU) registers a pager number at the front desk; the desk keeps a ledger: "room service for floor 3 → pager 0x41 on desk 1". When an order is ready the kitchen does not shout; it dials the number from the ledger. A "do not disturb" flag on a ledger line makes the kitchen hold the call and mark it pending; when the flag is cleared, the held call goes out at once.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>Hides:</strong> the "dial" is a 4-byte Memory Write that travels the same PCIe path as data, so it can be delayed by flow control, blocked by the Input-Output Memory Management Unit (IOMMU), or ordered behind earlier writes. <strong>Misleads:</strong> one held call per line, not one per order: the pending bit is a single bit, so ten events on a masked vector produce one interrupt on unmask, not ten. And the ledger lives inside the device's memory space (a BAR), not at the front desk (the CPU), even though the CPU writes it.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>MSI-X has four parts:</p>
+  <ol>
+    <li><strong>The capability</strong> — a small structure in the device's configuration space. It says "I support MSI-X", how many vectors, and where the table and pending bits are. It also holds the on/off switch (MSI-X Enable) and a master mute (Function Mask).</li>
+    <li><strong>The table</strong> — in the device's memory-mapped space (inside one of its BARs). One 16-byte row per vector: where to write (address), what to write (data), and a mute flag (mask bit).</li>
+    <li><strong>The Pending Bit Array</strong> — also in a BAR. One bit per vector, set by the device when it wanted to interrupt but that vector was muted.</li>
+    <li><strong>The message</strong> — when the device needs to interrupt on vector <var>v</var>, it writes table row <var>v</var>'s data to table row <var>v</var>'s address. That is the whole interrupt.</li>
+  </ol>
+  <p>The operating system fills the table so that each address/data pair means "interrupt this particular CPU with this particular vector number". The NVMe driver then tells the NVMe controller "completion queue 3 uses vector 3". From then on, whenever the controller puts a completion into CQ3 it sends vector 3's message, and the CPU that owns CQ3 is interrupted.</p>
+  <figure>
+<pre class="diagram">
+ Config space (PCIe capability list)              BAR0 (memory space), lab system
+ ┌───────────────────────────────┐                0xFE60_0000 ┌──────────────────────┐
+ │ MSI-X cap: ID 11h             │                            │ NVMe registers        │
+ │  Message Control:             │                0xFE60_1000 │ doorbells             │
+ │   Enable=1 FnMask=0 Size=32   │                            │                       │
+ │  Table  BIR=0 Offset=0x2000 ──┼───────────────►0xFE60_2000 │ MSI-X table           │
+ │  PBA    BIR=0 Offset=0x3000 ──┼──────┐                     │  entry 0 (16 B)       │
+ └───────────────────────────────┘      │                     │  entry 1 …entry 32    │
+                                        └──────────►0xFE60_3000 │ PBA: bits 0..32      │
+                                                    0xFE60_3FFF └──────────────────────┘
+</pre>
+    <figcaption>Synthetic example for teaching: the lab SSD's MSI-X structures. Table Size field = 32 (encodes 33 vectors).</figcaption>
+  </figure>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>The MSI-X capability structure</h3>
+  <p>The capability sits in the PCI-compatible capability list (Capability ID <strong>11h</strong>) and is three DWORDs long.</p>
+  <table class="packet">
+    <thead><tr><th class="row-label">Offset</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">+00h</td><td colspan="1" class="hl">En</td><td colspan="1" class="hl">FM</td><td colspan="3" class="rsvd">Rsvd</td><td colspan="11" class="hl">Table Size (N−1)</td><td colspan="8">Next Capability Pointer</td><td colspan="8">Capability ID = 11h</td></tr>
+      <tr><td class="row-label">+04h</td><td colspan="29">Table Offset (bits 31:3; QWORD aligned)</td><td colspan="3" class="hl">Table BIR</td></tr>
+      <tr><td class="row-label">+08h</td><td colspan="29">PBA Offset (bits 31:3; QWORD aligned)</td><td colspan="3" class="hl">PBA BIR</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>MSI-X capability fields</caption>
+    <thead><tr><th>Field</th><th>Bits</th><th>Owner</th><th>Purpose</th><th>What breaks if wrong</th></tr></thead>
+    <tbody>
+      <tr><td>Table Size</td><td>Message Control 10:0 (DW0 26:16)</td><td>Device (read-only)</td><td>Number of table entries minus 1; up to 2048 vectors</td><td>Software indexes past the table; vectors that do not exist</td></tr>
+      <tr><td>Function Mask</td><td>Message Control 14 (DW0 bit 30)</td><td>Software</td><td>Masks all vectors of the function regardless of per-vector mask bits</td><td>Left set: no interrupts at all; events accumulate as pending bits</td></tr>
+      <tr><td>MSI-X Enable</td><td>Message Control 15 (DW0 bit 31)</td><td>Software</td><td>Turns MSI-X on; when set, the function must not use INTx or MSI</td><td>Clear: device falls back to MSI/INTx or silence</td></tr>
+      <tr><td>Table BIR</td><td>+04h bits 2:0</td><td>Device (read-only)</td><td>Which BAR holds the table: 0–5 → BAR at config offsets 10h–24h (for a 64-bit BAR, the BIR names its lower DWORD)</td><td>Software maps the wrong region</td></tr>
+      <tr><td>Table Offset</td><td>+04h bits 31:3</td><td>Device (read-only)</td><td>Byte offset of the table within that BAR (low three bits treated as 0)</td><td>As above</td></tr>
+      <tr><td>PBA BIR / Offset</td><td>+08h</td><td>Device (read-only)</td><td>Location of the Pending Bit Array</td><td>Pending state unreadable</td></tr>
+    </tbody>
+  </table>
+  <p>Encoding example: a Table Size field of 0x020 (32) means 33 vectors (0–32). A Message Control value of 0x8020 means Enable=1, Function Mask=0, 33 vectors; 0xC020 means enabled but the whole function masked.</p>
+
+  <h3>The table entry</h3>
+  <p>Each entry is 16 bytes; entry <var>v</var> is at table base + 16 × <var>v</var>.</p>
+  <table class="packet">
+    <thead><tr><th class="row-label">Entry DW</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">DW0 (+0)</td><td colspan="30">Message Address [31:2]</td><td colspan="2" class="rsvd">00</td></tr>
+      <tr><td class="row-label">DW1 (+4)</td><td colspan="32">Message Upper Address [63:32]</td></tr>
+      <tr><td class="row-label">DW2 (+8)</td><td colspan="32" class="hl">Message Data</td></tr>
+      <tr><td class="row-label">DW3 (+C)</td><td colspan="16" class="rsvd">Reserved / optional extensions (version-dependent)</td><td colspan="15" class="rsvd">Reserved</td><td colspan="1" class="hl">M</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li><strong>Message Address / Upper Address</strong> — DWORD-aligned target address of the interrupt write. On x86 the low 32 bits are in the 0xFEEx_xxxx window and the upper address is 0.</li>
+    <li><strong>Message Data</strong> — the 32-bit value the device writes. The device does not interpret it.</li>
+    <li><strong>Vector Control, bit 0: Mask Bit</strong> — when 1, the device must not send this vector's message; it sets the vector's pending bit instead. The mask bit is <strong>set after reset</strong>, so software must clear it before a vector can fire.</li>
+  </ul>
+  <aside class="callout version"><p>Recent PCI Express Base Specification revisions allow the upper bits of Vector Control to carry a TLP Processing Hints (TPH) Steering Tag when the TPH Requester capability places its steering-tag table in the MSI-X table. Treat this as optional and version-dependent; on most NVMe drives today these bits are reserved. Confirm in the TPH Requester and MSI-X sections of the PCIe Base Specification.</p></aside>
+
+  <h3>The Pending Bit Array</h3>
+  <p>The PBA is an array of QWORDs: bit <var>v</var> of the array is the pending bit for vector <var>v</var>. It is read-only to software. The device sets bit <var>v</var> when an interrupt condition for vector <var>v</var> occurs while that vector (or the function) is masked; it clears the bit when it sends the deferred message, or when the condition goes away (for example, the host already consumed the CQ entries) — the latter is implementation-specific in its details.</p>
+
+  <h3>The delivery rule</h3>
+  <figure>
+<pre class="diagram">
+ event for vector v
+        │
+        ▼
+ MSI-X Enable = 1 ? ── no ──► (MSI-X not active: device uses MSI/INTx or nothing)
+        │ yes
+        ▼
+ Function Mask = 1  OR  entry[v].Mask = 1 ? ── yes ──► PBA[v] = 1   (no TLP)
+        │ no                                                  │
+        ▼                                                     │ later: both masks clear
+ send MWr(addr = entry[v].Address, data = entry[v].Data)  ◄───┘ and PBA[v] = 1
+        │                                                       → send, PBA[v] = 0
+        ▼
+ PBA[v] = 0
+</pre>
+    <figcaption>Conceptual MSI-X delivery decision, per the MSI-X rules in the PCI Express Base Specification.</figcaption>
+  </figure>
+  <p>Two further normative points matter in practice:</p>
+  <ul>
+    <li><strong>Do not change an unmasked entry.</strong> If software modifies an entry's address or data while the vector is unmasked, the result is undefined (the device may send a message with half-old, half-new contents). Correct software masks, rewrites, then unmasks.</li>
+    <li><strong>Bus Master Enable.</strong> An MSI-X message is a memory write; if the Command register's Bus Master Enable is clear, the function cannot send it, just as it cannot DMA.</li>
+  </ul>
+
+  <h3>The interrupt as a TLP</h3>
+  <p>The message is a posted Memory Write of one DWORD:</p>
+  <table class="packet">
+    <thead><tr><th class="row-label">DW</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">DW0</td><td colspan="3">Fmt 010</td><td colspan="5">Type 00000</td><td colspan="8">TC=0, attrs (RO should be 0)</td><td colspan="6">TD/EP/AT…</td><td colspan="10">Length = 1</td></tr>
+      <tr><td class="row-label">DW1</td><td colspan="16">Requester ID = 0x0100</td><td colspan="8">Tag</td><td colspan="4">Last BE 0000</td><td colspan="4" class="hl">First BE 1111</td></tr>
+      <tr><td class="row-label">DW2</td><td colspan="30" class="hl">Address [31:2] = Message Address (e.g. 0xFEE0_1000)</td><td colspan="2" class="rsvd">00</td></tr>
+      <tr><td class="row-label">Data</td><td colspan="32" class="hl">Message Data (e.g. 0x0000_0041)</td></tr>
+    </tbody>
+  </table>
+  <p>Fmt 010b with Type 00000b is a 3-DWORD-header Memory Write with data (MWr32), used because the x86 interrupt address is below 4 GiB. With a non-zero Message Upper Address the device uses a 4-DWORD header (MWr64). Simplified layout: real DW0/DW1 contain more fields; see <a href="ch11.html">TLP Header Anatomy</a>.</p>
+  <aside class="callout derived"><p>Tag value in a posted write has no completion to match, so analyzers often show it but nothing depends on it. The Requester ID tells you which function (and, with SR-IOV, which virtual function) sent the interrupt — essential when several functions share a link.</p></aside>
+
+  <h3>What the address and data mean on x86 (platform view)</h3>
+  <p>The device treats address and data as opaque. The platform gives them meaning. In the classic (non-remapped) x86 format, the address carries the destination Local APIC ID in bits 19:12 and the data carries the CPU vector in bits 7:0 plus delivery and trigger mode bits. With interrupt remapping enabled (Intel VT-d or AMD-Vi), the address instead carries a <em>handle</em> into an IOMMU-owned Interrupt Remapping Table, and the IOMMU validates the Requester ID before delivering. Consult the Intel Software Developer's Manual (MSI message format) and the Intel VT-d or AMD IOMMU specifications for exact bit layouts.</p>
+  <table>
+    <caption>Synthetic decode of the lab system's vector 1 (non-remapped format, for teaching)</caption>
+    <thead><tr><th>Field</th><th>Value</th><th>Meaning on x86</th></tr></thead>
+    <tbody>
+      <tr><td>Message Address</td><td>0xFEE0_1000</td><td>0xFEE window; destination APIC ID = 0x01 (bits 19:12)</td></tr>
+      <tr><td>Message Upper Address</td><td>0x0000_0000</td><td>Below 4 GiB → MWr32</td></tr>
+      <tr><td>Message Data</td><td>0x0000_0041</td><td>CPU vector 0x41, fixed delivery, edge</td></tr>
+      <tr><td>Vector Control</td><td>0x0000_0000</td><td>Unmasked</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Queue mapping in NVMe</h3>
+  <p>NVMe ties completion queues to MSI-X vectors with two fields in <strong>Create I/O Completion Queue</strong> (admin opcode 05h), Command Dword 11:</p>
+  <table class="packet">
+    <thead><tr><th class="row-label">CDW11</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody><tr><td class="row-label">Create I/O CQ</td><td colspan="16" class="hl">Interrupt Vector (IV)</td><td colspan="14" class="rsvd">Reserved</td><td colspan="1" class="hl">IEN</td><td colspan="1">PC</td></tr></tbody>
+  </table>
+  <ul>
+    <li><strong>IV</strong> — the MSI-X table index (or MSI vector) to use for this CQ. Must be less than the number of vectors the function supports; otherwise the controller fails the command with the command-specific status <em>Invalid Interrupt Vector</em> (see <a href="ch44.html">NVMe Errors</a>).</li>
+    <li><strong>IEN (Interrupts Enabled)</strong> — 1: the controller interrupts for this CQ; 0: it never does (used for polled queues).</li>
+    <li><strong>PC (Physically Contiguous)</strong> — unrelated to interrupts; included for completeness.</li>
+    <li>The <strong>admin CQ always uses vector 0</strong>.</li>
+    <li>Several CQs may share a vector. One CQ cannot use several vectors.</li>
+  </ul>
+  <p>How many vectors to ask for is negotiated in two places: the MSI-X Table Size (what the function supports) and the NVMe <strong>Number of Queues</strong> feature (Feature Identifier 07h; what the controller will allow in queues). Linux typically requests one I/O vector per CPU plus one for admin, bounded by both, and uses managed affinity so each vector is pinned to the CPUs of its hardware queue.</p>
+  <figure>
+    <ol class="seq" data-actors="NVMe driver|PCI/IRQ core|Config space|MSI-X table (BAR0)|NVMe controller">
+      <li data-from="NVMe driver" data-to="PCI/IRQ core">alloc irq vectors (n, affinity)</li>
+      <li data-from="PCI/IRQ core" data-to="Config space">read MSI-X cap: Size, BIR, offsets</li>
+      <li data-from="PCI/IRQ core" data-to="Config space">Message Control: Enable=1, FnMask=1</li>
+      <li data-from="PCI/IRQ core" data-to="MSI-X table (BAR0)">write entry v: addr, data (masked)</li>
+      <li data-from="PCI/IRQ core" data-to="Config space">FnMask=0</li>
+      <li data-from="PCI/IRQ core" data-to="MSI-X table (BAR0)">clear entry v Mask on request_irq</li>
+      <li data-from="NVMe driver" data-to="NVMe controller">Set Features 07h: Number of Queues</li>
+      <li data-from="NVMe driver" data-to="NVMe controller">Create I/O CQ: QID=v, IV=v, IEN=1</li>
+      <li data-from="NVMe driver" data-to="NVMe controller">Create I/O SQ: QID=v, CQID=v</li>
+      <li data-note="NVMe controller">CQ v now signals vector v</li>
+    </ol>
+    <figcaption>Conceptual initialization order on Linux. Exact ordering of PCI-core steps is kernel-implementation-dependent.</figcaption>
+  </figure>
+
+  <h3>The central concept on the ladder</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Each basket has a line on the clipboard telling the librarian which room to walk to and what to say, plus a "do not disturb" flag.</p></div>
+    <div class="rung" data-rung="B"><p>Each MSI-X vector has a table entry with an address, a data value and a mask bit. The OS fills it; the device uses it to send a memory write that the platform turns into a CPU interrupt.</p></div>
+    <div class="rung" data-rung="C"><p>The table and PBA are MMIO structures inside a device BAR (lab system: BAR0+0x2000 and +0x3000). The controller's interrupt engine reads entry <var>v</var> when CQ <var>y</var> (with IV=<var>v</var>) has new entries and either emits an MWr or sets PBA bit <var>v</var>.</p></div>
+    <div class="rung" data-rung="D"><p>PCIe Base Specification: MSI-X capability (ID 11h), Message Control, Table/PBA Offset and BIR, table entry format, masking and pending rules. NVMe Base Specification: Create I/O CQ IV/IEN; admin CQ vector 0; Number of Queues. NVMe over PCIe Transport: interrupt modes.</p></div>
+    <div class="rung" data-rung="E"><p>Device→Host posted MWr, 1 DW, First BE 1111b, address from the entry, data from the entry, Requester ID of the function, ordered behind the CQE write.</p></div>
+    <div class="rung" data-rung="F"><p>In the capture: RC→device MWrs to BAR0+0x2000.. at init (table programming), then during I/O pairs of (16-byte MWr to CQ memory, 4-byte MWr to 0xFEEx_xxxx). A missing second half of the pair is the signature of a masked or broken vector.</p></div>
+    <div class="rung" data-rung="G"><p>For a missing interrupt: read Message Control (Enable, Function Mask), the entry's mask bit and the PBA bit. PBA=1 → device wanted to fire, host masked it. PBA=0 and unmasked → device never decided to fire (IEN, IV, coalescing, firmware). Interrupt write seen but no handler → platform (remapping table, affinity, CPU state).</p></div>
+  </div>
+
+  <h3>The 16 questions for the MSI-X table entry</h3>
+  <table>
+    <caption>Sixteen questions, one concept</caption>
+    <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>What is it?</td><td>A 16-byte record (address, upper address, data, vector control) defining one interrupt message.</td></tr>
+      <tr><td>Why was it created?</td><td>MSI's single address and contiguous data values limited vector count and CPU targeting; per-vector entries remove both limits.</td></tr>
+      <tr><td>What problem does it solve?</td><td>Independent targeting and masking of up to 2048 interrupt sources per function.</td></tr>
+      <tr><td>What existed before it?</td><td>MSI (capability-resident, up to 32 vectors) and INTx.</td></tr>
+      <tr><td>Why is the current design better?</td><td>Table in MMIO is large and quick to update, masks are per vector, and the PBA makes pending state observable.</td></tr>
+      <tr><td>Who creates it?</td><td>Host software (OS PCI/IRQ core), via MMIO writes.</td></tr>
+      <tr><td>Who consumes it?</td><td>The device's interrupt engine.</td></tr>
+      <tr><td>Where does it live?</td><td>In the BAR named by Table BIR at Table Offset (lab: 0xFE60_2000 + 16·v).</td></tr>
+      <tr><td>What memory/registers are involved?</td><td>MSI-X capability, BAR, table, PBA, Command register Bus Master Enable, NVMe CQ IV/IEN.</td></tr>
+      <tr><td>What happens before it?</td><td>Enumeration assigns the BAR; driver allocates vectors; OS writes entries.</td></tr>
+      <tr><td>What happens after it?</td><td>Each event for the vector produces an MWr (or a pending bit).</td></tr>
+      <tr><td>What happens if it is wrong?</td><td>Wrong address: write goes to memory or is blocked (IOMMU fault). Wrong data: wrong CPU vector, "no handler" or spurious IRQ. Left masked: PBA set, timeouts.</td></tr>
+      <tr><td>What does the protocol analyzer show?</td><td>Programming MWrs from RC into the table region; later 1-DW MWrs from the device to the entry's address.</td></tr>
+      <tr><td>What does Linux show?</td><td><code>lspci -vvv</code> "MSI-X: Enable+ Count=N Masked-", "Vector table: BAR=0 offset=…", "PBA: …"; <code>/proc/interrupts</code> lines per vector.</td></tr>
+      <tr><td>What would a validation engineer test?</td><td>Each entry used exactly as written, mask/PBA behaviour, Function Mask, table reads return written values, reset state (all masked), 64-bit addresses, behaviour after FLR.</td></tr>
+      <tr><td>What would a senior engineer suspect when it fails?</td><td>Stale entry after reprogramming, entry modified while unmasked, IV/QID mismatch, IOMMU remapping entry not set up, Bus Master disabled, Function Mask left set after a reset path.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>Inside the controller the MSI-X table is usually a small SRAM or register file mapped into the BAR decoder. Host writes to the table region land there; the interrupt engine reads from it. Many designs cache entries or latch them at unmask time; the specification's rule that software must mask before changing an entry is what makes such caching safe.</p>
+  <ul>
+    <li><strong>Must participate:</strong> BAR decoder (host access to table/PBA), interrupt engine, PCIe transaction layer (to emit the MWr), configuration space (capability).</li>
+    <li><strong>May participate:</strong> coalescing logic, TPH steering-tag logic, SR-IOV (each virtual function has its own MSI-X capability and table).</li>
+    <li><strong>Observable:</strong> table contents and PBA (MMIO reads), capability (config reads), the MWr on the link, host interrupt counters.</li>
+    <li><strong>Unobservable:</strong> the device's internal decision timing, coalescing counters, any internal copy of the entry.</li>
+  </ul>
+  <aside class="callout impl"><p>Where the table lives is the device designer's choice: the lab SSD places it in BAR0 after the doorbells; other NVMe controllers use a separate BAR (some designs use the BAR pair at configuration offsets 20h/24h). Always follow Table BIR/Offset; never hard-code. The PCIe specification recommends that the table and PBA not share a naturally aligned 4 KiB page with other registers, so that hypervisors can map them separately — check the exact recommendation text in the MSI-X section.</p></aside>
+  <p>On the host side, the root complex steers writes in the interrupt address window to the interrupt fabric rather than to DRAM. If the IOMMU performs interrupt remapping, it looks up the handle in its remapping table, checks the Requester ID, and delivers to the target CPU's local APIC. A blocked or invalid entry generates an IOMMU fault record instead.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — MSI-X Capability and Table Structures</cite> <span class="badge normative">Normative</span> for the capability, table, PBA, masking and pending rules.</li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Create I/O Completion Queue command; Number of Queues feature</cite> for IV, IEN, vector 0 for the admin CQ.</li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4 — Interrupts</cite> for how NVMe CQs use MSI-X on PCIe.</li>
+  </ul>
+  <aside class="callout verified"><p>MSI-X Capability ID is 11h. Message Control holds Table Size (N−1, bits 10:0), Function Mask (bit 14) and MSI-X Enable (bit 15). Table and PBA are located by BIR (bits 2:0) and QWORD-aligned offset (bits 31:3). Each table entry is 16 bytes: Message Address, Message Upper Address, Message Data, Vector Control with Mask Bit in bit 0. Up to 2048 vectors. Create I/O Completion Queue CDW11 carries IV in bits 31:16 and IEN in bit 1; the admin CQ uses vector 0.</p></aside>
+  <aside class="callout derived"><p>That a missing interrupt with PBA=1 points at host-side masking, and with PBA=0 points at the device's decision logic, is reasoning from the delivery rules, not a statement in the specification.</p></aside>
+  <aside class="callout impl"><p>Table location; whether the device latches entries; when exactly a pending bit is cleared if the condition disappears while masked; how many vectors are implemented; Linux's vector-to-CPU assignment and whether vectors are shared.</p></aside>
+  <aside class="callout version"><p>Optional Vector Control extensions (TPH steering tags) depend on PCIe revision and capability presence. Linux interfaces for MSI-X (e.g. <code>pci_alloc_irq_vectors_affinity</code>, managed affinity, IRQ debugfs) have evolved across kernel versions.</p></aside>
+  <aside class="callout notsaid"><p>Confirm in the specifications: the exact rule for header format choice when the Message Upper Address is zero; attribute (Relaxed Ordering, No Snoop) requirements for MSI-X writes; the complete list of reasons the NVMe controller returns Invalid Interrupt Vector; and the recommended placement of the table relative to other registers. The specifications do not say which CPU a vector should target or how many vectors an OS should request.</p></aside>
+  <aside class="callout warn"><p>Never assume the table is at a fixed offset; never assume vector number equals CQ identifier; never edit an entry while it is unmasked; never interpret Message Data without knowing the platform's format and whether remapping is on.</p></aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>MSI-X related transactions over a device's lifetime</caption>
+    <thead><tr><th>Phase</th><th>Transaction</th><th>Direction</th><th>Type</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Discovery</td><td>Config reads of capability list</td><td>RC→Dev</td><td>CfgRd0 / CplD</td><td>Find ID 11h, read Message Control, Table, PBA</td></tr>
+      <tr><td>Setup</td><td>Config write Message Control</td><td>RC→Dev</td><td>CfgWr0 / Cpl</td><td>Enable=1 (often with Function Mask=1 first)</td></tr>
+      <tr><td>Setup</td><td>Table entry writes</td><td>RC→Dev</td><td>MWr (posted)</td><td>Address, upper, data; then Vector Control mask=0</td></tr>
+      <tr><td>Setup</td><td>Create I/O CQ</td><td>RC→Dev via SQ0</td><td>doorbell MWr + SQE fetch</td><td>IV and IEN bind CQ to vector</td></tr>
+      <tr><td>Run</td><td>Interrupt message</td><td>Dev→RC</td><td>MWr, 1 DW (posted)</td><td>After CQE write, same Requester ID</td></tr>
+      <tr><td>Run</td><td>Mask / unmask</td><td>RC→Dev</td><td>MWr to Vector Control</td><td>e.g. during affinity change</td></tr>
+      <tr><td>Debug</td><td>PBA read</td><td>RC→Dev</td><td>MRd / CplD</td><td>Non-posted, returns pending bits</td></tr>
+    </tbody>
+  </table>
+  <p>The interrupt message never generates a completion. If the root complex cannot accept it (for example, the address is not in a valid region), it handles it as an error on an upstream posted request — which may be reported through Advanced Error Reporting as an Unsupported Request at the root port, with no notification to the device. See <a href="ch45.html">PCIe Errors</a>.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Three synthetic traces on the lab system (BAR0 = 0xFE60_0000, table at +0x2000, PBA at +0x3000, SSD Requester ID 0x0100). Interrupt addresses are shown in the non-remapped x86 format for readability.</p>
+  <div class="trace" data-kind="synthetic" data-title="Normal: programming vector 3, creating CQ3, first interrupt">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 µs</td><td>CfgWr0</td><td>Reg=MSI-X cap (0xB0) Data=0xC020_xx11</td><td>Message Control: Enable=1, Function Mask=1</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>3 µs</td><td>MWr32</td><td>Addr=0xFE60_2030 Len=1 Data=0xFEE0_3000</td><td>Entry 3 Message Address (APIC ID 3)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>3 µs</td><td>MWr32</td><td>Addr=0xFE60_2034 Data=0x0000_0000</td><td>Entry 3 Upper Address</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>3 µs</td><td>MWr32</td><td>Addr=0xFE60_2038 Data=0x0000_0043</td><td>Entry 3 Data: CPU vector 0x43</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>9 µs</td><td>CfgWr0</td><td>Reg=0xB0 Data=0x8020_xx11</td><td>Function Mask=0</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>40 µs</td><td>MWr32</td><td>Addr=0xFE60_203C Data=0x0000_0000</td><td>Entry 3 Vector Control: unmask</td></tr>
+        <tr class="note"><td colspan="6">Admin command Create I/O CQ (opcode 05h) QID=3, QSIZE=1023, IV=3, IEN=1, PC=1; completes on admin CQ with vector 0</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>1.20 ms</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_2363_0000 Len=4</td><td>First CQE in CQ3 (P=1)</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>1.20 ms</td><td>MWr32</td><td>Req=0x0100 Addr=0xFEE0_3000 Len=1 Data=0x0000_0043</td><td>MSI-X vector 3 exactly as programmed in rows 2–4</td></tr>
+        <tr class="dir-down"><td>9</td><td>Host→Dev</td><td>1.203 ms</td><td>MWr32</td><td>Addr=0xFE60_101C Data=0x0000_0001</td><td>CQ3 head doorbell (0x1000 + (2·3+1)·4)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The decisive check is that row 8's address and data equal what rows 2 and 4 wrote. If they differ, either the capture missed a later reprogramming or the device used the wrong entry. Note the "mask while writing" discipline: Function Mask is set (row 1) while entries are written and cleared afterwards; the per-vector mask is cleared only when the driver registers its handler (row 6).</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: vector left masked — pending bit set, no interrupt">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 µs</td><td>MWr32</td><td>Addr=0xFE60_207C Data=0x0000_0001</td><td>Entry 7 Vector Control: Mask=1 (affinity change begins)</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>1 µs</td><td>MWr32</td><td>Addr=0xFE60_2070 Data=0xFEE0_5000</td><td>Entry 7 retargeted to APIC 5</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>2 µs</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_23A3_0200 Len=4</td><td>CQE in CQ7</td></tr>
+        <tr class="abnormal"><td>—</td><td>—</td><td>2 µs → 30 s</td><td>(nothing)</td><td>No unmask write to 0xFE60_207C; no interrupt MWr</td><td><strong>First abnormal event:</strong> the unmask that should follow row 2 never arrives</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>30 s</td><td>MRd32</td><td>Addr=0xFE60_3000 Len=2 Tag=0x05</td><td>Debug read of PBA QWORD 0</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>30 s</td><td>CplD</td><td>Cpl=0x0100 Tag=0x05 Status=SC Data=0x0000_0080 0x0000_0000</td><td>PBA bit 7 set: device wanted to interrupt on vector 7</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The device behaved correctly: it saw an event on a masked vector and set PBA bit 7 instead of sending. The first abnormal event is the missing unmask after the retarget — a host software bug in the affinity-change path (or a race with CPU hot-plug). Once the host clears the mask bit, the device must send the deferred message immediately, so the fix shows up in a trace as an unmask write followed within microseconds by an MWr to 0xFEE0_5000.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: interrupt write sent to a stale address after the table was rewritten unmasked">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 ns</td><td>MWr32</td><td>Addr=0xFE60_2020 Data=0xFEE0_6000</td><td>Entry 2 address rewritten <em>without</em> masking first</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>80 ns</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_2352_0110 Len=4</td><td>CQE in CQ2</td></tr>
+        <tr class="abnormal"><td>3</td><td>Dev→Host</td><td>150 ns</td><td>MWr32</td><td>Req=0x0100 Addr=0xFEE0_6000 Data=0x0000_0042</td><td><strong>First abnormal event:</strong> new address combined with old data (vector 0x42 belonged to the old target CPU)</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>200 ns</td><td>MWr32</td><td>Addr=0xFE60_2028 Data=0x0000_0046</td><td>Entry 2 data rewritten — too late for row 3</td></tr>
+        <tr class="note"><td colspan="6">Host: CPU 6 receives vector 0x42, which has no handler registered on CPU 6 → kernel logs an unexpected/spurious vector message; CQ2 completion waits for the next interrupt or a timeout.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> Row 1 broke the rule "mask before modifying". The device legally sampled the entry between the address write and the data write and produced a torn message. Everything after is a consequence. The evidence chain is: table write without a preceding mask (row 1), an interrupt MWr whose address/data pair matches neither the old nor the new entry (row 3), and a host log about an unexpected vector on CPU 6. With interrupt remapping enabled the same bug more often appears as an IOMMU interrupt-remapping fault in the kernel log instead.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Capability, enable/mask state, table and PBA location</span>
+sudo lspci -vvv -s 01:00.0 | sed -n '/MSI-X/,/PBA/p'
+
+<span class="cm"># Raw Message Control: find the capability offset first (e.g. 0xb0), then read 2 bytes at +2</span>
+sudo setpci -s 01:00.0 CAP_MSIX+2.w      <span class="cm"># newer pciutils understand CAP_MSIX names</span>
+
+<span class="cm"># Linux IRQs for the device's vectors, counts and affinity</span>
+ls /sys/bus/pci/devices/0000:01:00.0/msi_irqs/
+grep nvme0q /proc/interrupts
+for i in $(ls /sys/bus/pci/devices/0000:01:00.0/msi_irqs/); do
+  printf "irq %s  affinity %s\n" "$i" "$(cat /proc/irq/$i/effective_affinity_list)"
+done
+
+<span class="cm"># With CONFIG_GENERIC_IRQ_DEBUGFS: per-IRQ internal state</span>
+sudo cat /sys/kernel/debug/irq/irqs/&lt;irq&gt;
+
+<span class="cm"># IOMMU interrupt-remapping status and faults</span>
+sudo dmesg | grep -iE 'remapping|DMAR|AMD-Vi' | head</code></pre>
+  <p>Illustrative <code>lspci</code> fragment for the lab SSD (synthetic):</p>
+  <pre class="code" data-kind="read-only" data-lang="text" data-title="illustrative, not captured"><code>	Capabilities: [b0] MSI-X: Enable+ Count=33 Masked-
+		Vector table: BAR=0 offset=00002000
+		PBA: BAR=0 offset=00003000</code></pre>
+  <p><code>Count=33</code> is Table Size + 1. <code>Masked-</code> is the Function Mask, not the per-vector masks; lspci does not show per-vector state. To see individual entries you must read the BAR (lab below), or use IRQ debugfs.</p>
+  <aside class="callout warn"><p>Reading device MMIO through <code>/sys/bus/pci/devices/…/resource0</code> bypasses the driver. Reads of the MSI-X table and PBA are side-effect free by specification, but any mistake in offset can read registers that do have side effects on some devices. Never <em>write</em> the table from user space on a system you care about.</p></aside>
+  <table>
+    <caption>What each Linux source can and cannot prove</caption>
+    <thead><tr><th>Source</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>lspci MSI-X Enable+ / Masked-</td><td>Capability state</td><td>Per-vector mask, entry contents</td></tr>
+      <tr><td>msi_irqs directory</td><td>How many vectors Linux allocated</td><td>Which CQ each is bound to (that is in Create I/O CQ)</td></tr>
+      <tr><td>/proc/interrupts</td><td>Deliveries per CPU</td><td>Whether the device sent messages that were then blocked</td></tr>
+      <tr><td>IOMMU fault log</td><td>A message was blocked by remapping</td><td>Why the entry was stale (needs trace/timeline)</td></tr>
+      <tr><td>Table/PBA dump</td><td>Current entries and pending state</td><td>History — it is a snapshot</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <h3>MSI-X capability and table decoder</h3>
+  <p>Standard-library Python. With no arguments it decodes a built-in synthetic configuration-space image and table dump of the lab SSD. With a path to a <code>config</code> file from sysfs it decodes a real capability (root is needed to read beyond the first 64 bytes). It never touches the device's BAR.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="msix_decode.py"><code>#!/usr/bin/env python3
+"""Decode the MSI-X capability from a PCI config-space image and,
+optionally, MSI-X table entries from a table dump. Read-only.
+Usage: msix_decode.py [path/to/config]"""
+import struct, sys
+
+def synthetic_config():
+    cfg = bytearray(256)
+    struct.pack_into("&lt;HH", cfg, 0x00, 0xFFFF, 0x0000)    # placeholder IDs (synthetic)
+    struct.pack_into("&lt;H", cfg, 0x06, 0x0010)            # Status: Capabilities List
+    cfg[0x34] = 0x40                                       # first capability
+    cfg[0x40:0x42] = bytes([0x01, 0xB0])                   # PM cap -&gt; next 0xB0
+    # MSI-X cap at 0xB0: ID 11h, next 0, Message Control 0x8020
+    struct.pack_into("&lt;BBH", cfg, 0xB0, 0x11, 0x00, 0x8020)
+    struct.pack_into("&lt;I", cfg, 0xB4, 0x2000 | 0)        # Table: BAR0 + 0x2000
+    struct.pack_into("&lt;I", cfg, 0xB8, 0x3000 | 0)        # PBA:   BAR0 + 0x3000
+    return bytes(cfg)
+
+def synthetic_table(n=4):
+    out = b""
+    for v in range(n):
+        addr = 0xFEE00000 | (v &lt;&lt; 12)                      # APIC ID v (non-remapped format)
+        out += struct.pack("&lt;IIII", addr, 0, 0x40 + v, 1 if v == 3 else 0)
+    return out
+
+def find_cap(cfg, cap_id):
+    if not (struct.unpack_from("&lt;H", cfg, 0x06)[0] &amp; 0x10):
+        return None
+    ptr, seen = cfg[0x34] &amp; 0xFC, set()
+    while ptr and ptr not in seen and ptr + 1 &lt; len(cfg):
+        seen.add(ptr)
+        if cfg[ptr] == cap_id:
+            return ptr
+        ptr = cfg[ptr + 1] &amp; 0xFC
+    return None
+
+def decode_cap(cfg):
+    off = find_cap(cfg, 0x11)
+    if off is None:
+        print("no MSI-X capability found (or config image truncated)")
+        return
+    mc = struct.unpack_from("&lt;H", cfg, off + 2)[0]
+    tbl = struct.unpack_from("&lt;I", cfg, off + 4)[0]
+    pba = struct.unpack_from("&lt;I", cfg, off + 8)[0]
+    print(f"MSI-X capability at 0x{off:02X}")
+    print(f"  Message Control 0x{mc:04X}: Enable={mc &gt;&gt; 15 &amp; 1} "
+          f"FunctionMask={mc &gt;&gt; 14 &amp; 1} TableSize={(mc &amp; 0x7FF) + 1} vectors")
+    print(f"  Table: BIR {tbl &amp; 7} (BAR at cfg 0x{0x10 + 4 * (tbl &amp; 7):02X}) offset 0x{tbl &amp; ~7 &amp; 0xFFFFFFFF:X}")
+    print(f"  PBA:   BIR {pba &amp; 7} offset 0x{pba &amp; ~7 &amp; 0xFFFFFFFF:X}")
+
+def decode_table(raw):
+    for v in range(len(raw) // 16):
+        lo, hi, data, ctl = struct.unpack_from("&lt;IIII", raw, 16 * v)
+        addr = hi &lt;&lt; 32 | lo
+        note = ""
+        if hi == 0 and (lo &gt;&gt; 20) == 0xFEE:
+            if lo &amp; 0x10:
+                note = "x86 remappable format (handle-based; decode with IOMMU spec)"
+            else:
+                note = f"x86 compat: dest APIC 0x{(lo &gt;&gt; 12) &amp; 0xFF:02X}, CPU vector 0x{data &amp; 0xFF:02X}"
+        print(f"  entry {v:4d}: addr=0x{addr:016X} data=0x{data:08X} "
+              f"mask={ctl &amp; 1}  {note}")
+
+if __name__ == "__main__":
+    if len(sys.argv) &gt; 1:
+        with open(sys.argv[1], "rb") as f:
+            decode_cap(f.read())
+    else:
+        print("[synthetic example for teaching]")
+        decode_cap(synthetic_config())
+        decode_table(synthetic_table())</code></pre>
+
+  <h3>Device-side delivery logic (pseudocode)</h3>
+  <pre class="code" data-kind="pseudocode" data-lang="c"><code>void on_cq_has_new_entries(cq_t *cq) {
+    if (!cq-&gt;ien) return;                          /* polled queue */
+    vec_t *v = &amp;vectors[cq-&gt;iv];
+    if (!coalesce_should_fire(v)) return;          /* threshold/timer, unless CD set */
+    if (!msix.enable) { legacy_or_msi_path(cq); return; }
+    if (msix.function_mask || v-&gt;entry.mask) { pba_set(cq-&gt;iv); return; }
+    pcie_post_mwr(v-&gt;entry.addr, v-&gt;entry.data, /*len=*/1, /*ro=*/0);
+    pba_clear(cq-&gt;iv);
+}
+void on_unmask(int iv) {                           /* host cleared mask or FnMask */
+    if (pba_test(iv) &amp;&amp; vector_still_has_work(iv)) {
+        pcie_post_mwr(vectors[iv].entry.addr, vectors[iv].entry.data, 1, 0);
+        pba_clear(iv);
+    }
+}</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Task.</strong> Given the lab SSD's capability bytes at 0xB0: <code>11 00 20 C0 00 20 00 00 00 30 00 00</code> and a table dump of entry 5 at BAR0+0x2050: <code>00 50 E0 FE 00 00 00 00 45 00 00 00 01 00 00 00</code>, determine the device's interrupt state for vector 5.</p>
+  <ol>
+    <li>Byte 0 = 11h → MSI-X. Bytes 2–3 little-endian = 0xC020 → Enable=1 (bit 15), Function Mask=1 (bit 14), Table Size = 0x020 → 33 vectors.</li>
+    <li>Bytes 4–7 = 0x0000_2000 → Table BIR 0, offset 0x2000. Bytes 8–11 = 0x0000_3000 → PBA BIR 0, offset 0x3000.</li>
+    <li>Entry 5: address DW = 0xFEE0_5000, upper = 0, data = 0x45, vector control = 1 → masked.</li>
+    <li>Conclusion: <em>two</em> masks are active — the whole function is masked and vector 5 is individually masked. No vector of this function can interrupt right now. If this is a running system (not mid-initialization), this is a bug; check the PBA: any set bit shows events waiting.</li>
+    <li>Next step: work out from the driver's state machine why Function Mask was left set — for example, an error-recovery path that masked during reset and did not restore.</li>
+  </ol>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li>Reading Table Size as the vector count (it is N−1).</li>
+    <li>Using the raw Table Offset DWORD without masking off the BIR bits.</li>
+    <li>Confusing lspci's <code>Masked-</code> (Function Mask) with per-vector masks.</li>
+    <li>Assuming the table is in BAR0. Many devices put it elsewhere; follow BIR.</li>
+    <li>Rewriting an entry while unmasked (torn messages).</li>
+    <li>Expecting one deferred interrupt per masked event: the PBA is one bit per vector.</li>
+    <li>Forgetting Bus Master Enable: with it clear, a device can send no MSI-X messages at all — a common side effect of error recovery.</li>
+    <li>Thinking NVMe's IV field is a CPU vector. It is an MSI-X table index.</li>
+    <li>Blaming the SSD for an IOMMU interrupt-remapping fault: the fault says the message was blocked; the cause is usually host-side table or remapping-entry state.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>MSI-X failure patterns</caption>
+    <thead><tr><th>Pattern</th><th>Evidence</th><th>First check</th><th>Likely cause</th></tr></thead>
+    <tbody>
+      <tr><td>No interrupts from any queue</td><td>All nvme0q* counters frozen; admin commands time out</td><td>Message Control: Enable, Function Mask; Command register Bus Master Enable</td><td>Function masked or bus mastering off after reset/recovery</td></tr>
+      <tr><td>One queue silent</td><td>One counter frozen, CQEs present in memory</td><td>Entry mask bit, PBA bit; Create I/O CQ IV/IEN in trace</td><td>Vector left masked, IV mismatch, IEN=0</td></tr>
+      <tr><td>Interrupts on the wrong CPU</td><td>Counter moving in an unexpected CPU column</td><td>Entry address vs intended target; effective affinity</td><td>Retarget raced with traffic, irqbalance on non-managed vector</td></tr>
+      <tr><td>IOMMU remapping faults</td><td>dmesg DMAR/AMD-Vi interrupt-remapping fault naming 01:00.0</td><td>Timeline of table writes vs faults</td><td>Stale entry after remapping table change, torn entry</td></tr>
+      <tr><td>Create I/O CQ fails</td><td>Status: Invalid Interrupt Vector</td><td>IV vs Table Size and vectors enabled</td><td>Driver requested more vectors than granted</td></tr>
+    </tbody>
+  </table>
+  <p>The single most useful debugging artifact is a three-column timeline: table/mask writes (host), interrupt MWrs (device), handler entries (host). The <a href="ch47.html">Error Correlation</a> chapter builds this into a general method.</p>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <ul>
+    <li><strong>The PBA is your witness.</strong> It is the only place the device records "I wanted to interrupt". Read it before arguing about whose bug it is.</li>
+    <li><strong>Reset paths lose interrupts.</strong> Function Level Reset clears MSI-X Enable and leaves all vectors masked; Bus Master Enable is cleared too. Any recovery path that forgets to restore state yields a perfectly healthy controller that can never tell anyone it finished.</li>
+    <li><strong>Virtualization changes ownership.</strong> With device passthrough the guest writes what it believes is the table; the hypervisor traps those writes and programs the real entries (and the IOMMU's posted-interrupt structures). "Guest sees no interrupts" bugs are frequently in that translation layer.</li>
+    <li><strong>Vectors are a budget.</strong> 2048 per function is generous, but SR-IOV virtual functions each have their own table, and platforms have finite interrupt vectors per CPU. Large deployments run out of CPU vectors before they run out of MSI-X entries.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 43 — Decode an MSI-X capability and prove a queue-to-vector binding</h3>
+  <h4>Objective</h4>
+  <p>Decode your NVMe device's MSI-X capability from configuration space, locate the table and PBA, and connect each NVMe queue's Linux IRQ to its MSI-X index and CPU.</p>
+  <h4>Skills</h4>
+  <p>Capability-list walking, BIR/offset arithmetic, Linux IRQ inspection, reasoning from snapshots.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> for steps 1–3 (configuration-space reads and procfs). Step 4 (reading the table through resource0) is a <span class="badge caution">Caution lab</span>: it maps device MMIO; use a test machine, read only, and double-check offsets. Never write.</p></aside>
+  <h4>Hardware required</h4><p>Linux host with an NVMe SSD.</p>
+  <h4>Software required</h4><p>pciutils, Python 3, <code>msix_decode.py</code> from this chapter.</p>
+  <h4>Input</h4><p>Device BDF.</p>
+  <h4>Expected output</h4><p>Decoded capability (Enable, Function Mask, vector count, table/PBA BIR and offset); a table: nvme0qN → IRQ → MSI-X index → CPU.</p>
+  <h4>Background</h4><p>The number before <code>-edge</code> in <code>/proc/interrupts</code> is the MSI-X index on most kernels; <code>nvme0qN</code> is the queue name; Linux's NVMe driver creates CQ N with IV N in the common case.</p>
+  <h4>Step 1 — Decode the capability</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo python3 msix_decode.py /sys/bus/pci/devices/0000:01:00.0/config
+sudo lspci -vvv -s 01:00.0 | sed -n '/MSI-X/,/PBA/p'</code></pre>
+  <h4>Step 2 — Compute the table address</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo lspci -vv -s 01:00.0 | grep -E 'Region [0-9]'
+<span class="cm"># table address = (address of the BAR named by Table BIR) + Table Offset</span></code></pre>
+  <h4>Step 3 — Map queues to IRQs and CPUs</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>grep nvme0q /proc/interrupts | awk '{print $1, $(NF-2), $(NF-1), $NF}'</code></pre>
+  <h4>Step 4 (caution, optional) — Snapshot the PBA</h4>
+  <pre class="code" data-kind="hardware-dependent" data-lang="python" data-title="pba_peek.py (read-only MMIO)"><code>import mmap, os, struct, sys
+path, pba_off = sys.argv[1], int(sys.argv[2], 0)   # resourceN file, PBA offset
+fd = os.open(path, os.O_RDONLY | os.O_SYNC)
+m = mmap.mmap(fd, pba_off + 8, mmap.MAP_SHARED, mmap.PROT_READ)
+print(hex(struct.unpack_from("&lt;Q", m, pba_off)[0]))</code></pre>
+  <h4>Observation</h4><p>Record Function Mask, vector count, and which vectors are allocated by Linux compared with the device's Table Size.</p>
+  <h4>Questions</h4>
+  <ol><li>How many table entries are unused by Linux, and why?</li><li>Is the PBA normally zero on an idle running system? Why?</li><li>What would Function Mask=1 on a running system tell you?</li></ol>
+  <h4>Challenge</h4><p>Using a protocol analyzer if you have one (or the synthetic trace in this chapter if not), confirm that the interrupt write for a queue carries exactly the address/data of its table entry.</p>
+  <details class="hint"><summary>Hint</summary><p>Linux allocates at most one vector per CPU plus admin, bounded by the Number of Queues the controller grants.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>1. Unused entries = Table Size + 1 − allocated vectors. Linux allocates min(CPUs, controller queue limit) I/O vectors + 1 admin; a 33-vector device on an 8-CPU host leaves 24 unused (they remain masked).</p>
+    <p>2. Yes: unmasked vectors fire immediately so pending bits are clear; unused vectors never get events. A non-zero PBA on a running system means a vector is masked while the device has work for it.</p>
+    <p>3. No vector of the function can interrupt. On a running system that is a stuck recovery or initialization path; expect timeouts.</p>
+  </details>
+  <h4>What a senior engineer notices</h4><p>Whether the table shares a 4 KiB page with doorbells (affects passthrough), whether the address format is remappable (interrupt remapping on), and whether the vector count limits queue count on large-core hosts.</p>
+  <h4>Failure variants</h4><ul><li>Non-root read of config returns 64 bytes: the decoder reports no capability — run as root.</li><li>Device in D3hot: MMIO reads return all ones (0xFFFF_FFFF), which is not a valid PBA reading.</li></ul>
+  <h4>Extension</h4><p>Compare a virtual function's MSI-X capability (if your device supports SR-IOV) with the physical function's.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Message Control reads 0x07FF. Decode it and comment.</li>
+    <li>Table Offset/BIR reads 0x0000_4004. Where is the table?</li>
+    <li>Compute the byte address of vector 17's Vector Control on the lab SSD.</li>
+    <li>Write the host sequence to safely retarget vector 4 to a different CPU.</li>
+    <li>A Create I/O CQ with IV=40 completes with an error on a device whose Table Size field is 31. Explain.</li>
+  </ol>
+  <details class="answer"><summary>Model answers</summary>
+    <p>1. Enable=0, Function Mask=0, 2048 vectors supported; MSI-X not in use.</p>
+    <p>2. BIR=4 → the BAR at configuration offset 20h; offset 0x4000 (low 3 bits are BIR).</p>
+    <p>3. 0xFE60_2000 + 17×16 + 12 = 0xFE60_211C.</p>
+    <p>4. Set Vector Control mask=1; write Message Address/Upper/Data; clear mask; (the device sends any pending message on unmask).</p>
+    <p>5. Table Size 31 → 32 vectors (0–31); IV=40 is out of range, so the controller returns Invalid Interrupt Vector.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>The MSI-X Capability ID is</p><ul class="options" data-answer="3"><li>01h</li><li>05h</li><li>11h</li><li>10h</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>05h is MSI, 01h Power Management, 10h PCI Express. MSI-X is 11h.</p></details></li>
+    <li><p>Table Size field = 0x00F. How many vectors?</p><ul class="options" data-answer="2"><li>15</li><li>16</li><li>14</li><li>32</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>N−1 encoding: 15 + 1 = 16.</p></details></li>
+    <li><p>What does the device do when an event occurs for a masked vector?</p><ul class="options" data-answer="2"><li>Drops it</li><li>Sets the vector's pending bit in the PBA</li><li>Sends the message anyway</li><li>Falls back to INTx</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>Masked → pending bit; on unmask with pending set the message is sent.</p></details></li>
+    <li><p>Which field binds an NVMe completion queue to an MSI-X vector?</p><ul class="options" data-answer="1"><li>IV in Create I/O Completion Queue</li><li>CQID in Create I/O Submission Queue</li><li>INTMS</li><li>The Number of Queues feature</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>IV (CDW11 bits 31:16) with IEN (bit 1).</p></details></li>
+    <li><p>Size of one MSI-X table entry?</p><ul class="options" data-answer="3"><li>4 bytes</li><li>8 bytes</li><li>16 bytes</li><li>64 bytes</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>Address, upper address, data, vector control: four DWORDs.</p></details></li>
+    <li><p>In a trace, how is an MSI-X interrupt distinguished from a data write?</p><ul class="options" data-answer="4"><li>Its TLP type is Msg</li><li>It has a completion</li><li>It uses TC7</li><li>Only by its target address (the platform's interrupt window) and 1-DW length</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>On the wire it is an ordinary posted MWr; the address identifies it.</p></details></li>
+    <li><p>Why must software mask a vector before rewriting its entry?</p><details class="answer"><summary>Model answer</summary><p>The device may read the entry at any time; changing it unmasked can produce a message with a mix of old and new fields. The specification leaves the result undefined.</p></details></li>
+    <li><p>After Function Level Reset, what is the state of MSI-X?</p><details class="answer"><summary>Model answer</summary><p>MSI-X Enable cleared, per-vector mask bits set (reset default), Bus Master Enable cleared. Software must re-enable and reprogram before interrupts can be delivered.</p></details></li>
+    <li><p>What does a set PBA bit with an unmasked vector suggest?</p><details class="answer"><summary>Model answer</summary><p>Either the snapshot raced an unmask (benign), or the device failed to send the deferred message on unmask (device bug). Re-read; if it stays set while unmasked, suspect the device.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> What is in an MSI-X table entry?</p><details class="answer"><summary>Model answer</summary><p>Message Address, Message Upper Address, Message Data and Vector Control (mask bit).</p></details></li>
+    <li><p><strong>Beginner:</strong> Where is the MSI-X table?</p><details class="answer"><summary>Model answer</summary><p>In a memory BAR of the function, identified by Table BIR and Table Offset in the capability.</p></details></li>
+    <li><p><strong>Intermediate:</strong> How does Linux end up with one NVMe interrupt per CPU?</p><details class="answer"><summary>Model answer</summary><p>The driver requests vectors with managed affinity (one per hardware queue), the PCI core programs each entry to target that queue's CPUs, and the driver creates CQ N with IV N.</p></details></li>
+    <li><p><strong>Advanced:</strong> Explain the PBA and when you'd read it.</p><details class="answer"><summary>Model answer</summary><p>One bit per vector, set when an interrupt was needed while masked. Read it when interrupts are missing to decide between "host masked it" and "device never decided to fire".</p></details></li>
+    <li><p><strong>Advanced:</strong> What can go wrong with interrupts in a VM using device passthrough?</p><details class="answer"><summary>Model answer</summary><p>Guest table writes must be trapped and translated; IOMMU interrupt remapping / posted-interrupt descriptors must be updated; mistakes yield lost interrupts or remapping faults. The table sharing a page with other registers complicates trapping.</p></details></li>
+    <li><p><strong>Senior:</strong> A vendor claims their SSD "sends the interrupt" but the host never sees it. Design the experiment that settles it.</p><details class="answer"><summary>Model answer</summary><p>Capture on the link next to the device with a trigger on CQE writes to the queue in question. If an MWr with the entry's address/data follows, the device is right; then check the root port's AER for UR, IOMMU faults, and host vector state. If no MWr follows, read the entry mask, Function Mask and PBA at that moment; PBA=1 → host masked; PBA=0 and unmasked → device.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>Child:</strong> the clipboard, the red flag, and the "waiting" sheet.</li>
+    <li><strong>Junior engineer:</strong> decode a capability and table entry out loud.</li>
+    <li><strong>Senior engineer:</strong> explain how you would prove whether a missing interrupt is a device or host bug with one capture and one register read.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "The teachers write a list for the librarian. Each line says which room and what word. If a line has a red flag, the librarian waits and makes a tick; when the flag comes down, she goes straight away."</p>
+    <p><strong>Junior:</strong> "Capability ID 11h; Message Control 0x8020 means enabled, not function-masked, 33 vectors; table in BAR0 at 0x2000. Entry 1 says write 0x41 to 0xFEE0_1000, unmasked. CQ1 was created with IV 1, so CQ1 completions trigger that write."</p>
+    <p><strong>Senior:</strong> "Trigger on the CQE write; look for the interrupt MWr. Present → host side. Absent → read the vector's mask and PBA bit; PBA set means host masked, PBA clear and unmasked means the device never fired."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>MSI-X consists of a configuration-space capability (ID 11h: Table Size N−1, Function Mask, Enable; Table and PBA BIR/offset), a table of 16-byte entries in a BAR (address, upper address, data, vector control mask bit), and a Pending Bit Array. The device sends entry <var>v</var>'s data to entry <var>v</var>'s address as a posted 1-DW Memory Write; when masked it sets the pending bit and sends on unmask. NVMe binds each I/O CQ to a vector with IV and IEN at Create I/O CQ; the admin CQ uses vector 0. In a trace, the interrupt is the small MWr to the platform's interrupt window right after the CQE. In Linux, lspci shows capability state, <code>/proc/interrupts</code> shows deliveries per CPU, and IRQ affinity files show targets.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>decode an MSI-X capability from raw bytes</li>
+      <li>compute the address of any table entry and PBA bit from BAR, BIR and offset</li>
+      <li>decode a table entry, including the x86 non-remapped address/data meaning</li>
+      <li>state the masking, pending and "mask before modify" rules</li>
+      <li>explain IV/IEN and admin vector 0</li>
+      <li>identify the interrupt TLP in a trace and verify it against the table</li>
+      <li>separate host-masked, device-never-fired and platform-blocked interrupts with evidence</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — MSI-X Capability and Table Structures</cite></li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Create I/O Completion Queue; Number of Queues feature</cite></li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4 — Interrupts</cite></li>
+    <li>Intel 64 and IA-32 Architectures Software Developer's Manual — Message Signalled Interrupts (address/data format); Intel Virtualization Technology for Directed I/O specification — Interrupt Remapping; AMD I/O Virtualization Technology (IOMMU) specification.</li>
+    <li>Linux kernel documentation: "The MSI Driver Guide HOWTO".</li>
+    <li>Deeper: <a href="dd19.html">Deep-Dive Module: MSI and MSI-X</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch44.html">Chapter 44 — NVMe Errors</a> begins Part XV: what happens when a command does not succeed.</p>
+</section>

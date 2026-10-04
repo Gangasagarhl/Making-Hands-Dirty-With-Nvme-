@@ -1,0 +1,1101 @@
+<p class="lead">A hands-on forensic lab. You get NVMe commands, the host memory their data pointers reference, and synthetic PCIe traces. For each one you decide whether the command is valid, where the data really is, which Direct Memory Access (DMA) transactions should occur, and what failure results — then you prove it with a <span class="g" data-term="prp">Physical Region Page (PRP)</span> walker you can run.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>Chapters <a href="ch36.html">36</a> and <a href="ch37.html">37</a> taught the rules of PRPs and <span class="g" data-term="sgl">Scatter Gather Lists (SGLs)</span>. Rules are easy to recite and hard to apply under pressure: when a customer reports "one in a million writes has the wrong last 4 KiB", nobody hands you a labeled diagram. You get a trace with half a million Transaction Layer Packets (TLPs), an Input/Output Memory Management Unit (IOMMU) fault buried in a kernel log, and a driver that "works on every other SSD".</p>
+  <p>This chapter turns rules into a repeatable procedure. Each case gives you the same four questions the master prompt demands:</p>
+  <ol>
+    <li><strong>Is the command valid?</strong> Structurally (alignment, list shape, descriptor types) and semantically (does the data pointer describe exactly the bytes the command transfers?).</li>
+    <li><strong>Where is the data?</strong> The exact host address ranges the controller will touch.</li>
+    <li><strong>What DMA transactions should occur?</strong> Descriptor fetches, data Memory Read (MRd) or Memory Write (MWr) TLPs, the Completion Queue Entry (CQE), the interrupt.</li>
+    <li><strong>What failure might result?</strong> Error status, silent corruption, IOMMU fault, timeout — and which layer reports it.</li>
+  </ol>
+  <p>Data-pointer bugs are among the most expensive storage bugs because so many of them are <em>silent</em>. A malformed pointer that the controller follows without complaint moves real bytes to or from the wrong place. Learning to see them in a trace is a core senior skill.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Apply a fixed validation procedure to any PRP or SGL data pointer.</li>
+    <li>Recompute the transfer length from the controller's point of view and detect length disagreements.</li>
+    <li>Predict descriptor fetches and data TLPs, and find the first event that deviates.</li>
+    <li>Distinguish structural pointer bugs from mapping (IOMMU) and lifetime (use-after-free) bugs, which a structure check cannot see.</li>
+    <li>Write root-cause statements with evidence, fix and regression test.</li>
+    <li>Use and extend an executable PRP walker.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <ul>
+      <li><a href="ch36.html">Chapter 36 — Physical Region Pages</a>: PRP1, PRP2, lists, chaining, page counts.</li>
+      <li><a href="ch37.html">Chapter 37 — Scatter Gather Lists</a>: descriptor types, segments, SGL Support (SGLS), PRP or SGL for Data Transfer (PSDT).</li>
+      <li><a href="ch32.html">Chapter 32 — READ</a> and <a href="ch33.html">Chapter 33 — WRITE</a>: Number of Logical Blocks (NLB) is zero-based.</li>
+      <li><a href="ch12.html">Chapter 12 — Posted vs Non-Posted Transactions</a>: why a blocked MWr produces no error at the device.</li>
+      <li><a href="dd02.html">Module 2 — DMA and Address Translation</a>: IOVAs and IOMMU faults.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>You are the checker at a moving company. Every morning, before the trucks leave, you get a stack of job sheets. Each sheet says how many boxes to move and lists the rooms they are in. Your job is to catch mistakes before a truck drives off: a sheet that says "12 boxes" but only lists rooms for 10; a room number that is half-way through a wall; a "see the next page" note on a sheet that has no next page; a room that belonged to this customer last week but has since been rented to someone else.</p>
+    <p>If you miss a mistake, the movers do not stop and ask. They carry boxes out of a stranger's room, or they put boxes into a room that isn't yours, and nobody finds out until the stranger comes home.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>An aviation load-sheet audit is close: the load controller cross-checks the passenger count, the baggage weights per hold and the fuel figure, because each is computed by a different person from different sources. A plane is loaded according to the sheet, not according to reality. When two numbers that should agree do not — 180 passengers on the manifest, 179 boarding passes scanned — the auditor does not guess which is right. They find the first point where the two records diverge.</p>
+  </aside>
+  <aside class="callout breaks">
+    <ul>
+      <li><strong>There is no checker before the truck leaves.</strong> Nothing validates a data pointer between the driver writing it and the controller following it. Some controllers check some rules; none can check intent.</li>
+      <li><strong>"Last week's room" is literal.</strong> A freed buffer page is reused by unrelated code within microseconds; the analogy's week is far too slow.</li>
+      <li><strong>The movers can't see the street signs you see.</strong> The controller only knows bus addresses (IOVAs on our lab system); the driver may think in kernel virtual or physical addresses.</li>
+      <li><strong>The audit happens after the flight.</strong> In practice you audit traces and logs after the failure; the load-sheet auditor works before departure.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>Every NVMe command that moves data has two descriptions of the same bytes:</p>
+  <ul>
+    <li><strong>The command's length</strong>: for a Read or Write, (NLB + 1) × the logical block size of the namespace's current format, plus metadata if the format interleaves it.</li>
+    <li><strong>The data pointer's length</strong>: the bytes described by PRP1, PRP2 and any PRP list, or by the SGL's Data Block and Bit Bucket descriptors.</li>
+  </ul>
+  <p>A valid command has these two lengths equal and a well-formed data pointer whose addresses are mapped for this device for the whole life of the command. Almost every data-pointer bug breaks one of three things:</p>
+  <table>
+    <caption>Three families of data-pointer bugs</caption>
+    <thead><tr><th>Family</th><th>What breaks</th><th>Who can detect it</th><th>Cases in this chapter</th></tr></thead>
+    <tbody>
+      <tr><td>Structure</td><td>alignment, list shape, descriptor placement or type</td><td>controller (sometimes), a walker, an analyzer decoder</td><td>1, 3, 7, 8</td></tr>
+      <tr><td>Length</td><td>command length ≠ pointer length</td><td>controller for SGLs (length mismatch status); usually nobody for PRPs</td><td>2, 6</td></tr>
+      <tr><td>Mapping and lifetime</td><td>address not mapped, or mapped to memory now owned by someone else</td><td>the IOMMU (if strict and enabled), memory-debug tools, data verification</td><td>4, 5</td></tr>
+    </tbody>
+  </table>
+  <p>For structure and length bugs, the evidence is all in the command and the memory it points at. For mapping and lifetime bugs, the command can be perfect; the evidence is in host-side logs and timing.</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>The validation procedure</h3>
+  <div class="flow">
+    <div>Decode the SQE<small>opcode, NSID, PSDT, PRP1/PRP2 or SGL1, NLB, MPTR</small></div>
+    <div>Compute L from the namespace format<small>L = (NLB + 1) × LBA data size (+ metadata if extended)</small></div>
+    <div class="hl">Walk the pointer as the controller would<small>PRP: N pages, PRP2 role, list slots, chains — SGL: segments, types, sum</small></div>
+    <div>Check structure rules<small>alignment, chain position, descriptor types vs SGLS</small></div>
+    <div>Compare lengths<small>pointer length vs L</small></div>
+    <div>Check every address against the intended buffer<small>and against IOMMU mappings at the time of access</small></div>
+    <div>Predict the TLPs<small>descriptor MRds, data MWr or MRd, CQE, MSI-X</small></div>
+    <div>Compare with the trace<small>the first deviation is the first abnormal event</small></div>
+  </div>
+  <p>Do the steps in that order. Most mis-diagnoses come from skipping step 2 — taking the length from the application or from the driver's variable rather than recomputing it from NLB and the format the controller is actually using.</p>
+
+  <h3>Invariants to check</h3>
+  <table>
+    <caption>PRP invariants (memory page size PS = 2<sup>12 + CC.MPS</sup>)</caption>
+    <thead><tr><th>#</th><th>Invariant</th><th>Violation looks like</th></tr></thead>
+    <tbody>
+      <tr><td>P1</td><td>PRP1 bits 1:0 = 00b</td><td>odd PRP1 value</td></tr>
+      <tr><td>P2</td><td>N = ⌈((PRP1 mod PS) + L) / PS⌉ decides PRP2's role</td><td>PRP2 role differs from the builder's assumption</td></tr>
+      <tr><td>P3</td><td>PRP2 as data pointer has offset 0</td><td>PRP2 not a multiple of PS</td></tr>
+      <tr><td>P4</td><td>PRP2 as list pointer is quadword aligned</td><td>PRP2 bits 2:0 ≠ 0</td></tr>
+      <tr><td>P5</td><td>List holds exactly N − 1 data entries (plus chain pointers)</td><td>stale slots read; entries left over</td></tr>
+      <tr><td>P6</td><td>When more entries remain than slots in a list page, the last slot is a chain pointer</td><td>list runs past a page end; a data page read as a list</td></tr>
+      <tr><td>P7</td><td>Every list data entry has offset 0</td><td>PRP Offset Invalid status, or shifted data</td></tr>
+      <tr><td>P8</td><td>Every page belongs to this command's buffer and is mapped until the CQE is consumed</td><td>IOMMU faults, corruption elsewhere</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>SGL invariants</caption>
+    <thead><tr><th>#</th><th>Invariant</th><th>Violation looks like</th></tr></thead>
+    <tbody>
+      <tr><td>S1</td><td>PSDT ≠ 00b only if SGLS bits 1:0 ≠ 00b; never for admin commands over PCIe</td><td>Invalid Field in Command</td></tr>
+      <tr><td>S2</td><td>Every descriptor type and sub type is supported (Bit Bucket, Keyed, Transport per SGLS and transport)</td><td>SGL Descriptor Type Invalid</td></tr>
+      <tr><td>S3</td><td>Segment/Last Segment only as the last descriptor of a segment; none in the last segment</td><td>Invalid SGL Segment Descriptor</td></tr>
+      <tr><td>S4</td><td>Segment lengths are non-zero multiples of 16</td><td>truncated segment, invalid descriptor count</td></tr>
+      <tr><td>S5</td><td>Sum of Data Block + Bit Bucket lengths = L (or ≥ L if "longer than data" is supported)</td><td>Data SGL Length Invalid</td></tr>
+      <tr><td>S6</td><td>Alignment per SGLS (dword when 10b)</td><td>SGL-family or Invalid Field status — confirm which</td></tr>
+      <tr><td>S7</td><td>No Bit Bucket in host-to-controller transfers</td><td>descriptor type error</td></tr>
+      <tr><td>S8</td><td>Every Data Block range is mapped and owned until completion</td><td>IOMMU faults, corruption</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The teaching ladder for data-pointer forensics</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Check the job sheet against the box count and the room list before the movers act; afterwards, find the first room they entered that wasn't on your list.</p></div>
+    <div class="rung" data-rung="B"><p>Recompute the transfer length, walk the PRP/SGL structure, list every address the controller will touch, and compare with the intended buffer.</p></div>
+    <div class="rung" data-rung="C"><p>The controller's data-pointer engine follows whatever is in host memory at fetch time; the IOMMU is the only hardware that can refuse an access, and only if the IOVA is unmapped.</p></div>
+    <div class="rung" data-rung="D"><p>The NVMe Base Specification defines the structure rules and the statuses (PRP Offset Invalid, SGL family); it leaves detection of many malformed cases to the implementation.</p></div>
+    <div class="rung" data-rung="E"><p>Every data-pointer decision becomes visible as an MRd (descriptor or data) or MWr (data) with a specific address and length.</p></div>
+    <div class="rung" data-rung="F"><p>The first TLP whose address or length you did not predict is the first abnormal event.</p></div>
+    <div class="rung" data-rung="G"><p>Classify: structure, length, or mapping/lifetime; then fix the builder or the lifecycle, not the symptom, and add a regression test that would have caught it.</p></div>
+  </div>
+
+  <h3>The sixteen questions, for a malformed data pointer</h3>
+  <dl>
+    <dt>1–3. What is it, why does it exist, what problem does it cause?</dt><dd>A data pointer that does not describe exactly the command's bytes in memory the device may use; it exists because the host computes pointer and length separately and nothing checks them against each other; it causes misdirected DMA.</dd>
+    <dt>4–5. What existed before; why is the current design better?</dt><dd>Bounce buffers and vendor scatter lists; PRP/SGL let devices DMA directly into application buffers, at the cost of trusting the host's pointer.</dd>
+    <dt>6–7. Who creates it; who consumes it?</dt><dd>The driver (kernel, SPDK, test tool, firmware); the controller.</dd>
+    <dt>8–9. Where does it live; what is involved?</dt><dd>SQE Dwords 6–9, list/segment pages, data pages, IOMMU tables, <code>CC.MPS</code>, SGLS, namespace format.</dd>
+    <dt>10–11. Before and after?</dt><dd>Before: buffer mapping, list building, length computation. After: DMA, CQE, unmapping and freeing.</dd>
+    <dt>12. What if it is wrong?</dt><dd>Status error if detected; otherwise silent corruption, IOMMU faults, timeouts or crashes far from the cause.</dd>
+    <dt>13. Analyzer?</dt><dd>Descriptor fetches to unexpected addresses or of unexpected lengths; data TLPs outside the buffer; missing data TLPs.</dd>
+    <dt>14. Linux?</dt><dd>IOMMU fault messages, NVMe error messages with status, DMA-API debug warnings, data-verification failures.</dd>
+    <dt>15. Validation?</dt><dd>Boundary sweeps of offsets and lengths; negative tests; IOMMU-strict runs; pattern verification of neighboring memory.</dd>
+    <dt>16. Senior suspicion?</dt><dd>Two code paths computing one length; resource release on timeout paths; format changes; assumptions about controller checking.</dd>
+  </dl>
+</section>
+
+<section id="valid">
+  <h2>Valid reference examples</h2>
+  <p>Before the broken cases, three valid ones, answered with the four questions. Use them as your baseline. All are synthetic examples for teaching on the lab system: memory page size 4 KiB, Max Payload Size (MPS) 256 B, Max Read Request Size (MRRS) 512 B, Read Completion Boundary (RCB) 64 B, Namespace 1 with 512-byte blocks, SSD Requester ID 0x0100, IOMMU enabled.</p>
+
+  <h3>V1 — 4 KiB Read into an offset buffer</h3>
+  <p>SQE: opcode 02h, PSDT 00b, PRP1 = 0x2_0000_0800, PRP2 = 0x2_0000_1000, NLB = 0x0007.</p>
+  <ul>
+    <li><strong>Valid?</strong> L = 8 × 512 = 4,096. N = ⌈(2048 + 4096)/4096⌉ = 2 → PRP2 is a data page, offset 0. Valid.</li>
+    <li><strong>Where?</strong> 0x2_0000_0800–0x2_0000_0FFF and 0x2_0000_1000–0x2_0000_17FF.</li>
+    <li><strong>DMA:</strong> SQE MRd; 16 MWr of 256 B (8 per page); CQE MWr; MSI-X MWr. No list fetch.</li>
+    <li><strong>Failure:</strong> none.</li>
+  </ul>
+
+  <h3>V2 — 1 MiB Write with a chained list</h3>
+  <p>SQE: opcode 01h, PSDT 00b, PRP1 = 0x2_0000_0000, PRP2 = 0x1_5000_0C00, NLB = 0x07FF. List page 0x1_5000_0C00: 127 data entries and slot 127 = 0x1_5000_1000; list page 0x1_5000_1000: 128 data entries.</p>
+  <ul>
+    <li><strong>Valid?</strong> L = 1 MiB, N = 256, 255 entries. Slots at 0xC00: 128 → chain after 127. Second list page holds 128 ≤ 512. Valid (MDTS permitting).</li>
+    <li><strong>Where?</strong> 256 pages: PRP1's page plus the 255 listed pages.</li>
+    <li><strong>DMA:</strong> list MRds of 1,024 B and then 1,024 B (2 × 512 B each, the second pair only after the chain pointer is read); 2,048 data MRd of 512 B; ≥ 4,096 CplD; CQE; MSI-X.</li>
+    <li><strong>Failure:</strong> none.</li>
+  </ul>
+
+  <h3>V3 — SGL Read keeping only the second half</h3>
+  <p>SQE: opcode 02h, PSDT 01b, SGL1 = Last Segment 0x1_5000_1000 length 32, NLB = 0x000F. Segment: [Bit Bucket length 4096], [Data Block 0x2_0000_0000 length 4096]. Controller SGLS bits 1:0 = 01b with Bit Bucket support.</p>
+  <ul>
+    <li><strong>Valid?</strong> L = 8,192; sum = 4,096 + 4,096 = 8,192; Bit Bucket in a Read; supported. Valid.</li>
+    <li><strong>Where?</strong> blocks 0–7 discarded; blocks 8–15 to 0x2_0000_0000–0x2_0000_0FFF.</li>
+    <li><strong>DMA:</strong> SQE MRd; 1 MRd of 32 B (segment); 16 MWr of 256 B; CQE; MSI-X.</li>
+    <li><strong>Failure:</strong> none.</li>
+  </ul>
+</section>
+
+<section id="cases">
+  <h2>Broken cases</h2>
+  <p>Each case follows the trace-lab shape: scenario, command and memory, your four questions, the synthetic trace, then the analysis hidden in a solution block. Try each before opening the solution. Times are illustrative; real values are implementation- and platform-dependent.</p>
+
+  <h3>Case 1 — Misaligned PRP2</h3>
+  <h4>Scenario</h4>
+  <p>A new user-space driver allocates I/O buffers from a slab allocator that returns 512-byte-aligned chunks. A test reading 8 KiB passes on one SSD and corrupts an adjacent buffer on another.</p>
+  <h4>Command and memory</h4>
+  <p>Read, NLB = 0x000F, PRP1 = 0x2_0004_0000, PRP2 = 0x2_0004_1200. The driver intended the buffer to be 0x2_0004_0000 + 4 KiB and a second chunk at 0x2_0004_1200.</p>
+  <h4>Your questions</h4>
+  <p>Valid? Where would the second 4 KiB land? Which TLPs? What failure?</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 1 — controller that does not check the PRP2 offset">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE601008 Data=0x00000081</td><td>SQ1 tail doorbell</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>790</td><td>MRd64</td><td>Addr=0x1_2340_2000 Len=16 DW Tag=0x40</td><td>Fetch SQE slot 0x80</td></tr>
+        <tr class="abnormal"><td>3</td><td>Host→Dev</td><td>1,430</td><td>CplD</td><td>Tag=0x40 ByteCount=64</td><td>SQE: PRP1=0x2_0004_0000 PRP2=0x2_0004_1200 NLB=0x000F — PRP2 has offset 0x200</td></tr>
+        <tr class="dir-up"><td>4–19</td><td>Dev→Host</td><td>57,000…</td><td>MWr64</td><td>Addr=0x2_0004_0000 … 0x2_0004_0F00</td><td>First 4 KiB, correct</td></tr>
+        <tr class="dir-up"><td>20–33</td><td>Dev→Host</td><td>…</td><td>MWr64</td><td>Addr=0x2_0004_1200 … 0x2_0004_1F00</td><td>Second 4 KiB begins at the offset</td></tr>
+        <tr class="dir-up"><td>34–35</td><td>Dev→Host</td><td>…</td><td>MWr64</td><td>Addr=0x2_0004_2000, 0x2_0004_2100</td><td>512 B written into the next page — another buffer</td></tr>
+        <tr class="dir-up"><td>36</td><td>Dev→Host</td><td>75,600</td><td>MWr64</td><td>Addr=0x1_2341_0800 Len=4 DW</td><td>CQE: Success</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <details class="solution"><summary>Analysis: symptom, first abnormal event, root cause, fix</summary>
+    <ul>
+      <li><strong>Valid?</strong> No. L = 8,192, PRP1 offset 0 → N = 2 → PRP2 must be a page-aligned data pointer. 0x2_0004_1200 has offset 0x200 (invariant P3).</li>
+      <li><strong>Where?</strong> If the controller uses it as given, the second 4 KiB goes to 0x2_0004_1200–0x2_0004_21FF: 3,584 B in page 0x2_0004_1000 and 512 B in page 0x2_0004_2000. If the controller masks the offset, it goes to 0x2_0004_1000–0x2_0004_1FFF, overwriting the 512 B before the intended chunk. Both are implementation-dependent behaviors of a controller that does not reject the command.</li>
+      <li><strong>DMA:</strong> 32 MWr either way; the addresses differ.</li>
+      <li><strong>Symptom:</strong> the adjacent buffer at 0x2_0004_2000 is corrupted on SSD B; on SSD A the command fails with PRP Offset Invalid (the controller checks), which the test framework logged as a retryable error.</li>
+      <li><strong>First abnormal event:</strong> row 3 — the SQE content itself. Nothing on the link is wrong before that; everything after is consequence.</li>
+      <li><strong>Root cause:</strong> PRPs cannot describe a buffer whose second part starts mid-page. The driver treated PRP2 as "address of the second chunk" rather than "address of the second page".</li>
+      <li><strong>Fix:</strong> allocate I/O buffers page aligned (or at least so that only the first chunk starts mid-page and all chunks meet at page boundaries), or use SGLs when the controller supports them.</li>
+      <li><strong>Regression test:</strong> a builder unit test asserting P3 for every two-page command, plus an integration test with a guard pattern in the neighboring page.</li>
+    </ul>
+  </details>
+
+  <h3>Case 2 — Off-by-one PRP list length</h3>
+  <h4>Scenario</h4>
+  <p>Data verification on a 128 KiB sequential write workload reports that the last 4 KiB of some writes read back with old data. Smaller writes are fine.</p>
+  <h4>Command and memory</h4>
+  <p>Write, NLB = 0x00FF, PRP1 = 0x2_0008_0000, PRP2 = 0x1_5000_0000. The list page contains 30 entries 0x2_0008_1000 … 0x2_0009_E000; slot 30 (0x1_5000_00F0) still contains 0x2_0033_7000 from a previous command.</p>
+  <h4>Your questions</h4>
+  <p>Valid? Which page does the controller read the last 4 KiB from? Which TLPs? What failure?</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 2 — controller reads a stale list slot">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE601008 Data=0x00000091</td><td>SQ1 tail doorbell</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>800</td><td>MRd64</td><td>Addr=0x1_2340_2400 Len=16 DW Tag=0x50</td><td>Fetch SQE slot 0x90</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,440</td><td>CplD</td><td>Tag=0x50 ByteCount=64</td><td>SQE: opc=01h PRP1=0x2_0008_0000 PRP2=0x1_5000_0000 NLB=0x00FF</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,520</td><td>MRd64</td><td>Addr=0x1_5000_0000 Len=62 DW Tag=0x51</td><td>List fetch: 31 entries</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2,150</td><td>CplD</td><td>Tag=0x51 ByteCount=248</td><td>Entries 0–29 as expected; entry 30 = 0x2_0033_7000</td></tr>
+        <tr class="dir-up"><td>6…</td><td>Dev→Host</td><td>2,300…</td><td>MRd64</td><td>Addr=0x2_0008_0000 … 0x2_0009_EE00</td><td>Data for pages 0–30, correct</td></tr>
+        <tr class="abnormal"><td>254</td><td>Dev→Host</td><td>19,800</td><td>MRd64</td><td>Addr=0x2_0033_7000 Len=128 DW Tag=0x3A</td><td>First data read outside the buffer</td></tr>
+        <tr class="dir-up"><td>…</td><td>Dev→Host</td><td>…</td><td>MWr64</td><td>Addr=0x1_2341_0900 Len=4 DW</td><td>CQE: Success</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <details class="solution"><summary>Analysis: symptom, first abnormal event, root cause, fix</summary>
+    <ul>
+      <li><strong>Valid?</strong> Structurally the controller sees a valid 31-entry list; semantically no — entry 30 is not part of the buffer (invariant P5/P8). The walker reports <em>controller would access page 0x200337000, which is not part of the host buffer</em>.</li>
+      <li><strong>Where?</strong> Pages 0–30 of the buffer, then 0x2_0033_7000 instead of 0x2_0009_F000.</li>
+      <li><strong>DMA:</strong> one 248-byte list MRd; 256 data MRd, the last 8 of them at 0x2_0033_7000–0x2_0033_7E00.</li>
+      <li><strong>Symptom:</strong> the media receives whatever was in page 0x2_0033_7000 — often old data from an earlier command, hence "old data" on read-back. If that IOVA had been unmapped, the MRd would have been completed with an error status by the root complex and the controller would report a data transfer error instead.</li>
+      <li><strong>First abnormal event:</strong> strictly, row 5 (the list content); on the wire the first TLP you could not have predicted from the intended buffer is row 254.</li>
+      <li><strong>Root cause:</strong> the list-building loop runs <code>for (i = 1; i &lt; npages - 1; i++)</code> — one entry short, so page 31 is never listed — and the list page is recycled without being cleared.</li>
+      <li><strong>Fix:</strong> derive the entry count from the same N the controller uses (N − 1 entries), and assert it when building; optionally poison recycled list pages in debug builds so a short list produces an obvious fault instead of stale data.</li>
+      <li><strong>Regression test:</strong> sweep lengths from 3 to 513 pages, verifying each with read-back and with the walker; the bug appears at every list-using length.</li>
+    </ul>
+  </details>
+
+  <h3>Case 3 — PRP list crosses a page without chaining</h3>
+  <h4>Scenario</h4>
+  <p>A driver optimization packs several PRP lists into one 4 KiB page at 128-byte granularity to save memory. Large reads occasionally trigger IOMMU faults at addresses that look like ASCII text.</p>
+  <h4>Command and memory</h4>
+  <p>Read, NLB = 0x00FF, PRP1 = 0x2_000C_0000, PRP2 = 0x1_5000_1F80. The driver wrote 31 entries linearly from 0x1_5000_1F80 to 0x1_5000_2070, i.e. 16 in the first list page and 15 in the next page.</p>
+  <h4>Your questions</h4>
+  <p>Valid? How does the controller interpret slot 15? Which TLPs? What failure?</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 3 — a data page read as a PRP list">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>790</td><td>MRd64</td><td>Addr=0x1_2340_2800 Len=16 DW</td><td>Fetch SQE</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,430</td><td>CplD</td><td>ByteCount=64</td><td>PRP1=0x2_000C_0000 PRP2=0x1_5000_1F80 NLB=0x00FF</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,500</td><td>MRd64</td><td>Addr=0x1_5000_1F80 Len=32 DW Tag=0x61</td><td>List fetch: 16 slots to end of page</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2,120</td><td>CplD</td><td>Tag=0x61 ByteCount=128</td><td>Slots 0–14 = pages 1–15; slot 15 = 0x2_000D_0000</td></tr>
+        <tr class="abnormal"><td>6</td><td>Dev→Host</td><td>2,200</td><td>MRd64</td><td>Addr=0x2_000D_0000 Len=32 DW Tag=0x62</td><td>"Next list" fetch from a DATA page (16 entries still needed = 128 B; fetch size is implementation-dependent)</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>2,830</td><td>CplD</td><td>Tag=0x62</td><td>Returns old buffer bytes, e.g. 0x2073692073696854 ("This is " in ASCII)</td></tr>
+        <tr class="dir-up"><td>…</td><td>Dev→Host</td><td>60,000…</td><td>MWr64</td><td>Addr=0x2073_6920_7369_6000 …</td><td>Data for pages 16–31 to garbage addresses (offset bits ignored or rejected)</td></tr>
+        <tr class="note"><td colspan="6">IOMMU blocks the writes; host log shows DMA write faults for 01:00.0 at non-canonical addresses. CQE may report Success, PRP Offset Invalid, or a data transfer error — implementation-dependent.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <details class="solution"><summary>Analysis: symptom, first abnormal event, root cause, fix</summary>
+    <ul>
+      <li><strong>Valid?</strong> No. List pointer at offset 0xF80 leaves S = 16 slots. 31 entries &gt; 16, so slot 15 must be a chain pointer (invariant P6). The host put data page 16 there.</li>
+      <li><strong>Where?</strong> Pages 0–15 are correct. For pages 16–31 the controller uses whatever 8-byte values sit at the start of data page 0x2_000D_0000.</li>
+      <li><strong>DMA:</strong> list MRd of 128 B at 0x1_5000_1F80; a second "list" MRd at 0x2_000D_0000; data MWr to garbage addresses.</li>
+      <li><strong>Symptom:</strong> IOMMU faults at addresses that decode as ASCII; the application sees half its buffer unchanged.</li>
+      <li><strong>First abnormal event:</strong> row 6 — a list fetch targeting an address inside the data buffer. That single row identifies the bug class.</li>
+      <li><strong>Root cause:</strong> the list packer never checks the remaining slots in the current page.</li>
+      <li><strong>Fix:</strong> place lists so they cannot run off a page (Linux uses 256-byte blocks aligned to 256 that hold up to 32 entries, and full pages above that), or insert a chain pointer when slots run out — the walker's "fixed with chain" variant.</li>
+      <li><strong>Regression test:</strong> walker assertion on every list built; analyzer rule "a list fetch address must not fall inside any data range of the same command".</li>
+    </ul>
+  </details>
+
+  <h3>Case 4 — IOMMU fault on a data page</h3>
+  <h4>Scenario</h4>
+  <p>After a driver refactor, 16 KiB reads on systems with the IOMMU enabled return Success but the application finds the third 4 KiB all zeros. With the IOMMU disabled, everything works.</p>
+  <h4>Command and memory</h4>
+  <p>Read, NLB = 0x001F, PRP1 = 0x2_0014_0000, PRP2 = 0x1_5000_4000 → [0x2_0014_1000, 0x0000_0007_A3C2_2000, 0x2_0014_3000]. The middle entry is the <em>CPU physical address</em> of the third page; the refactor bypassed the DMA mapping call for pages that came from a different allocator.</p>
+  <h4>Your questions</h4>
+  <p>Valid? Where does the third page's data go? Which TLPs? What failure, and why does the device not notice?</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 4 — posted writes blocked by the IOMMU">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,430</td><td>CplD</td><td>ByteCount=64</td><td>SQE: PRP1=0x2_0014_0000 PRP2=0x1_5000_4000 NLB=0x001F</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,500</td><td>MRd64</td><td>Addr=0x1_5000_4000 Len=6 DW</td><td>List fetch: 3 entries</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2,110</td><td>CplD</td><td>ByteCount=24</td><td>0x2_0014_1000, 0x7_A3C2_2000, 0x2_0014_3000</td></tr>
+        <tr class="dir-up"><td>6–37</td><td>Dev→Host</td><td>58,000…</td><td>MWr64</td><td>pages 0 and 1</td><td>Correct</td></tr>
+        <tr class="abnormal"><td>38</td><td>Dev→Host</td><td>60,100</td><td>MWr64</td><td>Addr=0x7_A3C2_2000 Len=64 DW</td><td>Write to an IOVA that is not mapped for this device</td></tr>
+        <tr class="dir-up"><td>39–53</td><td>Dev→Host</td><td>…</td><td>MWr64</td><td>Addr=0x7_A3C2_2100 …</td><td>Rest of page 2, all blocked</td></tr>
+        <tr class="dir-up"><td>54–69</td><td>Dev→Host</td><td>…</td><td>MWr64</td><td>page 3</td><td>Correct</td></tr>
+        <tr class="dir-up"><td>70</td><td>Dev→Host</td><td>63,500</td><td>MWr64</td><td>Addr=0x1_2341_…</td><td>CQE: Success</td></tr>
+        <tr class="note"><td colspan="6">Host side (illustrative, format varies by platform and kernel): an IOMMU DMA-write fault record for device 01:00.0 at address 0x7a3c22000, reason "not present / no translation".</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <details class="solution"><summary>Analysis: symptom, first abnormal event, root cause, fix</summary>
+    <ul>
+      <li><strong>Valid?</strong> Structurally yes; the walker reports valid. Semantically no: one entry is not an IOVA mapped for this device (invariant P8). This is a mapping bug, invisible to structure checks.</li>
+      <li><strong>Where?</strong> Nowhere — the IOMMU drops the writes. With the IOMMU off, the address happens to equal the right physical page, which is why the bug hides.</li>
+      <li><strong>DMA:</strong> 64 MWr as normal; 16 are blocked at the root complex/IOMMU.</li>
+      <li><strong>Symptom:</strong> Success status with missing data. MWr is posted: no completion travels back, so the controller has no way to know. (For a Write command the same bug produces MRd requests that the root complex completes with Unsupported Request or Completer Abort; the controller then usually reports a data transfer error and may log an Advanced Error Reporting (AER) event — see <a href="ch45.html">Chapter 45</a>.)</li>
+      <li><strong>First abnormal event:</strong> row 38, correlated with the IOMMU fault record by address and time.</li>
+      <li><strong>Root cause:</strong> a code path that put CPU physical addresses into PRP entries instead of DMA addresses from the mapping API.</li>
+      <li><strong>Fix:</strong> map every page through the DMA API (or the user-space driver's IOVA allocator); never derive PRP values from physical addresses.</li>
+      <li><strong>Regression test:</strong> always run integration tests with the IOMMU in strict translated mode; fail the test on any IOMMU fault line naming the device under test.</li>
+    </ul>
+  </details>
+
+  <h3>Case 5 — Freed buffer (DMA after release)</h3>
+  <h4>Scenario</h4>
+  <p>Under a fault-injection test that delays some Read completions by 35 seconds, a test tool times out at 30 seconds, aborts the command, frees the buffer, and continues. Hours later, unrelated processes crash with corrupted heap structures.</p>
+  <h4>Command and memory</h4>
+  <p>Read, NLB = 0x0007, PRP1 = 0x2_0018_0000. At t = 30 s the tool issues Abort, gets "command not aborted" (the abort is best-effort), frees and unmaps the buffer anyway. The IOVA allocator, in a deferred-flush mode, has not yet invalidated the mapping; the physical page is handed to another process.</p>
+  <h4>Your questions</h4>
+  <p>Valid? Where does the data land at t = 35 s? Which TLPs? What failure?</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 5 — completion after the host gave up">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 s</td><td>MWr32</td><td>Addr=0xFE601008</td><td>SQ1 doorbell: Read CID 0x0123</td></tr>
+        <tr class="dir-up"><td>2–3</td><td>both</td><td>0.8 µs</td><td>MRd/CplD</td><td>SQE fetch</td><td>PRP1=0x2_0018_0000, PRP2 unused</td></tr>
+        <tr class="note"><td colspan="6">Fault injection delays the media read.</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>30.000 s</td><td>MWr32</td><td>Addr=0xFE601000</td><td>Admin SQ doorbell: Abort for CID 0x0123</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>30.000 s</td><td>MWr64</td><td>Addr=0x1_0000_1xxx</td><td>Admin CQE: Dword 0 reports the command was not aborted (confirm the bit meaning in your revision)</td></tr>
+        <tr class="note"><td colspan="6">Host frees and unmaps the buffer anyway; deferred IOTLB flush leaves the IOVA translation live for a short while; page reused.</td></tr>
+        <tr class="abnormal"><td>6</td><td>Dev→Host</td><td>35.002 s</td><td>MWr64</td><td>Addr=0x2_0018_0000 Len=64 DW</td><td>Data for a command the host no longer owns</td></tr>
+        <tr class="dir-up"><td>7–21</td><td>Dev→Host</td><td>35.002 s</td><td>MWr64</td><td>… 0x2_0018_0F00</td><td>Overwrites another process's memory</td></tr>
+        <tr class="dir-up"><td>22</td><td>Dev→Host</td><td>35.002 s</td><td>MWr64</td><td>CQ1</td><td>CQE for CID 0x0123: Success — ignored or treated as spurious by the tool</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <details class="solution"><summary>Analysis: symptom, first abnormal event, root cause, fix</summary>
+    <ul>
+      <li><strong>Valid?</strong> The command was valid when submitted. It became invalid when the host released the buffer while the command was still outstanding (invariant P8, lifetime).</li>
+      <li><strong>Where?</strong> At t = 35 s, wherever the IOVA translates: if the mapping was already invalidated, an IOMMU fault and no damage; if not (deferred flush) or if the IOMMU is off, into the page's new owner.</li>
+      <li><strong>DMA:</strong> 16 MWr and a CQE, exactly as for a normal Read — just late.</li>
+      <li><strong>Symptom:</strong> heap corruption in unrelated processes, far from the storage stack, hours later.</li>
+      <li><strong>First abnormal event:</strong> the host's free at t ≈ 30 s while the command was outstanding (a host event, not on the wire); on the wire, row 6 is the first TLP to memory the command no longer owns.</li>
+      <li><strong>Root cause:</strong> the tool treated a timeout as completion. "Command not aborted" means the controller may still execute it; the buffer must remain owned until a CQE arrives or the controller is reset (which stops all DMA).</li>
+      <li><strong>Fix:</strong> on timeout, either wait for the CQE, or reset the controller (disable, wait for <code>CSTS.RDY</code> = 0) before releasing any buffer or list memory; quarantine buffers of timed-out commands.</li>
+      <li><strong>Regression test:</strong> fault-injected late completions with buffers filled with a sentinel and a canary page after free; run with strict IOMMU invalidation and the kernel's DMA-API debugging enabled where available.</li>
+    </ul>
+  </details>
+
+  <h3>Case 6 — Wrong NLB versus buffer size</h3>
+  <h4>Scenario</h4>
+  <p>A firmware-validation script reads "8 blocks" into a 4 KiB page-aligned buffer. On an IOMMU system it logs a DMA fault at address 0 and sometimes a corrupted next buffer; without the IOMMU the machine occasionally hangs.</p>
+  <h4>Command and memory</h4>
+  <p>Read, NLB = 0x0008, PRP1 = 0x2_0010_0000, PRP2 = 0 (the script believed 4 KiB needs only PRP1).</p>
+  <h4>Your questions</h4>
+  <p>Valid? How many bytes does the controller move, and where? Which TLPs? What failure?</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 6 — zero-based NLB used as a count">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,440</td><td>CplD</td><td>ByteCount=64</td><td>SQE: opc=02h PRP1=0x2_0010_0000 PRP2=0x0 NLB=0x0008</td></tr>
+        <tr class="note"><td colspan="6">Controller: 9 × 512 = 4,608 B → 2 pages → PRP2 is a data pointer.</td></tr>
+        <tr class="dir-up"><td>4–19</td><td>Dev→Host</td><td>45,000…</td><td>MWr64</td><td>Addr=0x2_0010_0000 … 0x2_0010_0F00</td><td>First 4 KiB, correct</td></tr>
+        <tr class="abnormal"><td>20</td><td>Dev→Host</td><td>47,100</td><td>MWr64</td><td>Addr=0x0000_0000_0000_0000 Len=64 DW</td><td>Block 8 to address 0</td></tr>
+        <tr class="dir-up"><td>21</td><td>Dev→Host</td><td>47,160</td><td>MWr64</td><td>Addr=0x0000_0000_0000_0100 Len=64 DW</td><td>Rest of block 8</td></tr>
+        <tr class="dir-up"><td>22</td><td>Dev→Host</td><td>47,300</td><td>MWr64</td><td>CQ1</td><td>CQE: Success</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <details class="solution"><summary>Analysis: symptom, first abnormal event, root cause, fix</summary>
+    <ul>
+      <li><strong>Valid?</strong> No: L = (8 + 1) × 512 = 4,608 B needs two pages, and PRP2 = 0 (invariant P2/P3). The walker reports <em>PRP2 is 0 but the command needs a second page</em>.</li>
+      <li><strong>Where?</strong> 4,096 B into the buffer and 512 B to IOVA 0x0.</li>
+      <li><strong>DMA:</strong> 18 MWr instead of the intended 16.</li>
+      <li><strong>Symptom:</strong> IOMMU fault at address 0 (blocked); without an IOMMU, a write to physical address 0 — real memory on many platforms (low memory used by firmware structures), hence hangs.</li>
+      <li><strong>First abnormal event:</strong> row 20. The SQE already reveals it if you compute L instead of trusting the script's comment.</li>
+      <li><strong>Root cause:</strong> NLB is zero-based; the script passed a block count. The variant "same NLB after the namespace was reformatted from 512 B to 4 KiB blocks" moves 36 KiB into a 4 KiB buffer.</li>
+      <li><strong>Fix:</strong> one helper that takes a byte length, derives NLB = bytes / LBA size − 1 from the <em>current</em> format, and builds the PRPs from the same byte length.</li>
+      <li><strong>Regression test:</strong> assertion that the pointer length equals (NLB + 1) × LBA size for every command; tests for 1, 8, 9 blocks and after a format change.</li>
+    </ul>
+  </details>
+
+  <h3>Case 7 — SGL sent to a controller without SGL support</h3>
+  <h4>Scenario</h4>
+  <p>A test framework enables SGLs globally "for coverage". On one SSD model every I/O fails immediately.</p>
+  <h4>Command and memory</h4>
+  <p>Write, PSDT = 01b, SGL1 = Data Block 0x2_0020_0000 length 4096, NLB = 0x0007. The controller's Identify Controller SGLS bits 1:0 = 00b.</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 7 — immediate rejection">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,430</td><td>CplD</td><td>ByteCount=64</td><td>SQE: opc=01h CDW0 bits 15:14 = 01b, DPTR byte 15 = 0x00</td></tr>
+        <tr class="abnormal"><td>4</td><td>Dev→Host</td><td>2,050</td><td>MWr64</td><td>CQ1</td><td>CQE: Status Code Type 0h, Invalid Field in Command, DNR=1</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <details class="solution"><summary>Analysis</summary>
+    <ul>
+      <li><strong>Valid?</strong> No (invariant S1). Structurally the SGL is fine; the controller does not support SGLs.</li>
+      <li><strong>Where?</strong> Nowhere; no data moves.</li>
+      <li><strong>DMA:</strong> SQE fetch and CQE only. The absence of any data TLP between them is itself evidence of an early rejection.</li>
+      <li><strong>Symptom / first abnormal event:</strong> the CQE status (row 4). The expected status for this case should be confirmed in the specification; Invalid Field in Command is what controllers commonly return.</li>
+      <li><strong>Root cause:</strong> the framework did not consult SGLS.</li>
+      <li><strong>Fix:</strong> gate PSDT on SGLS per controller; report "not supported" as a skipped test rather than a failure.</li>
+      <li><strong>Regression test:</strong> run the suite on one SGL-capable and one PRP-only controller.</li>
+    </ul>
+  </details>
+
+  <h3>Case 8 — Byte-aligned SGL Data Block on a dword-granular controller</h3>
+  <h4>Scenario</h4>
+  <p>A network-storage gateway forwards payloads with odd lengths. On a controller reporting SGLS bits 1:0 = 10b, some Writes fail.</p>
+  <h4>Command and memory</h4>
+  <p>Write, PSDT = 01b, SGL1 = Last Segment 0x1_5000_5000 length 32 → [Data Block 0x2_0024_0002 length 510], [Data Block 0x2_0025_0000 length 3586]. NLB = 0x0007 (4,096 B).</p>
+  <div class="trace" data-kind="synthetic" data-title="Case 8 — alignment rejected after the segment fetch">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,430</td><td>CplD</td><td>ByteCount=64</td><td>SQE: PSDT=01b, SGL1 byte 15 = 0x30, len 32</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,500</td><td>MRd64</td><td>Addr=0x1_5000_5000 Len=8 DW</td><td>Segment fetch</td></tr>
+        <tr class="abnormal"><td>5</td><td>Host→Dev</td><td>2,120</td><td>CplD</td><td>ByteCount=32</td><td>Data Block 0x2_0024_0002 / 510: address and length not dword multiples</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>2,500</td><td>MWr64</td><td>CQ1</td><td>CQE: SGL-family or Invalid Field status (controller-specific choice; confirm)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <details class="solution"><summary>Analysis</summary>
+    <ul>
+      <li><strong>Valid?</strong> The sum (510 + 3,586 = 4,096) is right; alignment violates SGLS 10b (invariant S6).</li>
+      <li><strong>Where?</strong> Intended: 510 B at 0x2_0024_0002 and 3,586 B at 0x2_0025_0000. Actual: nothing, if rejected.</li>
+      <li><strong>DMA:</strong> SQE fetch, segment fetch, CQE; no data.</li>
+      <li><strong>First abnormal event:</strong> row 5 — the descriptor content.</li>
+      <li><strong>Root cause:</strong> the gateway assumed byte-granular SGLs.</li>
+      <li><strong>Fix:</strong> honour SGLS: when it reports 10b, align fragments (copy edges into an aligned bounce buffer) or fall back to a page-aligned bounce buffer with PRPs.</li>
+      <li><strong>Regression test:</strong> fragment sizes 1–7 bytes off alignment against controllers reporting 01b and 10b.</li>
+    </ul>
+  </details>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <aside class="callout hw"><p>Where each case is (or is not) caught in hardware.</p></aside>
+  <table>
+    <caption>Which hardware can catch which bug</caption>
+    <thead><tr><th>Component</th><th>Can catch</th><th>Cannot catch</th></tr></thead>
+    <tbody>
+      <tr><td>Controller data-pointer engine</td><td>offset/alignment violations (cases 1, 8), SGL type/segment/length errors (7, SGL length cases)</td><td>a well-formed pointer to the wrong page (2, 4, 5, 6)</td></tr>
+      <tr><td>IOMMU</td><td>accesses to unmapped IOVAs (4, 6, often 3, 5 if strictly invalidated)</td><td>accesses to mapped-but-wrong memory (1, 2, 5 with deferred flush)</td></tr>
+      <tr><td>Root complex</td><td>reports UR/CA completions for blocked reads; may raise AER</td><td>posted writes that the IOMMU drops silently from the device's point of view</td></tr>
+      <tr><td>PCIe analyzer</td><td>everything that crosses the link</td><td>host-side frees and mapping changes (5)</td></tr>
+    </tbody>
+  </table>
+  <p>Controllers differ in how much they validate and when: some check every PRP offset before moving data; some fetch whole list pages and never look at alignment; some move part of the data before discovering an SGL length problem <span class="badge impl">Implementation-dependent</span>. This is why the same buggy host passes on one SSD and fails on another.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Physical Region Page Entry and List; Scatter Gather List; Submission Queue Entry; Generic Command Status values; Abort command</cite></li>
+    <li><cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3 — Read and Write (Number of Logical Blocks, zero-based)</cite></li>
+    <li><cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4</cite></li>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Completion status (UR, CA), posted request handling, Advanced Error Reporting</cite></li>
+  </ul>
+  <aside class="callout verified">
+    <ul>
+      <li>The PRP and SGL structure rules used in the invariants (Chapters 36 and 37).</li>
+      <li>NLB is a zero-based value.</li>
+      <li>Abort is best-effort: a controller may complete the Abort with an indication that the command was not aborted.</li>
+      <li>Memory Write requests are posted and receive no completion.</li>
+    </ul>
+  </aside>
+  <aside class="callout derived">
+    <ul>
+      <li>The validation procedure, invariant numbering and the three bug families are this course's organization, not specification text.</li>
+      <li>"Buffers must stay owned until a CQE or a controller reset" follows from the absence of any other guarantee that DMA has stopped.</li>
+    </ul>
+  </aside>
+  <aside class="callout impl">
+    <ul>
+      <li>Which malformed pointers a controller detects, which status it returns, and whether any data moves first.</li>
+      <li>IOMMU invalidation policy (strict versus deferred) and fault reporting format.</li>
+      <li>How a root complex completes requests blocked by an IOMMU (UR or CA) and whether AER is raised.</li>
+    </ul>
+  </aside>
+  <aside class="callout version">
+    <p>Status code names and the set of SGL-related statuses have grown over revisions; IOMMU fault message formats change with kernel versions. Cite revisions and versions in every bug report.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <ul>
+      <li>The specification does not require a controller to detect every malformed data pointer; undetected cases have undefined data movement.</li>
+      <li>It does not define what happens to host memory when a host violates the rules.</li>
+      <li>Check in the specification: the exact status code for each malformed case you report (PRP Offset Invalid, SGL family, Invalid Field), and the Abort completion's Dword 0 meaning for your revision.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn">
+    <ul>
+      <li>Never conclude "the data pointer was fine" from a Success status.</li>
+      <li>Never free or reuse a buffer, PRP list or SGL segment of a timed-out command without a completion or a controller reset.</li>
+      <li>Never trust a length from a comment, a variable name or the application; recompute it from NLB and the current format.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>Predicting the DMA transactions is the bridge between the command and the trace. For any data command on PCIe the expected sequence is:</p>
+  <figure>
+    <ol class="seq" data-actors="Host memory|Root complex / IOMMU|NVMe controller">
+      <li data-from="NVMe controller" data-to="Root complex / IOMMU">MRd: SQE (64 B)</li>
+      <li data-from="Root complex / IOMMU" data-to="NVMe controller" class="dashed">CplD: SQE</li>
+      <li data-note="NVMe controller">compute L, pointer layout</li>
+      <li data-from="NVMe controller" data-to="Root complex / IOMMU">MRd: PRP list / SGL segment(s)</li>
+      <li data-from="Root complex / IOMMU" data-to="NVMe controller" class="dashed">CplD: entries / descriptors</li>
+      <li data-from="NVMe controller" data-to="Root complex / IOMMU">data MWr (Read) or MRd (Write)</li>
+      <li data-from="Root complex / IOMMU" data-to="Host memory">translated access (or fault)</li>
+      <li data-from="NVMe controller" data-to="Root complex / IOMMU">MWr: CQE</li>
+      <li data-from="NVMe controller" data-to="Root complex / IOMMU">MWr: MSI-X</li>
+    </ol>
+    <figcaption>Conceptual: every step is a place where a prediction can be compared with the trace.</figcaption>
+  </figure>
+  <table>
+    <caption>Predicting counts (lab system: MPS 256 B, MRRS 512 B, RCB 64 B, 4 KiB pages)</caption>
+    <thead><tr><th>Item</th><th>Prediction</th></tr></thead>
+    <tbody>
+      <tr><td>List fetch (PRP)</td><td>8 × (entries in each list page) bytes per list page, in MRRS-sized MRds; later list pages only after the chain pointer arrives</td></tr>
+      <tr><td>Segment fetch (SGL)</td><td>exactly the Length of the pointing descriptor, at its Address</td></tr>
+      <tr><td>Data for a Read</td><td>MWr ≤ 256 B each, never crossing 4 KiB; one or more per 256-byte-aligned window touched</td></tr>
+      <tr><td>Data for a Write</td><td>MRd ≤ 512 B each, never crossing 4 KiB; completions ≤ 256 B each, split at 64-byte boundaries as the completer chooses</td></tr>
+      <tr><td>Bit Bucket</td><td>no TLPs</td></tr>
+      <tr><td>Early rejection</td><td>SQE fetch (and descriptor fetch for SGLs), then CQE with error, no data</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>The cases above each contain a trace. Here is the hardest kind: an <em>ambiguous</em> trace where the same evidence fits several explanations.</p>
+  <div class="trace" data-kind="synthetic" data-title="Ambiguous: Read completes with Success, fewer data TLPs than expected">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,430</td><td>CplD</td><td>ByteCount=64</td><td>SQE: opc=02h PSDT=01b SGL1=Last Segment 0x1_5000_6000 len 32, NLB=0x000F</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,500</td><td>MRd64</td><td>Addr=0x1_5000_6000 Len=8 DW</td><td>Segment fetch</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2,120</td><td>CplD</td><td>ByteCount=32 — payload not captured</td><td>Capture filter dropped payloads</td></tr>
+        <tr class="abnormal"><td>6–21</td><td>Dev→Host</td><td>58,000…</td><td>MWr64</td><td>Addr=0x2_0030_0000 … 0x2_0030_0F00</td><td>Only 16 data MWr (4 KiB) for an 8 KiB Read</td></tr>
+        <tr class="dir-up"><td>22</td><td>Dev→Host</td><td>62,000</td><td>MWr64</td><td>CQ1</td><td>CQE: Success</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Hypotheses.</strong> (a) The segment holds a Bit Bucket of 4 KiB plus a Data Block of 4 KiB — a valid V3-style command, no bug. (b) The other half went to an address the analyzer's filter excluded (for example, a filter on 0x2_0030_xxxx). (c) The capture dropped packets (check the analyzer's lost-packet indicators and link-layer sequence numbers). (d) A controller bug skipped data.</p>
+    <p><strong>Disambiguating evidence.</strong> Recapture with segment payloads enabled (decides a vs others); widen the address filter (b); check capture integrity counters (c). Only if all three are excluded does (d) become credible. The senior habit: <em>missing evidence is not evidence of a missing event</em>.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Read-only inspection. Tracing commands need root and add a little overhead.</p></aside>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># IOMMU faults mentioning the SSD (message format varies by platform and kernel)</span>
+sudo dmesg -T | grep -i -E 'DMAR|AMD-Vi|iommu|smmu' | grep -i '01:00.0'
+
+<span class="cm"># NVMe errors reported by the driver, with status names when the kernel decodes them</span>
+sudo dmesg -T | grep -i nvme
+
+<span class="cm"># Is the IOMMU translating for this device, and in which mode?</span>
+cat /sys/bus/pci/devices/0000:01:00.0/iommu_group/type 2&gt;/dev/null
+
+<span class="cm"># Controller limits the driver uses to build pointers</span>
+sudo nvme id-ctrl /dev/nvme0 | grep -i -E '^mdts|^sgls'
+sudo nvme id-ns /dev/nvme0n1 -H | grep -i 'in use'      <span class="cm"># current LBA format</span>
+
+<span class="cm"># Per-command trace (opcode, CID, cdw10-15) - correlate CIDs with CQE status</span>
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_setup_cmd/enable'
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_complete_rq/enable'
+sudo cat /sys/kernel/tracing/trace_pipe | head -50
+sudo sh -c 'echo 0 &gt; /sys/kernel/tracing/events/nvme/enable'</code></pre>
+  <table>
+    <caption>What the outputs prove</caption>
+    <thead><tr><th>Evidence</th><th>Proves</th><th>Does not prove</th></tr></thead>
+    <tbody>
+      <tr><td>IOMMU fault for 01:00.0 at address A, direction W</td><td>The SSD attempted a write to an unmapped IOVA A</td><td>Which command; whether other writes went to mapped-but-wrong addresses</td></tr>
+      <tr><td>Current LBA format "in use"</td><td>The block size the controller uses to compute L</td><td>That the driver used the same size when it built the pointer</td></tr>
+      <tr><td><code>nvme_setup_cmd</code> with cdw12</td><td>NLB (low 16 bits of CDW12) for each command</td><td>The PRP/SGL contents</td></tr>
+      <tr><td>Completion status in <code>nvme_complete_rq</code></td><td>What the controller reported</td><td>That a Success command moved data where intended</td></tr>
+    </tbody>
+  </table>
+  <p>Kernel builds with DMA-API debugging enabled can warn about drivers that unmap memory still in use or map with the wrong direction; enable it only on test systems <span class="badge version">Version-dependent</span>.</p>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>The PRP walker. Given a buffer address, length and memory page size, it prints PRP1, PRP2, every list page with its entries and chain pointers, the list fetches, and the data TLPs a controller would plausibly issue. With <code>--lab</code> it walks the broken PRP sets of this chapter as a controller would and reports what is wrong. Standard library only.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="prp_walk.py"><code>#!/usr/bin/env python3
+"""prp_walk.py - build, print and check NVMe PRP data pointers (teaching tool).
+
+Synthetic example for teaching. Standard library only.
+
+  python3 prp_walk.py                         # run the built-in worked examples
+  python3 prp_walk.py 0x200000800 4096        # one buffer: address, length
+  python3 prp_walk.py 0x200000000 1048576 --page-size 4096 \\
+          --list-base 0x150000c00 --dir write --mps 256 --mrrs 512
+  python3 prp_walk.py --lab                   # check the broken PRP sets of the debugging lab
+
+The TLP split it prints is ONE plausible device behavior (requests cut at
+MPS/MRRS-aligned boundaries, completions cut at RCB boundaries). Real
+controllers and root complexes choose their own split: implementation-dependent.
+"""
+import argparse
+
+
+def align_down(x, a):
+    return x - (x % a)
+
+
+def build_prps(addr, length, ps, list_base):
+    """Return (prp1, prp2, list_pages, data_pages) following the PRP rules.
+
+    list_pages: list of (list_page_address, [(slot_address, value, kind), ...])
+    kind is 'data' for a data-page entry and 'chain' for a next-list pointer.
+    """
+    if addr % 4:
+        raise ValueError("PRP1 must be dword aligned (bits 1:0 = 00b)")
+    if length &lt;= 0:
+        raise ValueError("length must be positive")
+    first_off = addr % ps
+    npages = (first_off + length + ps - 1) // ps
+    data_pages = [addr] + [align_down(addr, ps) + i * ps for i in range(1, npages)]
+    prp1 = addr
+    if npages == 1:
+        return prp1, 0, [], data_pages          # PRP2 not used
+    if npages == 2:
+        return prp1, data_pages[1], [], data_pages   # PRP2 = second page
+    if list_base % 8:
+        raise ValueError("PRP list pointer must be qword aligned")
+    remaining = data_pages[1:]
+    list_pages, cur, next_page = [], list_base, align_down(list_base, ps) + ps
+    while remaining:
+        slots = (ps - cur % ps) // 8            # entries that fit before page end
+        entries = []
+        if len(remaining) &gt; slots:              # must chain: last slot -&gt; next list
+            for i in range(slots - 1):
+                entries.append((cur + 8 * i, remaining[i], "data"))
+            entries.append((cur + 8 * (slots - 1), next_page, "chain"))
+            remaining = remaining[slots - 1:]
+            list_pages.append((cur, entries))
+            cur, next_page = next_page, next_page + ps
+        else:
+            for i, v in enumerate(remaining):
+                entries.append((cur + 8 * i, v, "data"))
+            list_pages.append((cur, entries))
+            remaining = []
+    return prp1, list_base, list_pages, data_pages
+
+
+def segments(addr, length, ps):
+    """Split a virtually contiguous buffer into (address, bytes) per memory page."""
+    out, a, left = [], addr, length
+    while left:
+        n = min(left, ps - a % ps)
+        out.append((a, n))
+        a, left = a + n, left - n
+    return out
+
+
+def split_requests(segs, limit):
+    """Cut each segment at limit-aligned boundaries (limit = MPS or MRRS)."""
+    out = []
+    for a, n in segs:
+        while n:
+            k = min(n, limit - a % limit)
+            out.append((a, k))
+            a, n = a + k, n - k
+    return out
+
+
+def completions_for(addr, n, mps, rcb):
+    """One plausible completer: CplDs of at most MPS bytes ending on RCB boundaries."""
+    out = []
+    while n:
+        if n &lt;= mps:
+            k = n
+        else:
+            k = mps - ((addr + mps) % rcb)
+        out.append((addr, k))
+        addr, n = addr + k, n - k
+    return out
+
+
+def report(addr, length, ps, list_base, direction, mps, mrrs, rcb, show_tlps=8):
+    prp1, prp2, lists, pages = build_prps(addr, length, ps, list_base)
+    print(f"Buffer 0x{addr:x}, {length} bytes, memory page size {ps}")
+    print(f"  pages touched : {len(pages)}  (first-page offset 0x{addr % ps:x})")
+    print(f"  PRP1          : 0x{prp1:016x}")
+    if not prp2:
+        print("  PRP2          : not used (transfer fits in PRP1's page)")
+    elif not lists:
+        print(f"  PRP2          : 0x{prp2:016x}  (second data page)")
+    else:
+        print(f"  PRP2          : 0x{prp2:016x}  (PRP list pointer)")
+    for n, (base, entries) in enumerate(lists):
+        ndata = sum(1 for e in entries if e[2] == "data")
+        print(f"  PRP list page {n} at 0x{base:x}: {len(entries)} entries "
+              f"({ndata} data, {len(entries) - ndata} chain), {8 * len(entries)} bytes")
+        shown = entries if len(entries) &lt;= 6 else entries[:3] + [None] + entries[-2:]
+        for e in shown:
+            if e is None:
+                print("      ...")
+            else:
+                tag = "-&gt; next PRP list" if e[2] == "chain" else "data page"
+                print(f"      [0x{e[0]:x}] = 0x{e[1]:016x}  {tag}")
+    segs = segments(addr, length, ps)
+    list_reads = []
+    for base, entries in lists:
+        list_reads += split_requests([(base, 8 * len(entries))], mrrs)
+    if direction == "read":   # NVMe Read: controller WRITES host memory
+        tlps = split_requests(segs, mps)
+        print(f"  Data TLPs (NVMe Read -&gt; device MWr): {len(tlps)} MWr of &lt;= {mps} B")
+        for a, n in tlps[:show_tlps]:
+            print(f"      MWr 0x{a:x} {n} B")
+        if len(tlps) &gt; show_tlps:
+            print(f"      ... {len(tlps) - show_tlps} more")
+    else:                     # NVMe Write: controller READS host memory
+        reqs = split_requests(segs, mrrs)
+        cpls = sum(len(completions_for(a, n, mps, rcb)) for a, n in reqs)
+        print(f"  Data TLPs (NVMe Write -&gt; device MRd): {len(reqs)} MRd of &lt;= {mrrs} B,"
+              f" about {cpls} CplD (completer-dependent)")
+        for a, n in reqs[:show_tlps]:
+            print(f"      MRd 0x{a:x} {n} B")
+        if len(reqs) &gt; show_tlps:
+            print(f"      ... {len(reqs) - show_tlps} more")
+    if list_reads:
+        print(f"  PRP list fetches: {len(list_reads)} MRd (" +
+              ", ".join(f"0x{a:x}/{n} B" for a, n in list_reads) + ")")
+    print()
+
+
+def check(prp1, prp2, length, ps, memory, intended=None):
+    """Walk a PRP set the way a controller would and return a list of findings.
+
+    length:   bytes the COMMAND asks for ((NLB + 1) x LBA size), not what the host allocated.
+    memory:   dict {address: 64-bit value} holding whatever is in the PRP list slots,
+              including stale values the host did not mean to be there.
+    intended: optional set of page addresses the host meant to use; any data page the
+              controller would touch outside this set is reported.
+    """
+    problems, touched = [], [align_down(prp1, ps)]
+    data_lo = align_down(prp1, ps)
+    data_hi = data_lo + ((prp1 % ps + length + ps - 1) // ps) * ps
+    if prp1 % 4:
+        problems.append(f"PRP1 0x{prp1:x} is not dword aligned")
+    left = length - min(length, ps - prp1 % ps)
+    if 0 &lt; left &lt;= ps:                      # exactly two pages: PRP2 is data
+        if prp2 == 0:
+            problems.append("PRP2 is 0 but the command needs a second page: "
+                            "the controller will DMA to/from address 0")
+        elif prp2 % ps:
+            problems.append(f"PRP2 0x{prp2:x} used as data pointer but has offset "
+                            f"0x{prp2 % ps:x} (must be page aligned)")
+        touched.append(align_down(prp2, ps))
+        left = 0
+    elif left &gt; ps and prp2 % 8:
+        problems.append(f"PRP2 0x{prp2:x} used as list pointer but not qword aligned")
+        left = 0
+    slot = prp2
+    lists = 1 if left else 0
+    while left &gt; 0:
+        if slot not in memory:
+            problems.append(f"list slot 0x{slot:x} was never written by the host "
+                            f"({left} bytes still to place) - list too short")
+            break
+        val = memory[slot]
+        if (slot + 8) % ps == 0 and left &gt; ps:      # last slot, more than a page to go
+            if data_lo &lt;= val &lt; data_hi or (intended and val in intended):
+                problems.append(f"last slot of list page (0x{slot:x}) holds 0x{val:x}, a DATA "
+                                "page: the controller treats it as the next PRP list and "
+                                "reads data bytes as PRP entries")
+                break
+            if val % ps:
+                problems.append(f"chain pointer at 0x{slot:x} = 0x{val:x} not page aligned")
+                break
+            slot, lists = val, lists + 1
+            continue
+        if val % ps:
+            problems.append(f"entry at 0x{slot:x} = 0x{val:x} has offset 0x{val % ps:x}")
+        touched.append(align_down(val, ps))
+        left -= min(ps, left)
+        slot += 8
+    if intended:
+        alien = [t for t in touched if t not in intended]
+        for t in alien:
+            problems.append(f"controller would access page 0x{t:x}, which is not part "
+                            "of the host buffer (stale or wrong entry)")
+    if not problems:
+        if lists:
+            return [f"valid: {len(touched)} data pages, {lists} list page(s) walked"]
+        return [f"valid: {len(touched)} data page(s), no list"]
+    return problems
+
+
+def lab_cases(ps=4096):
+    """The structural cases of the PRP/SGL debugging lab (same numbers as the chapter)."""
+    lst = 0x1_5000_0000
+
+    def pages(base, n):
+        return {base + i * ps for i in range(n)}
+
+    cases = []
+    # Case 1: 8 KiB Read, PRP2 has offset 0x200
+    b = 0x2_0004_0000
+    cases.append(("1 misaligned PRP2", b, b + 0x1200, 8192, {}, pages(b, 2)))
+    # Case 2: 128 KiB Write, host wrote 30 entries; slot 30 holds a stale value
+    b = 0x2_0008_0000
+    m = {lst + 8 * i: b + (i + 1) * ps for i in range(30)}
+    m[lst + 8 * 30] = 0x2_0033_7000
+    cases.append(("2 off-by-one list length", b, lst, 128 * 1024, m, pages(b, 32)))
+    # Case 3: 128 KiB Read, list starts at 0xF80 of its page and runs on without a chain
+    b, lp = 0x2_000C_0000, lst + 0x1F80
+    m = {lp + 8 * i: b + (i + 1) * ps for i in range(31)}
+    cases.append(("3 list crosses page, no chain", b, lp, 128 * 1024, m, pages(b, 32)))
+    # Case 3 fixed: 15 data entries, chain in slot 15, 16 entries in a new list page
+    m = {lp + 8 * i: b + (i + 1) * ps for i in range(15)}
+    m[lp + 8 * 15] = lst + 0x3000
+    m.update({lst + 0x3000 + 8 * i: b + (i + 16) * ps for i in range(16)})
+    cases.append(("3 fixed with chain", b, lp, 128 * 1024, m, pages(b, 32)))
+    # Case 6: NLB = 8 (nine 512-byte blocks = 4,608 B) into a 4 KiB buffer, PRP2 = 0
+    b = 0x2_0010_0000
+    cases.append(("6 NLB one too large", b, 0, 9 * 512, {}, pages(b, 1)))
+    # Case 4 and 5 are structurally valid: the walker cannot see mapping or lifetime bugs
+    b = 0x2_0014_0000
+    cases.append(("4/5 structurally valid 16 KiB", b, lst + 0x4000, 16384,
+                  {lst + 0x4000 + 8 * i: b + (i + 1) * ps for i in range(3)}, pages(b, 4)))
+    for name, p1, p2, n, mem, want in cases:
+        print(f"{name:32s} -&gt; " + "; ".join(check(p1, p2, n, ps, mem, want)))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("addr", nargs="?", help="buffer IOVA, e.g. 0x200000800")
+    ap.add_argument("length", nargs="?", help="bytes, e.g. 4096 or 0x20000")
+    ap.add_argument("--page-size", type=lambda s: int(s, 0), default=4096,
+                    help="memory page size = 2^(12+CC.MPS); default 4096")
+    ap.add_argument("--list-base", type=lambda s: int(s, 0), default=0x1_5000_0000,
+                    help="address of the first PRP list (qword aligned)")
+    ap.add_argument("--dir", choices=["read", "write"], default="read",
+                    help="NVMe command direction: read = device writes host memory")
+    ap.add_argument("--mps", type=int, default=256, help="PCIe Max Payload Size")
+    ap.add_argument("--mrrs", type=int, default=512, help="PCIe Max Read Request Size")
+    ap.add_argument("--rcb", type=int, default=64, help="Read Completion Boundary")
+    ap.add_argument("--lab", action="store_true", help="check the debugging-lab PRP sets")
+    a = ap.parse_args()
+    if a.lab:
+        lab_cases(a.page_size)
+        return
+    common = dict(ps=a.page_size, list_base=a.list_base, direction=a.dir,
+                  mps=a.mps, mrrs=a.mrrs, rcb=a.rcb)
+    if a.addr is not None and a.length is not None:
+        report(int(a.addr, 0), int(a.length, 0), **common)
+        return
+    for addr, n in [(0x2_0000_0000, 4096), (0x2_0000_0000, 8192),
+                    (0x2_0000_0800, 4096), (0x2_0000_0000, 128 * 1024)]:
+        report(addr, n, **common)
+    common["list_base"] = 0x1_5000_0C00     # 1 MiB with an offset list: chains
+    report(0x2_0000_0000, 1024 * 1024, **common)
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+  <h3>Using it</h3>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>python3 prp_walk.py                                  <span class="cm"># the five worked examples of Chapter 36</span>
+python3 prp_walk.py 0x200040800 8192 --dir write     <span class="cm"># one buffer, NVMe Write direction</span>
+python3 prp_walk.py 0x200000000 0x100000 --list-base 0x150000c00
+python3 prp_walk.py --lab                            <span class="cm"># check the broken cases</span></code></pre>
+  <p>With <code>--lab</code> the walker prints one verdict per case: Case 1 reports the PRP2 offset 0x200; Case 2 reports access to page 0x200337000 outside the buffer; Case 3 reports that the last slot of the list page holds a data page; the fixed Case 3 walks two list pages; Case 6 reports PRP2 = 0 with a second page needed; and the Case 4/5 command is reported <em>valid</em> — the point being that mapping and lifetime bugs are invisible to a structure check.</p>
+  <aside class="callout insight"><p>The walker's <code>check()</code> takes the length the <em>command</em> implies, not the buffer the host allocated. That single design choice is what lets it catch Case 6. Tools that take the length from the host's allocation repeat the host's mistake.</p></aside>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p>Work Case 3 from raw evidence, the way you would at a customer site.</p>
+  <ol>
+    <li><strong>Decode the SQE</strong> (from the analyzer's CplD at row 3): opcode 02h, PSDT 00b, PRP1 = 0x2_000C_0000, PRP2 = 0x1_5000_1F80, NLB = 0x00FF.</li>
+    <li><strong>Get the format:</strong> <code>nvme id-ns -H</code> says the LBA format in use has 512-byte data and no metadata. L = 256 × 512 = 131,072.</li>
+    <li><strong>Walk:</strong> offset 0 → N = 32 → PRP2 is a list pointer; 31 entries needed. List pointer offset 0xF80 → S = (4096 − 3968)/8 = 16 slots. 31 &gt; 16 → slots 0–14 data, slot 15 must be a chain pointer.</li>
+    <li><strong>Predict:</strong> list MRd of 128 B at 0x1_5000_1F80; then a list MRd at whatever slot 15 holds, which must be a page in list memory (0x1_5000_xxxx region on this system).</li>
+    <li><strong>Compare:</strong> row 6 reads 0x2_000D_0000 — the data region. Prediction violated. First abnormal event found.</li>
+    <li><strong>Confirm with the walker:</strong> run <code>python3 prp_walk.py --lab</code>; Case 3 reports "last slot of list page (0x150001ff8) holds 0x2000d0000, a DATA page".</li>
+    <li><strong>Explain the downstream symptoms:</strong> the controller reads "This is " as a PRP entry → MWr to 0x2073692073696000 → IOMMU fault with an ASCII-looking address.</li>
+    <li><strong>Write the root cause:</strong> "The PRP list builder places lists at 128-byte granularity and fills them linearly without checking remaining slots; lists longer than the remaining slots run into the next page and the controller interprets the last in-page slot as a chain pointer."</li>
+    <li><strong>Fix and test:</strong> chain or reallocate; add the walker check to the builder's debug path; add the analyzer rule.</li>
+  </ol>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Starting from the symptom.</strong> Chasing the IOMMU fault address in Case 3 leads nowhere: it is data, not a pointer anyone built. Start from the command.</li>
+    <li><strong>Trusting the host's length.</strong> Every length bug in this chapter is invisible if you take the length from the host code.</li>
+    <li><strong>Treating Success as proof.</strong> Cases 2, 4, 5 and 6 can all complete with Success.</li>
+    <li><strong>Blaming the SSD because another SSD works.</strong> Different validation and prefetch behavior exposes the same host bug differently.</li>
+    <li><strong>Disabling the IOMMU "to make it work".</strong> That converts detectable faults into silent corruption.</li>
+    <li><strong>Reading byte 15 of DPTR as an SGL identifier without checking PSDT.</strong> With PRPs, it is the top byte of PRP2.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>Root-cause summary of the cases</caption>
+    <thead><tr><th>Case</th><th>Family</th><th>First abnormal event</th><th>Root cause</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>1 Misaligned PRP2</td><td>Structure</td><td>SQE with PRP2 offset 0x200</td><td>PRP2 treated as chunk address</td><td>page-aligned buffers or SGLs</td></tr>
+      <tr><td>2 Off-by-one list</td><td>Length</td><td>data MRd outside buffer (stale slot)</td><td>loop bound one short</td><td>entries = N − 1 from shared arithmetic</td></tr>
+      <tr><td>3 List crosses page</td><td>Structure</td><td>list fetch from data page</td><td>no remaining-slot check</td><td>chain or never straddle</td></tr>
+      <tr><td>4 IOMMU fault</td><td>Mapping</td><td>MWr to unmapped IOVA</td><td>physical address in PRP</td><td>DMA API for every page</td></tr>
+      <tr><td>5 Freed buffer</td><td>Lifetime</td><td>host free while outstanding</td><td>timeout treated as completion</td><td>wait for CQE or reset first</td></tr>
+      <tr><td>6 Wrong NLB</td><td>Length</td><td>MWr to address 0</td><td>NLB used as a count</td><td>derive NLB and PRPs from one byte length</td></tr>
+      <tr><td>7 SGL unsupported</td><td>Structure</td><td>error CQE, no data</td><td>SGLS ignored</td><td>gate PSDT on SGLS</td></tr>
+      <tr><td>8 SGL alignment</td><td>Structure</td><td>segment content</td><td>SGLS 10b ignored</td><td>align or bounce</td></tr>
+    </tbody>
+  </table>
+  <p>For writing these up, use the bug-report method in <a href="bug-reports.html">Engineering Bug Report Training</a> and the correlation method in <a href="ch41.html">Chapter 41</a>. More data-pointer failures appear in the <a href="failure-library.html">Failure Library</a>.</p>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight">
+    <ul>
+      <li><strong>Ask "who computed the length, and how many times?"</strong> If the answer is more than once, you have probably found the bug.</li>
+      <li><strong>Lifetime bugs hide behind timeouts.</strong> Every timeout path in a driver or test tool deserves a review for "who owns the buffer now?".</li>
+      <li><strong>Make the IOMMU your ally.</strong> Strict translation in all test environments turns silent corruption into a fault with an address and a device.</li>
+      <li><strong>Poison what you recycle.</strong> List pages, segments and buffers filled with a recognizable pattern on free make stale-entry bugs scream instead of whisper.</li>
+      <li><strong>Encode the invariants in the builder.</strong> A debug-build assertion that walks every pointer you build costs microseconds and saves months.</li>
+      <li><strong>Separate observation from inference in reports.</strong> "MRd at 0x2_000D_0000 with list-fetch length" is an observation; "the list ran off the page" is the inference; the walker output is the corroboration.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 38 — Data-pointer forensics</h3>
+  <h4>Objective</h4>
+  <p>Diagnose four unlabeled data-pointer incidents from command bytes, memory contents and trace excerpts, using the validation procedure and the PRP walker.</p>
+  <h4>Skills</h4>
+  <ul><li>Length recomputation</li><li>PRP/SGL walking</li><li>First-abnormal-event identification</li><li>Root-cause writing</li></ul>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Offline analysis and Python only. Do not reproduce these bugs on a machine holding data you care about, and never with the IOMMU disabled.</p></aside>
+  <h4>Hardware required</h4><p>None.</p>
+  <h4>Software required</h4><p>Python 3 with <code>prp_walk.py</code>.</p>
+  <h4>Input</h4>
+  <ol type="A">
+    <li>Read, NLB = 0x0001, PRP1 = 0x2_0040_0F00, PRP2 = 0. Namespace format 512 B.</li>
+    <li>Write, NLB = 0x003F, PRP1 = 0x2_0044_0000, PRP2 = 0x1_5000_7000; list page holds 7 entries 0x2_0044_1000 … 0x2_0044_7000. Namespace format <strong>4 KiB</strong>.</li>
+    <li>Read, NLB = 0x003F, same PRP1/PRP2/list as B. Namespace format 512 B.</li>
+    <li>Write, PSDT = 01b, SGL1 = Data Block 0x2_0048_0000 length 0x2000, NLB = 0x000F, SGLS = 01b; analyzer shows 16 MRd of 512 B from 0x2_0048_0000 and a CQE with Success, but the kernel log shows an IOMMU read fault at 0x2_0048_1000 at the same time.</li>
+  </ol>
+  <h4>Expected output</h4>
+  <p>For each: valid or not, data ranges, predicted TLPs, failure, first abnormal event, root cause, fix.</p>
+  <h4>Background</h4>
+  <p>Use the invariant tables; recompute L from the format given.</p>
+  <h4>Step 1</h4><p>Compute L and the pointer length for each input.</p>
+  <h4>Step 2</h4><p>Walk each pointer by hand, then with <code>check()</code> from the walker (write a few lines calling it with the input values).</p>
+  <h4>Step 3</h4><p>Predict the TLPs and say which one would be the first abnormal event.</p>
+  <h4>Observation</h4><p>Note which inputs the walker flags and which it cannot.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Which input is valid?</li>
+    <li>Which input is a format-change bug?</li>
+    <li>Why can input D complete with Success despite the fault?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Extend <code>check()</code> to take the LBA size and NLB instead of a byte length, and to flag a format mismatch when given the size the host assumed.</p>
+  <details class="hint"><summary>Hint</summary><p>For A, compute where 1,024 bytes starting at offset 0xF00 end. For D, think about what an MRd blocked by the IOMMU returns and what a controller might do with it.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <ol type="A">
+      <li>L = 2 × 512 = 1,024; offset 0xF00 leaves 256 B in page 0 → N = 2 → PRP2 needed but 0. Invalid. 256 B to 0x2_0040_0F00, 768 B to address 0. First abnormal: MWr to 0x0. Root cause: page count computed from length only. Fix: include the offset.</li>
+      <li>L = 64 × 4,096 = 256 KiB → N = 64 → 63 entries needed; the list has 7 (built for 64 × 512 = 32 KiB). Invalid. The controller reads 56 stale slots (or zeros) → MRd from stale addresses / address 0. First abnormal: list fetch of 504 B where the host built 56 B, then data MRd outside the buffer. Root cause: the host assumed 512-byte blocks after the namespace was reformatted to 4 KiB. Fix: read the current format before building commands.</li>
+      <li>L = 64 × 512 = 32 KiB, N = 8, 7 entries. Valid. One 56-byte list MRd, 128 data MWr of 256 B.</li>
+      <li>Structure valid and sum correct. The IOMMU blocked reads of the second page; the root complex completed those MRd with an error status (UR or CA), but if the analyzer view shown filters completions, you see only the requests. A controller that correctly handles poisoned or failed completions should report an error; one that ignores completion status writes garbage to media and reports Success — a controller bug on top of a host mapping bug (the buffer's second page was not mapped, e.g. mapped with length 0x1000 instead of 0x2000). Fix the mapping length; report the controller's error handling separately.</li>
+    </ol>
+    <p>Challenge sketch: <code>check_cmd(prp1, prp2, nlb, lba_size, ps, memory, assumed_lba=None)</code> computes <code>length = (nlb + 1) * lba_size</code>, calls <code>check()</code>, and if <code>assumed_lba</code> differs, adds "host built for (nlb+1) × assumed_lba bytes".</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>Input D has two bugs from two parties. The report must separate them: the host mapping bug causes the fault; the controller's handling of failed completions determines whether the failure was loud or silent.</p>
+  <h4>Failure variants</h4>
+  <ul><li>Input B with the list page zeroed: MRd to address 0 instead of stale pages.</li><li>Input A on a system without an IOMMU: memory at physical 0 overwritten.</li></ul>
+  <h4>Extension</h4>
+  <p>Add an SGL mode to the walker by importing <code>walk()</code> from <code>sgl_tool.py</code> (<a href="ch37.html#code">Chapter 37</a>) and run Cases 7 and 8 through it.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>For each of Cases 1–8, state whether a controller <em>could</em> detect it from the command and descriptors alone.
+      <details class="answer"><summary>Answer</summary><p>Detectable: 1, 3 (if it notices the chain points into the command's own data range — most do not check), 7, 8. Not detectable: 2, 4, 5, 6 (6 is detectable only in the PRP2 = 0 special case, if the controller chooses to reject a zero address).</p></details></li>
+    <li>Rewrite Case 2's loop correctly in pseudocode.
+      <details class="answer"><summary>Answer</summary><p><code>for (i = 1; i &lt; npages; i++) add_entry(page_base(i));</code> with chain insertion when slots run out, and <code>npages</code> computed with the offset.</p></details></li>
+    <li>Why does Case 3 produce addresses that look like ASCII?
+      <details class="answer"><summary>Answer</summary><p>The controller reads 8-byte values from a data page holding text and uses them as page addresses.</p></details></li>
+    <li>In Case 5, list three host actions that would have made the late DMA harmless.
+      <details class="answer"><summary>Answer</summary><p>Waiting for the CQE; resetting the controller before freeing; strict IOMMU invalidation on unmap (turns corruption into a fault); quarantining the buffer.</p></details></li>
+    <li>Design an analyzer trigger that catches Case 3 in production captures.
+      <details class="answer"><summary>Answer</summary><p>Track, per command, the data ranges derived from PRP1 and fetched list entries; trigger on any MRd whose address lies inside a data range of the same command and whose length is a multiple of 8 consistent with a list fetch, immediately after a list fetch that ended at a page boundary.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>A Read completes with Success. Which statement is justified?</p>
+      <ul class="options" data-answer="3"><li>The data pointer was valid</li><li>All data reached the buffer</li><li>The controller believes it completed the command</li><li>No IOMMU fault occurred</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Posted writes give the controller no feedback; Success only reflects the controller's view.</p></details></li>
+    <li><p>NLB = 0x0008 with 512-byte blocks moves how many bytes?</p>
+      <ul class="options" data-answer="2"><li>4,096</li><li>4,608</li><li>4,104</li><li>8</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>(8 + 1) × 512 = 4,608; NLB is zero-based.</p></details></li>
+    <li><p>A list pointer at offset 0xF80 in a 4 KiB page has how many slots before the page ends?</p>
+      <ul class="options" data-answer="1"><li>16</li><li>31</li><li>128</li><li>512</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>(4096 − 3968) / 8 = 16.</p></details></li>
+    <li><p>Which bug cannot be detected by any structure check?</p>
+      <ul class="options" data-answer="4"><li>Misaligned PRP2</li><li>List crossing a page</li><li>SGL segment descriptor in the last segment</li><li>Buffer freed while the command is outstanding</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Lifetime bugs involve a well-formed pointer whose memory changed owner.</p></details></li>
+    <li><p>For an NVMe Write, an IOMMU-blocked data read most likely causes:</p>
+      <ul class="options" data-answer="2"><li>No visible effect anywhere</li><li>An error completion to the controller's MRd, and usually an error status in the CQE</li><li>A CQE with PRP Offset Invalid</li><li>A link retrain</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>MRd is non-posted; the root complex returns a completion with an error status; how the controller reports it is implementation-dependent.</p></details></li>
+    <li><p>What is the first abnormal event in Case 3?</p>
+      <details class="answer"><summary>Model answer</summary><p>The list-fetch MRd to 0x2_000D_0000, an address inside the command's own data buffer.</p></details></li>
+    <li><p>Why does the walker take the command's length rather than the buffer size?</p>
+      <details class="answer"><summary>Model answer</summary><p>Because the controller does; using the host's allocation would reproduce the host's error and hide length bugs such as Case 6.</p></details></li>
+    <li><p>Give two reasons the same host bug might pass on SSD A and fail on SSD B.</p>
+      <details class="answer"><summary>Model answer</summary><p>Different validation (A rejects bad offsets, B follows them); different list prefetch (A fetches only needed entries, B reads whole pages); different data ordering and timing exposing races.</p></details></li>
+    <li><p>In the ambiguous trace, what must you rule out before blaming the controller?</p>
+      <details class="answer"><summary>Model answer</summary><p>A valid Bit Bucket in the segment, capture filtering of other addresses, and capture loss.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><strong>Beginner:</strong> What four questions do you ask of a command's data pointer?
+      <details class="answer"><summary>Model answer</summary><p>Is it valid; where is the data; what DMA transactions should occur; what failure would result if it is wrong.</p></details></li>
+    <li><strong>Intermediate:</strong> A 4 KiB read writes to address 0. What do you check?
+      <details class="answer"><summary>Model answer</summary><p>Whether the transfer actually needs two pages — an offset in PRP1 or NLB off by one — with PRP2 left zero.</p></details></li>
+    <li><strong>Intermediate:</strong> How do posted and non-posted semantics change what an IOMMU fault looks like for Reads versus Writes?
+      <details class="answer"><summary>Model answer</summary><p>NVMe Read → device MWr (posted) → blocked silently from the device's view → Success; NVMe Write → device MRd (non-posted) → error completion → controller sees the failure.</p></details></li>
+    <li><strong>Advanced:</strong> Walk me through diagnosing heap corruption suspected to come from DMA.
+      <details class="answer"><summary>Model answer</summary><p>Enable strict IOMMU and DMA-API debug on a test system; correlate corruption addresses with IOVA mappings; look for late completions after timeouts; check buffer lifetime on abort/reset paths; capture with an analyzer and compare data TLP addresses to live mappings.</p></details></li>
+    <li><strong>Senior:</strong> How would you design a driver so these eight cases cannot happen?
+      <details class="answer"><summary>Model answer</summary><p>One byte-length source of truth; builders that derive NLB and pointers from it; debug-build walkers; page-aligned list allocation that cannot straddle; SGLS-gated SGL use with alignment handling; strict ownership: buffers owned until CQE or reset; poisoning on free; IOMMU-strict CI.</p></details></li>
+    <li><strong>Senior:</strong> A customer insists the SSD corrupted data. Your trace shows the controller read from a page outside the buffer. How do you communicate this?
+      <details class="answer"><summary>Model answer</summary><p>Present observations (SQE fields, list content, data TLP addresses), the walker's independent verdict, the invariant violated, and the host code path responsible; acknowledge any controller-side improvement (e.g. stricter checking) separately; propose the fix and a regression test.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>Child:</strong> the moving-company checker and the job sheet that does not match the boxes.</li>
+    <li><strong>Junior:</strong> the eight-step validation procedure applied to Case 6.</li>
+    <li><strong>Senior:</strong> the three bug families, which hardware catches each, and how you would design tests and tooling to catch the rest.</li>
+  </ul>
+  <details class="answer"><summary>Model explanation (junior)</summary><p>"Decode the SQE: NLB 8, PRP1 page aligned, PRP2 zero. Compute L: nine blocks, 4,608 bytes. Walk: two pages, so PRP2 must be the second page — but it's zero. Predict: 16 MWr to the buffer, then 2 MWr to address 0. Compare: the trace shows exactly that. Root cause: NLB used as a count. Fix: derive NLB from bytes."</p></details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <ul>
+    <li>Every data command has two lengths — the command's and the pointer's — that must agree.</li>
+    <li>Bugs fall into structure, length, and mapping/lifetime families; only the first two are visible in the command.</li>
+    <li>The validation procedure: decode, recompute L, walk, check rules, compare lengths, check addresses, predict TLPs, compare with the trace.</li>
+    <li>The first abnormal event is the first deviation from your prediction, often the command or descriptor content itself.</li>
+    <li>Success status, a working second SSD and a disabled IOMMU are not evidence of correctness.</li>
+  </ul>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>apply the validation procedure to an unseen PRP or SGL command</li>
+      <li>diagnose all eight cases without opening the solutions</li>
+      <li>predict list/segment fetches and data TLPs for any command</li>
+      <li>explain why IOMMU faults look different for NVMe Reads and Writes</li>
+      <li>run and extend the PRP walker</li>
+      <li>write a root-cause statement with evidence, fix and regression test</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Physical Region Page Entry and List; Scatter Gather List; Generic Command Status values; Abort</cite></li>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Completion Status; Advanced Error Reporting</cite></li>
+    <li>Linux kernel documentation: DMA API, DMA-API debugging, IOMMU; <code>drivers/nvme/host/pci.c</code>.</li>
+    <li>Course: <a href="dd34.html">Module 34 — PRP</a>, <a href="dd35.html">Module 35 — SGL</a>, <a href="dd36.html">Module 36 — DMA with NVMe</a>, <a href="trace-lab.html">Trace Analysis Laboratory</a>, <a href="tool-prp.html">PRP Visualizer</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch39.html">Chapter 39 — The Most Important Chapter</a>, which follows one command end to end across every layer you have learned.</p>
+</section>

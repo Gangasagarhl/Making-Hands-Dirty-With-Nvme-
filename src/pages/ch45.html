@@ -1,0 +1,599 @@
+<p class="lead">PCI Express (PCIe) has its own error model, entirely separate from NVMe's: bits flip on the wire, packets arrive corrupted or malformed, requests go to addresses nobody claims, completions never come back, and links drop without warning. This chapter teaches every major PCIe error by the layer that detects it, how it is classified (correctable, uncorrectable non-fatal, uncorrectable fatal), how it is signalled, and what it does to the NVMe traffic riding on top.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p><a href="ch44.html">Chapter 44</a> covered errors that NVMe reports inside successful PCIe writes. This chapter is about the transport underneath failing. When PCIe fails, NVMe sees the consequence — a Data Transfer Error, a command that never completes, a register read returning all ones, a controller that vanishes — but NVMe cannot tell you <em>why</em>. Only PCIe error reporting can.</p>
+  <p>PCIe errors are also where good engineers most often fool themselves: a log full of correctable errors that are harmless; a single uncorrectable error that explains everything; an error logged at the root port that was actually caused by the device; an error reported by a device that was actually caused by host software. This chapter builds the vocabulary to avoid those traps, and <a href="ch46.html">Chapter 46</a> shows the registers that record it all.</p>
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Classify PCIe errors as correctable, uncorrectable non-fatal or uncorrectable fatal, and explain what each class means for data and for the link.</li>
+    <li>Explain each major error by detecting layer: Receiver Error (Physical); Bad TLP, Bad DLLP, Replay Timer Timeout, REPLAY_NUM Rollover, Data Link Protocol Error, Surprise Down (Data Link); Poisoned TLP, ECRC Error, Unsupported Request, Completer Abort, Unexpected Completion, Completion Timeout, Malformed TLP, Receiver Overflow, Flow Control Protocol Error (Transaction).</li>
+    <li>Describe how errors are signalled: error messages (ERR_COR, ERR_NONFATAL, ERR_FATAL), completion status (UR, CA), and status bits.</li>
+    <li>Predict what each PCIe error does to an in-flight NVMe command.</li>
+    <li>Read PCIe error indications in <code>lspci</code> and the Linux kernel log, and know what they prove.</li>
+  </ul>
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq"><p>You need the PCIe layer model from <a href="ch07.html">PCIe Layer Model</a>, TLPs and their headers from <a href="ch10.html">TLPs</a> and <a href="ch11.html">TLP Header Anatomy</a>, <a href="ch12.html">posted vs non-posted</a> and <a href="ch13.html">tags</a>, the Data Link Layer's ACK/NAK and replay from <a href="ch15.html">DLLP</a>, <a href="ch16.html">Flow Control</a>, and the link state machine from <a href="ch08.html">LTSSM</a>.</p></aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>The road between the school and the library has trucks carrying parcels. Lots of things can go wrong.</p>
+    <ul>
+      <li>A gust of wind smudges a label. The receiving guard can't read it, throws it away, and shouts "send that one again!" The truck driver resends it. Nobody else ever knows. (That's a <em>correctable</em> problem.)</li>
+      <li>A parcel arrives addressed to a building that doesn't exist. The guard sends back a note: "No such building." That parcel's job failed, but the road is fine. (<em>Non-fatal</em>.)</li>
+      <li>A parcel arrives with a sticker saying "contents spoiled". Someone opened it and found the food bad. They stamped it so nobody eats it. (<em>Poisoned</em>.)</li>
+      <li>The teacher sends for a book and waits… and waits… and the book never comes. (<em>Completion timeout</em>.)</li>
+      <li>A truck arrives that's twice the legal size, or shaped all wrong. The guard can't trust anything about the road any more and calls for help. (<em>Malformed</em> — usually <em>fatal</em>.)</li>
+      <li>The bridge collapses. (<em>Surprise down</em>.)</li>
+    </ul>
+  </aside>
+  <aside class="callout analogy">
+    <p>PCIe error handling resembles a railway's safety system. Track-level faults (a signal glitch) are caught by the signalling equipment and the train simply repeats its approach — passengers never notice. Train-level faults (a wagon sent to a station that has no siding for it) cancel that wagon's journey but the line keeps running. Line-level faults (a derailment, a broken bridge) close the line and call the emergency services. Every incident is written in a log at the nearest signal box, and serious ones are telegraphed to central control.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>Hides:</strong> PCIe correctable errors are not free. Every replay costs bandwidth and latency; a link correcting thousands of errors per second is a slow, sick link heading for failure. <strong>Misleads:</strong> "fatal" in PCIe means "the link or device can no longer be trusted" — it does not necessarily mean data was lost, nor that the machine crashes; with proper recovery (Downstream Port Containment, link reset) the system often survives. And the signal box that logs the incident is not always where the fault was: a root port logs errors it <em>detected</em>, which may have been caused by the device at the other end.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>PCIe divides errors into three classes by their consequence:</p>
+  <table>
+    <caption>The three PCIe error classes</caption>
+    <thead><tr><th>Class</th><th>What it means</th><th>Data lost?</th><th>Link usable?</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="correctable-error">Correctable</span></td><td>Hardware detected and fixed the problem (usually by resending)</td><td>No</td><td>Yes</td><td>Bad TLP (corrupted packet, replayed)</td></tr>
+      <tr><td>Uncorrectable, non-fatal</td><td>A particular transaction failed; the link is fine</td><td>That transaction's</td><td>Yes</td><td>Unsupported Request, Completion Timeout, Poisoned TLP</td></tr>
+      <tr><td>Uncorrectable, fatal</td><td>The link or device can no longer be trusted</td><td>Possibly</td><td>Must be reset</td><td>Malformed TLP, Surprise Down, Data Link Protocol Error</td></tr>
+    </tbody>
+  </table>
+  <p>Errors are also grouped by the layer that detects them. Remember the PCIe stack: the <strong>Physical Layer</strong> moves bits, the <strong>Data Link Layer</strong> makes sure each packet arrives intact and in order (with sequence numbers, a Link CRC and ACK/NAK), and the <strong>Transaction Layer</strong> deals with requests and completions.</p>
+  <div class="flow">
+    <div>Transaction Layer<small>Poisoned TLP · ECRC · UR · CA · Unexpected Completion · Completion Timeout · Malformed TLP · Receiver Overflow · FC Protocol</small></div>
+    <div class="hl">Data Link Layer<small>Bad TLP · Bad DLLP · Replay Timer Timeout · REPLAY_NUM Rollover · DL Protocol Error · Surprise Down</small></div>
+    <div>Physical Layer<small>Receiver Error</small></div>
+  </div>
+  <p>When a device detects an error it may record it in its own registers and send an <strong>error message</strong> up to the root complex: ERR_COR for correctable, ERR_NONFATAL or ERR_FATAL for uncorrectable. The root complex then raises an interrupt so the operating system can log it and, if needed, recover.</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>Detection, logging, signalling, handling</h3>
+  <p>Every PCIe error goes through up to four steps, and different components do each:</p>
+  <ol>
+    <li><strong>Detection</strong> — by a receiver (Physical/Data Link) or by a requester/completer (Transaction).</li>
+    <li><strong>Logging</strong> — status bits in the detecting function: Device Status (Correctable/Non-Fatal/Fatal/Unsupported Request Detected), the legacy PCI Status register, and, if implemented, the Advanced Error Reporting (AER) capability with per-error bits and a header log (<a href="ch46.html">Chapter 46</a>).</li>
+    <li><strong>Signalling</strong> — an error message to the root complex if enabled (Device Control's reporting enables, and AER masks), and/or a completion status for a non-posted request (UR, CA).</li>
+    <li><strong>Handling</strong> — the root port collects messages, logs the source, interrupts the OS; the OS reads registers, logs, and may run recovery (driver callbacks, link reset, Downstream Port Containment).</li>
+  </ol>
+  <figure>
+    <ol class="seq" data-actors="Device (01:00.0)|Root port (00:01.1)|OS AER driver|NVMe driver">
+      <li data-note="Device (01:00.0)">detects error; sets status bits</li>
+      <li data-from="Device (01:00.0)" data-to="Root port (00:01.1)" class="bad">Msg ERR_NONFATAL (Req ID 0x0100)</li>
+      <li data-note="Root port (00:01.1)">Root Error Status; source ID logged</li>
+      <li data-from="Root port (00:01.1)" data-to="OS AER driver">interrupt (MSI/MSI-X of root port)</li>
+      <li data-from="OS AER driver" data-to="Device (01:00.0)">config reads: AER status, header log</li>
+      <li data-from="OS AER driver" data-to="NVMe driver">error_detected() callback</li>
+      <li data-note="NVMe driver">quiesce, maybe reset, resume</li>
+    </ol>
+    <figcaption>Conceptual error signalling path for an uncorrectable non-fatal error detected by the SSD.</figcaption>
+  </figure>
+
+  <h3>Physical Layer: Receiver Error</h3>
+  <p>A <strong>Receiver Error</strong> (correctable) is logged when the receiver's physical layer sees something it cannot decode: a framing violation, an invalid symbol or block, a disparity or sync-header error, elastic buffer problems. The exact set of conditions depends on the encoding (8b/10b at Gen1–2; 128b/130b at Gen3–5; PAM4 with FLIT mode at Gen6 and later). A corrupted symbol inside a TLP usually also causes a Bad TLP (the LCRC fails), so Receiver Errors and Bad TLPs tend to appear together.</p>
+  <aside class="callout version"><p>From PCIe 6.0, FLIT mode with forward error correction (FEC) changes where errors are caught: many bit errors are corrected by FEC before the Data Link Layer sees them, and retry operates on FLITs. The names of logged errors are largely retained but their frequency and meaning shift. Confirm details in the Physical Layer and FLIT mode material of the revision you work with.</p></aside>
+
+  <h3>Data Link Layer errors</h3>
+  <p>The Data Link Layer protects each TLP with a 12-bit sequence number and a 32-bit Link CRC (LCRC), keeps a copy in its replay buffer until it receives an ACK, and resends on NAK or timeout. Its errors are therefore mostly about that machinery:</p>
+  <table>
+    <caption>Data Link Layer errors</caption>
+    <thead><tr><th>Error</th><th>Detected by</th><th>Cause</th><th>Default class</th><th>Consequence</th></tr></thead>
+    <tbody>
+      <tr><td>Bad TLP</td><td>Receiver of the TLP</td><td>LCRC check failed, or sequence number wrong (not a duplicate), or nullified-TLP rules violated</td><td>Correctable</td><td>Receiver discards, sends NAK; transmitter replays</td></tr>
+      <tr><td>Bad DLLP</td><td>Receiver of the DLLP</td><td>The 16-bit CRC of a Data Link Layer Packet (ACK, NAK, flow-control update, power management) failed</td><td>Correctable</td><td>DLLP discarded; later ACKs/updates usually supersede it</td></tr>
+      <tr><td>Replay Timer Timeout</td><td>Transmitter</td><td>No ACK/NAK for an outstanding TLP within the replay timeout</td><td>Correctable</td><td>Transmitter replays the buffer</td></tr>
+      <tr><td>REPLAY_NUM Rollover</td><td>Transmitter</td><td>The 2-bit replay counter wrapped: the same TLPs replayed several times without forward progress</td><td>Correctable</td><td>Transmitter forces link retraining (LTSSM to Recovery)</td></tr>
+      <tr><td>Data Link Protocol Error</td><td>Receiver of ACK/NAK</td><td>An ACK or NAK named a sequence number that was never sent (or similar protocol violation)</td><td>Uncorrectable, fatal by default</td><td>Link state no longer trustworthy</td></tr>
+      <tr><td>Surprise Down</td><td>Downstream Port</td><td>The link left DL_Active without being told to (cable pull, device power loss, device crash)</td><td>Uncorrectable, fatal by default</td><td>Everything behind the port is gone until re-trained</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <ol class="seq" data-actors="Transmitter DLL|Link|Receiver DLL">
+      <li data-from="Transmitter DLL" data-to="Receiver DLL">TLP seq 0x41A (LCRC ok)</li>
+      <li data-from="Transmitter DLL" data-to="Receiver DLL" class="bad">TLP seq 0x41B (bit flip → LCRC bad)</li>
+      <li data-note="Receiver DLL">Bad TLP logged; discard</li>
+      <li data-from="Receiver DLL" data-to="Transmitter DLL" class="dashed">NAK seq 0x41A</li>
+      <li data-from="Transmitter DLL" data-to="Receiver DLL">replay TLP seq 0x41B</li>
+      <li data-from="Receiver DLL" data-to="Transmitter DLL" class="dashed">ACK seq 0x41B</li>
+    </ol>
+    <figcaption>Conceptual: a corrupted TLP is NAKed and replayed. The Transaction Layer above never sees the error.</figcaption>
+  </figure>
+  <aside class="callout insight" data-title="Rollover is the alarm bell"><p>A single Bad TLP is noise. REPLAY_NUM Rollover means the link failed to make progress through several replays in a row and had to retrain. Frequent rollovers predict link failure, speed downgrades and width downgrades. Count them separately from Bad TLPs.</p></aside>
+
+  <h3>Transaction Layer errors</h3>
+  <table>
+    <caption>Transaction Layer errors</caption>
+    <thead><tr><th>Error</th><th>Detected by</th><th>Cause</th><th>Default class</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="poisoned-tlp">Poisoned TLP</span> Received</td><td>Receiver of a TLP with the EP (Error Poisoned) bit set</td><td>The sender knew the data payload was bad (e.g. an uncorrectable memory ECC error on the host) and forwarded it marked as poisoned</td><td>Uncorrectable, non-fatal</td></tr>
+      <tr><td>ECRC Error</td><td>Final receiver, if ECRC checking enabled</td><td>End-to-end CRC (optional TLP Digest) mismatch: corruption inside a switch or root complex, not on a link</td><td>Uncorrectable, non-fatal</td></tr>
+      <tr><td><span class="g" data-term="unsupported-request">Unsupported Request</span> (UR)</td><td>Completer</td><td>Request type not supported, address not claimed by any BAR/window, function in a state where it cannot accept the request (e.g. Memory Space Enable off), or a request that violates a programming model</td><td>Uncorrectable, non-fatal</td></tr>
+      <tr><td>Completer Abort (CA)</td><td>Completer</td><td>Completer understood the request but refuses or failed it for internal reasons (e.g. a violation of its own programming model)</td><td>Uncorrectable, non-fatal</td></tr>
+      <tr><td>Unexpected Completion</td><td>Requester</td><td>A completion arrived matching no outstanding request (wrong Requester ID/Tag, or after a timeout already retired the tag)</td><td>Uncorrectable, non-fatal</td></tr>
+      <tr><td><span class="g" data-term="completion-timeout">Completion Timeout</span></td><td>Requester</td><td>A non-posted request did not receive all its completions within the completion timeout</td><td>Uncorrectable, non-fatal</td></tr>
+      <tr><td><span class="g" data-term="malformed-tlp">Malformed TLP</span></td><td>Receiver</td><td>TLP violates format rules: payload larger than Max Payload Size, Length field inconsistent with actual data, memory request crossing a 4 KiB boundary, illegal Type/Fmt, illegal byte enables, TC not mapped to a VC…</td><td>Uncorrectable, fatal</td></tr>
+      <tr><td>Receiver Overflow</td><td>Receiver</td><td>Transmitter sent a TLP for which it had no flow-control credit</td><td>Uncorrectable, fatal</td></tr>
+      <tr><td>Flow Control Protocol Error</td><td>Receiver</td><td>Flow-control rules violated (e.g. illegal credit advertisement)</td><td>Uncorrectable, fatal</td></tr>
+    </tbody>
+  </table>
+  <p>"Default class" refers to the default value of the AER Uncorrectable Error Severity register; software can change the severity of each uncorrectable error. Correctable errors are always correctable.</p>
+
+  <h3>Completion status: how a completer says no</h3>
+  <p>For a non-posted request (Memory Read, Configuration Read/Write, I/O, some AtomicOps), the completer must answer. The Completion Status field carries the verdict:</p>
+  <table>
+    <caption>Completion Status values</caption>
+    <thead><tr><th>Code</th><th>Name</th><th>Meaning to the requester</th></tr></thead>
+    <tbody>
+      <tr><td>000b</td><td>Successful Completion (SC)</td><td>Data (if any) follows</td></tr>
+      <tr><td>001b</td><td>Unsupported Request (UR)</td><td>Completer did not support or claim the request</td></tr>
+      <tr><td>010b</td><td>Configuration Request Retry Status (CRS) — renamed Request Retry Status (RRS) in recent revisions</td><td>Function not ready yet (typically after reset); retry the configuration request</td></tr>
+      <tr><td>100b</td><td>Completer Abort (CA)</td><td>Completer refused or failed the request</td></tr>
+    </tbody>
+  </table>
+  <p>A posted request (Memory Write, Message) gets no completion, so a posted request to a bad address is reported only by the completer that detected it (error message, logged as UR) — the requester never learns. That is why a DMA write from the SSD into an unmapped address shows up as an error at the <em>root port</em> (or IOMMU), not at the SSD.</p>
+
+  <h3>Completion timeout in depth</h3>
+  <p>A requester tracks each outstanding non-posted request by its Tag. If the completion does not arrive in time, it logs a Completion Timeout, retires the tag, and must handle the failure itself. Timeout ranges are configured in the Device Control 2 register (Completion Timeout Value and Completion Timeout Disable), with the supported ranges advertised in Device Capabilities 2. The default range is 50 µs to 50 ms.</p>
+  <p>Two NVMe-relevant directions:</p>
+  <ul>
+    <li><strong>Host → device read times out</strong> (CPU reads an NVMe register, e.g. CSTS, and the SSD does not answer). The root complex logs the timeout and typically returns all ones to the CPU. The driver sees CSTS = 0xFFFF_FFFF. On some platforms this is a machine check rather than all-ones data — platform-dependent.</li>
+    <li><strong>Device → host read times out</strong> (SSD fetches an SQE, PRP list or write data and the host does not answer). The SSD logs the timeout. The NVMe command typically completes with Data Transfer Error, or, if the SQE fetch itself failed, the command never starts and the host eventually times out.</li>
+  </ul>
+  <aside class="callout warn"><p>Completion timeouts are the most misattributed PCIe error. The function that <em>logs</em> a completion timeout is the <em>requester</em>, and it is usually the victim. The cause is upstream or downstream: a completer that hung, a switch that dropped the completion, a link that went down, or an unexpected-completion pair (the completion arrived but with wrong ID/tag).</p></aside>
+
+  <h3>Poisoned data</h3>
+  <p>Poisoning is the PCIe way to say "this data is known bad, do not use it" without stopping the system. If host memory reports an uncorrectable ECC error while servicing the SSD's DMA read of write data, the root complex can return the CplD with EP=1. The SSD logs Poisoned TLP Received, must not commit that data, and should complete the NVMe WRITE with an error (typically Data Transfer Error). In the opposite direction, if the SSD's internal data is bad it should not send it poisoned as a READ result unless it is designed to; it reports a media error instead.</p>
+
+  <h3>Malformed TLP and the MPS trap</h3>
+  <p>The most common Malformed TLP in the field is a <strong>Max Payload Size mismatch</strong>: one side is configured for 512 bytes, the other for 256; the first sends a 512-byte write; the receiver sees a payload larger than its MPS and declares the TLP malformed. Because Malformed TLP is fatal by default, the result is dramatic: the link is reset, the device disappears, and the NVMe controller times out. Linux normally configures MPS consistently along a path, but hot-plug, BIOS settings and kernel parameters (<code>pci=pcie_bus_*</code>) can produce mismatches.</p>
+
+  <h3>Advisory Non-Fatal errors</h3>
+  <p>Some uncorrectable errors are better handled by the agent at the other end. For example, a completer that detects an Unsupported Request for a non-posted request returns a UR completion, and the requester will handle it; signalling ERR_NONFATAL as well would make the OS think something more serious happened. AER-capable functions can therefore report certain non-fatal errors as <strong>Advisory Non-Fatal Errors</strong>: they set the uncorrectable status bit but signal ERR_COR and set the Advisory Non-Fatal bit in the correctable status. The exact cases are defined in the PCIe Base Specification's role-based error reporting rules — read them before deciding an error was "missed".</p>
+
+  <h3>Legacy PCI status bits still matter</h3>
+  <p>Even without AER, the PCI Status register records <em>Received Master Abort</em> (a request it sent got UR), <em>Received Target Abort</em> (got CA), <em>Signaled Target Abort</em> (it sent CA), <em>Detected Parity Error</em> (it received poisoned data) and <em>Signaled System Error</em> (it sent ERR_FATAL/ERR_NONFATAL). These bits appear in <code>lspci</code> as <code>&gt;TAbort</code>, <code>&lt;TAbort</code>, <code>&lt;MAbort</code>, <code>&gt;SERR</code>, <code>&lt;PERR</code> on the Status line.</p>
+
+  <h3>What each PCIe error does to NVMe</h3>
+  <table>
+    <caption>PCIe error → effect on NVMe</caption>
+    <thead><tr><th>PCIe error</th><th>Where</th><th>Typical NVMe-visible effect</th></tr></thead>
+    <tbody>
+      <tr><td>Receiver Error / Bad TLP / Bad DLLP / Replay Timeout</td><td>Either end</td><td>None functionally; extra latency. Possibly lower throughput.</td></tr>
+      <tr><td>REPLAY_NUM Rollover</td><td>Either end</td><td>Microsecond-scale stall while the link retrains; possible speed/width change</td></tr>
+      <tr><td>Completion Timeout at SSD</td><td>SSD as requester</td><td>Command completes with Data Transfer Error, or stalls → host I/O timeout</td></tr>
+      <tr><td>Completion Timeout at root complex</td><td>Host MMIO read</td><td>Register reads return all ones; driver declares controller dead and resets</td></tr>
+      <tr><td>UR at root port for SSD's DMA</td><td>Root port / IOMMU</td><td>DMA write lost (posted) or read failed (non-posted → UR completion to SSD) → Data Transfer Error</td></tr>
+      <tr><td>UR at SSD</td><td>SSD as completer</td><td>Host MMIO write to unclaimed address ignored; read returns UR → all ones</td></tr>
+      <tr><td>Poisoned TLP at SSD</td><td>SSD</td><td>WRITE fails with Data Transfer Error (or similar)</td></tr>
+      <tr><td>Malformed TLP / Surprise Down / DLP error</td><td>Either end</td><td>Fatal: link reset, device disappears, all commands fail, controller reset or removal</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The central concept on the ladder</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Smudged labels get resent quietly; parcels to nowhere come back with a note; a collapsed bridge stops everything.</p></div>
+    <div class="rung" data-rung="B"><p>PCIe errors are correctable (hardware fixed it), uncorrectable non-fatal (one transaction failed) or uncorrectable fatal (link/device untrustworthy), and each is detected by a specific layer.</p></div>
+    <div class="rung" data-rung="C"><p>Receivers check symbols and LCRCs, transmitters run replay timers and counters, requesters track tags against a completion timer, completers decode addresses against BARs. Each sets status bits in its own configuration space and may send an error message upstream.</p></div>
+    <div class="rung" data-rung="D"><p>PCI Express Base Specification: Error Signaling and Logging; Error classification; Data Link Layer retry rules; Completion Timeout mechanism; Poisoned TLP rules; Malformed TLP rules; AER capability; Device Control/Status error bits.</p></div>
+    <div class="rung" data-rung="E"><p>On the wire: NAK DLLPs and replayed TLPs; Cpl with UR/CA status; TLPs with EP=1; Msg ERR_COR/ERR_NONFATAL/ERR_FATAL routed to the root complex; LTSSM entering Recovery.</p></div>
+    <div class="rung" data-rung="F"><p>An analyzer shows NAKs and duplicate sequence numbers (replay), completions with non-SC status, error messages with the reporter's Requester ID, gaps where a completion should be, and electrical idle when a link drops.</p></div>
+    <div class="rung" data-rung="G"><p>Ask: which layer detected it, which function logged it, was it the requester or the completer, and is it the first abnormal event or a consequence? Then look for the cause one hop away.</p></div>
+  </div>
+
+  <h3>The 16 questions for Completion Timeout</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>An uncorrectable (default non-fatal) error logged by a requester when a non-posted request does not receive its completion(s) in time.</dd>
+    <dt>2. Why was it created?</dt><dd>Without it, a lost completion would hang the requester forever with a tag consumed.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Bounded failure: the requester can retire the tag and report an error instead of hanging.</dd>
+    <dt>4. What existed before it?</dt><dd>Conventional PCI's Master Abort (no device claimed the cycle) and target retry/disconnect semantics on a shared bus.</dd>
+    <dt>5. Why is the current design better?</dt><dd>Split transactions let requests and completions be separated in time; a timeout is the only way to bound a split transaction.</dd>
+    <dt>6. Who creates it?</dt><dd>The requester's transaction layer.</dd>
+    <dt>7. Who consumes it?</dt><dd>The requester's own logic (fail the operation), and the OS via AER.</dd>
+    <dt>8. Where does it live?</dt><dd>Uncorrectable Error Status (Completion Timeout bit) of the requester; Device Status; timeout configuration in Device Control 2.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>Device Capabilities 2 (ranges supported, disable supported), Device Control 2 (value, disable), AER status/mask/severity.</dd>
+    <dt>10. What happens before it?</dt><dd>A non-posted request was sent with a tag; time passed with no (complete) completion.</dd>
+    <dt>11. What happens after it?</dt><dd>Tag retired; operation failed; ERR_NONFATAL (if enabled and not masked); a late completion would now be an Unexpected Completion.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Too short: false timeouts under heavy load or on slow paths. Disabled: hangs forever on a lost completion.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>A request with tag T, no matching completion for longer than the timeout, then (maybe) an ERR_NONFATAL message from the requester.</dd>
+    <dt>14. What does Linux show?</dt><dd>AER message naming the device with "CmpltTO"; for host MMIO reads, all-ones values and driver "controller is down" messages.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>Each supported range; disable; behaviour when completions are dropped; late completions handled as Unexpected Completion; NVMe command status on SQE/PRP/data fetch timeouts.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>The completer or path, not the requester: a hung completer, a link in recovery, a switch dropping completions, a reset mid-flight, or an IOMMU stall.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <ul>
+    <li><strong>Receiver PHY</strong> — clock and data recovery, decoders, elastic buffer; source of Receiver Errors. Marginal signal integrity (long traces, bad connectors, risers, retimers) shows up here first.</li>
+    <li><strong>Data Link Layer</strong> — LCRC generation/check, sequence numbers, replay buffer, replay timer, REPLAY_NUM counter, ACK/NAK scheduling, DLLP CRC. Source of Bad TLP/Bad DLLP/Replay/Rollover/DLP errors.</li>
+    <li><strong>Transaction Layer</strong> — header decode and format checks (Malformed), flow-control credit accounting (Receiver Overflow, FC Protocol), address decode against BARs (UR), tag tracking and completion timers (Completion Timeout, Unexpected Completion), ECRC.</li>
+    <li><strong>Application / core logic</strong> — decides Completer Abort, poisons outgoing data when its internal memory reports uncorrectable errors, handles received poison.</li>
+    <li><strong>Downstream ports</strong> (root ports, switch downstream ports) — detect Surprise Down, can implement Downstream Port Containment (DPC) to stop traffic after an uncorrectable error (see <a href="ch55.html">Advanced Error Handling</a>).</li>
+  </ul>
+  <aside class="callout impl"><p>Which errors a component can detect beyond the mandatory set, its replay timer values, its completion timeout ranges, whether it implements AER, ECRC and DPC, and how a root complex answers a failed CPU read (all-ones vs machine check) are implementation- or platform-dependent.</p></aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Error Signaling and Logging (error classification, error messages, Advisory Non-Fatal cases, error pollution rules); Data Link Layer (LCRC, retry, replay timer, REPLAY_NUM); Transaction Layer (Completion Timeout, Poisoned TLP, Malformed TLP rules, ECRC); Advanced Error Reporting Capability</cite>. A PCI-SIG members' document: cite by name and revision family.</li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite> — the NVMe side of PCIe errors (how a controller may report transport errors in NVMe status).</li>
+  </ul>
+  <aside class="callout verified"><p>PCIe errors are classified as correctable, uncorrectable non-fatal and uncorrectable fatal, signalled with ERR_COR, ERR_NONFATAL and ERR_FATAL messages. Correctable errors include Receiver Error, Bad TLP, Bad DLLP, REPLAY_NUM Rollover, Replay Timer Timeout, Advisory Non-Fatal Error. Uncorrectable errors include Data Link Protocol Error, Surprise Down, Poisoned TLP Received, Flow Control Protocol Error, Completion Timeout, Completer Abort, Unexpected Completion, Receiver Overflow, Malformed TLP, ECRC Error, Unsupported Request. Default fatal: DLP Error, Surprise Down, FC Protocol Error, Receiver Overflow, Malformed TLP (and Uncorrectable Internal Error). Completion status UR = 001b, CA = 100b. Default completion timeout range is 50 µs–50 ms.</p></aside>
+  <aside class="callout derived"><p>Statements about which component is "the victim" vs "the cause" are diagnostic reasoning, not specification text. The NVMe-effect table above is derived from how NVMe controllers and Linux typically map PCIe failures.</p></aside>
+  <aside class="callout impl"><p>Replay timer values (within specified limits), completion timeout actual values within a range, optional error detection (ECRC, ACS violations), AER presence on endpoints, root complex behaviour on failed reads, and NVMe status chosen for a PCIe failure.</p></aside>
+  <aside class="callout version"><p>New errors and capabilities appear in newer revisions (for example, errors tied to TLP prefixes, AtomicOps egress, FLIT mode, and the CRS→RRS renaming). Older devices implement fewer error bits. Check the revision your components claim in their PCI Express Capability.</p></aside>
+  <aside class="callout notsaid"><p>Check in the specification: the full list of Malformed TLP conditions; the precise Advisory Non-Fatal cases; the exact replay timer formula for your link speed and width; error pollution rules (which error is logged when several occur from one cause). The PCIe specification does not define how an operating system must recover, nor what an NVMe controller must report to its host when its DMA fails — the latter is NVMe's domain.</p></aside>
+  <aside class="callout warn"><p>Never assume the logger is the culprit. Never assume correctable means harmless at high rates. Never assume a fatal error crashed the system or lost data. Never assume ERR_* messages arrive if reporting is disabled or masked — absence of AER logs is not proof of no errors.</p></aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>How each kind of PCIe error appears on the link</caption>
+    <thead><tr><th>Error</th><th>Link-visible signs</th><th>Direction of the evidence</th></tr></thead>
+    <tbody>
+      <tr><td>Bad TLP</td><td>NAK DLLP, then the same sequence number transmitted again</td><td>NAK flows opposite to the corrupted TLP</td></tr>
+      <tr><td>Replay Timer Timeout</td><td>TLP retransmitted without a NAK having been seen</td><td>Same direction as the original TLP</td></tr>
+      <tr><td>REPLAY_NUM Rollover</td><td>Several replays then LTSSM Recovery (TS1/TS2 ordered sets)</td><td>Both</td></tr>
+      <tr><td>Unsupported Request (non-posted)</td><td>Cpl with Status = UR, no data</td><td>Completer → requester</td></tr>
+      <tr><td>Unsupported Request (posted)</td><td>Nothing back to the requester; ERR_NONFATAL (or advisory ERR_COR) from the completer</td><td>Completer → root complex</td></tr>
+      <tr><td>Completer Abort</td><td>Cpl with Status = CA</td><td>Completer → requester</td></tr>
+      <tr><td>Poisoned TLP</td><td>TLP with EP = 1 (data present but marked bad)</td><td>Sender → receiver</td></tr>
+      <tr><td>Completion Timeout</td><td>A request whose tag never sees a completion; later ERR_NONFATAL from requester</td><td>Absence; then requester → RC</td></tr>
+      <tr><td>Unexpected Completion</td><td>A completion whose Requester ID/Tag matches nothing outstanding</td><td>Completer → requester</td></tr>
+      <tr><td>Malformed TLP</td><td>The offending TLP itself (e.g. Length=128 DW with MPS=256 B); ERR_FATAL from receiver</td><td>Offender's direction; then receiver → RC</td></tr>
+      <tr><td>Surprise Down</td><td>Electrical idle / loss of symbol lock; LTSSM leaves L0; no traffic</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p>Error messages are Message TLPs routed to the root complex. The Message Code identifies the class (ERR_COR, ERR_NONFATAL, ERR_FATAL) and the Requester ID identifies the reporting function. Switches forward them upstream; the root port records the source in its AER Error Source Identification register.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic traces on the lab system (Gen4 x4, root port 00:01.1 = RID 0x0009, SSD 01:00.0 = RID 0x0100, MPS 256 B). Data Link Layer packets are shown because several of these errors live there.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Normal: data write acknowledged">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MWr64</td><td>Seq=0x41A Req=0x0100 Addr=0x2_0000_0000 Len=64 LCRC ok</td><td>256 B of READ data</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>70</td><td>MWr64</td><td>Seq=0x41B Addr=0x2_0000_0100 Len=64</td><td>Next 256 B</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>310</td><td>DLLP Ack</td><td>AckNak_Seq_Num=0x41B</td><td>Root port acknowledges both</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal (correctable): LCRC failure, NAK and replay">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MWr64</td><td>Seq=0x41A Len=64</td><td>OK</td></tr>
+        <tr class="abnormal"><td>2</td><td>Dev→Host</td><td>70</td><td>MWr64</td><td>Seq=0x41B Len=64 <strong>LCRC mismatch</strong> (analyzer flags symbol error lane 2)</td><td><strong>First abnormal event:</strong> corrupted TLP; root port logs Receiver Error + Bad TLP</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>140</td><td>MWr64</td><td>Seq=0x41C Len=64</td><td>Discarded by receiver (out of sequence after a bad TLP)</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>260</td><td>DLLP Nak</td><td>AckNak_Seq_Num=0x41A</td><td>"Everything after 0x41A must be resent"</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>330</td><td>MWr64</td><td>Seq=0x41B Len=64 (replay)</td><td>Replay</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>400</td><td>MWr64</td><td>Seq=0x41C Len=64 (replay)</td><td>Replay</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>620</td><td>DLLP Ack</td><td>AckNak_Seq_Num=0x41C</td><td>Recovered</td></tr>
+        <tr class="note"><td colspan="6">Not on the link: the root port detected the error itself, so it records RxErr/BadTLP in its own AER registers and signals the OS internally (no ERR_COR message travels over this link).</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The detecting function is the root port (receiver of the bad TLP), so the correctable error is logged at 00:01.1 even though the SSD's transmitter or the channel between them may be the cause. Cost: ~550 ns delay for two TLPs. Isolated, harmless. Thousands per second on lane 2 → signal integrity problem on that lane: check lane-margin data, connectors, retimer settings.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal (non-fatal): SSD's PRP-list read times out, WRITE fails">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64</td><td>Req=0x0100 Tag=0x31 Addr=0x1_2340_0600 Len=16</td><td>Fetch WRITE SQE (CID 0x0090, 64 KiB, PRP2 → list)</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>0.8 µs</td><td>CplD</td><td>Tag=0x31 SC Len=16</td><td>SQE delivered</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>1.2 µs</td><td>MRd64</td><td>Req=0x0100 Tag=0x32 Addr=0x1_5000_0000 Len=32 (128 B)</td><td>Fetch PRP list (16 entries)</td></tr>
+        <tr class="abnormal"><td>—</td><td>—</td><td>1.2 µs → 50 ms</td><td>(nothing)</td><td>No CplD for Tag 0x32</td><td><strong>First abnormal event:</strong> completion for the PRP list read never arrives</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>~50 ms</td><td>Msg</td><td>ERR_NONFATAL Req=0x0100</td><td>SSD logs Completion Timeout, signals non-fatal</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>~50 ms</td><td>MWr64</td><td>Addr=0x1_2341_0180 Len=4 DW3 status SCT 0h SC 04h</td><td>NVMe: Data Transfer Error for CID 0x0090</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>~50 ms</td><td>MWr32</td><td>Addr=0xFEE0_1000</td><td>Interrupt</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The SSD logs Completion Timeout (it is the requester) and reports an NVMe Data Transfer Error. Neither proves the SSD is at fault. The question is why the host never completed a read of 0x1_5000_0000: check the root port and IOMMU logs for that time (an IOMMU fault on that IOVA, a root complex internal error, a link recovery in the downstream direction). Note the ordering of evidence: the PCIe error message (row 4) precedes the NVMe error (row 5), consistent with the PCIe failure being the cause.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal (fatal): Max Payload Size mismatch → Malformed TLP → link reset">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Setup error: after a hot-plug, SSD Device Control MPS = 512 B; root port MPS = 256 B.</td></tr>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MWr64</td><td>Req=0x0100 Addr=0x2_0000_0000 Len=64 (256 B)</td><td>Fine</td></tr>
+        <tr class="abnormal"><td>2</td><td>Dev→Host</td><td>90 ns</td><td>MWr64</td><td>Req=0x0100 Addr=0x2_0000_0100 <strong>Len=128 (512 B)</strong></td><td><strong>First abnormal event:</strong> payload exceeds receiver's MPS → Malformed TLP at root port</td></tr>
+        <tr class="note"><td colspan="6">Root port logs Malformed TLP (fatal), captures the header in its AER Header Log, signals internally; with DPC enabled it immediately contains the link.</td></tr>
+        <tr class="dir-down"><td>3</td><td>—</td><td>1 µs</td><td>LTSSM</td><td>Link → Disabled/Recovery; DL_Down</td><td>Containment / reset</td></tr>
+        <tr class="note"><td colspan="6">All outstanding NVMe commands lost; MMIO reads to BAR0 return all ones; NVMe driver times out and the AER/DPC recovery path resets the link.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The decisive clue is in the header log: Length = 0x080 DW (512 B) on a link whose root port MPS is 256 B. The root cause is configuration, not hardware: MPS must not exceed the smallest supported value along the path. The fix is to set consistent MPS (and check kernel parameters / firmware settings for hot-plug).</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Ambiguous: SSD DMA write to unmapped IOVA (posted → UR at root complex)">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="abnormal"><td>1</td><td>Dev→Host</td><td>0</td><td>MWr64</td><td>Req=0x0100 Addr=0x3_7F00_0000 Len=64</td><td><strong>First abnormal event:</strong> write to an IOVA with no IOMMU mapping</td></tr>
+        <tr class="note"><td colspan="6">No completion is possible (posted). The SSD believes the data was delivered.</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.2 µs</td><td>MWr64</td><td>CQE status 0 for that READ</td><td>NVMe says success!</td></tr>
+        <tr class="note"><td colspan="6">Host: IOMMU logs a DMA write fault for 01:00.0 at 0x37F000000; depending on platform the root port may also log UR. The application reads stale buffer contents.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> This is the dangerous case: PCIe and NVMe both look healthy from the SSD's side. The only evidence is host-side (IOMMU fault, perhaps root port AER). The bad address came from the PRP entries — either host software built them wrongly (use-after-unmap) or the controller computed them wrongly. Compare the address with the SQE's PRPs to decide.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Error-related status for the SSD and its root port</span>
+sudo lspci -vvv -s 01:00.0 | grep -E 'Status:|DevSta|CESta|UESta|UESvrt|DevCtl|DevCtl2|LnkSta'
+sudo lspci -vvv -s 00:01.1 | grep -E 'DevSta|CESta|UESta|RootSta|RootCtl|LnkSta'
+
+<span class="cm"># Per-device AER counters kept by the kernel (if AER is active)</span>
+cat /sys/bus/pci/devices/0000:01:00.0/aer_dev_correctable
+cat /sys/bus/pci/devices/0000:01:00.0/aer_dev_nonfatal
+cat /sys/bus/pci/devices/0000:01:00.0/aer_dev_fatal
+
+<span class="cm"># Kernel log</span>
+sudo dmesg -T | grep -Ei 'AER|PCIe Bus Error|DPC|pciehp|Link Down|nvme'
+
+<span class="cm"># Link speed/width now vs capability (downgrades follow error storms)</span>
+sudo lspci -vv -s 01:00.0 | grep -E 'LnkCap:|LnkSta:'</code></pre>
+  <p>Illustrative (synthetic) lspci lines after a correctable error:</p>
+  <pre class="code" data-kind="read-only" data-lang="text" data-title="illustrative, not captured"><code>		DevSta:	CorrErr+ NonFatalErr- FatalErr- UnsupReq- AuxPwr- TransPend-
+		CESta:	RxErr+ BadTLP+ BadDLLP- Rollover- Timeout- AdvNonFatalErr-
+		UESta:	DLP- SDES- TLP- FCP- CmpltTO- CmpltAbrt- UnxCmplt- RxOF- MalfTLP- ECRC- UnsupReq- ACSViol-</code></pre>
+  <table>
+    <caption>lspci abbreviations</caption>
+    <thead><tr><th>Abbreviation</th><th>Error</th><th>Abbreviation</th><th>Error</th></tr></thead>
+    <tbody>
+      <tr><td>RxErr</td><td>Receiver Error</td><td>DLP</td><td>Data Link Protocol Error</td></tr>
+      <tr><td>BadTLP</td><td>Bad TLP</td><td>SDES</td><td>Surprise Down Error</td></tr>
+      <tr><td>BadDLLP</td><td>Bad DLLP</td><td>TLP</td><td>Poisoned TLP Received</td></tr>
+      <tr><td>Rollover</td><td>REPLAY_NUM Rollover</td><td>FCP</td><td>Flow Control Protocol Error</td></tr>
+      <tr><td>Timeout</td><td>Replay Timer Timeout</td><td>CmpltTO / CmpltAbrt / UnxCmplt</td><td>Completion Timeout / Completer Abort / Unexpected Completion</td></tr>
+      <tr><td>AdvNonFatalErr</td><td>Advisory Non-Fatal Error</td><td>RxOF / MalfTLP / ECRC / UnsupReq</td><td>Receiver Overflow / Malformed TLP / ECRC Error / Unsupported Request</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout warn"><p>Status bits are sticky until cleared; a "+" may be from boot, from a previous hot-plug, or from enumeration probing (UR during probing is common and harmless). Always record timestamps and clear-then-observe rather than reading a single snapshot. Clearing is a write — do it only on a test system (<a href="ch46.html">Chapter 46</a>).</p></aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <h3>Replay and rollover simulator</h3>
+  <p>A simplified Data Link Layer model: TLPs are corrupted with a given probability, NAKed and replayed; four consecutive replays of the same TLP without progress cause a rollover (retrain). It shows how quickly a healthy-looking error rate turns into retraining.</p>
+  <pre class="code" data-kind="simulation" data-lang="python" data-title="replay_sim.py"><code>#!/usr/bin/env python3
+"""Toy Data Link Layer retry model (simulation, not spec-exact).
+p = probability one TLP transmission is corrupted (LCRC fail).
+REPLAY_NUM is a 2-bit counter: it increments on each replay of the same
+oldest TLP and resets on forward progress; wrapping past 3 => rollover."""
+import random
+
+def run(p, tlps=1_000_000, seed=7):
+    rnd = random.Random(seed)
+    bad = replays = rollovers = 0
+    sent = 0
+    for _ in range(tlps):
+        replay_num = 0
+        while True:
+            sent += 1
+            if rnd.random() &gt;= p:
+                break                      # ACKed: forward progress
+            bad += 1
+            replays += 1
+            replay_num += 1
+            if replay_num &gt; 3:            # 2-bit counter wraps
+                rollovers += 1
+                replay_num = 0             # link retrains, then retries
+    return bad, replays, rollovers, sent / tlps
+
+if __name__ == "__main__":
+    for p in (1e-6, 1e-4, 1e-2, 0.2, 0.5):
+        bad, rep, roll, eff = run(p)
+        print(f"p={p:&lt;7g} badTLP={bad:8d} replays={rep:8d} "
+              f"rollovers={roll:6d} transmissions/TLP={eff:6.3f}")</code></pre>
+  <p>Expected pattern: at 1e-6 a handful of Bad TLPs per million and no rollovers; at 0.2–0.5 (a badly broken lane) rollovers appear and throughput collapses. Real links fail more abruptly because errors are bursty, not independent — the simplification is part of the lesson.</p>
+  <h3>Classifying an error report (pseudocode)</h3>
+  <pre class="code" data-kind="pseudocode" data-lang="text"><code>for each error report:
+    layer  = PHY if RxErr; DLL if BadTLP|BadDLLP|Replay*|DLP|SDES; else TL
+    role   = requester if CmpltTO|UnxCmplt|received UR/CA completion
+             completer if UR|CA detected; receiver otherwise
+    victim_or_cause = "victim" if role == requester else "detector"
+    look_for_cause_at = other_end_of(link) if layer in (PHY, DLL)
+                        else completer_of(request) if role == requester
+                        else requester_of(request)</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Scenario (synthetic).</strong> A fleet monitor flags a server whose SSD's <code>aer_dev_correctable</code> shows BadTLP 41 and RxErr 39, accumulated over 90 days. Another server shows BadTLP 1,800,000 over one day and Rollover 220. Both run fine. Which needs action?</p>
+  <ol>
+    <li><strong>Normalise.</strong> 41 Bad TLPs in 90 days ≈ one every two days. On a Gen4 x4 link carrying billions of TLPs a day that is far below any concern; it is normal noise (and Receiver Errors accompany Bad TLPs as expected).</li>
+    <li><strong>Second server.</strong> 1.8 M per day ≈ 21 per second, with 220 rollovers ≈ one every 6–7 minutes. Each rollover is a retrain — a latency spike of microseconds to milliseconds. This link is degraded.</li>
+    <li><strong>Locate.</strong> Which side logged them? If the root port logs Bad TLP, the corrupted direction is device→host (the SSD's transmitter, the channel, or the root port's receiver). If the SSD logs them, host→device. Check <code>LnkSta</code>: has the link downtrained to Gen3 or x2?</li>
+    <li><strong>Correlate.</strong> Do NVMe latency outliers line up with rollovers? Use timestamps from kernel AER logs and the application's latency histogram.</li>
+    <li><strong>Act.</strong> Reseat or swap the drive/riser/cable; compare with another slot; check firmware for retimer settings; run lane margining if the platform supports it.</li>
+  </ol>
+  <aside class="callout derived"><p>The thresholds here are engineering judgement. The PCIe specification defines the errors and their classes, not an acceptable rate. Your platform vendor may publish guidance.</p></aside>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li>Blaming the device that logged a Completion Timeout. It is the requester; look at the completer and path.</li>
+    <li>Ignoring which end logged a Bad TLP. It tells you the direction of the corrupted traffic.</li>
+    <li>Treating UR during boot enumeration as a fault (probing unimplemented functions or registers produces URs).</li>
+    <li>Thinking a posted write to a bad address will be reported to the writer. It cannot be.</li>
+    <li>Confusing "Poisoned TLP" (data known bad, EP bit) with "Bad TLP" (LCRC failure on the link).</li>
+    <li>Treating "fatal" as "the server will crash". With DPC and AER recovery, the system often survives.</li>
+    <li>Reading sticky status bits without timestamps and assuming they are recent.</li>
+    <li>Forgetting MPS/MRRS configuration when a Malformed TLP appears after hot-plug or firmware changes.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>PCIe error patterns and first moves</caption>
+    <thead><tr><th>Pattern</th><th>Possible causes</th><th>First check</th><th>Disambiguating experiment</th></tr></thead>
+    <tbody>
+      <tr><td>Correctable storm (RxErr/BadTLP)</td><td>Signal integrity: connector, riser, retimer, lane</td><td>Which end logs; LnkSta speed/width</td><td>Move the drive to another slot; force lower speed and see errors stop</td></tr>
+      <tr><td>Rollover + retrains</td><td>Severely marginal link</td><td>Rollover count rate; latency spikes</td><td>Same as above, plus lane margining</td></tr>
+      <tr><td>Completion Timeout at SSD</td><td>Host not answering reads: IOMMU stall, RC issue, link recovery</td><td>Root port AER and IOMMU logs at the same time</td><td>Disable IOMMU translation (passthrough) on a test system</td></tr>
+      <tr><td>CSTS all ones</td><td>Link down, device reset, device hung, power</td><td>LnkSta, Surprise Down at root port, pciehp messages</td><td>Read config space: if config reads also fail, the link is down</td></tr>
+      <tr><td>Malformed TLP</td><td>MPS mismatch, device bug, broken switch</td><td>Header Log at the detecting port</td><td>Set MPS conservatively (128/256) and retest</td></tr>
+      <tr><td>Poisoned TLP at SSD</td><td>Host memory uncorrectable ECC, RC internal error</td><td>Machine-check / EDAC logs on the host</td><td>Memory tests; correlate with DIMM error counts</td></tr>
+    </tbody>
+  </table>
+  <p>The general method — anchor on the first abnormal event, decide which layer, then find the cause one hop away — is formalised in <a href="ch47.html">Error Correlation</a>. Registers for each error are in <a href="ch46.html">AER</a>.</p>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <ul>
+    <li><strong>Logger ≠ culprit.</strong> Every PCIe error is logged by a detector. Your first job is to name the detector's role (receiver, requester, completer) and then look at the other party.</li>
+    <li><strong>Rates beat counts.</strong> A cumulative counter is meaningless without time. Instrument rates and correlate with workload and temperature.</li>
+    <li><strong>The first fatal error explains the rest.</strong> After a link goes down you will see Completion Timeouts, all-ones reads, NVMe timeouts and resets. Only the first is evidence of the cause.</li>
+    <li><strong>Silence is not health.</strong> AER may be masked, disabled by firmware (firmware-first error handling), or not implemented on the endpoint. Before declaring "no PCIe errors", confirm that errors <em>could</em> have been reported.</li>
+    <li><strong>Configuration bugs look like hardware bugs.</strong> MPS, MRRS, ASPM, completion timeout ranges and ACS settings produce errors that disappear when you swap the "faulty" hardware into a correctly configured system.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 45 — PCIe error census of a live system</h3>
+  <h4>Objective</h4><p>Build an inventory of PCIe error state for an NVMe SSD and its upstream port, determine which errors have occurred and where, and decide whether they matter.</p>
+  <h4>Skills</h4><p>Reading Device Status, AER status bits, kernel counters and link status; reasoning about detector role.</p>
+  <h4>Safety</h4><aside class="callout safety"><p><span class="badge safe">Safe lab</span> Read-only. Do not clear status bits or change masks on a production system; that is covered as a caution lab in <a href="ch46.html">Chapter 46</a>.</p></aside>
+  <h4>Hardware required</h4><p>Linux host with an NVMe SSD; ideally a second host or slot for comparison.</p>
+  <h4>Software required</h4><p>pciutils, Python 3 (for <code>replay_sim.py</code>).</p>
+  <h4>Input</h4><p>SSD BDF and its upstream port BDF (from <code>lspci -t</code> or <code>readlink /sys/bus/pci/devices/0000:01:00.0</code>).</p>
+  <h4>Expected output</h4><p>A table: function, DevSta flags, CESta set bits, UESta set bits, kernel counters, link speed/width vs capability, and your verdict.</p>
+  <h4>Background</h4><p>Status bits are sticky; kernel counters count since boot (only errors the kernel was notified of).</p>
+  <h4>Step 1 — Find the path</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>readlink -f /sys/bus/pci/devices/0000:01:00.0
+lspci -tv | head -40</code></pre>
+  <h4>Step 2 — Collect status at both ends</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>for d in 00:01.1 01:00.0; do echo "== $d"; sudo lspci -vvv -s $d | grep -E 'DevSta|CESta|UESta|LnkCap:|LnkSta:'; done</code></pre>
+  <h4>Step 3 — Collect kernel counters and logs</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>for f in correctable nonfatal fatal; do echo "-- $f"; cat /sys/bus/pci/devices/0000:01:00.0/aer_dev_$f 2&gt;/dev/null; done
+uptime
+sudo dmesg -T | grep -Ei 'AER|PCIe Bus Error' | tail -20</code></pre>
+  <h4>Observation</h4><p>Which end has which bits set? Are counts consistent with status bits? Is the link at full speed and width?</p>
+  <h4>Questions</h4>
+  <ol><li>If the root port shows BadTLP+ and the SSD shows BadTLP-, which direction had corruption?</li><li>If DevSta shows UnsupReq+ on the SSD but no kernel UR messages appear, give two explanations.</li><li>What rate of correctable errors per hour did you measure, and is it concerning?</li></ol>
+  <h4>Challenge</h4><p>Run <code>replay_sim.py</code> with your measured Bad TLP rate converted to a per-TLP probability (estimate TLPs per second from throughput / 256 B) and predict rollovers. Compare with the Rollover bit.</p>
+  <details class="hint"><summary>Hint</summary><p>Kernel counters only count errors that were signalled and handled by the kernel's AER driver; firmware-first platforms may handle them elsewhere.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>1. Device → host: the root port received the corrupted TLPs.</p>
+    <p>2. UR detection is logged even when reporting is disabled/masked or classified as advisory; or it happened during enumeration before the AER driver loaded; or firmware-first handling consumed the message.</p>
+    <p>3. Answers vary; a handful per day on a busy link is unremarkable, sustained per-second rates or any rollovers merit investigation.</p>
+  </details>
+  <h4>What a senior engineer notices</h4><p>Link speed/width below capability (silent downtraining), UR bits on root ports from enumeration noise, AER capability absent on the endpoint, and whether the platform uses firmware-first error handling (kernel log mentions of APEI/GHES).</p>
+  <h4>Failure variants</h4><ul><li>No AER lines in lspci: the device lacks AER or lspci lacks privileges (run as root).</li><li>aer_dev_* files missing: older kernel or AER not enabled for the device.</li></ul>
+  <h4>Extension</h4><p>Repeat after a heavy fio run and after a warm reboot; note which bits are sticky across which events.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>For each of: Bad TLP, Completion Timeout, Unsupported Request, Malformed TLP — name the detecting role and the default class.</li>
+    <li>Explain why a posted Memory Write to a non-existent address cannot produce a Completion Timeout.</li>
+    <li>The SSD logs Unexpected Completion shortly after a Completion Timeout for the same tag. Reconstruct what happened.</li>
+    <li>Why does a Malformed TLP default to fatal while Unsupported Request defaults to non-fatal?</li>
+    <li>A Gen4 x4 link trains at Gen4 x2 after a reboot, with no errors logged. What can you conclude?</li>
+  </ol>
+  <details class="answer"><summary>Model answers</summary>
+    <p>1. Bad TLP: receiver, correctable. Completion Timeout: requester, non-fatal. UR: completer, non-fatal. Malformed: receiver, fatal.</p>
+    <p>2. Posted requests have no completion, so there is nothing to time out.</p>
+    <p>3. The completion was delayed beyond the timeout; the SSD retired the tag (Completion Timeout); the late completion then matched nothing (Unexpected Completion). Look for a slow completer or a congested path.</p>
+    <p>4. A malformed TLP means the receiver cannot trust the sender's framing or rules — the link's integrity is in doubt. A UR is a well-formed request the completer simply does not support; the link is fine.</p>
+    <p>5. Width negotiation chose x2 (lane failure or poor signal on two lanes, or a slot wired x2). No error logs is consistent: training does not log AER errors for lanes that failed to train. Check LnkCap vs LnkSta and the platform's slot wiring.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>A Bad TLP is detected by</p><ul class="options" data-answer="2"><li>The transmitter's replay timer</li><li>The receiver's LCRC/sequence check</li><li>The completer's address decoder</li><li>The root complex only</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>The receiving Data Link Layer checks LCRC and sequence numbers.</p></details></li>
+    <li><p>REPLAY_NUM Rollover causes</p><ul class="options" data-answer="3"><li>A fatal error</li><li>A Completion Timeout</li><li>Link retraining (Recovery)</li><li>A poisoned TLP</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>It is correctable; the transmitter forces the link into Recovery.</p></details></li>
+    <li><p>Which is fatal by default?</p><ul class="options" data-answer="4"><li>Completion Timeout</li><li>Unsupported Request</li><li>Poisoned TLP</li><li>Malformed TLP</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>Malformed TLP, DLP, Surprise Down, FC Protocol, Receiver Overflow are fatal by default.</p></details></li>
+    <li><p>Completion Status 001b means</p><ul class="options" data-answer="1"><li>Unsupported Request</li><li>Completer Abort</li><li>Successful</li><li>Retry status</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>000 SC, 001 UR, 010 CRS/RRS, 100 CA.</p></details></li>
+    <li><p>Who logs a Completion Timeout?</p><ul class="options" data-answer="2"><li>The completer</li><li>The requester</li><li>The switch</li><li>The root port always</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>The requester owns the tag and the timer.</p></details></li>
+    <li><p>The EP bit in a TLP header indicates</p><ul class="options" data-answer="3"><li>ECRC present</li><li>End of packet</li><li>Poisoned data</li><li>Error message</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>EP = Error Poisoned; TD indicates a digest (ECRC).</p></details></li>
+    <li><p>Explain why a root port logging Bad TLP may indicate a problem with the SSD's transmitter.</p><details class="answer"><summary>Model answer</summary><p>Bad TLP is logged by the receiver; the root port received corrupted TLPs that the SSD transmitted. The cause can be the SSD's transmitter, the channel, or the root port's receiver — the log tells you direction, not culprit.</p></details></li>
+    <li><p>Give two NVMe-visible consequences of a Completion Timeout at the host for an MMIO read.</p><details class="answer"><summary>Model answer</summary><p>The register read returns all ones (e.g. CSTS=0xFFFFFFFF); the NVMe driver concludes the controller is dead and resets or removes it; I/O fails.</p></details></li>
+    <li><p>What is an Advisory Non-Fatal Error?</p><details class="answer"><summary>Model answer</summary><p>An uncorrectable non-fatal error that the detecting function reports as correctable (ERR_COR, with the Advisory Non-Fatal bit) because another agent is expected to handle it — e.g. a completer that returned UR for a non-posted request.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> Name the three PCIe error classes.</p><details class="answer"><summary>Model answer</summary><p>Correctable, uncorrectable non-fatal, uncorrectable fatal.</p></details></li>
+    <li><p><strong>Beginner:</strong> What does the Data Link Layer do when a TLP arrives with a bad LCRC?</p><details class="answer"><summary>Model answer</summary><p>Discards it, logs Bad TLP, sends a NAK; the transmitter replays from its replay buffer.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Difference between Unsupported Request and Completer Abort?</p><details class="answer"><summary>Model answer</summary><p>UR: request not supported or not claimed (e.g. address not in any BAR). CA: completer recognised the request but refused/failed it for its own reasons.</p></details></li>
+    <li><p><strong>Intermediate:</strong> What's a poisoned TLP and how should an NVMe controller react to receiving one for write data?</p><details class="answer"><summary>Model answer</summary><p>A TLP whose data is marked bad by EP=1. The controller must not commit the data; log Poisoned TLP Received; complete the WRITE with an error status.</p></details></li>
+    <li><p><strong>Advanced:</strong> Explain the MPS mismatch failure.</p><details class="answer"><summary>Model answer</summary><p>A sender configured for a larger MPS than the receiver sends a TLP whose payload exceeds the receiver's MPS; the receiver flags Malformed TLP (fatal by default) → link reset, device loss. Fix: consistent MPS along the path.</p></details></li>
+    <li><p><strong>Advanced:</strong> Why are completion timeouts often misattributed?</p><details class="answer"><summary>Model answer</summary><p>They're logged by the requester, which is the victim; the cause is the completer or path. Engineers see the error on device X and blame X.</p></details></li>
+    <li><p><strong>Senior:</strong> Fleet data shows rising correctable errors on one server model after a BIOS update. How do you proceed?</p><details class="answer"><summary>Model answer</summary><p>Normalise to rates; separate by detecting end and error type; compare BIOS versions (equalisation presets, retimer firmware, ASPM, speed); correlate with slot/riser; reproduce on a lab unit with A/B BIOS; use lane margining; engage the platform vendor with data.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>Child:</strong> smudged labels, parcels to nowhere, spoiled food, and the collapsed bridge.</li>
+    <li><strong>Junior engineer:</strong> classify ten named errors by layer, detector role and default class.</li>
+    <li><strong>Senior engineer:</strong> argue why the device that logs an error is often not the device that caused it, with two examples.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "If a label is smudged, the guard asks for it again and nobody notices. If a parcel goes to a building that doesn't exist, that parcel fails but the road is fine. If the bridge breaks, nothing can get through until it's fixed."</p>
+    <p><strong>Junior:</strong> "Receiver Error — PHY, receiver, correctable. Bad TLP/Bad DLLP — DLL, receiver, correctable. Replay Timeout/Rollover — DLL, transmitter, correctable. DLP/Surprise Down — DLL, fatal. Poisoned — TL, receiver, non-fatal. UR/CA — TL, completer, non-fatal. Completion Timeout/Unexpected Completion — TL, requester, non-fatal. Malformed — TL, receiver, fatal."</p>
+    <p><strong>Senior:</strong> "Completion Timeout is logged by the requester waiting on a hung completer. Bad TLP is logged by the receiver of corruption caused by the far transmitter or the channel. In both, evidence lives at the detector but the cause lives one hop away."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>PCIe errors are detected by the Physical Layer (Receiver Error), the Data Link Layer (Bad TLP, Bad DLLP, Replay Timer Timeout, REPLAY_NUM Rollover, Data Link Protocol Error, Surprise Down) and the Transaction Layer (Poisoned TLP, ECRC, Unsupported Request, Completer Abort, Unexpected Completion, Completion Timeout, Malformed TLP, Receiver Overflow, Flow Control Protocol Error). They are classed as correctable, uncorrectable non-fatal or uncorrectable fatal, signalled by ERR_COR/ERR_NONFATAL/ERR_FATAL messages and completion status (UR, CA), and logged in status registers. To NVMe they appear as extra latency, Data Transfer Errors, timeouts, all-ones reads or a vanished device. The detecting function is rarely the culprit: always reason about role and look one hop away.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>place every error named here in its layer, detector role and default class</li>
+      <li>explain ACK/NAK replay and why rollover matters</li>
+      <li>explain completion timeout from both directions and its NVMe effect</li>
+      <li>tell Poisoned TLP from Bad TLP from Malformed TLP</li>
+      <li>read DevSta/CESta/UESta in lspci and kernel AER counters</li>
+      <li>find NAKs, UR/CA completions, missing completions and error messages in a trace</li>
+      <li>argue from detector role to likely cause</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Error Signaling and Logging; Data Link Layer retry; Completion Timeout; Advanced Error Reporting Capability</cite></li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite></li>
+    <li>Linux kernel documentation: "The PCI Express Advanced Error Reporting Driver Guide HOWTO" and "PCI Error Recovery".</li>
+    <li>Deeper: <a href="dd40.html">Deep-Dive Module: PCIe Errors</a>, <a href="dd16.html">DLLP and Replay</a>, <a href="ch55.html">Advanced Error Handling</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch46.html">Chapter 46 — AER</a> opens the registers that record all of these errors, and shows how to read real-looking kernel AER reports.</p>
+</section>

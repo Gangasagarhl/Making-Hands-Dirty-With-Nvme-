@@ -1,0 +1,586 @@
+<p class="lead">Before any operating system runs, something has to find an NVM Express (NVMe) device, bring its controller up, read a boot loader from it, and hand everything over cleanly. This chapter follows that pre-operating-system (pre-OS) journey: platform firmware and the Unified Extensible Firmware Interface (UEFI), option ROMs, local boot from an NVMe namespace, NVMe Boot Partitions, booting over NVMe over Fabrics (NVMe-oF) as defined by the NVMe Boot Specification 1.4, and the handoff to the OS driver.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>Every chapter so far assumed a Linux driver was in charge. At power-on there is no Linux, no driver and no file system — just platform firmware with a small, carefully written NVMe driver of its own. If that driver cannot initialise the controller, there is no boot. If it leaves the controller in a strange state, the OS driver inherits a mess. And in cloud and disaggregated designs, the boot disk may not be in the server at all: it is an NVMe namespace on a target across a Transmission Control Protocol (TCP) network, so the pre-OS environment must speak NVMe over TCP.</p>
+  <p>Boot problems are among the hardest to debug — no shell, little logging, and every failure looks like "no bootable device". Engineers who understand the sequence (firmware enumeration → controller enable → Identify → read the partition table → load loader → handoff) can localise them; engineers who do not, swap hardware until something works.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Describe the pre-OS environment: reset, platform firmware, PCI Express (PCIe) enumeration, UEFI driver model, legacy Basic Input/Output System (BIOS) and option ROMs.</li>
+    <li>Walk through booting from a local NVMe namespace, including the PCIe and NVMe transactions involved.</li>
+    <li>Explain NVMe Boot Partitions and the BPINFO, BPRSEL and BPMBL registers, and when they are used.</li>
+    <li>Explain transport-aware boot: what the NVMe Boot Specification adds for NVMe-oF (especially NVMe/TCP), including the NVMe Boot Firmware Table (NBFT).</li>
+    <li>Describe the OS handoff and the controller state the OS driver must handle.</li>
+    <li>Diagnose boot failures from synthetic traces and firmware logs.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>You need: PCIe enumeration and Base Address Registers (BARs) (<a href="ch17.html">Chapter 17</a>, <a href="ch19.html">Chapter 19</a>); configuration space including the Expansion ROM BAR (<a href="ch18.html">Chapter 18</a>); controller registers CAP, CC, CSTS, AQA, ASQ, ACQ (<a href="ch24.html">Chapter 24</a>); the admin queue and Identify (<a href="ch26.html">Chapter 26</a>, <a href="ch30.html">Chapter 30</a>); NVMe reset (<a href="ch48.html">Chapter 48</a>); and for fabric boot, the NVMe-oF model (<a href="ch65.html">Chapter 65</a>) and NVMe/TCP (<a href="ch66.html">Chapter 66</a>).</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Early in the morning, before the teacher arrives, the school's <strong>night caretaker</strong> unlocks the building. The caretaker does not know how to teach, but knows exactly one thing: how to open the library, find the shelf with the teacher's <strong>first-day instructions</strong>, and put them on the teacher's desk. Then the caretaker goes home. The teacher arrives, reads the instructions, and from then on runs the school — including opening the library properly in their own way.</p>
+    <p>Sometimes the first-day instructions are not in this building at all; they are in a library across town. Then the caretaker must make a phone call, and leave the teacher a note saying exactly which library and which phone number, so the teacher can call back.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A relay race with a baton. The first runner (platform firmware) has a short leg, carries the baton (control of the NVMe controller and the loaded OS loader), and must hand it over inside the exchange zone (ExitBootServices). A dropped baton — a controller left half-initialised, a connection the second runner does not know about — loses the race even if both runners were fast.</p>
+  </aside>
+  <aside class="callout breaks">
+    <ul>
+      <li><strong>Runners do not reset each other.</strong> The OS driver normally <em>resets</em> the controller and starts over; what is handed over is the boot loader and configuration information, not live queues.</li>
+      <li><strong>Hidden: three different storage locations.</strong> The "instructions" may be in a file system on a namespace (normal UEFI boot), in an NVMe Boot Partition (small dedicated area read by register mechanism), or on a remote target (NVMe-oF boot).</li>
+      <li><strong>Hidden: the note format.</strong> For fabric boot the note is a standard Advanced Configuration and Power Interface (ACPI) table (the NBFT), not an informal message.</li>
+      <li><strong>Misleading: one caretaker.</strong> Several firmware drivers participate: PCIe bus driver, NVMe driver, partition and file-system drivers, network stack, boot manager.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>When a computer powers on, the central processing unit (CPU) starts executing platform firmware (today almost always UEFI firmware; older systems used a legacy BIOS). The firmware:</p>
+  <ol>
+    <li>initialises memory and the PCIe hierarchy, assigning bus numbers and BAR addresses to devices;</li>
+    <li>loads drivers for devices it wants to boot from — for NVMe, a UEFI NVMe driver built into the firmware or loaded from the device's option ROM;</li>
+    <li>uses that driver to enable the NVMe controller, discover namespaces, and present each namespace as a block device to the rest of the firmware;</li>
+    <li>finds the EFI System Partition (ESP) on a GUID Partition Table (GPT), reads the OS loader file (for example <code>\EFI\BOOT\BOOTX64.EFI</code> or a path stored in a boot variable), and runs it;</li>
+    <li>the OS loader loads the kernel, calls ExitBootServices, and the OS takes over; the OS NVMe driver then re-initialises the controller.</li>
+  </ol>
+  <p>Two variations matter for NVMe engineers:</p>
+  <ul>
+    <li><strong>Boot Partitions</strong>: an optional NVMe feature giving small, dedicated areas that a very simple host (for example an embedded system-on-chip boot ROM) can read with a register-level mechanism, without building admin queues.</li>
+    <li><strong>NVMe-oF boot</strong>: the boot namespace is on a remote NVMe target. The firmware runs an NVMe/TCP initiator, connects, reads the loader over the network, and passes the connection details to the OS. The NVMe Boot Specification standardises this.</li>
+  </ul>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>The pre-OS environment</h3>
+  <p>UEFI firmware runs in phases (security, pre-EFI initialisation, driver execution environment, boot device selection, runtime). For storage, the important phase is the Driver Execution Environment (DXE) and Boot Device Selection (BDS): PCI bus drivers enumerate devices and expose PCI I/O protocols; device drivers bind to them; the boot manager walks boot options. <span class="badge informative">Informative</span> summary of the UEFI Platform Initialization model — read the UEFI specification for normative detail.</p>
+  <figure>
+    <div class="flow">
+      <div>Reset vector<small>CPU starts firmware</small></div>
+      <div>Memory + PCIe init<small>bus numbers, BARs, bridges; link training already done by hardware</small></div>
+      <div class="hl">UEFI NVMe driver<small>binds to class code 01h/08h/02h (mass storage, NVM, NVMe); enables controller; installs NVM Express Pass Thru and Block I/O</small></div>
+      <div>Partition + File Allocation Table (FAT) drivers<small>GPT, ESP</small></div>
+      <div>Boot manager<small>Boot#### variables, BootOrder, device paths</small></div>
+      <div>OS loader → kernel<small>ExitBootServices: firmware drivers stop</small></div>
+      <div>OS NVMe driver<small>resets and re-initialises the controller</small></div>
+    </div>
+    <figcaption>Conceptual pre-OS storage stack for local NVMe boot.</figcaption>
+  </figure>
+
+  <h3>BIOS, UEFI and option ROMs</h3>
+  <p>A PCIe device can carry an <span class="g" data-term="option-rom">option ROM</span> — firmware code the platform can load and run — exposed through the Expansion ROM Base Address Register in configuration space (offset 30h in a Type 0 header). Legacy BIOS option ROMs hooked the INT 13h disk interrupt; UEFI option ROMs contain UEFI driver images. <span class="badge verified">Verified</span> for the Expansion ROM BAR location (PCI header layout).</p>
+  <ul>
+    <li>Most current UEFI platform firmware includes a built-in NVMe driver (the open-source EDK II implementation is commonly called NvmExpressDxe), so most NVMe solid-state drives (SSDs) do not need an option ROM to boot. <span class="badge impl">Implementation-dependent</span></li>
+    <li>Legacy BIOS boot from NVMe generally needs an option ROM on the device or in the platform, which many NVMe drives never shipped; this is why early NVMe adoption pushed systems to UEFI.</li>
+    <li>Secure Boot validates option ROMs and OS loaders against signature databases; an unsigned option ROM is skipped on a Secure Boot platform.</li>
+  </ul>
+  <p>The UEFI specification defines an NVM Express Pass Thru Protocol through which UEFI code sends raw NVMe commands to a controller, and an NVMe namespace device-path node (identifying namespace by namespace identifier (NSID) and 64-bit Extended Unique Identifier (EUI-64)) so boot variables can name a specific namespace. <span class="badge verified">Verified</span> that these exist in the UEFI specification; check field layouts there.</p>
+
+  <h3>Boot from a local NVMe namespace</h3>
+  <p>The firmware NVMe driver performs a compact version of the initialisation you learned in <a href="ch24.html">Chapter 24</a> and <a href="ch26.html">Chapter 26</a>:</p>
+  <ol>
+    <li>Enable memory space and bus mastering in the PCI Command register.</li>
+    <li>Read CAP (00h) for the timeout (CAP.TO, in 500 ms units), doorbell stride and supported page sizes; read VS (08h).</li>
+    <li>If CSTS.RDY = 1, clear CC.EN and wait for CSTS.RDY = 0.</li>
+    <li>Allocate small admin queues in firmware memory; program AQA (24h), ASQ (28h), ACQ (30h).</li>
+    <li>Set CC (14h): EN = 1, page size, I/O queue entry sizes; wait for CSTS.RDY = 1 up to CAP.TO.</li>
+    <li>Identify Controller, Identify active namespace list, Identify Namespace for each.</li>
+    <li>Create one I/O completion queue (CQ) and submission queue (SQ) (often small, often polled rather than interrupt-driven).</li>
+    <li>Read logical block address (LBA) 0 (the protective Master Boot Record, MBR) and LBA 1 (GPT header), the partition entries, then the ESP's file system and the loader file.</li>
+  </ol>
+  <aside class="callout insight">
+    <p>Firmware drivers are minimal: usually one I/O queue, polled completions, Physical Region Pages (PRPs) only, small transfers. A drive that performs perfectly under Linux can still fail in firmware if it mishandles a code path only firmware uses — for example a very small queue size, or an unusual order of Identify commands. Boot qualification must test with the real platform firmware.</p>
+  </aside>
+
+  <h3>NVMe Boot Partitions</h3>
+  <p><span class="g" data-term="boot-partition">Boot Partitions</span> are an optional feature of the NVMe Base Specification: small storage areas, separate from namespaces, intended for boot code of systems that want to read their first stage without full NVMe initialisation. There are two Boot Partitions (identified 0 and 1), allowing one to be updated while the other remains active.</p>
+  <table>
+    <caption>Boot Partition registers (controller registers, NVMe over PCIe)</caption>
+    <thead><tr><th>Register</th><th>Offset (commonly given)</th><th>Purpose</th><th>Key fields (by name)</th></tr></thead>
+    <tbody>
+      <tr><td>BPINFO — Boot Partition Information</td><td>40h <span class="badge uncertain">confirm</span></td><td>Size and read status</td><td>Boot Partition Size (in 128 KiB units), Boot Read Status (no read / in progress / completed / error), Active Boot Partition ID</td></tr>
+      <tr><td>BPRSEL — Boot Partition Read Select</td><td>44h <span class="badge uncertain">confirm</span></td><td>Starts a read</td><td>Boot Partition Identifier, read offset and read size (in 4 KiB units)</td></tr>
+      <tr><td>BPMBL — Boot Partition Memory Buffer Location</td><td>48h <span class="badge uncertain">confirm</span></td><td>Where the controller writes the data</td><td>Host memory base address (4 KiB aligned), 64-bit</td></tr>
+    </tbody>
+  </table>
+  <p>Support is indicated by a capability bit in CAP (Boot Partition Support). <span class="badge uncertain">Uncertain</span> — confirm offsets, field bit positions and units in the Base 2.4 "Controller Registers" section and the PCIe Transport 1.4 specification before writing code. The read mechanism, in outline:</p>
+  <ol class="seq" data-actors="Boot ROM (host)|Controller|Host memory">
+    <li data-from="Boot ROM (host)" data-to="Controller">read BPINFO: size, active ID</li>
+    <li data-from="Boot ROM (host)" data-to="Controller">write BPMBL = buffer address</li>
+    <li data-from="Boot ROM (host)" data-to="Controller">write BPRSEL: ID, offset, size</li>
+    <li data-note="Controller">read status = in progress</li>
+    <li data-from="Controller" data-to="Host memory">MWr: boot image data (DMA)</li>
+    <li data-from="Boot ROM (host)" data-to="Controller">poll BPINFO read status</li>
+    <li data-from="Controller" data-to="Boot ROM (host)" class="dashed">status = completed</li>
+  </ol>
+  <p>The key property: this can be done without enabling the controller and without any admin queue. <span class="badge uncertain">Uncertain</span> on the precise CC.EN preconditions — the specification states when a Boot Partition read may be initiated; confirm it. Writing a Boot Partition uses ordinary admin commands: Firmware Image Download to transfer the image and Firmware Commit with Boot-Partition-specific commit actions to replace a partition or mark it active. Boot Partition write protection (controllable via a feature in the 2.x specifications) can lock partitions. <span class="badge uncertain">Uncertain</span> on commit action values and feature identifiers — check Base 2.4.</p>
+  <aside class="callout remember">
+    <p>On ordinary PCs and servers, UEFI boots from a GPT/ESP on a namespace; Boot Partitions are mainly for embedded and specialised platforms. Do not assume a laptop uses them.</p>
+  </aside>
+
+  <h3>Transport-aware boot: NVMe over Fabrics</h3>
+  <p>The <cite class="spec">NVM Express Boot Specification, Revision 1.4</cite> standardises how pre-OS software boots from NVMe-oF namespaces, focusing on NVMe/TCP because TCP needs only ordinary network interfaces. <span class="badge verified">Verified</span> that NVMe Boot is a separate specification at Revision 1.4 in the August 2026 set. It covers, in outline:</p>
+  <ul>
+    <li><strong>Configuration</strong> of the pre-OS host: host NVMe Qualified Name (NQN) and Host Identifier, network interface parameters (static or Dynamic Host Configuration Protocol, DHCP), and target or discovery-controller addresses — through firmware setup, UEFI variables or similar platform means. <span class="badge impl">Implementation-dependent</span> mechanism.</li>
+    <li><strong>Discovery and connection</strong>: the pre-OS NVMe/TCP initiator optionally queries a discovery controller, connects an admin queue and I/O queue to the subsystem, and presents the namespace as a boot block device.</li>
+    <li><strong>Handoff</strong>: the firmware publishes the <span class="g" data-term="nbft">NVMe Boot Firmware Table (NBFT)</span>, an ACPI table describing the host identity, host fabric interfaces, subsystem namespaces and discovery information used for boot, so the OS can re-establish the same connections. <span class="badge verified">Verified</span> that NBFT is the handoff mechanism defined by NVMe Boot; table layout must be read from the specification.</li>
+  </ul>
+  <p>Booting over NVMe/RDMA is conceptually similar but needs RDMA-capable firmware drivers; check whether Boot 1.4 covers transports beyond TCP. <span class="badge uncertain">Uncertain</span></p>
+  <figure>
+    <ol class="seq" data-actors="UEFI firmware|DHCP/Discovery|NVMe/TCP target|OS">
+      <li data-from="UEFI firmware" data-to="DHCP/Discovery">obtain IP; optional discovery query</li>
+      <li data-from="DHCP/Discovery" data-to="UEFI firmware" class="dashed">subsystem NQN, address, port</li>
+      <li data-from="UEFI firmware" data-to="NVMe/TCP target">TCP connect; ICReq / ICResp</li>
+      <li data-from="UEFI firmware" data-to="NVMe/TCP target">Fabrics Connect (admin, then I/O)</li>
+      <li data-from="UEFI firmware" data-to="NVMe/TCP target">Identify; Read GPT, ESP, loader</li>
+      <li data-note="UEFI firmware">publish NBFT (ACPI)</li>
+      <li data-from="UEFI firmware" data-to="OS">ExitBootServices: loader + kernel</li>
+      <li data-from="OS" data-to="NVMe/TCP target">read NBFT; reconnect; mount root</li>
+    </ol>
+    <figcaption>Conceptual NVMe/TCP boot flow. Message names follow NVMe/TCP (<a href="ch66.html">Chapter 66</a>); boot-specific details are in NVMe Boot 1.4.</figcaption>
+  </figure>
+
+  <h3>OS handoff</h3>
+  <p>After ExitBootServices, firmware drivers must no longer touch devices. Two handoff facts follow:</p>
+  <ul>
+    <li><strong>Local NVMe:</strong> the controller is typically left enabled with firmware-created queues in memory the OS may reuse. The OS driver therefore disables the controller (CC.EN = 0, wait CSTS.RDY = 0), discarding firmware queues, and initialises from scratch. A firmware that leaves DMA in flight, or a controller that is slow to go not-ready, creates early-boot failures. <span class="badge derived">Derived</span></li>
+    <li><strong>NVMe/TCP:</strong> the firmware's TCP connections disappear with the firmware network stack. The OS reads the NBFT and creates new connections — ideally with the same host NQN/ID — before it can mount the root file system. If the OS cannot reconnect, the kernel boots but cannot find root.</li>
+  </ul>
+
+  <h3>The central concept on the ladder: from power-on to OS-owned NVMe</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>A night caretaker opens the library, fetches the first-day instructions, leaves a note, and goes home; the teacher takes over.</p></div>
+    <div class="rung" data-rung="B"><p>Firmware enumerates PCIe, runs an NVMe driver, reads the boot loader from a namespace (or a Boot Partition, or a remote target), and hands off to the OS, which re-initialises the controller.</p></div>
+    <div class="rung" data-rung="C"><p>Real registers change: Command register (bus master), CC, CSTS, AQA/ASQ/ACQ; firmware memory holds small queues; for Boot Partitions, BPMBL/BPRSEL/BPINFO; for fabric boot, a network interface controller (NIC) and a TCP/IP stack in firmware.</p></div>
+    <div class="rung" data-rung="D"><p>NVMe Base 2.4 (initialisation, Boot Partitions), NVMe over PCIe Transport 1.4, NVMe Boot 1.4 (pre-OS NVMe-oF, NBFT), NVMe/TCP Transport 1.3, UEFI and ACPI specifications.</p></div>
+    <div class="rung" data-rung="E"><p>Config reads/writes during enumeration; memory-mapped I/O (MMIO) writes to CC and admin doorbells; admin commands; reads of LBA 0/1 and the ESP; or TCP protocol data units (PDUs) for fabric boot; then a reset sequence by the OS.</p></div>
+    <div class="rung" data-rung="F"><p>In a PCIe trace: a burst of CfgRd/CfgWr, a BAR write, CC.EN write, CSTS polling reads, the first submission queue entry (SQE) fetch, small reads of LBAs 0 and 1 — then silence until the OS reset writes CC.EN = 0.</p></div>
+    <div class="rung" data-rung="G"><p>"No bootable device": did enumeration see the device? Did CSTS.RDY rise before the firmware's timeout? Did Identify succeed? Is there a GPT/ESP? For fabric boot: did TCP connect, did Fabrics Connect succeed, did the OS find the NBFT?</p></div>
+  </div>
+
+  <h3>The sixteen questions for the boot handoff</h3>
+  <dl>
+    <dt>What is it?</dt><dd>The transfer of control of an NVMe device and boot information from platform firmware to the OS.</dd>
+    <dt>Why was it created?</dt><dd>Firmware and OS have separate drivers; a defined handoff lets each initialise safely.</dd>
+    <dt>What problem does it solve?</dt><dd>Booting from devices that need complex initialisation (NVMe queues, fabric connections) without OS help.</dd>
+    <dt>What existed before?</dt><dd>BIOS INT 13h disk services via option ROMs; iSCSI Boot Firmware Table (iBFT) for network boot over iSCSI.</dd>
+    <dt>Why is the current design better?</dt><dd>UEFI drivers are modular and signed; NBFT carries NVMe-oF specifics (NQNs, host IDs, multiple paths) that iBFT could not.</dd>
+    <dt>Who creates it?</dt><dd>Firmware (driver state, NBFT, boot variables).</dd>
+    <dt>Who consumes it?</dt><dd>The OS loader and OS (initramfs, NVMe driver, nvme-cli tooling).</dd>
+    <dt>Where does it live?</dt><dd>UEFI variables, ACPI tables in memory, the controller's register state.</dd>
+    <dt>Memory/registers involved?</dt><dd>CC, CSTS, AQA/ASQ/ACQ, firmware queue memory, NBFT memory, Boot Partition registers if used.</dd>
+    <dt>What happens before?</dt><dd>Enumeration, controller init, reading the loader.</dd>
+    <dt>What happens after?</dt><dd>OS controller reset and re-initialisation, or fabric reconnection from NBFT.</dd>
+    <dt>What if it is wrong?</dt><dd>Hang at early boot, missing root device, DMA into memory the OS reused, duplicate host identities on the fabric.</dd>
+    <dt>Analyzer view?</dt><dd>Firmware init burst, idle gap, OS reset (CC.EN 1→0) and re-init.</dd>
+    <dt>Linux view?</dt><dd><code>dmesg</code> controller reset messages, <code>efibootmgr -v</code>, <code>/sys/firmware/acpi/tables/NBFT</code>, <code>nvme nbft show</code> (version-dependent).</dd>
+    <dt>Validation tests?</dt><dd>Boot across firmware versions, cold/warm boot, Secure Boot, slow-ready drives, Boot Partition switching, fabric boot with path failures.</dd>
+    <dt>Senior suspicion on failure?</dt><dd>Firmware timeout shorter than CAP.TO; leftover DMA; mismatched host NQN; NBFT not consumed by initramfs.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>By the time firmware code runs, PCIe link training has completed in hardware (<a href="ch09.html">Chapter 09</a>). The firmware sees the device only after it assigns bus numbers. The NVMe controller itself may still be busy: after a power-on, the SSD's own firmware must load from flash, rebuild or validate mapping tables, and only then report ready. This is why CAP.TO exists — the device declares the worst-case time to become ready, in 500 ms units, and the host must wait at least that long before declaring failure.</p>
+  <table>
+    <caption>Hardware actors in the boot path</caption>
+    <thead><tr><th>Actor</th><th>Local NVMe boot</th><th>Boot Partition boot</th><th>NVMe/TCP boot</th></tr></thead>
+    <tbody>
+      <tr><td>Root complex / PCIe link</td><td>Must</td><td>Must</td><td>Must (for the NIC)</td></tr>
+      <tr><td>NVMe controller</td><td>Must (full init)</td><td>Must (register-level read)</td><td>Not in the server (remote target)</td></tr>
+      <tr><td>NIC</td><td>No</td><td>No</td><td>Must, with UEFI network driver</td></tr>
+      <tr><td>Flash media</td><td>Namespace data</td><td>Boot Partition area</td><td>On the target</td></tr>
+      <tr><td>Firmware memory</td><td>Small queues, buffers</td><td>Destination buffer (BPMBL)</td><td>TCP buffers, NBFT</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw">
+    <p>Drives with power-loss protection and large flash translation layers (FTLs) may take seconds to report ready after an unsafe shutdown. Some platforms' firmware NVMe drivers give up after a fixed timeout shorter than CAP.TO; the result is an intermittent "no boot device" that only follows unclean power-offs. <span class="badge impl">Implementation-dependent</span></p>
+  </aside>
+  <figure>
+    <pre class="diagram">
+ Time ─────────────────────────────────────────────────────────────────────▶
+ Power  │▇ PERST# deasserted
+ Link   │  ▇▇ LTSSM → L0 (hardware)
+ FW     │       ▇▇▇▇ enumeration  ▇▇ NVMe init ▇▇▇ read GPT/ESP/loader ▇ ExitBootServices
+ SSD FW │  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ internal boot (CSTS.RDY=0 until done)
+ OS     │                                                                  ▇▇ CC.EN=0 → re-init
+</pre>
+    <figcaption>Conceptual timeline (not to scale). The SSD's internal boot overlaps platform enumeration.</figcaption>
+  </figure>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Boot Specification, Revision 1.4</cite> — pre-OS NVMe-oF boot, NBFT. <span class="badge normative">Normative</span></li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Controller Initialization; Boot Partitions; Firmware Commit</cite> <span class="badge normative">Normative</span></li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite> — PCIe-specific register mapping. <span class="badge normative">Normative</span></li>
+    <li><cite class="spec">NVMe over TCP Transport Specification, Revision 1.3</cite> — for fabric boot.</li>
+    <li><cite class="spec">UEFI Specification — NVM Express Pass Thru Protocol; device path nodes</cite>, <cite class="spec">ACPI Specification</cite> (table framework for NBFT), <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0</cite> (Expansion ROM BAR, configuration).</li>
+  </ul>
+  <aside class="callout verified"><p>NVMe Boot is a separate NVMe family specification, current revision 1.4 (August 2026). NVMe controller registers CAP (00h), VS (08h), CC (14h), CSTS (1Ch), AQA (24h), ASQ (28h), ACQ (30h). CAP.TO is expressed in 500 ms units. The Expansion ROM BAR sits at configuration offset 30h of a Type 0 header.</p></aside>
+  <aside class="callout derived"><p>Because the OS driver re-initialises the controller, any firmware-created queues are abandoned; a correct firmware must stop DMA before handoff, and a correct OS must not assume the controller is disabled when it starts.</p></aside>
+  <aside class="callout impl"><p>Firmware NVMe driver timeouts, queue sizes, polling vs interrupts, whether option ROMs are executed, how NVMe/TCP boot is configured in firmware setup, and how the OS initramfs consumes NBFT.</p></aside>
+  <aside class="callout version"><p>The NVMe Boot Specification first appeared in 2022 (Revision 1.0) and has been revised to 1.4 in the 2.4 set. <span class="badge uncertain">Uncertain</span> on what each minor revision added; consult the "NVM Express Revision Changes 2026.07.30" document for 1.4. Boot Partition features (for example write protection) also evolved in the Base specification across 1.3, 1.4 and 2.x.</p></aside>
+  <aside class="callout notsaid"><ul>
+    <li>Confirm BPINFO/BPRSEL/BPMBL offsets, field positions and units, and the CC.EN preconditions for a Boot Partition read.</li>
+    <li>Confirm Firmware Commit action values for Boot Partitions and the Boot Partition write-protection feature.</li>
+    <li>Confirm NBFT structure layout and the list of descriptors in NVMe Boot 1.4.</li>
+    <li>The NVMe specifications do not define how a platform's boot menu works or how long firmware waits; that belongs to UEFI and platform vendors.</li>
+  </ul></aside>
+  <aside class="callout warn"><ul>
+    <li>Never assume the controller is disabled when the OS driver starts.</li>
+    <li>Never assume a firmware timeout honours CAP.TO.</li>
+    <li>Never assume a PC uses Boot Partitions.</li>
+    <li>Never assume the pre-OS and OS host NQN/host ID match unless NBFT is consumed correctly.</li>
+  </ul></aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>What crosses the PCIe link during local firmware boot (lab system)</caption>
+    <thead><tr><th>Phase</th><th>Transactions</th><th>Direction</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Enumeration</td><td>CfgRd0/CfgWr0: Vendor/Device ID, class code, BAR sizing, Command register</td><td>RC → device, Cpl/CplD back</td><td>Non-posted; every config request gets a completion</td></tr>
+      <tr><td>Controller enable</td><td>MRd CAP, CSTS; MWr CC, AQA, ASQ, ACQ</td><td>RC → device</td><td>CSTS polled until RDY = 1</td></tr>
+      <tr><td>Admin commands</td><td>MWr doorbell; device MRd SQE; device MWr data and CQE</td><td>Both</td><td>Firmware often polls CQ phase bit instead of using Message Signaled Interrupts Extended (MSI-X)</td></tr>
+      <tr><td>Read boot data</td><td>NVM Read (02h) of LBA 0, 1, partition entries, ESP clusters, loader file</td><td>Both</td><td>Small transfers; a loader of a few MiB</td></tr>
+      <tr><td>OS takeover</td><td>MWr CC.EN = 0; MRd CSTS until RDY = 0; full re-init</td><td>RC → device</td><td>New queues, MSI-X enabled</td></tr>
+    </tbody>
+  </table>
+  <p>For Boot Partition reads, the only host-initiated transactions are register MRd/MWr; the data arrives as device-initiated MWr TLPs to the BPMBL address. For NVMe/TCP boot, the PCIe link carries NIC traffic only; the NVMe protocol is inside TCP PDUs on the network (Initialize Connection Request/Response, Command Capsules, Data PDUs, Response Capsules).</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic traces on the lab system (BAR0 = 0xFE60_0000, SSD 01:00.0, Requester ID 0x0100). In firmware, queues live in firmware-allocated memory, here at 0x7F00_0000 (admin SQ) and 0x7F00_1000 (admin CQ); the I/O memory management unit (IOMMU) is typically not yet active, so addresses are physical.</p>
+  <div class="trace" data-kind="synthetic" data-title="Normal: UEFI firmware brings up the controller and reads the GPT header">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ms)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.000</td><td>CfgRd0</td><td>Req=RC 01:00.0 Reg=0x00</td><td>Vendor/Device ID</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.001</td><td>CplD</td><td>Status=SC</td><td>Device present</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>0.003</td><td>CfgRd0</td><td>Reg=0x08</td><td>Class code 01h/08h/02h: NVMe — firmware NVMe driver will bind</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>0.010</td><td>CfgWr0</td><td>Reg=0x10 Data=0xFE60_0004</td><td>BAR0 assigned (64-bit, upper dword in BAR1)</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>0.012</td><td>CfgWr0</td><td>Reg=0x04 Data=0x0006</td><td>Command: Memory Space + Bus Master enable</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>0.020</td><td>MRd</td><td>Addr=0xFE60_0000 Len=2DW</td><td>Read CAP: TO = 0x3C (60 × 500 ms = 30 s), DSTRD = 0</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>0.025</td><td>MRd</td><td>Addr=0xFE60_001C</td><td>CSTS: RDY = 0 (already disabled)</td></tr>
+        <tr class="dir-down"><td>8</td><td>Host→Dev</td><td>0.030</td><td>MWr</td><td>Addr=0xFE60_0024 Data=0x001F001F</td><td>AQA: 32-entry admin SQ/CQ (0-based 31)</td></tr>
+        <tr class="dir-down"><td>9</td><td>Host→Dev</td><td>0.032</td><td>MWr</td><td>Addr=0xFE60_0028 / 0x30</td><td>ASQ = 0x7F00_0000, ACQ = 0x7F00_1000</td></tr>
+        <tr class="dir-down"><td>10</td><td>Host→Dev</td><td>0.035</td><td>MWr</td><td>Addr=0xFE60_0014 Data=0x00460001</td><td>CC: EN = 1, IOSQES = 6, IOCQES = 4, MPS = 0</td></tr>
+        <tr class="note"><td colspan="6">Firmware polls CSTS every 1 ms …</td></tr>
+        <tr class="dir-down"><td>11</td><td>Host→Dev</td><td>412.0</td><td>MRd</td><td>Addr=0xFE60_001C → 0x00000001</td><td>CSTS.RDY = 1 after ~412 ms</td></tr>
+        <tr class="dir-down"><td>12</td><td>Host→Dev</td><td>412.1</td><td>MWr</td><td>Addr=0xFE60_1000 Data=1</td><td>Admin SQ tail = 1: Identify Controller (06h)</td></tr>
+        <tr class="dir-up"><td>13</td><td>Dev→Host</td><td>412.1</td><td>MRd</td><td>Req=0x0100 Addr=0x7F00_0000 Len=16DW</td><td>SQE fetch</td></tr>
+        <tr class="dir-up"><td>14</td><td>Dev→Host</td><td>412.3</td><td>MWr ×16</td><td>Addr=firmware buffer, 256 B each</td><td>4 KiB Identify data</td></tr>
+        <tr class="dir-up"><td>15</td><td>Dev→Host</td><td>412.4</td><td>MWr</td><td>Addr=0x7F00_1000 Len=4DW</td><td>CQE (firmware polls phase bit; no MSI-X)</td></tr>
+        <tr class="note"><td colspan="6">… Identify namespace list, Identify Namespace 1, Create I/O CQ/SQ (05h/01h) …</td></tr>
+        <tr class="dir-up"><td>16</td><td>Dev→Host</td><td>414.0</td><td>MWr ×2</td><td>512 B to buffer</td><td>Read (02h) LBA 1: GPT header ("EFI PART" signature)</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: enumeration, enable, wait for ready, Identify, I/O queue, read GPT — the standard firmware sequence. 412 ms to ready is well within CAP.TO = 30 s. Values are illustrative.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: intermittent 'no bootable device' after unclean shutdown">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ms)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.035</td><td>MWr</td><td>Addr=0xFE60_0014 Data=0x00460001</td><td>CC.EN = 1</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>1 … 5,000</td><td>MRd ×5000</td><td>Addr=0xFE60_001C → 0x00000000</td><td>CSTS.RDY = 0, CFS = 0: device still recovering after power loss</td></tr>
+        <tr class="abnormal"><td>3</td><td>Host→Dev</td><td>5,001</td><td>MWr</td><td>Addr=0xFE60_0014 Data=0x00460000</td><td><strong>First abnormal event:</strong> firmware abandons enable after 5 s and clears CC.EN, although CAP.TO allowed 30 s</td></tr>
+        <tr class="note"><td colspan="6">Firmware marks device unusable; boot manager reports "no bootable device".</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>(next boot)</td><td>MWr / MRd</td><td>CSTS.RDY = 1 after 380 ms</td><td>Warm reboot: device ready quickly, boots normally</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the device never reported a fatal status (CSTS.CFS = 0) — it was slow, not broken. The first abnormal event is the host's timeout decision, not a device action: the firmware waited 5 s instead of CAP.TO (30 s). Hypotheses: firmware driver uses a fixed timeout; SSD's recovery after unsafe shutdown exceeds 5 s. Evidence: correlation with unclean shutdowns (SMART health-log unsafe-shutdown counter increments), success on the next boot. Corrective action: firmware honours CAP.TO; SSD vendor reviews recovery time. Regression test: 100 power-cut/boot cycles with an analyzer measuring time to CSTS.RDY and asserting the firmware waits up to CAP.TO.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Normal: Boot Partition read of 128 KiB by an embedded boot ROM">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MRd</td><td>Addr=BAR0+BPINFO</td><td>Boot Partition size, active partition = 0, read status = none</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>2</td><td>MWr</td><td>Addr=BAR0+BPMBL Len=2DW Data=0x0000_0000_8000_0000</td><td>Destination buffer (4 KiB aligned)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>4</td><td>MWr</td><td>Addr=BAR0+BPRSEL</td><td>Partition 0, offset 0, size 32 × 4 KiB</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>90 … 210</td><td>MWr ×512</td><td>Req=0x0100 Addr=0x8000_0000… Len=64DW</td><td>128 KiB delivered in 256-byte writes (MPS 256)</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>250</td><td>MRd</td><td>Addr=BAR0+BPINFO</td><td>Read status = completed</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: no admin queue, no SQE, no CQE — the register mechanism replaces them. Register offsets are shown by name because this course has not verified them; field encodings likewise. 128 KiB / 256 B = 512 writes.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Was the system booted via UEFI? Which boot entry, which device path?</span>
+[ -d /sys/firmware/efi ] &amp;&amp; echo UEFI || echo legacy
+sudo efibootmgr -v            <span class="cm"># look for NVMe(0x1,...) namespace device-path nodes</span>
+
+<span class="cm"># How the OS driver took over the controller</span>
+sudo dmesg | grep -i -E "nvme|pci 0000:01:00.0" | head -40
+
+<span class="cm"># Controller registers now (OS-owned); boot partition fields if supported (nvme-cli decodes many)</span>
+sudo nvme show-regs /dev/nvme0 -H | grep -i -E "bpinfo|bprsel|bpmbl|cap|csts" -A3
+
+<span class="cm"># Boot Partition log page, if the controller supports Boot Partitions (version-dependent subcommand)</span>
+sudo nvme help | grep -i boot
+
+<span class="cm"># NVMe-oF boot: is an NBFT present, and what does it describe?</span>
+ls -l /sys/firmware/acpi/tables/ | grep -i nbft
+sudo nvme nbft show           <span class="cm"># nvme-cli 2.x; version-dependent</span></code></pre>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> for the read-only commands above. Writing a Boot Partition (Firmware Image Download/Commit), changing boot variables, or altering firmware boot settings are <span class="badge expert">Expert lab</span> operations that can leave a system unbootable.</p></aside>
+  <table>
+    <caption>What the output can and cannot prove</caption>
+    <thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>efibootmgr -v</code> shows an NVMe device path</td><td>Which boot entry and namespace firmware was told to use</td><td>That firmware actually booted from it this time (check BootCurrent)</td></tr>
+      <tr><td><code>dmesg</code> shows controller reset at boot</td><td>The OS driver re-initialised the controller</td><td>What state firmware left it in</td></tr>
+      <tr><td>NBFT present</td><td>Firmware performed or configured NVMe-oF boot</td><td>That the OS used it to reconnect (check <code>nvme list-subsys</code>)</td></tr>
+      <tr><td>show-regs BPINFO non-zero</td><td>Boot Partitions supported (and sized)</td><td>That anything boots from them</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <pre class="code" data-kind="pseudocode" data-lang="c"><code>/* Pseudocode: minimal firmware-style controller enable honouring CAP.TO. */
+int fw_nvme_enable(volatile u8 *bar0, u64 asq, u64 acq)
+{
+    u64 cap = rd64(bar0 + 0x00);
+    u32 to_ms = (u32)((cap &gt;&gt; 24) &amp; 0xFF) * 500;      /* CAP.TO, 500 ms units */
+    if (rd32(bar0 + 0x1C) &amp; 1) {                         /* CSTS.RDY */
+        wr32(bar0 + 0x14, rd32(bar0 + 0x14) &amp; ~1u);      /* CC.EN = 0 */
+        if (wait_bit(bar0 + 0x1C, 1, 0, to_ms)) return -ETIMEDOUT;
+    }
+    wr32(bar0 + 0x24, (31u &lt;&lt; 16) | 31u);               /* AQA: 32/32 */
+    wr64(bar0 + 0x28, asq);
+    wr64(bar0 + 0x30, acq);
+    wr32(bar0 + 0x14, (4u &lt;&lt; 20) | (6u &lt;&lt; 16) | 1u);   /* IOCQES=4, IOSQES=6, EN=1 */
+    for (u32 t = 0; t &lt; to_ms; t++) {
+        u32 csts = rd32(bar0 + 0x1C);
+        if (csts &amp; 2) return -EIO;                       /* CSTS.CFS: fatal */
+        if (csts &amp; 1) return 0;                          /* RDY */
+        delay_ms(1);
+    }
+    return -ETIMEDOUT;                                   /* only after the full CAP.TO */
+}</code></pre>
+  <p>The bit positions used (CAP.TO in bits 31:24 of CAP; CC.EN bit 0, IOSQES bits 19:16, IOCQES bits 23:20; CSTS.RDY bit 0, CFS bit 1) are the well-established ones from the Base specification's Controller Registers section. Boot Partition register access is left out deliberately: write it only from the verified layout.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="gpt_check.py"><code>#!/usr/bin/env python3
+"""Check a disk image (or a copy of the first sectors of a disk) for a protective MBR and a GPT header,
+the two things UEFI firmware reads first. Usage: python3 gpt_check.py disk.img [sector_size]
+Safe: opens the file read-only. Create a test image with: python3 gpt_check.py --make test.img"""
+import struct, sys, zlib
+
+def make(path, ss=512):
+    img = bytearray(ss * 34)
+    img[510:512] = b"\x55\xAA"
+    img[446 + 4] = 0xEE                                  # protective MBR partition type
+    hdr = bytearray(92)
+    struct.pack_into("&lt;8sIII", hdr, 0, b"EFI PART", 0x00010000, 92, 0)
+    struct.pack_into("&lt;QQQQ", hdr, 24, 1, 0, 34, 0)
+    struct.pack_into("&lt;I", hdr, 16, zlib.crc32(bytes(hdr)) &amp; 0xFFFFFFFF)
+    img[ss:ss + 92] = hdr
+    open(path, "wb").write(img)
+
+def check(path, ss=512):
+    with open(path, "rb") as f:
+        data = f.read(ss * 2)
+    mbr_ok = data[510:512] == b"\x55\xAA" and data[446 + 4] == 0xEE
+    hdr = bytearray(data[ss:ss + 92])
+    sig, rev, size, crc = struct.unpack_from("&lt;8sIII", hdr, 0)
+    struct.pack_into("&lt;I", hdr, 16, 0)
+    crc_ok = 92 &lt;= size &lt;= ss and (zlib.crc32(bytes(hdr[:size])) &amp; 0xFFFFFFFF) == crc
+    print(f"protective MBR: {mbr_ok}; GPT signature: {sig == b'EFI PART'}; header CRC ok: {crc_ok}")
+
+if __name__ == "__main__":
+    if sys.argv[1] == "--make":
+        make(sys.argv[2]); print("wrote", sys.argv[2])
+    else:
+        check(sys.argv[1], int(sys.argv[2]) if len(sys.argv) &gt; 2 else 512)</code></pre>
+  <p>Running <code>python3 gpt_check.py --make test.img</code> then <code>python3 gpt_check.py test.img</code> prints <code>protective MBR: True; GPT signature: True; header CRC ok: True</code>. On a 4 KiB-LBA namespace (namespace 2 in the lab system), pass <code>4096</code>: the GPT header is at LBA 1 of the namespace's own LBA size — a classic cause of "firmware cannot find the ESP" after cloning a disk between LBA formats.</p>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Scenario (synthetic):</strong> a server must boot from an NVMe/TCP namespace on a storage target. In firmware setup the operator configures host NQN <code>nqn.2014-08.org.nvmexpress:uuid:1b4e28ba-…</code>, a static IP on NIC port 1, and the target's discovery address. Boot succeeds to the kernel, but the system drops to an emergency shell: "cannot find root device".</p>
+  <ol>
+    <li><strong>Localise the phase.</strong> The kernel loaded, so firmware boot over NVMe/TCP worked: discovery, connect and reads all succeeded. The failure is in the OS reconnection.</li>
+    <li><strong>Was the handoff produced?</strong> In the emergency shell: <code>ls /sys/firmware/acpi/tables/</code> shows NBFT. Yes.</li>
+    <li><strong>Was it consumed?</strong> <code>nvme list-subsys</code> shows no fabric subsystems: the initramfs did not connect. The initramfs was built without NVMe-oF/NBFT support (for example, the dracut module for NVMe-oF absent).</li>
+    <li><strong>Fix.</strong> Rebuild initramfs with NVMe-oF support and nvme-cli; regenerate; reboot.</li>
+    <li><strong>Second issue.</strong> After the fix, the target logs show <em>two</em> host NQNs from this server: the OS used <code>/etc/nvme/hostnqn</code> (a different value) for a second, manual connection. The target's access control allowed only the firmware's NQN, so some namespaces were missing. Fix: make the OS identity match NBFT, or update target access control lists (ACLs). <span class="badge derived">Derived</span> scenario; tooling details are distribution-dependent.</li>
+  </ol>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ol>
+    <li>Assuming firmware honours CAP.TO.</li>
+    <li>Assuming the OS starts with the controller disabled.</li>
+    <li>Confusing Boot Partitions with the EFI System Partition.</li>
+    <li>Cloning a disk image between 512-byte and 4 KiB LBA namespaces and expecting the GPT to be found.</li>
+    <li>Building an initramfs without NVMe-oF/NBFT support for a fabric-booted system.</li>
+    <li>Mismatched host NQN/host ID between firmware and OS.</li>
+    <li>Testing boot only with warm reboots, never after unclean power-off.</li>
+    <li>Assuming legacy BIOS can boot NVMe without an option ROM.</li>
+  </ol>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>Boot failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Disambiguating experiment</th></tr></thead>
+    <tbody>
+      <tr><td>Device absent from firmware setup</td><td>Link not trained; enumeration issue; slot disabled</td><td>Firmware PCI device list; link LEDs</td><td>Boot Linux from USB: does <code>lspci</code> see it?</td></tr>
+      <tr><td>Device present, "no bootable device"</td><td>Firmware NVMe init timeout; no GPT/ESP; wrong boot entry; Secure Boot rejects loader</td><td>Firmware event log; CSTS during boot with analyzer</td><td>Cold vs warm boot; disable Secure Boot temporarily in a lab</td></tr>
+      <tr><td>Hang at early OS boot</td><td>OS reset wait on CSTS.RDY; leftover firmware DMA; interrupt setup</td><td>Kernel log with <code>earlyprintk</code>/serial console</td><td>Analyzer trace of CC.EN 1→0 and CSTS</td></tr>
+      <tr><td>Fabric boot: loader OK, root missing</td><td>Initramfs lacks NBFT/NVMe-oF support; network config differs in OS</td><td>NBFT present? <code>nvme list-subsys</code></td><td>Manual <code>nvme connect</code> from the emergency shell</td></tr>
+      <tr><td>Boot Partition read returns error status</td><td>Read beyond partition size; unaligned BPMBL; controller state precondition</td><td>BPINFO size vs BPRSEL request</td><td>Read a single 4 KiB unit at offset 0</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <ul>
+    <li><strong>The boot path is a different product.</strong> Firmware NVMe drivers, firmware TCP stacks and boot ROMs exercise code paths the OS never touches. Qualify them separately, with the exact platform firmware revision.</li>
+    <li><strong>Handoffs are where bugs live.</strong> Firmware → OS (controller state, DMA quiescence), firmware → OS (NBFT identity). Write down what each side assumes and test the assumption directly.</li>
+    <li><strong>Time is a contract.</strong> CAP.TO is the device's promise; the platform's timeout is the host's patience. When they disagree, the failure appears only under rare conditions (unclean shutdown, large drives), which is why it escapes testing.</li>
+    <li><strong>Diskless fleets change the blast radius.</strong> With NVMe/TCP boot, a target or network problem can stop many servers from booting. Multipath descriptions in NBFT and redundant discovery are design requirements, not extras.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab — Reconstruct a boot and find the handoff</h3>
+  <h4>Objective</h4><p>Reconstruct how your machine booted from NVMe using read-only tools, verify the GPT logic on an image, and diagnose the synthetic timeout trace.</p>
+  <h4>Skills</h4><p>Boot-path reconstruction, register reasoning, log correlation.</p>
+  <h4>Safety</h4><p><span class="badge safe">Safe lab</span>: read-only commands and file images only. Do not modify boot variables or Boot Partitions.</p>
+  <h4>Hardware required</h4><p>Any Linux system booted from NVMe (optional); otherwise none.</p>
+  <h4>Software required</h4><p>Python 3, efibootmgr, nvme-cli.</p>
+  <h4>Input</h4><p><code>gpt_check.py</code>, the abnormal trace.</p>
+  <h4>Expected output</h4><p>A one-page boot reconstruction: boot entry, device path, namespace, OS reset evidence; GPT check results; timeout diagnosis.</p>
+  <h4>Background</h4><p>Re-read the local boot steps and the OS handoff section.</p>
+  <h4>Step 1</h4><p>Run <code>efibootmgr -v</code>; identify BootCurrent and decode its device path down to the NVMe namespace node. Map it to <code>/dev/nvme0n1</code> via NSID.</p>
+  <h4>Step 2</h4><p>Run <code>dmesg | grep nvme</code> and find evidence the OS driver re-initialised the controller (queue counts, any reset messages).</p>
+  <h4>Step 3</h4><p>Create a test image with <code>gpt_check.py --make</code>, verify it, then corrupt one byte in the GPT header (offset 512+40) and re-check. Then check the image with sector size 4096 and explain the result.</p>
+  <h4>Observation</h4><p>Record each check's result and the reason.</p>
+  <h4>Questions</h4><ol><li>Why does the 4096 check fail on a 512-byte image?</li><li>In the abnormal trace, what single register value proves the device was not in a fatal state?</li></ol>
+  <h4>Challenge</h4><p>Compute the CAP.TO value a drive would need to report if its worst-case recovery is 23 s, and the CAP register bits that hold it.</p>
+  <details class="hint"><summary>Hints</summary><p>CAP.TO counts 500 ms units; round up.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>Step 3: corruption → "header CRC ok: False"; with 4096 the tool looks for the header at byte 4096 where the 512-byte image has only zeros → signature False and CRC check False (header size field is 0).</p>
+    <p>Questions: firmware reads LBA 1 in the namespace's LBA size; CSTS = 0x00000000 shows CFS = 0 (no fatal status) and RDY = 0.</p>
+    <p>Challenge: 23 s / 0.5 s = 46 → CAP.TO = 46 (0x2E), in CAP bits 31:24.</p>
+  </details>
+  <h4>What a senior engineer notices</h4><p>Whether BootCurrent matches the expected entry (fallback paths hide real failures), and whether the system has ever been tested after an unclean power-off.</p>
+  <h4>Failure variants</h4><ul><li>Boot entry points to a namespace by EUI-64 that changed after a drive swap.</li><li>Two ESPs on two drives; firmware picks the wrong one.</li><li>CSTS.CFS = 1 during boot — a genuine device fault.</li></ul>
+  <h4>Extension</h4><p>In a virtual machine with UEFI firmware (for example OVMF) and an emulated NVMe device, enable firmware debug logging and compare the firmware NVMe driver's command sequence with the trace above.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>List every register write a firmware NVMe driver makes from enumeration to the first Identify, in order.</li>
+    <li>Explain why a Boot Partition read needs no admin queue, and what replaces the CQE.</li>
+    <li>Describe what information the OS needs to reconnect after NVMe/TCP boot, and where it gets it.</li>
+    <li>Compute the number of 256-byte MWr TLPs to deliver a 512 KiB Boot Partition read.</li>
+    <li>Design a test that would catch a firmware timeout shorter than CAP.TO.</li>
+  </ol>
+  <details class="answer"><summary>Model answers</summary>
+    <p>1: Config: BAR0/BAR1, Command register. MMIO: (CC.EN=0 if needed), AQA, ASQ, ACQ, CC; then doorbell SQ0 tail.</p>
+    <p>2: The host names the data (partition, offset, size) and buffer through registers; completion is reported as read status in BPINFO.</p>
+    <p>3: Host NQN and host ID, interface addressing, subsystem NQN, transport address/port, namespace identity, discovery info — from the NBFT.</p>
+    <p>4: 524,288 / 256 = 2,048.</p>
+    <p>5: An emulated or instrumented drive that delays CSTS.RDY by a controlled time below CAP.TO; boot must succeed for every delay up to CAP.TO.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>On a typical UEFI PC, where does the OS loader for an NVMe boot come from?</p>
+      <ul class="options" data-answer="2"><li>NVMe Boot Partition 0</li><li>A file on the EFI System Partition in a namespace</li><li>The Controller Memory Buffer</li><li>The option ROM</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>UEFI reads the GPT, finds the ESP and loads the loader file. Boot Partitions are mainly for embedded hosts.</p></details></li>
+    <li><p>In what units is CAP.TO expressed?</p>
+      <ul class="options" data-answer="3"><li>1 ms</li><li>100 ms</li><li>500 ms</li><li>1 s</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>500 ms units; CAP.TO = 60 means 30 s.</p></details></li>
+    <li><p>Which ACPI table hands NVMe-oF boot information to the OS?</p>
+      <ul class="options" data-answer="4"><li>iBFT</li><li>MCFG</li><li>DMAR</li><li>NBFT</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>NBFT, defined by the NVMe Boot Specification. iBFT is for iSCSI; MCFG describes PCIe Enhanced Configuration Access Mechanism (ECAM) regions; DMAR describes DMA remapping hardware (the IOMMU).</p></details></li>
+    <li><p>What does the OS NVMe driver usually do first with a controller that firmware enabled?</p>
+      <ul class="options" data-answer="1"><li>Disable it (CC.EN = 0), wait for CSTS.RDY = 0, then re-initialise</li><li>Reuse the firmware's queues</li><li>Issue a Boot Partition read</li><li>Nothing; it is already ready</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The OS cannot trust firmware queue memory; it resets and builds its own.</p></details></li>
+    <li><p>Name the three Boot Partition registers and their roles.</p>
+      <details class="answer"><summary>Model answer</summary><p>BPINFO (size, read status, active partition), BPRSEL (which partition, offset, size — starts the read), BPMBL (host buffer address). Offsets to be confirmed in the specification.</p></details></li>
+    <li><p>Why might legacy BIOS fail to boot an NVMe drive that UEFI boots fine?</p>
+      <details class="answer"><summary>Model answer</summary><p>Legacy BIOS needs an INT 13h option ROM for NVMe; many drives/platforms do not provide one, whereas UEFI firmware includes an NVMe driver.</p></details></li>
+    <li><p>In the abnormal boot trace, why is the first abnormal event a host action?</p>
+      <details class="answer"><summary>Model answer</summary><p>The device behaved within its declared contract (not ready, no fatal status, within CAP.TO); the host gave up early.</p></details></li>
+    <li><p>What PCIe traffic does an NVMe/TCP boot generate between CPU and the boot namespace?</p>
+      <details class="answer"><summary>Model answer</summary><p>None to an NVMe controller — the PCIe link carries NIC traffic; NVMe commands travel inside TCP PDUs on the network.</p></details></li>
+    <li><p>Which configuration-space register exposes an option ROM?</p>
+      <details class="answer"><summary>Model answer</summary><p>The Expansion ROM Base Address Register at offset 30h in a Type 0 header.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> How does a UEFI system boot from an NVMe SSD?</p><details class="answer"><summary>Model answer</summary><p>Firmware enumerates PCIe, its NVMe driver enables the controller and exposes namespaces as block devices, the boot manager finds the ESP on the GPT and runs the loader, which loads the OS.</p></details></li>
+    <li><p><strong>Intermediate:</strong> What are NVMe Boot Partitions for?</p><details class="answer"><summary>Model answer</summary><p>Small dedicated areas readable through a register mechanism without full controller initialisation, for simple boot ROMs; two partitions allow safe updates.</p></details></li>
+    <li><p><strong>Intermediate:</strong> What happens to the controller at OS handoff?</p><details class="answer"><summary>Model answer</summary><p>Firmware stops using it at ExitBootServices; the OS driver disables and re-initialises it with its own queues and interrupts.</p></details></li>
+    <li><p><strong>Advanced:</strong> Explain NVMe/TCP boot and the role of NBFT.</p><details class="answer"><summary>Model answer</summary><p>A firmware NVMe/TCP initiator connects to the target (optionally via discovery), reads the loader, and records host identity, interfaces, and subsystem/namespace information in the NBFT so the OS can reconnect identically.</p></details></li>
+    <li><p><strong>Senior:</strong> Intermittent "no boot device" after power failures across 2% of a fleet. Approach?</p><details class="answer"><summary>Model answer</summary><p>Correlate with unsafe-shutdown counts; capture boot with an analyzer or firmware log to measure time-to-ready; compare to CAP.TO and the firmware timeout; reproduce with power-cut cycles; fix the side violating the contract.</p></details></li>
+    <li><p><strong>Senior:</strong> What would you require in a design review of a diskless NVMe/TCP-booted fleet?</p><details class="answer"><summary>Model answer</summary><p>Redundant discovery/targets and multipath in NBFT; consistent host identity; initramfs support tested; boot-storm capacity on targets; security of boot configuration; fallback/recovery boot path.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>Child:</strong> the night caretaker who fetches the first-day instructions and leaves a note.</li>
+    <li><strong>Junior engineer:</strong> the firmware NVMe init sequence and why the OS resets the controller.</li>
+    <li><strong>Senior engineer:</strong> the two handoffs (controller state, fabric identity) and the timing contract.</li>
+  </ul>
+  <details class="answer"><summary>Model teach-back (senior)</summary><p>Boot is a chain of contracts: the device promises readiness within CAP.TO, the firmware must wait that long and must quiesce DMA before ExitBootServices, the OS must assume nothing about controller state, and for fabric boot the NBFT is the contract that keeps host identity and paths consistent across the firmware/OS boundary.</p></details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>Booting from NVMe means a firmware NVMe driver performs a minimal controller initialisation, reads GPT and ESP from a namespace, and hands off to an OS that re-initialises the controller. Option ROMs matter for legacy and add-in scenarios; UEFI usually has a built-in NVMe driver. Boot Partitions offer a register-driven read path for simple hosts (BPINFO, BPRSEL, BPMBL — confirm their layouts). The NVMe Boot Specification 1.4 standardises pre-OS NVMe-oF boot and the NBFT handoff. Most boot failures are contract violations at a handoff: timeouts shorter than CAP.TO, DMA not quiesced, identity not carried across.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>list the firmware NVMe init sequence with register names and offsets</li>
+      <li>explain Boot Partitions and how a read completes without a CQE</li>
+      <li>draw the NVMe/TCP boot flow including NBFT</li>
+      <li>diagnose the early-timeout trace and name the first abnormal event</li>
+      <li>reconstruct your own system's boot path from <code>efibootmgr</code> and <code>dmesg</code></li>
+      <li>state what to confirm in Base 2.4 and Boot 1.4</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Boot Specification, Revision 1.4</cite></li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Controller Initialization, Boot Partitions, Firmware Commit</cite></li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite>; <cite class="spec">NVMe over TCP Transport Specification, Revision 1.3</cite></li>
+    <li><cite class="spec">UEFI Specification — NVM Express Pass Thru Protocol</cite>; <cite class="spec">ACPI Specification</cite></li>
+    <li><cite class="spec">NVM Express Revision Changes 2026.07.30</cite> — Boot 1.4 changes</li>
+    <li>Course: <a href="dd49.html">Deep-Dive Module 49 — NVMe Boot</a>; <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch65.html">Chapter 65 — NVMe-oF Mental Model</a>, which builds the fabric picture that fabric boot relies on.</p>
+</section>

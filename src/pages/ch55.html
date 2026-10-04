@@ -1,0 +1,819 @@
+<p class="lead">Chapters 44–47 taught you to detect, classify and correlate errors. This chapter is about what happens next: how a platform contains an uncorrectable error before bad data spreads, how it keeps devices from talking around the IOMMU, who handles the error (firmware or the operating system), how hot-plug and containment interact, and how an NVMe SSD is brought back to service — or deliberately removed.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>In a laptop, an uncorrectable PCI Express (PCIe) error usually means a crash or a reboot. In a server running hundreds of virtual machines on dozens of NVMe drives, that is unacceptable: one drive's fatal error must not take down the host, corrupt another tenant's data, or leave the operating system waiting forever for a completion that will never come. The machinery that makes this possible — Downstream Port Containment (DPC), Access Control Services (ACS), firmware-first error handling, hot-plug, and the Linux PCI error recovery framework — is where PCIe errors meet system reliability.</p>
+  <p>It is also where many of the hardest field bugs live, because the failure crosses layers and owners: the SSD, the root port, platform firmware, the kernel's PCIe port driver and the NVMe driver all act in turn, often within a few milliseconds, and each logs a different piece of the story.</p>
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Explain error containment and why simply reporting an uncorrectable error is not enough.</li>
+    <li>Describe DPC: triggers, what the port does to the link, how outstanding requests are completed, and how software releases containment. Explain what the root-port extensions (often called enhanced DPC, eDPC) add.</li>
+    <li>Explain ACS and its controls, and how ACS relates to IOMMU groups, peer-to-peer traffic and isolation.</li>
+    <li>Compare firmware-first and OS-first error handling, including ACPI _OSC negotiation, APEI/GHES, CPER records and Error Disconnect Recover (EDR).</li>
+    <li>Explain how hot-plug (planned and surprise removal) interacts with DPC and AER.</li>
+    <li>Walk through the Linux PCI error recovery callbacks and how the NVMe driver uses them.</li>
+    <li>Read a containment event in a synthetic trace and in kernel logs, and identify the first abnormal event.</li>
+  </ul>
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p><a href="ch45.html">Chapter 45 — PCIe Errors</a> (correctable, non-fatal, fatal; error messages), <a href="ch46.html">Chapter 46 — AER</a> (status, mask, severity, header log), <a href="ch47.html">Chapter 47 — Error Correlation</a>, <a href="ch48.html">Chapter 48 — NVMe Reset</a> and <a href="ch49.html">Chapter 49 — PCIe Reset</a> (FLR, hot reset, secondary bus reset), and <a href="ch20.html">Chapter 20 — DMA</a> for the IOMMU. Deep-dives: <a href="dd18.html">Module 18 — AER</a> and <a href="dd40.html">Module 40 — PCIe Errors</a>.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Imagine a water park with many slides, all fed from one big pipe. One day a slide cracks and starts leaking dirty water. If nobody does anything, the dirty water could flow back into the pipe and into the other slides.</p>
+    <p>So each slide has a valve at the top. The moment a lifeguard sees a crack, they close that slide's valve. The other slides keep running. Then a repair crew fixes the slide, tests it, and opens the valve again. If they cannot fix it, the slide stays closed and the park tells everyone to use another one. And there are also fences between slides, so children cannot cut across from one slide to another without passing the lifeguard.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>In a building, fire doors close automatically when a sensor detects smoke in one section, so the fire cannot spread down the corridor. The building management system logs the alarm; the fire service decides when the doors may reopen. Some buildings call the fire service directly from the alarm panel (the panel handles it first); others let the building manager decide (the manager handles it first). Either way, someone must decide, and the doors must stay closed until they do.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What it hides:</strong> containment in PCIe is not only "stop new traffic." Requests already in flight toward the contained device must still be answered, or the CPU will hang waiting. DPC answers them with synthesized error completions — fire doors do not reply to anyone.</p>
+    <p><strong>Where it misleads:</strong> the "fences" (ACS) are not about errors at all in the first place; they are routing rules that force peer-to-peer traffic through the root complex where the IOMMU can check it. Their error-handling benefit is a consequence of isolation, not their primary purpose. And in PCIe the "repair crew" (the driver) often brings the device back within a second, which is very unlike a cracked slide.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>From <a href="ch45.html">Chapter 45</a> you know PCIe errors are <em>correctable</em> (fixed by hardware, logged only), <em>uncorrectable non-fatal</em> (a transaction failed but the link is fine) or <em>uncorrectable fatal</em> (the link or device can no longer be trusted). Advanced Error Reporting (AER) records them and sends ERR_COR, ERR_NONFATAL or ERR_FATAL messages toward the root complex.</p>
+  <p>Reporting is not the same as stopping damage. Between the moment an SSD sends a corrupted packet and the moment software reacts (microseconds to milliseconds later), more packets can flow. Some of those might carry corrupted data into memory, or the CPU might issue reads that will never complete. <strong>Containment</strong> means: as soon as hardware detects a serious error, it blocks the path so nothing more crosses, answers anything outstanding with an error, and waits for software.</p>
+  <p>The main PCIe containment mechanism is <span class="g" data-term="dpc">Downstream Port Containment</span> (DPC). A downstream port (a root port or a switch downstream port) with DPC enabled reacts to an uncorrectable error from below by taking its link down and holding it down. Everything beneath that port is cut off; everything else in the system keeps running. Software then logs what happened, resets and reinitializes the device, and releases the containment.</p>
+  <p>Three more ideas complete the picture:</p>
+  <ul>
+    <li><strong>Who handles the error:</strong> either the operating system directly (OS-first or "native") or platform firmware first, which then tells the OS (firmware-first).</li>
+    <li><strong>Isolation:</strong> <span class="g" data-term="acs">Access Control Services</span> (ACS) in switches and root ports force traffic between devices to go up through the IOMMU, so one device (or a VM controlling it) cannot reach another directly.</li>
+    <li><strong>Hot-plug:</strong> a device being removed looks, electrically, a lot like a fatal error. The platform must tell the difference, or at least handle both safely.</li>
+  </ul>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>Why containment is needed</h3>
+  <p>Consider an NVMe SSD whose controller has a firmware bug that sends a malformed TLP. Without containment:</p>
+  <ul>
+    <li>The root port logs a Malformed TLP (uncorrectable, fatal by default) and sends an ERR_FATAL indication to the root complex.</li>
+    <li>Meanwhile, the SSD may continue to DMA data (possibly corrupted) into host memory and write completion queue entries saying "success."</li>
+    <li>The CPU may have MMIO reads outstanding to the SSD's BAR (for example the driver reading CSTS). If the SSD stops responding, those reads wait for a Completion Timeout — and on some platforms a timed-out CPU read is itself escalated to a machine check.</li>
+    <li>If the platform's response to ERR_FATAL is a system-wide reset, every other device and VM is lost.</li>
+  </ul>
+  <p>Containment addresses the second and third points directly and makes the fourth unnecessary.</p>
+
+  <h3>Downstream Port Containment (DPC)</h3>
+  <p>DPC is an optional extended capability of downstream ports, added to the PCI Express Base Specification by an engineering change notice in the 3.x era and part of the base specification since. When <strong>triggered</strong>, the port:</p>
+  <ol>
+    <li>Sets <strong>DPC Trigger Status</strong> and records the <strong>DPC Trigger Reason</strong> (and, for some reasons, the <strong>DPC Error Source ID</strong> — the Requester ID of the function that sent the error message).</li>
+    <li>Directs its LTSSM to the <strong>Disabled</strong> state, taking the link down, and keeps it there while Trigger Status is set.</li>
+    <li>Discards TLPs it would otherwise forward downstream, and stops accepting TLPs from below.</li>
+    <li>Completes outstanding and new non-posted requests that target the contained hierarchy with an error completion, either <strong>Unsupported Request</strong> (UR) or <strong>Completer Abort</strong> (CA), as selected by the <strong>DPC Completion Control</strong> setting, so requesters do not hang.</li>
+    <li>Optionally signals a DPC interrupt (MSI/MSI-X) or ERR_COR to software.</li>
+  </ol>
+  <p>Software investigates, then clears DPC Trigger Status (a write-1-to-clear bit). The port leaves Disabled, the link retrains, and the device below can be reinitialized.</p>
+  <table>
+    <caption>DPC trigger conditions (configured in DPC Control)</caption>
+    <thead><tr><th>Trigger</th><th>When</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Unmasked uncorrectable error detected by the port itself</td><td>e.g. Surprise Down, Malformed TLP or Receiver Overflow received from the device</td><td>Subject to the port's AER mask and severity settings and the DPC Trigger Enable choice</td></tr>
+      <tr><td>ERR_FATAL message received from below</td><td>A device below reports a fatal error</td><td>Enabled by "ERR_FATAL" or "ERR_NONFATAL or ERR_FATAL" setting</td></tr>
+      <tr><td>ERR_NONFATAL message received from below</td><td>A device below reports a non-fatal error</td><td>Only with the broader setting; many platforms leave non-fatal to driver recovery</td></tr>
+      <tr><td>Software trigger</td><td>Software sets DPC Software Trigger</td><td>Optional; useful for testing and for deliberate isolation</td></tr>
+      <tr><td>Root port PIO error (root-port extensions)</td><td>A CPU-initiated request (programmed I/O) to the hierarchy fails, e.g. completion timeout or UR</td><td>Only on root ports implementing "RP Extensions for DPC"</td></tr>
+    </tbody>
+  </table>
+  <p><span class="badge verified">Verified</span> as the structure of the DPC capability; the exact encodings of DPC Trigger Enable, Trigger Reason and Completion Control should be read from the DPC Extended Capability description in the base specification.</p>
+
+  <h3>Root-port extensions ("eDPC")</h3>
+  <p>The term <span class="g" data-term="edpc">eDPC</span> (enhanced DPC) is widely used for the <strong>Root Port Extensions for DPC</strong>. They add <strong>RP PIO</strong> (Root Port Programmed I/O) error handling: when a CPU load or store to the contained hierarchy fails (a completion timeout, UR or CA on a CPU-originated request), the root port can log it in RP PIO status, header log and related registers and trigger DPC, and can synthesize a completion so the CPU does not stall. Without these extensions, a CPU read that times out may surface as an uncontained machine check on some platforms. The extensions also report "DPC RP Busy" while the port is still completing its containment work, so software knows when it is safe to release. <span class="badge impl">Implementation-dependent</span>: what the CPU actually receives for a synthesized error completion on a read (typically all-ones data) and whether a machine check is raised are platform behaviours.</p>
+  <aside class="callout insight" data-title="All-ones is the universal symptom">
+    <p>When a device is contained, removed, or dead, CPU reads to its BAR return all ones: 0xFFFFFFFF. The NVMe driver reading CSTS sees 0xFFFFFFFF — CSTS.RDY = 1 and CSTS.CFS = 1 at the same time, which is nonsense for a live controller. Linux treats CSTS = all-ones as "controller is gone." Learn to spot 0xFFFFFFFF in any register dump as "the path to the device is broken," not as a register value.</p>
+  </aside>
+
+  <h3>Poisoned TLPs and egress blocking</h3>
+  <p>A TLP with the EP (poisoned) bit set carries data known to be bad. The receiver logs a Poisoned TLP Received error. By default, the poisoned data can still be forwarded (for example, a switch passes it on). DPC adds an optional <strong>Poisoned TLP Egress Blocking</strong> feature: the downstream port can refuse to transmit poisoned TLPs to the device below, logging the event, so known-bad data never reaches a device that might not check poison. This is containment of data, not of the link.</p>
+
+  <h3>Access Control Services (ACS)</h3>
+  <p>ACS is an extended capability of switch downstream ports, root ports and multi-function devices that controls how requests are routed between peers. Its controls, by name, are:</p>
+  <table>
+    <caption>ACS controls</caption>
+    <thead><tr><th>Control</th><th>Effect</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>Source Validation</td><td>The port checks that a request's Requester ID bus number belongs to the hierarchy below it</td><td>Stops a device from spoofing another device's Requester ID (the IOMMU trusts the ID)</td></tr>
+      <tr><td>Translation Blocking</td><td>Blocks requests that claim to carry already-translated addresses (Address Type = translated)</td><td>Stops a device bypassing the IOMMU with pre-translated addresses unless ATS is explicitly trusted</td></tr>
+      <tr><td>P2P Request Redirect</td><td>Requests from one downstream port to a peer are sent upstream instead of directly across the switch</td><td>Forces peer-to-peer traffic through the root complex and IOMMU</td></tr>
+      <tr><td>P2P Completion Redirect</td><td>Same for completions</td><td>Keeps completion routing consistent with request redirect</td></tr>
+      <tr><td>Upstream Forwarding</td><td>Redirected requests are forwarded upstream</td><td>Required for redirect to work</td></tr>
+      <tr><td>P2P Egress Control</td><td>Fine-grained per-port blocking of peer traffic via an egress control vector</td><td>Selective isolation</td></tr>
+      <tr><td>Direct Translated P2P</td><td>Allows requests with translated addresses to go directly peer-to-peer</td><td>Performance path for trusted ATS devices</td></tr>
+    </tbody>
+  </table>
+  <p>Linux builds <strong>IOMMU groups</strong> from this information: devices that can reach each other without going through the IOMMU must be in the same group, and a group is the smallest unit that can be assigned to a VM. A switch without ACS puts all devices below it into one group. A request that violates an enabled ACS rule is blocked and logged as an <strong>ACS Violation</strong>, an uncorrectable error reported through AER, which may in turn trigger DPC.</p>
+  <aside class="callout warn">
+    <p>ACS and peer-to-peer DMA pull in opposite directions. NVMe peer-to-peer (for example, a GPU or NIC reading directly from an SSD's Controller Memory Buffer) is fastest with redirect disabled; secure multi-tenant isolation needs it enabled. This is a policy decision with security consequences, not a tuning knob. Kernel parameters that override ACS checks to split IOMMU groups remove isolation and should never be used where tenants do not trust each other.</p>
+  </aside>
+
+  <h3>Firmware-first versus OS-first</h3>
+  <p>Who receives and handles AER and DPC events is negotiated at boot between platform firmware and the operating system.</p>
+  <table>
+    <caption>Two models of error handling</caption>
+    <thead><tr><th></th><th>OS-first ("native")</th><th>Firmware-first</th></tr></thead>
+    <tbody>
+      <tr><td>Who owns AER/DPC registers</td><td>The OS, after firmware grants control through the ACPI <code>_OSC</code> method</td><td>Platform firmware (BIOS/UEFI, often in System Management Mode, or a baseboard management controller)</td></tr>
+      <tr><td>Who is interrupted first</td><td>The OS's PCIe port driver (AER/DPC interrupt)</td><td>Firmware (platform-specific error signal)</td></tr>
+      <tr><td>How the OS learns of it</td><td>Reads AER/DPC registers directly</td><td>Firmware writes a Common Platform Error Record (CPER) and notifies the OS through ACPI Platform Error Interfaces (APEI) — a Generic Hardware Error Source (GHES) described in the Hardware Error Source Table (HEST)</td></tr>
+      <tr><td>Who performs DPC recovery</td><td>The OS</td><td>Firmware contains; then, with Error Disconnect Recover (EDR), firmware notifies the OS to perform device recovery and tells it when to release</td></tr>
+      <tr><td>Strengths</td><td>Fast, transparent, full register access for debugging</td><td>Platform-wide policy, consistent logs across OSes, BMC visibility, handling of errors the OS cannot see</td></tr>
+      <tr><td>Weaknesses</td><td>Platform loses central visibility</td><td>Extra latency; the OS sees a summary, sometimes without full header logs; bugs in firmware become invisible</td></tr>
+    </tbody>
+  </table>
+  <p>The <code>_OSC</code> negotiation covers several PCIe features independently, including native hot-plug, AER, PME, the PCIe capability structure, LTR and DPC. The rules for EDR and the DPC-related <code>_OSC</code> bits are in the <cite class="spec">PCI Firmware Specification</cite> (PCI-SIG) together with the <cite class="spec">ACPI Specification</cite>; CPER formats are defined in the <cite class="spec">UEFI Specification — Common Platform Error Record appendix</cite>.</p>
+  <aside class="callout linux">
+    <p>Linux logs which features it was granted at boot, in lines like "acpi PNP0A08:00: _OSC: OS now controls [PCIeHotplug SHPCHotplug PME AER PCIeCapability LTR DPC]". If AER or DPC is missing from that list, the OS is not handling those errors natively and you must look for firmware-first logs (lines beginning with "[Hardware Error]" from the GHES driver, and the BMC's event log).</p>
+  </aside>
+
+  <h3>Hot-plug interactions</h3>
+  <p>PCIe hot-plug lets a device be added or removed while the system runs. Two kinds of removal matter:</p>
+  <ul>
+    <li><strong>Orderly removal:</strong> the operator requests removal (attention button, management command or software), the OS unbinds the driver, powers down the slot, then the device is pulled. No errors occur.</li>
+    <li><strong>Surprise removal:</strong> the device is pulled, or fails, with no warning. The link goes down. The downstream port detects a <strong>Surprise Down</strong> uncorrectable error (if it reports it) and the hot-plug controller sees Presence Detect Changed and/or Data Link Layer State Changed.</li>
+  </ul>
+  <p>Surprise Down is also a DPC trigger. On a port with both hot-plug and DPC, a surprise removal can therefore raise <em>two</em> responses: the hot-plug driver wants to remove the device's software state, while the DPC driver wants to recover it. Platforms and kernels coordinate these: a common approach is that the hot-plug driver ignores link-down/link-up events that DPC caused and recovered from, and handles removal only when the device is really gone (presence lost or recovery fails). Some platforms mask Surprise Down for DPC on hot-plug-capable slots. <span class="badge impl">Implementation-dependent</span>: Linux behaviour has changed across kernel versions; check your kernel's <code>pciehp</code> and <code>dpc</code> drivers.</p>
+  <aside class="callout debug">
+    <p>For NVMe in hot-plug bays (U.2, U.3, E3.S), the classic confusion is "the drive reset itself" versus "the drive was removed and re-inserted" versus "DPC contained and recovered it." All three produce a link down and up. The distinguishing evidence: presence-detect events (removal), DPC Trigger Status and Reason (containment), and NVMe controller-level resets without any PCIe link event (NVMe reset only).</p>
+  </aside>
+
+  <h3>The Linux PCI error recovery framework</h3>
+  <p>When the OS handles an uncorrectable error natively, the PCIe port driver runs a recovery procedure across all devices below the affected port, calling each driver's <code>struct pci_error_handlers</code> callbacks:</p>
+  <table>
+    <caption>Recovery callbacks (from the kernel's PCI error recovery documentation)</caption>
+    <thead><tr><th>Callback</th><th>Called when</th><th>Driver's job</th><th>Return</th></tr></thead>
+    <tbody>
+      <tr><td><code>error_detected()</code></td><td>Error reported; link may be down</td><td>Stop issuing I/O; do not touch the device if the channel is frozen</td><td>CAN_RECOVER, NEED_RESET or DISCONNECT</td></tr>
+      <tr><td><code>mmio_enabled()</code></td><td>Non-fatal, MMIO works again</td><td>Inspect device, collect state</td><td>RECOVERED or NEED_RESET</td></tr>
+      <tr><td><code>slot_reset()</code></td><td>After link/slot reset (or DPC release)</td><td>Reinitialize the device from scratch</td><td>RECOVERED or DISCONNECT</td></tr>
+      <tr><td><code>resume()</code></td><td>Recovery succeeded</td><td>Restart I/O</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p>For a fatal error, the framework resets the link (a secondary bus reset of the port, or a DPC release that retrains the link). For DPC, containment has already taken the link down, so the "reset" is the DPC release. If any driver returns DISCONNECT, or the device does not come back, the device is removed from the system.</p>
+  <p>The NVMe PCIe driver implements these callbacks: on <code>error_detected</code> it quiesces queues and (for a frozen channel) prepares to disable the controller; on <code>slot_reset</code> it restores PCI state and schedules a controller reset (the NVMe reset sequence of <a href="ch48.html">Chapter 48</a>: CC.EN = 0, wait CSTS.RDY = 0, reconfigure admin queue, CC.EN = 1, recreate I/O queues); on <code>resume</code> it restarts I/O. Commands that were in flight are retried or failed according to the block layer's policy and the NVMe driver's retry rules. <span class="badge impl">Implementation-dependent</span> on kernel version.</p>
+
+  <h3>Recovery flows compared</h3>
+  <table>
+    <caption>From error to service</caption>
+    <thead><tr><th>Event</th><th>Containment</th><th>Reset used</th><th>NVMe outcome</th></tr></thead>
+    <tbody>
+      <tr><td>Correctable error</td><td>None needed</td><td>None</td><td>Invisible; counters increment</td></tr>
+      <tr><td>Non-fatal, e.g. Completion Timeout on one SSD read</td><td>Usually none (DPC only if configured for non-fatal)</td><td>Often none; driver decides</td><td>Affected command may fail or retry; NVMe timeout handler may reset the controller</td></tr>
+      <tr><td>Fatal, DPC disabled</td><td>None — errors may propagate</td><td>Secondary bus reset by the OS (or platform reset)</td><td>Controller reset; in-flight I/O retried; risk of corrupted data before reset</td></tr>
+      <tr><td>Fatal, DPC enabled</td><td>Link disabled immediately</td><td>DPC release (link retrain)</td><td>Controller reset; in-flight I/O retried; MMIO returned all-ones in the meantime</td></tr>
+      <tr><td>Surprise removal</td><td>DPC (if enabled) plus hot-plug</td><td>None — device gone</td><td>Namespaces removed; I/O failed; multipath fails over if configured</td></tr>
+      <tr><td>Recovery fails</td><td>Link stays down</td><td>—</td><td>Device removed from the system ("dead" controller)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The central concept on the ladder</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>When a slide cracks, the lifeguard closes its valve at once so dirty water does not spread; the repair crew fixes it and reopens it.</p></div>
+    <div class="rung" data-rung="B"><p>On an uncorrectable error, the downstream port shuts the link, answers waiting requests with errors, and waits for software to recover the device and release the link.</p></div>
+    <div class="rung" data-rung="C"><p>The DPC capability in a root port or switch downstream port: trigger logic tied to AER, LTSSM forced to Disabled, synthesized completions for pending requests, status and source-ID registers, optional RP PIO logging.</p></div>
+    <div class="rung" data-rung="D"><p>The PCI Express Base Specification defines the DPC Extended Capability (control, status, error source ID, RP PIO registers), ACS, AER, Surprise Down and hot-plug; the PCI Firmware Specification and ACPI define _OSC and EDR.</p></div>
+    <div class="rung" data-rung="E"><p>An ERR_FATAL message or a detected error at the port; then the link drops (electrical idle); CPU requests to the hierarchy get UR/CA completions synthesized by the port; later TS1s as the link retrains after release.</p></div>
+    <div class="rung" data-rung="F"><p>An analyzer on the SSD link sees the triggering TLP or message, then the link go to electrical idle with no further DLLPs; minutes or milliseconds later, a full retrain. An analyzer above the port sees nothing unusual except UR completions.</p></div>
+    <div class="rung" data-rung="G"><p>Read DPC Trigger Reason and Source ID, then the AER logs of the source device, then the header log to find the offending TLP; correlate with the NVMe driver's reset messages and I/O errors.</p></div>
+  </div>
+
+  <h3>The 16 questions, for DPC</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>A downstream-port feature that disables the link to a hierarchy when an uncorrectable error occurs, and holds it down until software releases it.</dd>
+    <dt>2. Why was it created?</dt><dd>To stop errors and corrupted data from spreading, and to avoid system-wide resets for one bad device.</dd>
+    <dt>3. What problem does it solve?</dt><dd>The window between error detection and software response, during which bad data and hung requests can propagate.</dd>
+    <dt>4. What existed before?</dt><dd>AER reporting plus software-initiated secondary bus reset, or a full platform reset; no hardware containment.</dd>
+    <dt>5. Why is it better?</dt><dd>It acts in hardware immediately, keeps the rest of the system running, and gives a clean, defined state to recover from.</dd>
+    <dt>6. Who creates it?</dt><dd>The downstream port's hardware triggers it; software enables and configures it.</dd>
+    <dt>7. Who consumes it?</dt><dd>The OS DPC driver (OS-first) or platform firmware (firmware-first, with EDR to the OS).</dd>
+    <dt>8. Where does it live?</dt><dd>In root ports and switch downstream ports, as an extended capability.</dd>
+    <dt>9. Registers?</dt><dd>DPC Capability, Control, Status, Error Source ID; RP PIO status, mask, severity, header log (with root-port extensions); related AER registers.</dd>
+    <dt>10. Before it?</dt><dd>An uncorrectable error is detected or reported, and passes masking/severity checks.</dd>
+    <dt>11. After it?</dt><dd>Software logs, resets the hierarchy's drivers, clears Trigger Status; link retrains; devices reinitialize.</dd>
+    <dt>12. If it is wrong?</dt><dd>Too aggressive: unnecessary device outages. Disabled or misconfigured: errors propagate, CPU hangs, platform resets. Poor coordination with hot-plug: devices removed instead of recovered.</dd>
+    <dt>13. Analyzer shows?</dt><dd>Triggering TLP/message, then link to electrical idle, later retraining.</dd>
+    <dt>14. Linux shows?</dt><dd>DPC containment messages from the port driver, AER logs, NVMe reset or removal messages.</dd>
+    <dt>15. Validation tests?</dt><dd>Error injection for each trigger reason, outstanding-request completion behaviour, release and recovery timing, interaction with hot-plug, firmware-first EDR flow.</dd>
+    <dt>16. Senior suspects?</dt><dd>The device's first error (from AER header logs), signal integrity behind Surprise Down, and hot-plug/DPC coordination bugs when devices disappear instead of recovering.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <figure>
+    <pre class="diagram">
+                    CPU / memory / IOMMU
+                            |
+                     Root Complex
+          +-----------------+------------------+
+          |                                    |
+   Root port 00:01.1 [DPC][AER][ACS]     Root port 00:01.2 [DPC]
+          |                                    |
+     (link to switch)                      NVMe SSD B
+          |
+   PCIe switch  upstream port
+     +----+-----------+-------------+
+     |                |             |
+   DSP [DPC][ACS]  DSP [DPC][ACS]  DSP [DPC][ACS]
+     |                |             |
+  Lab SSD 01:00.0   NVMe SSD C     NIC
+  (error source)
+
+  DPC at the switch DSP above Lab SSD contains only Lab SSD.
+  DPC at root port 00:01.1 would contain the switch AND all three devices.
+  ACS on the switch DSPs forces SSD C -> NIC traffic up through the root complex.
+    </pre>
+    <figcaption>Where containment and isolation act — a synthetic variant of the course lab system with a switch inserted (elsewhere in this chapter the Lab SSD sits directly below root port 00:01.1). The closest DPC-capable port above the failing device gives the smallest blast radius.</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Blast radius</strong> is decided by which port triggers. A platform that only enables DPC at root ports loses the whole switch hierarchy on any error below it.</li>
+    <li><strong>Endpoints do not implement DPC.</strong> The SSD's role is only to report errors correctly and to recover cleanly after reset.</li>
+    <li><strong>Synthesized completions</strong> are generated by the port itself, with the port as completer; the Requester ID and Tag match the original request so the requester can retire it.</li>
+    <li><strong>Hot-plug slot hardware</strong> (presence detect, power controller, attention button, indicators) lives in the downstream port's Slot Capabilities/Control/Status registers, alongside DPC.</li>
+  </ul>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>The relevant documents are the <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Downstream Port Containment; Access Control Services; Advanced Error Reporting; Error Signaling and Logging; Hot-Plug Support</cite>, the <cite class="spec">PCI Firmware Specification — _OSC and Error Disconnect Recover</cite>, the <cite class="spec">ACPI Specification — Platform Error Interfaces (APEI)</cite>, and the <cite class="spec">UEFI Specification — Common Platform Error Record</cite>. On the NVMe side, the <cite class="spec">NVMe Base Specification 2.4 — Controller Reset and Controller Fatal Status</cite> and the <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite> describe how the controller behaves across PCIe resets.</p>
+  <aside class="callout verified">
+    <p><strong>What is verified?</strong> DPC is an optional extended capability of downstream ports; when triggered it disables the link and holds it down until software clears DPC Trigger Status; outstanding requests are completed with UR or CA per DPC Completion Control; root-port extensions add RP PIO logging; ACS controls listed above exist and violations are reported as ACS Violation; Surprise Down is an uncorrectable error; _OSC negotiates OS control of AER, DPC and hot-plug; CPER is the firmware-first record format.</p>
+  </aside>
+  <aside class="callout derived">
+    <p><strong>What is derived?</strong> The blast-radius reasoning, the recovery-flow comparison table, and the diagnostic order (trigger reason → source → header log → device history).</p>
+  </aside>
+  <aside class="callout impl">
+    <p><strong>What is implementation-dependent?</strong> Which ports implement DPC; which triggers platforms enable; whether Surprise Down is masked on hot-plug slots; firmware-first vs OS-first policy; what a CPU sees for a synthesized error completion (all-ones, machine check, or both); Linux recovery behaviour by kernel version; NVMe driver retry policy.</p>
+  </aside>
+  <aside class="callout version">
+    <p><strong>What is version-dependent?</strong> DPC entered via an ECN in the 3.x era; EDR was added to the PCI Firmware Specification later; Linux DPC, EDR and hot-plug coordination evolved over many kernel releases. Flit mode (6.0+) changes error-detection details at the link level but not the DPC concept.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p><strong>What must be checked in the specification?</strong> DPC Trigger Enable and Trigger Reason encodings; RP PIO register layout; timing requirements after clearing Trigger Status before configuration accesses are allowed; ACS capability presence rules for multi-function devices; EDR handshake details.</p>
+    <p><strong>What the specification does not say:</strong> which errors a platform <em>should</em> contain; how an OS should retry I/O; how NVMe namespaces should be presented to applications during recovery.</p>
+  </aside>
+  <aside class="callout warn">
+    <p><strong>What should never be assumed?</strong> That DPC is enabled because the capability exists; that the OS owns AER (check _OSC); that a device that came back after DPC is healthy; that all-ones data from a register is a real register value; that ACS is enabled in every switch.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <figure>
+    <ol class="seq" data-actors="CPU / driver|Root port (DPC)|Lab SSD">
+      <li data-from="Lab SSD" data-to="Root port (DPC)" class="bad">MWr 512 B (exceeds MPS)</li>
+      <li data-note="Root port (DPC)">Malformed TLP: AER log; DPC trigger</li>
+      <li data-note="Root port (DPC)|Lab SSD">link → Disabled (electrical idle)</li>
+      <li data-from="CPU / driver" data-to="Root port (DPC)">MRd CSTS (BAR0+0x1C)</li>
+      <li data-from="Root port (DPC)" data-to="CPU / driver" class="dashed bad">synthesized Cpl UR → all-ones</li>
+      <li data-from="Root port (DPC)" data-to="CPU / driver">DPC interrupt</li>
+      <li data-note="CPU / driver">error_detected(): quiesce NVMe</li>
+      <li data-from="CPU / driver" data-to="Root port (DPC)">clear DPC Trigger Status</li>
+      <li data-note="Root port (DPC)|Lab SSD">link retrains to L0</li>
+      <li data-from="CPU / driver" data-to="Lab SSD">slot_reset(): restore config, CC.EN=0/1</li>
+      <li data-from="Lab SSD" data-to="CPU / driver" class="dashed">CSTS.RDY=1; queues recreated</li>
+    </ol>
+    <figcaption>Conceptual DPC containment and recovery for the Lab SSD (OS-first). The synthesized completion never crosses the SSD's link.</figcaption>
+  </figure>
+  <p>Protocol facts to keep in mind:</p>
+  <ul>
+    <li>The error message (ERR_FATAL/ERR_NONFATAL) travels upstream as a Message TLP; DPC can trigger on receiving it at the downstream port.</li>
+    <li>After triggering, <em>nothing</em> crosses the contained link. Any requests the CPU sends are answered by the port, not the device.</li>
+    <li>Posted writes from the CPU to the contained device (doorbells) are silently dropped. The driver cannot tell from the write itself that it was lost.</li>
+    <li>Recovery involves configuration requests (restore BARs, command register, MSI-X) before any MMIO, and the NVMe controller reset follows.</li>
+    <li>With firmware-first, the same hardware events occur, but the first software actor is firmware, and the OS acts on an EDR notification or a GHES record.</li>
+  </ul>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>All traces are <strong>synthetic examples for teaching</strong> on the lab system: Lab SSD 01:00.0 directly below root port 00:01.1, which implements DPC with root-port extensions; Gen4 x4; MPS 256 bytes. Times are illustrative.</p>
+
+  <h3>Trace 1 — normal: a correctable error, no containment</h3>
+  <div class="trace" data-kind="synthetic" data-title="Correctable Bad TLP with replay; DPC not involved">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MWr64</td><td>RID=0x0100 Addr=0x2_0040_0000 Len=64 Seq=0x112 (LCRC bad)</td><td>Corrupted on the wire</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>90</td><td>NAK</td><td>Seq=0x111</td><td>Root port requests replay</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>160</td><td>MWr64</td><td>Seq=0x112 (good)</td><td>Replay succeeds</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host (internal)</td><td>200</td><td>AER</td><td>Correctable: Bad TLP</td><td>Root port logs correctable error; ERR_COR to RC (if enabled)</td></tr>
+      </tbody>
+    </table>
+    <p>Correctable errors never trigger DPC. The only visible effect is a counter increment and, perhaps, a rate-limited kernel log line. If these become frequent, revisit <a href="ch54.html">Chapter 54</a>.</p>
+  </div>
+
+  <h3>Trace 2 — abnormal: Malformed TLP triggers DPC; recovery succeeds</h3>
+  <div class="trace" data-kind="synthetic" data-title="SSD firmware sends an oversized MWr; root port contains and recovers">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>RC Addr=BAR0+0x1008 Data=0x00000031</td><td>SQ1 tail doorbell</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.9</td><td>MRd64</td><td>RID=0x0100 Addr=0x1_2340_0C00 Len=16 Tag=0x0F</td><td>Fetch SQE (READ, 128 KiB)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.6</td><td>CplD</td><td>Tag=0x0F Len=16 SC</td><td>SQE returned</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>48.2</td><td>MWr64</td><td>Addr=0x2_0040_0000 Len=64 (256 B)</td><td>Normal data write</td></tr>
+        <tr class="abnormal"><td>5</td><td>Dev→Host</td><td>48.3</td><td>MWr64</td><td>Addr=0x2_0040_0100 Len=128 (512 B) Tag=0x0F</td><td><strong>First abnormal event:</strong> payload 512 B exceeds MPS 256 B → Malformed TLP at the root port</td></tr>
+        <tr class="note"><td colspan="6">Root port: AER Uncorrectable Status bit 18 (Malformed TLP), header logged = 60000080 01000FFF 00000002 00400100 (illustrative). DPC triggers: reason "unmasked uncorrectable error". Link → Disabled.</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>48.4</td><td>(electrical idle)</td><td>No TS, no DLLPs</td><td>The analyzer on the SSD link sees the link drop</td></tr>
+        <tr class="note"><td colspan="6">CPU (driver) reads CSTS at BAR0+0x1C; the root port synthesizes a UR completion upstream; driver reads 0xFFFFFFFF. Not visible on the SSD link.</td></tr>
+        <tr class="note"><td colspan="6">≈ 320 ms later: software clears DPC Trigger Status. Link trains (Detect → Polling → Configuration → L0 at 2.5 GT/s → equalization → 16 GT/s).</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>~331 000</td><td>CfgWr0</td><td>Restore BAR0, Command (Memory Space, Bus Master)</td><td>slot_reset(): PCI state restored</td></tr>
+        <tr class="dir-down"><td>8</td><td>Host→Dev</td><td>~331 200</td><td>MWr32</td><td>BAR0+0x14 CC.EN=1 (after admin queue setup)</td><td>NVMe controller enable</td></tr>
+        <tr class="dir-down"><td>9</td><td>Host→Dev</td><td>~332 000</td><td>MRd32</td><td>BAR0+0x1C</td><td>Poll CSTS</td></tr>
+        <tr class="dir-up"><td>10</td><td>Dev→Host</td><td>~332 001</td><td>CplD</td><td>Data=0x00000001</td><td>CSTS.RDY=1: controller back</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning:</strong> the first abnormal event is #5 — the SSD violated MPS. Everything after is the platform working as designed: containment, all-ones reads, recovery. The bug is in the SSD (it ignored the Max Payload Size programmed in its Device Control register). Evidence chain: AER header log at the root port decodes to an MWr with Length 128 DW from Requester 0x0100; Device Control on the SSD shows MPS 256; therefore the SSD sent an illegal TLP. Corrective action belongs to SSD firmware; the regression test injects MPS = 128 and 256 configurations and checks every MWr length.</p>
+  </div>
+
+  <h3>Trace 3 — abnormal: firmware-first Completion Timeout</h3>
+  <div class="trace" data-kind="synthetic" data-title="Firmware-first: CPER record for a Completion Timeout at the root port">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ms)</th><th>Event</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0.000</td><td>MRd64</td><td>RID=0x0100 Addr=0x2_9000_0000 Len=128 Tag=0x52</td><td>SSD fetches write data</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>0.002</td><td>MRd32</td><td>RC Addr=BAR0+0x1C Tag=0x07</td><td>Driver polls CSTS</td></tr>
+        <tr class="abnormal"><td>3</td><td>—</td><td>0.002 → 50</td><td>(no completion for RC Tag 0x07)</td><td>SSD stops responding to MMIO; link still in L0; UpdateFCs continue</td><td><strong>First abnormal event:</strong> the SSD's front end hangs; the RC's request is outstanding</td></tr>
+        <tr class="note"><td colspan="6">Root port: Completion Timeout on a CPU-originated request (RP PIO). Firmware-first platform: error signalled to firmware, which logs CPER and notifies the OS through GHES.</td></tr>
+        <tr class="note"><td colspan="6">OS log (illustrative): "[Hardware Error]: event severity: recoverable … section_type: PCIe error … device_id: 0000:00:01.1 … aer_uncor_status: 0x00004000" (bit 14 = Completion Timeout).</td></tr>
+        <tr class="note"><td colspan="6">Firmware triggered DPC and sent an EDR notification; OS performed recovery; NVMe controller reset.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning:</strong> the link-level evidence shows a <em>healthy link</em> (UpdateFCs continue, no errors) with an unresponsive device — this is a device hang, not a channel problem. The OS log names the <em>root port</em> as the device (it detected the timeout), not the SSD; a junior engineer often blames the root port. The firmware-first record may omit the TLP header; the analyzer capture supplies the missing request (RC Tag 0x07 to CSTS).</p>
+  </div>
+
+  <h3>Trace 4 — ambiguous: link down in a hot-plug bay</h3>
+  <div class="trace" data-kind="synthetic" data-title="Link down on a U.2 bay — removal, containment, or both?">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ms)</th><th>Event</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MWr64 stream</td><td>Normal</td><td>I/O in progress</td></tr>
+        <tr class="abnormal"><td>2</td><td>—</td><td>3.1</td><td>Link lost</td><td>Electrical idle on all lanes, no Recovery attempt captured</td><td><strong>First abnormal event:</strong> abrupt loss of the link</td></tr>
+        <tr class="note"><td colspan="6">Root port: Surprise Down Error → DPC trigger. Slot Status: Data Link Layer State Changed set; Presence Detect State still = present.</td></tr>
+        <tr class="note"><td colspan="6">After DPC release: link retrains, device enumerates; recovery succeeds. 14 minutes later the same again.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning:</strong> presence remained asserted, so the drive was not removed. An abrupt loss with no Recovery attempt suggests power loss to the drive (its own power fault, or a backplane power glitch) or a contact problem, rather than slowly degrading signal integrity (which usually shows correctable errors and Recovery entries first). Evidence is ambiguous between "SSD reset itself internally" and "power or connector intermittent"; next steps: SSD's NVMe logs after recovery (Unsafe Shutdowns incrementing in the SMART log suggests power loss — see <a href="ch57.html">Chapter 57</a>), backplane power telemetry, and moving the drive.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>All commands are read-only, <span class="badge safe">Safe lab</span>. Message formats vary by kernel version; the examples are illustrative.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Who owns AER/DPC/hot-plug: firmware or the OS?</span>
+sudo dmesg | grep -i '_OSC'
+
+<span class="cm"># Does the root port implement DPC, and is it enabled? (lspci decodes the capability)</span>
+sudo lspci -vvv -s 00:01.1 | grep -A6 'Downstream Port Containment'
+
+<span class="cm"># ACS capability and control on root ports / switch downstream ports</span>
+sudo lspci -vvv | grep -E '^[0-9a-f]|ACSCap|ACSCtl'
+
+<span class="cm"># IOMMU groups: which devices share a group (ACS determines this)</span>
+for g in /sys/kernel/iommu_groups/*; do echo "group ${g##*/}: $(ls $g/devices)"; done
+
+<span class="cm"># Hot-plug slot capabilities and status</span>
+sudo lspci -vvv -s 00:01.1 | grep -E 'SltCap|SltCtl|SltSta'
+
+<span class="cm"># Containment, AER, firmware-first and NVMe recovery messages</span>
+sudo dmesg | grep -iE 'DPC|AER|Hardware Error|pciehp|nvme'
+
+<span class="cm"># Per-device AER statistics</span>
+grep . /sys/bus/pci/devices/0000:00:01.1/aer_* 2&gt;/dev/null</code></pre>
+  <p>Illustrative lines you might see (do not treat the numbers as real):</p>
+  <pre class="code" data-kind="read-only" data-lang="text"><code>pcieport 0000:00:01.1: DPC: containment event, status:0x0001 source:0x0000
+pcieport 0000:00:01.1: DPC: unmasked uncorrectable error detected
+nvme nvme0: frozen state error detected, reset controller
+pcieport 0000:00:01.1: AER: device recovery successful
+nvme nvme0: controller is down; will reset: CSTS=0xffffffff, PCI_STATUS=0xffff</code></pre>
+  <table>
+    <caption>What each source can and cannot prove</caption>
+    <thead><tr><th>Evidence</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>_OSC line</td><td>Which features the OS controls</td><td>That firmware handles errors correctly</td></tr>
+      <tr><td>DPC containment message</td><td>Containment happened at that port, with a reason</td><td>Which TLP caused it (see AER header log) or why the device misbehaved</td></tr>
+      <tr><td>AER header log</td><td>The first offending TLP's header as received</td><td>Whether that TLP was corrupted on the wire or sent that way (check for LCRC/correctable history)</td></tr>
+      <tr><td>CSTS=0xffffffff</td><td>The driver could not reach the controller</td><td>That the controller failed (it may be contained, removed or powered off)</td></tr>
+      <tr><td>"[Hardware Error]" CPER lines</td><td>Firmware saw and classified an error</td><td>Full detail; some fields may be summarized or missing</td></tr>
+      <tr><td>IOMMU groups</td><td>Which devices the kernel considers isolatable</td><td>That ACS is enabled at runtime in every port (check ACSCtl)</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout safety">
+    <p>Do not inject errors, trigger DPC by software, or toggle ACS on a production system. Error injection (for example through the kernel's AER injection facility or a platform's EINJ interface) is an <span class="badge expert">Expert lab</span> activity for test machines, with data backed up, because it can remove devices or reset the platform.</p>
+  </aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <h3>Containment timeline builder (runnable)</h3>
+  <p>This script turns kernel log lines into a layered timeline and decodes the unmasked AER uncorrectable bits. It is <strong>executable</strong> with the standard library; the embedded log is synthetic. You can pass a saved <code>dmesg</code> text file instead.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="dpc_timeline.py"><code>#!/usr/bin/env python3
+"""dpc_timeline.py - build a layered timeline from kernel log lines around a
+containment event, decode the AER Uncorrectable Error Status value, and name
+the first abnormal event.  The embedded log is SYNTHETIC (teaching example);
+line formats imitate recent Linux kernels but vary between versions.
+Usage: python3 dpc_timeline.py            (uses the embedded sample)
+       python3 dpc_timeline.py dmesg.txt  (your own saved 'dmesg -T' or 'dmesg' text)
+"""
+import re
+import sys
+
+# AER Uncorrectable Error Status bits (PCIe Base Spec, AER capability).
+UNCOR_BITS = {
+    4: "Data Link Protocol Error", 5: "Surprise Down Error",
+    12: "Poisoned TLP Received", 13: "Flow Control Protocol Error",
+    14: "Completion Timeout", 15: "Completer Abort",
+    16: "Unexpected Completion", 17: "Receiver Overflow",
+    18: "Malformed TLP", 19: "ECRC Error", 20: "Unsupported Request",
+    21: "ACS Violation", 22: "Uncorrectable Internal Error",
+    23: "MC Blocked TLP", 24: "AtomicOp Egress Blocked",
+    25: "TLP Prefix Blocked", 26: "Poisoned TLP Egress Blocked",
+}
+
+SAMPLE = """\
+[ 8811.402113] pcieport 0000:00:01.1: DPC: containment event, status:0x0001 source:0x0000
+[ 8811.402120] pcieport 0000:00:01.1: DPC: unmasked uncorrectable error detected
+[ 8811.402131] pcieport 0000:00:01.1: PCIe Bus Error: severity=Uncorrected (Fatal), type=Transaction Layer, (Receiver ID)
+[ 8811.402135] pcieport 0000:00:01.1:   device [1234:5678] error status/mask=00040000/00000000
+[ 8811.402139] pcieport 0000:00:01.1:    [18] MalfTLP                (First)
+[ 8811.402150] pcieport 0000:00:01.1: AER:   TLP Header: 60000080 01000fff 00000002 00400000
+[ 8811.402203] nvme nvme0: frozen state error detected, reset controller
+[ 8811.731880] pcieport 0000:00:01.1: pciehp: Slot(1): Link Down/Up ignored (recovered by DPC)
+[ 8811.912447] nvme nvme0: 32/0/0 default/read/poll queues
+[ 8811.913002] pcieport 0000:00:01.1: AER: device recovery successful
+"""
+
+RULES = [  # (regex, layer, label, abnormal?)
+    (r"DPC: containment event", "PCIe/DPC", "link contained by downstream port", True),
+    (r"DPC: .*error detected", "PCIe/DPC", "DPC trigger reason", False),
+    (r"PCIe Bus Error", "PCIe/AER", "uncorrectable error logged", False),
+    (r"error status/mask=", "PCIe/AER", "AER status register", False),
+    (r"TLP Header", "PCIe/AER", "header of offending TLP", False),
+    (r"Surprise Down|Link Down", "PCIe/hot-plug", "link state change", False),
+    (r"nvme nvme\d+: .*(reset|frozen)", "NVMe driver", "controller recovery", False),
+    (r"nvme nvme\d+: .*queues", "NVMe driver", "queues recreated", False),
+    (r"controller is down", "NVMe driver", "controller unreachable (all-ones)", True),
+    (r"recovery successful", "PCIe/AER", "recovery complete", False),
+    (r"recovery failed|removing", "PCIe/AER", "device removed", True),
+]
+
+def decode_uncor(value):
+    return [f"[{b}] {name}" for b, name in UNCOR_BITS.items() if value &gt;&gt; b &amp; 1]
+
+def main():
+    text = open(sys.argv[1]).read() if len(sys.argv) &gt; 1 else SAMPLE
+    first = None
+    print(f"{'time (s)':&gt;12}  {'layer':&lt;14} event")
+    for line in text.splitlines():
+        m = re.match(r"\[\s*([\d.]+)\]\s*(.*)", line)
+        if not m:
+            continue
+        t, msg = float(m.group(1)), m.group(2)
+        for rx, layer, label, abnormal in RULES:
+            if re.search(rx, msg):
+                print(f"{t:12.6f}  {layer:&lt;14} {label}")
+                s = re.search(r"error status/mask=([0-9a-fA-F]+)/([0-9a-fA-F]+)", msg)
+                if s:
+                    st, mask = int(s.group(1), 16), int(s.group(2), 16)
+                    for bit in decode_uncor(st &amp; ~mask):
+                        print(f"{'':12}  {'':&lt;14}   unmasked: {bit}")
+                if abnormal and first is None:
+                    first = (t, label)
+                break
+    if first:
+        print(f"\nFirst abnormal event in the log: t={first[0]:.6f} s, {first[1]}.")
+        print("The log shows the containment, not the cause: the cause is the error that")
+        print("triggered it (see the AER lines) and whatever happened on the link before.")
+
+if __name__ == "__main__":
+    main()</code></pre>
+  <p>Output for the embedded sample:</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>    time (s)  layer          event
+ 8811.402113  PCIe/DPC       link contained by downstream port
+ 8811.402120  PCIe/DPC       DPC trigger reason
+ 8811.402131  PCIe/AER       uncorrectable error logged
+ 8811.402135  PCIe/AER       AER status register
+                               unmasked: [18] Malformed TLP
+ 8811.402150  PCIe/AER       header of offending TLP
+ 8811.402203  NVMe driver    controller recovery
+ 8811.731880  PCIe/hot-plug  link state change
+ 8811.912447  NVMe driver    queues recreated
+ 8811.913002  PCIe/AER       recovery complete
+
+First abnormal event in the log: t=8811.402113 s, link contained by downstream port.
+The log shows the containment, not the cause: the cause is the error that
+triggered it (see the AER lines) and whatever happened on the link before.</code></pre>
+  <h3>Driver error handlers (pseudocode, modelled on the Linux callbacks)</h3>
+  <pre class="code" data-kind="pseudocode" data-lang="c"><code>pci_ers_result_t nvme_like_error_detected(struct pci_dev *pdev, pci_channel_state_t state) {
+    switch (state) {
+    case pci_channel_io_normal:      <span class="cm">/* non-fatal: device still reachable */</span>
+        return PCI_ERS_RESULT_CAN_RECOVER;
+    case pci_channel_io_frozen:      <span class="cm">/* fatal or DPC: link down, MMIO returns all-ones */</span>
+        stop_submitting_io();
+        mark_controller_resetting();  <span class="cm">/* do not touch BAR0 now */</span>
+        return PCI_ERS_RESULT_NEED_RESET;
+    case pci_channel_io_perm_failure:
+        fail_all_io();
+        return PCI_ERS_RESULT_DISCONNECT;
+    }
+}
+
+pci_ers_result_t nvme_like_slot_reset(struct pci_dev *pdev) {
+    pci_restore_state(pdev);          <span class="cm">/* BARs, command register, MSI-X */</span>
+    schedule_controller_reset();      <span class="cm">/* CC.EN=0 → RDY=0 → AQA/ASQ/ACQ → CC.EN=1 → RDY=1 → queues */</span>
+    return PCI_ERS_RESULT_RECOVERED;
+}
+
+void nvme_like_resume(struct pci_dev *pdev) {
+    wait_for_reset_complete();
+    restart_io();                     <span class="cm">/* requeued commands are resubmitted */</span>
+}</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <h3>Choosing DPC policy for an NVMe storage server</h3>
+  <p>A server has 24 U.2 NVMe SSDs behind three PCIe switches (8 drives each), with root ports above the switches. All switch downstream ports and root ports implement DPC. The question: which ports should enable DPC, with which triggers?</p>
+  <ol>
+    <li><strong>Blast radius.</strong> Enabling DPC only at root ports means a fatal error from one drive takes down 8 drives. Enabling DPC at each switch downstream port limits it to 1 drive. → Enable at switch downstream ports.</li>
+    <li><strong>Trigger choice.</strong> Fatal errors from drives (Malformed TLP, Surprise Down, Receiver Overflow) should trigger. Non-fatal errors (e.g. an Unsupported Request on one transaction) are usually recoverable by the driver without dropping the link; triggering DPC on them would turn small errors into outages. → "ERR_FATAL" trigger at drive-facing ports. <span class="badge derived">Derived</span> policy; platforms differ.</li>
+    <li><strong>Root ports.</strong> Keep DPC enabled at root ports too, for errors in the switch itself (its upstream link). Enable root-port extensions so CPU MMIO timeouts are contained instead of escalating.</li>
+    <li><strong>Hot-plug coordination.</strong> These are hot-plug bays. Surprise Down will occur on every unannounced removal; confirm the kernel handles DPC + hot-plug together, or the drive may be "recovered" while physically absent.</li>
+    <li><strong>Firmware-first?</strong> If the operator needs BMC-level logs for fleet analysis, firmware-first with EDR gives central visibility; if the team debugs with kernel logs and analyzers, OS-first keeps full detail. Document whichever is chosen; a mixed configuration (AER native, DPC firmware) is the hardest to debug.</li>
+    <li><strong>ACS.</strong> If drives are passed through to different VMs, ACS redirect must be enabled at switch downstream ports so each drive gets its own IOMMU group. If drives use peer-to-peer DMA to a local accelerator, that path is blocked or redirected — measure the performance cost before deciding.</li>
+  </ol>
+  <h3>Recovery time budget</h3>
+  <p>Suppose containment takes &lt; 1 µs, the OS reacts in 1 ms, the kernel waits for the link after release and for the device to become ready (often hundreds of milliseconds), and the NVMe controller reset takes 1–2 s for a drive with a large mapping table. Total ≈ 2 s. If the I/O timeout in the stack above (for example, a distributed storage heartbeat) is shorter than that, the node will be declared failed even though recovery works. <span class="badge derived">Derived</span>; measure on your platform.</p>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Blaming the port that logged the error.</strong> The root port logs errors it detects; the source may be the device below (check Error Source ID and header log).</li>
+    <li><strong>Reading all-ones as data.</strong> 0xFFFFFFFF from a BAR means the path is broken.</li>
+    <li><strong>Assuming DPC is on.</strong> The capability may exist with triggers disabled.</li>
+    <li><strong>Enabling DPC for non-fatal errors everywhere,</strong> turning recoverable errors into device outages.</li>
+    <li><strong>Forgetting that posted writes are silently dropped</strong> during containment — doorbells written in that window are lost and the driver must rebuild state.</li>
+    <li><strong>Using ACS override to "fix" IOMMU groups</strong> in multi-tenant systems, removing isolation.</li>
+    <li><strong>Ignoring _OSC.</strong> Searching kernel logs for AER details on a firmware-first platform, finding nothing, and concluding there was no error.</li>
+    <li><strong>Treating successful recovery as root cause closure.</strong> Recovery hides the bug; the first error still needs an owner.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>For every containment or recovery event, build the chain in this order:</p>
+  <div class="flow">
+    <div>Who handled it?<small>_OSC: OS-first or firmware-first</small></div>
+    <div>Where was it contained?<small>which port's DPC triggered; blast radius</small></div>
+    <div>Why did it trigger?<small>Trigger Reason; Error Source ID</small></div>
+    <div class="hl">What was the first error?<small>AER First Error Pointer and header log at the detecting port</small></div>
+    <div>What preceded it?<small>correctable errors, link events, temperature, firmware activity</small></div>
+    <div>Did recovery work?<small>NVMe reset messages; SMART/telemetry after recovery</small></div>
+  </div>
+  <table>
+    <caption>Failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>Likely causes</th><th>First check</th><th>Disambiguating experiment</th></tr></thead>
+    <tbody>
+      <tr><td>Repeated DPC events, Malformed TLP</td><td>Device firmware bug; MPS mismatch after hot-plug</td><td>Header log vs Device Control MPS on both ends</td><td>Set MPS to a common lower value; does it stop?</td></tr>
+      <tr><td>DPC with Surprise Down, presence stays asserted</td><td>Power glitch, connector, device internal reset</td><td>Correctable error history; Unsafe Shutdowns counter</td><td>Move drive; monitor slot power</td></tr>
+      <tr><td>Device disappears instead of recovering</td><td>Hot-plug and DPC racing; recovery timeout too short; device not ready in time</td><td>Kernel log order of pciehp vs dpc messages</td><td>Newer kernel; adjust device readiness waits</td></tr>
+      <tr><td>CPU machine check on device failure</td><td>No RP PIO containment; firmware escalates timeouts</td><td>DPC root-port extension support and enablement</td><td>Enable RP extensions; repeat injection on a test system</td></tr>
+      <tr><td>VM can read another VM's device memory via P2P</td><td>ACS redirect disabled on a switch</td><td>ACSCtl on the switch downstream ports; IOMMU groups</td><td>Enable ACS redirect; re-check groups</td></tr>
+      <tr><td>No AER details in kernel log after a crash</td><td>Firmware-first handling</td><td>_OSC line; BMC event log; "[Hardware Error]" lines</td><td>Compare with OS-first configuration on a test system</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <ul>
+    <li><strong>Containment converts an unknown-state problem into a known-state problem.</strong> Its value is less the stopping of traffic than the guarantee that the system is in a defined, recoverable state.</li>
+    <li><strong>The first error is the only one that matters for root cause.</strong> Everything after containment is the platform behaving correctly. Teams lose weeks analysing recovery noise.</li>
+    <li><strong>Every recovery path needs a test.</strong> Error injection per trigger reason, with I/O running, on every supported kernel and firmware combination. Recovery code that is never exercised does not work.</li>
+    <li><strong>Firmware-first is a contract, not a black box.</strong> Insist that CPER records include the AER header log and that firmware versioning is tracked with every incident.</li>
+    <li><strong>Isolation is a security property.</strong> ACS decisions belong in a threat model, not in a performance tuning guide.</li>
+    <li><strong>Recovered is not healthy.</strong> After any containment event, check the device's NVMe logs (error log, SMART, telemetry) before returning it to service.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 55 — Reconstruct a containment event</h3>
+  <dl>
+    <dt>Objective</dt><dd>From kernel log text and configuration-space inspection, reconstruct who handled an error, where it was contained, why, what the first error was, and whether recovery succeeded.</dd>
+    <dt>Skills</dt><dd>Reading _OSC, DPC, AER and NVMe recovery messages; decoding AER status; reasoning about blast radius and isolation.</dd>
+    <dt>Safety</dt><dd><span class="badge safe">Safe lab</span> for Steps 1–3 (read-only commands and synthetic logs). Step 4 is optional and <span class="badge expert">Expert lab</span>: error injection on a dedicated test machine only, with data backed up.</dd>
+    <dt>Hardware required</dt><dd>Optional: Linux machine with an NVMe SSD (Steps 1 and 4).</dd>
+    <dt>Software required</dt><dd>Python 3.8+; <code>pciutils</code>.</dd>
+    <dt>Input</dt><dd><code>dpc_timeline.py</code> and its embedded sample; Trace 2; your system's <code>lspci</code> and <code>dmesg</code>.</dd>
+    <dt>Expected output</dt><dd>A one-page incident summary using the debugging chain above.</dd>
+  </dl>
+  <h4>Background</h4>
+  <p>Containment events produce evidence in at least three places: the detecting port's AER and DPC registers, the kernel log, and the device's own logs. None alone is sufficient.</p>
+  <h4>Step 1 — Inventory your platform</h4>
+  <p>Run the Linux view commands. Record: _OSC features granted; whether your SSD's root port has DPC (and whether triggers are enabled); ACS presence on ports; IOMMU group of your SSD; whether the slot is hot-plug capable.</p>
+  <h4>Step 2 — Analyze the synthetic event</h4>
+  <p>Run <code>dpc_timeline.py</code>. Decode the TLP header in the sample (60000080 01000FFF 00000002 00400000): Fmt/Type, Length, Requester ID, Tag, address. Explain why it is malformed for MPS = 256.</p>
+  <h4>Step 3 — Write the incident summary</h4>
+  <p>Using Trace 2 and the timeline, answer: handler, containment point, trigger reason, first error, offending component, recovery result, corrective action, regression test.</p>
+  <h4>Step 4 (optional, Expert) — Controlled injection</h4>
+  <p>On a test machine with a kernel built with AER error injection support, follow the kernel's AER injection documentation to inject a non-fatal error at the SSD and observe the recovery callbacks in the log. Do not inject fatal errors unless you are prepared to lose the device until reboot.</p>
+  <h4>Observation</h4>
+  <p>Note the time between containment and recovery complete in the sample (≈ 0.51 s) and identify which steps dominate it.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>In the sample, why is the "first abnormal event in the log" not the root cause?</li>
+    <li>Why does the hot-plug driver line say the Link Down/Up was ignored?</li>
+    <li>If the same event happened on a firmware-first platform, which lines would be missing and what would replace them?</li>
+    <li>What would change if DPC were enabled only at a root port above a switch with eight SSDs?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Extend <code>dpc_timeline.py</code> to recognise "[Hardware Error]" CPER lines and extract <code>aer_uncor_status</code>, decoding it with the same bit table.</p>
+  <details class="hint"><summary>Hints</summary>
+    <p>DW0 0x60000080: Fmt = 011b (4 DW header with data), Type = 00000b (memory request) → MWr64; Length field = 0x080 = 128 DW. DW1: Requester ID 0x0100, Tag 0x0F, byte enables FFh. DW2–DW3: 64-bit address.</p>
+  </details>
+  <details class="solution"><summary>Solution</summary>
+    <p><strong>Step 2:</strong> MWr64 from 0x0100 (Lab SSD), Tag 0x0F, 128 DW = 512 bytes to address 0x2_0040_0000 (the sample's DW3; the trace used the next 256-byte block). 512 &gt; MPS 256 → Malformed TLP.</p>
+    <p><strong>Step 3 (model):</strong> "OS-first (AER and DPC granted by _OSC). Contained at root port 00:01.1 (the only port above the SSD). Trigger: unmasked uncorrectable error detected by the port. First error: Malformed TLP, header shows a 512-byte MWr from 01:00.0 while MPS is 256. Offending component: SSD firmware. Recovery: successful in ≈ 0.5 s, controller reset, queues recreated. Corrective action: SSD firmware must honour Device Control MPS. Regression: run I/O at MPS 128 and 256 with an analyzer checking MWr lengths, plus a DPC recovery soak."</p>
+    <p><strong>Q1:</strong> the containment message is the platform's reaction; the cause is the earlier Malformed TLP, shown in the AER lines that follow it in the log (log order is not event order).</p>
+    <p><strong>Q2:</strong> the link went down because DPC disabled it and came back when DPC released it; the hot-plug driver recognises this and does not treat it as a removal.</p>
+    <p><strong>Q3:</strong> the native DPC/AER lines would be replaced by "[Hardware Error]" CPER lines from the GHES driver (and possibly EDR-related messages); the header log may or may not be included.</p>
+    <p><strong>Q4:</strong> all eight SSDs behind the switch (and the switch) would be cut off and recovered, not just the faulty one.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>That the log's order is not the event order (DPC printed before AER though AER detection came first); that the recovery time depends mostly on device readiness, not on the platform; and that the SSD's own logs have not yet been examined.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>Recovery reports "failed" and the device is removed: look for link training failure after release, or the device not responding to configuration reads in time.</li>
+    <li>CSTS=0xffffffff with no DPC message: the device may have dropped off the bus without a reported error (power loss, firmware crash with link down while DPC disabled).</li>
+    <li>DPC events with Completion Timeout on a hot-plug slot after removal: expected; confirm presence detect.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Study <a href="ch47.html">Chapter 47 — Error Correlation</a> and build a joint timeline from an analyzer capture, the kernel log and the NVMe error log for Trace 2.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>List three ways a CPU can be harmed by a device failing without containment.</li>
+    <li>Explain why synthesized completions must carry the original Requester ID and Tag.</li>
+    <li>Your SSD and a NIC behind the same switch are in one IOMMU group. What does that tell you about the switch?</li>
+    <li>Describe how firmware-first handling changes where you look for evidence.</li>
+    <li>Why might a platform mask Surprise Down for DPC on hot-plug slots, and what is the risk?</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p><strong>1.</strong> A CPU load hangs waiting for a completion (or causes a machine check on timeout); corrupted DMA data reaches memory used by the OS or applications; a platform-wide reset is triggered by an unhandled fatal error.</p>
+    <p><strong>2.</strong> The requester matches completions to its outstanding requests by Requester ID and Tag; without them, it could not retire the request and would time out anyway.</p>
+    <p><strong>3.</strong> The switch does not provide (or has not enabled) ACS redirect between those downstream ports, so the kernel assumes they can communicate peer-to-peer without IOMMU checks.</p>
+    <p><strong>4.</strong> Evidence moves from AER/DPC registers and kernel lines to CPER records, BMC event logs and firmware logs; the OS may have only a summary.</p>
+    <p><strong>5.</strong> To let hot-plug handle removals without a containment event racing it. Risk: a real link failure (not a removal) is then not contained by DPC.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>What does a downstream port do to its link when DPC triggers?</p>
+      <ul class="options" data-answer="2">
+        <li>Retrains it at a lower speed</li>
+        <li>Disables it and holds it down until software clears Trigger Status</li>
+        <li>Sends a hot reset to the device</li>
+        <li>Nothing; DPC only logs</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>DPC directs the LTSSM to Disabled and keeps the link down while DPC Trigger Status is set.</p></details>
+    </li>
+    <li>
+      <p>How are outstanding CPU reads to a contained device completed?</p>
+      <ul class="options" data-answer="3">
+        <li>They time out normally</li>
+        <li>The device completes them after recovery</li>
+        <li>The port synthesizes UR or CA completions, per DPC Completion Control</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>DPC answers requests targeting the contained hierarchy so requesters do not hang; the CPU typically sees all-ones data.</p></details>
+    </li>
+    <li>
+      <p>Which ACS control forces peer-to-peer requests between switch downstream ports to go upstream?</p>
+      <ul class="options" data-answer="2">
+        <li>Source Validation</li>
+        <li>P2P Request Redirect</li>
+        <li>Translation Blocking</li>
+        <li>Direct Translated P2P</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Request Redirect (with Upstream Forwarding) sends peer requests to the root complex where the IOMMU checks them.</p></details>
+    </li>
+    <li>
+      <p>Which ACPI mechanism lets the OS take native control of AER and DPC?</p>
+      <ul class="options" data-answer="1">
+        <li>The _OSC method</li>
+        <li>The HEST table</li>
+        <li>The MCFG table</li>
+        <li>The _PRT method</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>_OSC negotiates control; HEST describes firmware-first error sources.</p></details>
+    </li>
+    <li>
+      <p>The NVMe driver reads CSTS = 0xFFFFFFFF. What is the most accurate conclusion?</p>
+      <details class="answer"><summary>Model answer</summary><p>The driver cannot reach the controller: it is contained, removed, powered off or its link is down. It does not prove the controller itself failed. Check DPC/AER/hot-plug logs.</p></details>
+    </li>
+    <li>
+      <p>Which Linux callback reinitializes the device after the link has been reset or DPC released?</p>
+      <ul class="options" data-answer="3">
+        <li>error_detected()</li>
+        <li>mmio_enabled()</li>
+        <li>slot_reset()</li>
+        <li>resume()</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>slot_reset() is called after the reset; resume() restarts I/O afterwards.</p></details>
+    </li>
+    <li>
+      <p>What do the root-port extensions for DPC add?</p>
+      <details class="answer"><summary>Model answer</summary><p>RP PIO error handling: logging and containment of failures on CPU-originated requests (e.g. completion timeouts on MMIO), with status, mask, severity and header log registers, plus a busy indicator for safe release.</p></details>
+    </li>
+    <li>
+      <p>A drive in a hot-plug bay shows link down, Surprise Down, presence still asserted, then successful recovery. Was it removed?</p>
+      <ul class="options" data-answer="2">
+        <li>Yes, removal always causes Surprise Down</li>
+        <li>Probably not: presence stayed asserted; suspect power or contact</li>
+        <li>Cannot have happened: Surprise Down is correctable</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Presence detect still asserted means the drive was in the slot. Surprise Down is uncorrectable, and with presence asserted points to the link or the device's power.</p></details>
+    </li>
+    <li>
+      <p>Why should DPC usually trigger on ERR_FATAL but not ERR_NONFATAL at drive-facing ports?</p>
+      <details class="answer"><summary>Model answer</summary><p>Non-fatal errors affect individual transactions while the link remains reliable; drivers can recover without taking the link down. Triggering DPC on them converts recoverable errors into device outages. Fatal errors mean the link or device cannot be trusted, so containment is appropriate.</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> What is the difference between reporting and containing an error?</p>
+      <details class="answer"><summary>Model answer</summary><p>Reporting (AER) records the error and notifies software. Containment (DPC) stops further traffic across the affected link immediately in hardware and answers pending requests, so damage cannot spread while software reacts.</p></details></li>
+    <li><p><strong>Beginner:</strong> What is an IOMMU group and what decides it?</p>
+      <details class="answer"><summary>Model answer</summary><p>The smallest set of devices the kernel can isolate from each other; devices that can communicate without passing through the IOMMU share a group. ACS capabilities in switches and root ports (and multi-function devices) decide it.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Walk through what happens from an SSD sending a malformed TLP to I/O resuming.</p>
+      <details class="answer"><summary>Model answer</summary><p>Root port detects Malformed TLP, logs AER, triggers DPC; link disabled; CPU accesses get synthesized error completions; DPC interrupt; OS calls error_detected() on the NVMe driver (frozen); OS clears DPC Trigger Status after logging; link retrains; slot_reset() restores config and resets the NVMe controller; resume() restarts I/O; requeued commands are retried.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Firmware-first vs OS-first: pros and cons?</p>
+      <details class="answer"><summary>Model answer</summary><p>Firmware-first: central platform policy, BMC logging, consistency across OSes; but added latency, less detail to the OS, and firmware bugs are harder to see. OS-first: fast, detailed, debuggable; but less centralized visibility. EDR bridges firmware-first containment with OS-driven device recovery.</p></details></li>
+    <li><p><strong>Advanced:</strong> How do DPC and hot-plug interact and what can go wrong?</p>
+      <details class="answer"><summary>Model answer</summary><p>Surprise removal triggers both Surprise Down (DPC) and hot-plug link/presence events. The hot-plug driver must not remove a device that DPC is recovering, and DPC must not keep trying to recover a device that is gone. Races lead to devices removed unnecessarily or stale devices left behind. Kernels coordinate by having pciehp ignore DPC-caused link changes and by checking presence.</p></details></li>
+    <li><p><strong>Advanced:</strong> Why are synthesized completions necessary?</p>
+      <details class="answer"><summary>Model answer</summary><p>Without them, requests already issued to the contained hierarchy would wait for Completion Timeout, during which CPUs can stall, and some platforms escalate timeouts to machine checks. Synthesized UR/CA completions retire them promptly.</p></details></li>
+    <li><p><strong>Senior:</strong> Design the error-handling policy for a multi-tenant NVMe server.</p>
+      <details class="answer"><summary>Model answer</summary><p>Enable DPC at the closest port above each drive with ERR_FATAL triggers; root-port extensions for MMIO timeouts; ACS redirect for per-drive IOMMU groups (accept P2P cost or use trusted P2P only within a tenant); choose OS-first or firmware-first explicitly and ensure CPER includes header logs if firmware-first; coordinate DPC with hot-plug; set upper-layer timeouts above worst-case recovery time; test each path with injection; after any recovery, check device logs before returning it to service.</p></details></li>
+    <li><p><strong>Senior:</strong> A fleet reports "NVMe drive disappeared" after rare DPC events on one kernel version only. How do you approach it?</p>
+      <details class="answer"><summary>Model answer</summary><p>Collect logs from affected and unaffected kernels and compare message order (dpc, pciehp, nvme). Suspect a regression in DPC/hot-plug coordination or device readiness waiting after release. Reproduce on a test system with software-triggered DPC (if supported) or injection, bisect kernel changes, and in parallel examine the root cause of the DPC triggers themselves from AER header logs.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain why the water park closes one slide's valve instead of shutting the whole park.</li>
+    <li><strong>To a junior engineer:</strong> explain why reading 0xFFFFFFFF from CSTS does not mean the NVMe controller failed.</li>
+    <li><strong>To a senior engineer:</strong> argue for DPC at switch downstream ports with ERR_FATAL triggers, and state the conditions under which you would choose firmware-first.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "If one slide breaks, you close just that slide so the dirty water doesn't spread, and everybody else keeps playing. Then the repair crew fixes it."</p>
+    <p><strong>Junior:</strong> "All-ones is what the CPU gets when nothing answers — the link is down, the device is contained by DPC, removed, or powered off. Check DPC and AER messages first; the controller may be perfectly fine once the link is restored."</p>
+    <p><strong>Senior:</strong> "Containment at the closest port gives a blast radius of one drive; ERR_FATAL-only triggers avoid converting recoverable errors into outages. I would choose firmware-first when fleet operations rely on BMC-level error records and the firmware's CPER records include AER header logs, with EDR handing device recovery to the OS; otherwise OS-first gives faster, more detailed debugging."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>Reporting an uncorrectable error is not enough; it must be contained. DPC in root ports and switch downstream ports disables the link on configured triggers, completes pending requests with UR or CA, and waits for software; root-port extensions extend containment to CPU-initiated failures. Poisoned TLP egress blocking contains bad data. ACS forces peer traffic through the IOMMU, defining IOMMU groups and isolation. Error handling is negotiated between firmware and OS through _OSC; firmware-first uses APEI/GHES/CPER and EDR. Hot-plug and DPC must be coordinated because removal looks like a fatal error. Linux recovers devices with error_detected, mmio_enabled, slot_reset and resume, and the NVMe driver turns slot_reset into a controller reset. The first error, not the recovery, holds the root cause.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>explain what DPC does on trigger, including synthesized completions, and how it is released</li>
+      <li>choose DPC placement and triggers for a given topology and justify the blast radius</li>
+      <li>name the ACS controls and explain how they shape IOMMU groups</li>
+      <li>tell from Linux logs whether a platform is OS-first or firmware-first</li>
+      <li>distinguish removal, containment and an NVMe-only reset from evidence</li>
+      <li>map the Linux recovery callbacks to the NVMe reset sequence</li>
+      <li>find the first error behind a containment event from AER logs</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Downstream Port Containment; Access Control Services; Advanced Error Reporting; Hot-Plug</cite>.</li>
+    <li><cite class="spec">PCI Firmware Specification — _OSC control and Error Disconnect Recover</cite>.</li>
+    <li><cite class="spec">ACPI Specification — APEI (HEST, GHES)</cite>; <cite class="spec">UEFI Specification — Common Platform Error Record</cite>.</li>
+    <li>Linux kernel documentation: <code>Documentation/PCI/pci-error-recovery.rst</code>, <code>Documentation/PCI/pcieaer-howto.rst</code>, and the IOMMU/VFIO documentation on groups.</li>
+    <li>Course: <a href="dd18.html">Module 18 — AER</a>, <a href="dd40.html">Module 40 — PCIe Errors</a>, <a href="dd41.html">Module 41 — Reset</a>, <a href="failure-library.html">Failure Library</a>, <a href="me-feature-labs.html">Feature Labs</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch56.html">Chapter 56 — SR-IOV</a>: one physical SSD, many virtual functions — and why ACS, IOMMU groups and per-function reset suddenly matter much more.</p>
+</section>

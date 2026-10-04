@@ -1,0 +1,1015 @@
+<p class="lead">NVMe over Fabrics (NVMe-oF) takes the NVMe command set you learned over PCIe and carries it across a network. This chapter builds the mental model that keeps the three transports straight. It covers what stays exactly the same (commands, completions, namespaces, status), what is replaced (doorbells, interrupts, register reads, PRPs and queue-creation commands), and why the unit of exchange becomes a <em>capsule</em> instead of a memory write.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>Up to this point, every command you have followed has lived in host memory. A driver wrote a 64-byte Submission Queue Entry (SQE) into a ring, rang a doorbell with a PCI Express (PCIe) Memory Write, and the controller reached back into host memory with Direct Memory Access (DMA) to fetch the command and move the data. That whole picture depends on one thing: the controller and the host share an address space over a PCIe link.</p>
+  <p>NVMe over Fabrics removes that assumption. The host and the NVM subsystem might sit in different racks, connected by Ethernet, InfiniBand or Fibre Channel. There is no shared memory and no Transaction Layer Packet (TLP) between them, and there is no doorbell register the host can write. Yet a <code>Read</code> is still opcode 02h, a completion still carries a Command Identifier and a status field, and a namespace is still a namespace.</p>
+  <p>Engineers who do not build a clean mental model here make two opposite mistakes. Some assume "it is just NVMe, nothing changes" and go looking for doorbell writes in a packet capture. Others assume "it is a totally different protocol" and miss that the familiar command and completion structures sit, byte for byte, inside every network message. This chapter gives you the dividing line.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>State precisely which parts of NVMe are transport-independent and which are defined by a transport binding.</li>
+    <li>Define a command capsule, a response capsule and in-capsule data, and say where each lives on PCIe, RDMA and TCP.</li>
+    <li>Contrast the memory-based transport model (PCIe) with the message-based transport model (fabrics).</li>
+    <li>Explain why fabrics have no doorbells, no interrupts and no PRPs, and what replaces each.</li>
+    <li>Name the Fabrics commands (Connect, Property Get, Property Set, Authentication Send, Authentication Receive, Disconnect) and say what each replaces or adds.</li>
+    <li>Explain how a queue pair is created over a fabric with a Connect command instead of Create I/O Submission/Completion Queue.</li>
+    <li>Read a synthetic packet capture of an NVMe/TCP read and map every row back to the PCIe sequence you already know.</li>
+    <li>Identify the first abnormal event in a failed fabric connection and say which layer owns it.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>This chapter leans on the following earlier material. Revisit any that feel shaky:</p>
+    <ul>
+      <li><a href="ch21.html">What Is NVMe?</a> and <a href="ch22.html">NVMe 2.x Architecture</a>: the split between the Base specification, command set specifications and transport specifications.</li>
+      <li><a href="ch25.html">Queue Architecture</a> and <a href="ch28.html">Doorbells</a>: head/tail ownership and why the doorbell exists.</li>
+      <li><a href="ch29.html">NVMe Command Structure</a>: the 64-byte SQE and the 16-byte Completion Queue Entry (CQE).</li>
+      <li><a href="ch37.html">Scatter Gather Lists</a>: SGL descriptor types. Fabrics use SGLs exclusively.</li>
+      <li><a href="ch39.html">The Most Important Chapter</a>: the end-to-end NVMe-over-PCIe command flow. We will compare against it constantly.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Imagine the school library is in the same building as your classroom. When the teacher wants a book, she puts a request slip in the request box by the door and rings a little bell. The librarian walks over, reads the slip, walks back, finds the book and places it directly on the teacher's table. Then she drops an answer slip in the answer box.</p>
+    <p>Now imagine the library moves across town. The librarian can no longer walk into the classroom, reach into the request box or put a book on the table. So the teacher does something new. She copies the request slip onto a card, puts the card in an envelope and mails it. If the teacher is sending a small thing, like a page of notes to be stored, she slips it into the same envelope. For a big box of books, the librarian mails back a note saying "send me the first part now", and the teacher mails it over. When the work is done, the librarian mails back an envelope with the answer slip inside.</p>
+    <p>The request slip is written exactly the same way in both cases. What changed is how it travels. Nobody rings a bell, because the arrival of the envelope <em>is</em> the bell.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>Think of a restaurant kitchen with a pass, the counter where waiters clip order tickets onto a rail. In the in-house dining room (PCIe), the waiter clips a ticket to the rail and taps the bell, and the chef pulls tickets off the rail when ready. Plates go straight onto a shelf the waiter can reach.</p>
+    <p>Now the restaurant also takes delivery orders through a courier company (the fabric). The ticket is identical, with the same dish codes and table number field, but it now arrives inside a courier pouch. The kitchen cannot reach into the customer's house to drop the food, so the food goes back through the courier too. The kitchen also needs a new front-desk procedure: "Which restaurant are you trying to reach, who are you, and how many orders may you have in flight?" That procedure is the Connect command.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What the analogy hides.</strong> Couriers are slow and unreliable. NVMe-oF transports are reliable, in-order connections (a TCP stream, or an RDMA Reliable Connected queue pair) that deliver in microseconds. The analogy also hides that with RDMA the "kitchen" really <em>can</em> reach into the customer's house: the target's network adapter reads and writes host memory directly, but only memory the host has registered and named with a key.</p>
+    <p><strong>Where it misleads.</strong> It suggests the envelope always carries the food. In-capsule data is limited by a size the controller advertises. Larger writes use a separate data phase: Ready to Transfer (R2T) plus host-to-controller data PDUs on TCP, or RDMA READ on RDMA. It also suggests there is one courier per restaurant. In practice, every NVMe queue pair gets its own connection.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>NVMe is two things glued together. First, it is a <strong>language</strong>: a set of commands (Read, Write, Identify, Get Log Page…), a fixed command format, a fixed completion format and a set of status codes. Second, it needs a <strong>way of delivering</strong> that language between a host and a controller. The original delivery method is PCIe, where the host and controller share memory.</p>
+  <p>NVMe over Fabrics keeps the language and swaps the delivery method. The host builds the same 64-byte command. Instead of leaving it in host memory and ringing a doorbell, it packs it into a network message called a <span class="g" data-term="command-capsule">command capsule</span> and sends it over a network connection. The controller runs the command and sends back a <span class="g" data-term="response-capsule">response capsule</span> containing the same 16-byte completion entry you already know.</p>
+  <p>Three families of fabric are defined today:</p>
+  <ul>
+    <li><strong>RDMA</strong> (Remote Direct Memory Access): RoCE (RDMA over Converged Ethernet), iWARP (Internet Wide Area RDMA Protocol) or InfiniBand. The network adapter can read and write the other side's memory directly. See <a href="ch67.html">NVMe/RDMA</a>.</li>
+    <li><strong>TCP</strong> (Transmission Control Protocol): ordinary Ethernet and IP networks, with NVMe messages framed into Protocol Data Units (PDUs) on a TCP stream. See <a href="ch66.html">NVMe/TCP</a>.</li>
+    <li><strong>Fibre Channel</strong> (FC-NVMe): defined by the INCITS T11 committee rather than NVM Express. We mention it for completeness and do not cover it in depth.</li>
+  </ul>
+  <p>Because there is no shared memory, three things you relied on over PCIe disappear:</p>
+  <ol>
+    <li><strong>Doorbells.</strong> The arrival of a capsule tells the controller there is new work.</li>
+    <li><strong>Interrupts.</strong> The arrival of a response capsule tells the host the command finished.</li>
+    <li><strong>Physical Region Page (PRP) lists.</strong> Data locations are described with Scatter Gather List (SGL) descriptors that make sense to the transport: an offset inside the capsule, a transport-managed data transfer, or an RDMA memory key plus address.</li>
+  </ol>
+  <p>Two new things appear:</p>
+  <ol>
+    <li><strong>Connecting.</strong> Before any command flows, the host opens a network connection and sends a <span class="g" data-term="connect-command">Connect</span> command that names the subsystem it wants (by its <span class="g" data-term="nqn">NVMe Qualified Name (NQN)</span>), names itself and sets up one queue pair.</li>
+    <li><strong>Discovery.</strong> The host needs a way to learn which subsystems exist and at which network addresses. It does this by talking to a <span class="g" data-term="discovery-controller">discovery controller</span>. That is the subject of <a href="ch68.html">Fabric Architecture</a>.</li>
+  </ol>
+  <aside class="callout remember">
+    <p>The SQE and CQE do not change shape when they cross a network. If you can decode a Read command from a PCIe trace, you can decode it from a packet capture. It just sits inside a capsule, which sits inside a transport PDU or message.</p>
+  </aside>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>Where NVMe-oF lives in the specification family</h3>
+  <p>In the NVMe 1.x era, fabrics had their own document, the "NVMe over Fabrics" specification (revision 1.0 in 2016, 1.1 in 2019). With the NVMe 2.0 restructuring in 2021, the fabrics architecture (capsules, Fabrics commands, discovery, the message-based queueing model) was merged into the NVM Express Base Specification. Each transport moved into its own transport specification. In the 2.4 set (August 2026) you therefore read:</p>
+  <table>
+    <caption>Where fabric material lives in the NVMe 2.4 specification set</caption>
+    <thead><tr><th>Topic</th><th>Document (2.4 set)</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Capsules, Fabrics commands, Connect, discovery, Discovery Log Page, keep alive, ANA, authentication framework</td><td>NVM Express Base Specification, Revision 2.4</td><td>Transport-independent architecture</td></tr>
+      <tr><td>Memory-based binding: registers, doorbells, PRPs, MSI-X, queue creation</td><td>NVMe over PCIe Transport Specification, Revision 1.4</td><td>See <a href="dd37.html">NVMe over PCIe</a></td></tr>
+      <tr><td>RDMA binding: queue pairs, keyed SGL, RDMA_CM parameters</td><td>NVMe over RDMA Transport Specification, Revision 1.3</td><td><a href="ch67.html">Chapter 67</a></td></tr>
+      <tr><td>TCP binding: PDUs, ICReq/ICResp, R2T, digests, TLS</td><td>NVMe over TCP Transport Specification, Revision 1.3</td><td><a href="ch66.html">Chapter 66</a></td></tr>
+      <tr><td>Fibre Channel binding</td><td>INCITS FC-NVMe (T11), not an NVM Express document</td><td>Mentioned only</td></tr>
+      <tr><td>Read, Write, Flush, Dataset Management</td><td>NVM Command Set Specification, Revision 1.3</td><td>Unchanged by the transport</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The transport binding idea</h3>
+  <p>The Base specification describes a controller, its queues and its commands in abstract terms. A <span class="g" data-term="transport-binding">transport binding</span> answers the concrete questions:</p>
+  <ul>
+    <li>How does a command get from the host to the controller?</li>
+    <li>How does a completion get back?</li>
+    <li>How does data move, and how are data buffers described?</li>
+    <li>How is a queue created, sized and torn down?</li>
+    <li>How does the host reach controller registers or properties?</li>
+    <li>How are transport errors detected and reported?</li>
+  </ul>
+  <p>The PCIe transport answers with memory writes, DMA, PRP/SGL, admin queue-creation commands, MMIO registers and AER. A fabric transport answers with capsules, transport data transfers, SGL descriptors, the Connect command, Property Get/Set and transport-level error PDUs or connection teardown.</p>
+
+  <h3>Memory-based versus message-based transport models</h3>
+  <p>The Base specification names two models. The difference between them is the single most useful idea in this chapter.</p>
+  <table>
+    <caption>Memory-based vs message-based transport models</caption>
+    <thead><tr><th>Aspect</th><th>Memory-based (NVMe over PCIe)</th><th>Message-based (NVMe over Fabrics: TCP, RDMA, FC)</th></tr></thead>
+    <tbody>
+      <tr><td>Where the SQ lives</td><td>Host memory (or Controller Memory Buffer); controller fetches entries by DMA</td><td>Conceptually at the controller; host sends entries in command capsules</td></tr>
+      <tr><td>New-work signal</td><td>Host writes the SQ Tail doorbell register</td><td>Arrival of the capsule</td></tr>
+      <tr><td>Where the CQ lives</td><td>Host memory; controller writes CQEs by DMA</td><td>Conceptually at the host; controller sends CQEs in response capsules</td></tr>
+      <tr><td>Completion signal</td><td>Phase tag flip, usually plus an MSI-X interrupt</td><td>Arrival of the response capsule</td></tr>
+      <tr><td>CQ head release</td><td>Host writes the CQ Head doorbell</td><td>Implicit; the host consumes response capsules as they arrive</td></tr>
+      <tr><td>SQ head reporting</td><td>SQ Head Pointer (SQHD) field in the CQE</td><td>SQHD in the CQE (SQ flow control), which may be disabled at Connect time</td></tr>
+      <tr><td>Data pointer</td><td>PRP or SGL (host physical/IOVA addresses)</td><td>SGL only: in-capsule offset, transport data block, or keyed (RDMA) descriptor</td></tr>
+      <tr><td>Queue creation</td><td>Admin commands Create I/O CQ (05h), Create I/O SQ (01h)</td><td>Fabrics Connect command, one per queue, over that queue's connection</td></tr>
+      <tr><td>Register access</td><td>MMIO reads/writes to BAR0</td><td>Property Get / Property Set Fabrics commands on the admin queue</td></tr>
+      <tr><td>SQ:CQ mapping</td><td>Many SQs may share one CQ</td><td>Strictly one SQ to one CQ (a queue pair)</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout insight" data-title="The one-sentence version">
+    <p>Over PCIe, the host and controller <em>share memory and signal each other</em>. Over fabrics, they <em>send each other messages and share nothing</em>. RDMA blurs this for data, but not for commands.</p>
+  </aside>
+  <p>RDMA sits in an interesting middle position. Commands and completions are still messages (RDMA SEND operations carrying capsules), but data can move with memory semantics: the target's RDMA NIC issues RDMA READ and RDMA WRITE operations directly against host buffers the host has registered. This is why NVMe/RDMA feels closer to PCIe for data movement and closer to TCP for command delivery. <a href="ch67.html">Chapter 67</a> works through it.</p>
+
+  <h3>Capsules</h3>
+  <p>A <strong>capsule</strong> is the transport-independent unit of NVMe-oF communication. The Base specification defines two kinds:</p>
+  <ul>
+    <li>A <strong>command capsule</strong> contains a 64-byte SQE and may also contain additional SGL descriptors and/or data (in-capsule data).</li>
+    <li>A <strong>response capsule</strong> contains a 16-byte CQE and, depending on the transport and controller, may contain additional data. NVMe/TCP and NVMe/RDMA response capsules in practice carry just the CQE.</li>
+  </ul>
+  <figure>
+<pre class="diagram">
+ Command capsule                                     Response capsule
++------------------------------------------+        +---------------------------+
+| SQE (64 bytes)                           |        | CQE (16 bytes)            |
+|   CDW0: opcode, flags (PSDT=SGL), CID    |        |   DW0/DW1: command-specific|
+|   NSID, CDW2-3, MPTR                     |        |   DW2: SQHD, SQID         |
+|   DPTR = SGL1 (16-byte SGL descriptor)   |        |   DW3: CID, P, Status     |
+|   CDW10-15                               |        +---------------------------+
++------------------------------------------+         (optional data, if the
+| optional: more SGL descriptors           |          transport/controller uses it)
++------------------------------------------+
+| optional: in-capsule data                |
+|   (starts at an offset; size limited by  |
+|    the controller's capsule size)        |
++------------------------------------------+
+</pre>
+    <figcaption>Conceptual capsule layouts, adapted to the course's notation. The SQE and CQE are the same structures used over PCIe.</figcaption>
+  </figure>
+  <p>The transport then wraps the capsule. NVMe/TCP puts a command capsule inside a CapsuleCmd PDU, with an 8-byte common header and optional digests. NVMe/RDMA sends it as the payload of an RDMA SEND. NVMe/FC puts it in an FC-NVMe information unit. The capsule is identical in each case. Only the envelope differs.</p>
+
+  <h3>In-capsule data</h3>
+  <p><span class="g" data-term="in-capsule-data">In-capsule data</span> is write data (or other host-to-controller data) placed directly after the SQE in the same command capsule. It saves a round trip. The controller does not need to ask for the data, because it already has it when the command arrives.</p>
+  <ul>
+    <li>The controller advertises how large an I/O command capsule it accepts in the Identify Controller data structure, in the <strong>I/O Queue Command Capsule Supported Size (IOCCSZ)</strong> field, expressed in 16-byte units. Subtract the 64-byte SQE and you get the maximum in-capsule data for I/O queues.</li>
+    <li>A companion field, <strong>I/O Queue Response Capsule Supported Size (IORCSZ)</strong>, gives the response capsule size, also in 16-byte units.</li>
+    <li>The <strong>In Capsule Data Offset (ICDOFF)</strong> field says where data starts relative to the end of the SQE, in 16-byte units. It is usually zero.</li>
+    <li>The admin queue has its own in-capsule rules, which the transport specification defines. For example, NVMe/TCP requires an admin queue in-capsule data size large enough for a Connect command's 1024-byte data. <span class="badge uncertain">Confirm exact value</span> The TCP transport specification states the admin queue capsule size, so check it there rather than relying on implementation constants.</li>
+  </ul>
+  <p>The SQE's data pointer for in-capsule data is an SGL <strong>Data Block descriptor with the Offset subtype</strong>. Its "address" field holds an offset into the capsule's data area, not a memory address. For data that does not fit, the descriptor is either a <strong>Transport SGL Data Block descriptor</strong> (NVMe/TCP: data moves in separate data PDUs) or a <strong>Keyed SGL Data Block descriptor</strong> (NVMe/RDMA: an address in host memory plus a remote key).</p>
+  <aside class="callout warn">
+    <p>Read data never travels as in-capsule data in a command capsule, because the command capsule goes from host to controller. Read data travels in C2HData PDUs on TCP or as RDMA WRITE operations on RDMA, before the response capsule.</p>
+  </aside>
+
+  <h3>What stays exactly the same</h3>
+  <ul>
+    <li><strong>The command sets.</strong> NVM Command Set opcodes (Flush 00h, Write 01h, Read 02h, Dataset Management 09h), Zoned Namespace and Key Value commands are unchanged.</li>
+    <li><strong>Most admin commands.</strong> Identify (06h), Get Log Page (02h), Set/Get Features, Asynchronous Event Request, Keep Alive (18h), Abort and Namespace Management all work. The exceptions are the queue-management commands that make no sense without shared memory (Create/Delete I/O SQ/CQ, Doorbell Buffer Config). Over fabrics, the Connect command replaces them.</li>
+    <li><strong>The SQE format.</strong> 64 bytes: Command Dword 0 (opcode, fused, PSDT, Command Identifier), NSID, data pointer, command dwords 10–15.</li>
+    <li><strong>The CQE format.</strong> 16 bytes: command-specific DW0/DW1, SQ Head Pointer, SQ Identifier, Command Identifier, Phase tag and Status field. The Phase tag has no meaning over fabrics, since there is no ring in host memory to poll.</li>
+    <li><strong>Status codes.</strong> Generic, command-specific, media and path-related status types keep their meaning. Fabrics add command-specific status values for Connect and path-related status values for transport issues.</li>
+    <li><strong>Namespaces, NSIDs, subsystems, controllers.</strong> Same objects, same identifiers.</li>
+    <li><strong>Controller properties.</strong> CAP, VS, CC and CSTS keep the same offsets (00h, 08h, 14h, 1Ch) and meaning. They are reached by Property Get/Set instead of MMIO.</li>
+  </ul>
+
+  <h3>What changes</h3>
+  <table>
+    <caption>PCIe mechanism and its fabric replacement</caption>
+    <thead><tr><th>Over PCIe</th><th>Over fabrics</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>SQ tail doorbell MWr</td><td>Sending the command capsule</td><td>No shared address space; a message arrival is its own signal</td></tr>
+      <tr><td>Controller fetches SQE by MRd/CplD</td><td>SQE arrives inside the capsule</td><td>Push model instead of pull model</td></tr>
+      <tr><td>PRP lists in host memory</td><td>SGL descriptors (offset, transport, keyed)</td><td>PRPs assume the controller can read host physical/IOVA memory</td></tr>
+      <tr><td>Data by controller DMA (MRd for writes, MWr for reads)</td><td>TCP: H2CData/C2HData PDUs. RDMA: RDMA READ/WRITE</td><td>The transport moves the bytes</td></tr>
+      <tr><td>CQE written to host memory + MSI-X</td><td>Response capsule</td><td>Push model; host networking stack delivers it</td></tr>
+      <tr><td>CQ head doorbell</td><td>None</td><td>No ring to release</td></tr>
+      <tr><td>Create I/O SQ/CQ admin commands</td><td>Connect (Fabrics command) per queue</td><td>Queues map to transport connections</td></tr>
+      <tr><td>MMIO register reads/writes</td><td>Property Get / Property Set</td><td>No BAR to map</td></tr>
+      <tr><td>PCIe enumeration finds the device</td><td>Discovery controller and Discovery Log Page</td><td>Networks need explicit naming and addressing</td></tr>
+      <tr><td>Physical presence implies trust</td><td>Host NQN allow lists, DH-HMAC-CHAP authentication, TLS (TCP)</td><td>Networks are shared and reachable</td></tr>
+      <tr><td>Link down / surprise removal</td><td>Keep Alive timeout, transport connection loss, reconnect</td><td>Networks fail partially and silently</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Fabrics commands</h3>
+  <p>All <span class="g" data-term="fabrics-command">Fabrics commands</span> share one opcode, <strong>7Fh</strong>. A <strong>Fabrics Command Type (FCTYPE)</strong> field in the command distinguishes them. The values below match the Base specification and the Linux kernel's definitions. <span class="badge verified">Verified</span> Even so, check the Fabrics Command Type table of the Base specification before encoding them in a tool.</p>
+  <table>
+    <caption>Fabrics commands (opcode 7Fh)</caption>
+    <thead><tr><th>FCTYPE</th><th>Command</th><th>Queue</th><th>Purpose</th><th>Replaces / adds</th></tr></thead>
+    <tbody>
+      <tr><td>00h</td><td>Property Set</td><td>Admin</td><td>Write a controller property (e.g., CC to set CC.EN)</td><td>MMIO register write</td></tr>
+      <tr><td>01h</td><td>Connect</td><td>Admin and each I/O queue</td><td>Create a queue pair and bind it to a host and a controller</td><td>Create I/O CQ/SQ; also creates the association</td></tr>
+      <tr><td>04h</td><td>Property Get</td><td>Admin</td><td>Read a controller property (CAP, VS, CSTS…)</td><td>MMIO register read</td></tr>
+      <tr><td>05h</td><td>Authentication Send</td><td>Admin and I/O</td><td>Carry an authentication protocol message host→controller</td><td>New (security)</td></tr>
+      <tr><td>06h</td><td>Authentication Receive</td><td>Admin and I/O</td><td>Retrieve an authentication protocol message controller→host</td><td>New (security)</td></tr>
+      <tr><td>08h</td><td>Disconnect</td><td>I/O</td><td>Tear down an individual I/O queue</td><td>Delete I/O SQ/CQ <span class="badge version">Version-dependent</span></td></tr>
+    </tbody>
+  </table>
+  <p>Disconnect was added in a later revision than the original four. Not every host or target implements it, so check the controller's support before relying on it.</p>
+
+  <h3>The Connect command in detail</h3>
+  <p>Connect is the most important Fabrics command, because nothing works until it succeeds. It does three jobs at once:</p>
+  <ol>
+    <li><strong>Creates a queue pair</strong> (SQ and CQ) of a requested size on the connection it was sent over. The Queue ID (QID) field says which: QID 0 is the admin queue, 1…n are I/O queues.</li>
+    <li><strong>Establishes or joins an association.</strong> The first Connect (QID 0) creates an <em>association</em> between a host and a controller. Later Connects for I/O queues name the same controller by its Controller ID (CNTLID), returned by the admin Connect.</li>
+    <li><strong>Identifies both ends.</strong> Its 1024-byte data portion carries the Host Identifier (a 128-bit value), the requested CNTLID, the subsystem NQN the host wants and the host's own NQN.</li>
+  </ol>
+  <table>
+    <caption>Connect command fields (by name; confirm offsets in the Base specification, Connect command)</caption>
+    <thead><tr><th>Where</th><th>Field</th><th>Owner</th><th>Purpose</th><th>What breaks if wrong</th></tr></thead>
+    <tbody>
+      <tr><td>SQE</td><td>Opcode 7Fh, FCTYPE 01h</td><td>Host</td><td>Marks this as Connect</td><td>Controller rejects as invalid opcode/field</td></tr>
+      <tr><td>SQE</td><td>Record Format (RECFMT)</td><td>Host</td><td>Version of the Connect data layout (0 today)</td><td>Connect Incompatible Format</td></tr>
+      <tr><td>SQE</td><td>Queue ID (QID)</td><td>Host</td><td>0 = admin, otherwise I/O queue number</td><td>Duplicate/invalid QID → Connect Invalid Parameters</td></tr>
+      <tr><td>SQE</td><td>SQ Size (SQSIZE)</td><td>Host</td><td>Queue depth requested (0's based)</td><td>Too large for CAP.MQES → Connect Invalid Parameters</td></tr>
+      <tr><td>SQE</td><td>Connect Attributes (CATTR)</td><td>Host</td><td>Includes the request to disable SQ flow control, and priority on some revisions</td><td>Mismatch with controller support → rejected</td></tr>
+      <tr><td>SQE</td><td>Keep Alive Timeout (KATO)</td><td>Host</td><td>Admin Connect only: keep alive timeout in milliseconds</td><td>Too short → spurious association teardown</td></tr>
+      <tr><td>Data</td><td>Host Identifier (HOSTID)</td><td>Host</td><td>128-bit host identity, consistent across all connections</td><td>Reservations and controller matching break</td></tr>
+      <tr><td>Data</td><td>Controller ID (CNTLID)</td><td>Host</td><td>FFFFh on admin Connect for the dynamic controller model; the returned CNTLID on I/O Connects</td><td>Connect Invalid Parameters</td></tr>
+      <tr><td>Data</td><td>Subsystem NQN (SUBNQN)</td><td>Host</td><td>Which NVM subsystem the host wants</td><td>Connect Invalid Parameters / unknown subsystem</td></tr>
+      <tr><td>Data</td><td>Host NQN (HOSTNQN)</td><td>Host</td><td>Who the host claims to be; matched against the subsystem's allowed host list</td><td>Connect Invalid Host</td></tr>
+      <tr><td>Response</td><td>CNTLID, authentication requirements (AUTHREQ)</td><td>Controller</td><td>Assigned controller ID; whether in-band authentication must follow</td><td>Host never authenticates → I/O refused</td></tr>
+    </tbody>
+  </table>
+  <p>Connect has its own command-specific status values, which you will meet in traces. In the Linux kernel's definitions and the Base specification, they are Connect Incompatible Format (SC 80h), Connect Controller Busy (81h), Connect Invalid Parameters (82h), Connect Restart Discovery (83h) and Connect Invalid Host (84h), all with Status Code Type 1h (command specific). <span class="badge uncertain">Confirm in spec</span> Check them against the Connect command's status table in the Base 2.4 revision you are working with before writing a decoder.</p>
+
+  <h3>Controller models: dynamic and static</h3>
+  <p>A fabric subsystem may use the <strong>dynamic controller model</strong>, where each admin Connect with CNTLID FFFFh makes the subsystem allocate a fresh controller for that association, or the <strong>static controller model</strong>, where controllers exist ahead of time and the host asks for a specific one. Discovery controllers are always dynamic. Most software targets, including Linux <code>nvmet</code>, use the dynamic model. The difference matters for anything that is per-controller state: feature settings, Asynchronous Event Requests and keep alive.</p>
+
+  <h3>Bringing a controller up over a fabric</h3>
+  <p>The initialization sequence mirrors the PCIe one you learned in <a href="ch23.html">NVMe Controller</a>, with transport steps in front and Fabrics commands replacing MMIO:</p>
+  <ol>
+    <li>Transport connect for the admin queue (TCP three-way handshake + ICReq/ICResp, or RDMA_CM connection establishment).</li>
+    <li>Connect command, QID 0 → response carries CNTLID.</li>
+    <li>If required, authentication (Authentication Send/Receive exchanges) on the admin queue.</li>
+    <li>Property Get CAP, Property Get VS.</li>
+    <li>Property Set CC (with CC.EN = 1, I/O queue entry sizes) → Property Get CSTS until CSTS.RDY = 1.</li>
+    <li>Identify Controller (admin opcode 06h): learn IOCCSZ, IORCSZ, MDTS, number of queues, SGL support, KAS…</li>
+    <li>Set Features Number of Queues, Asynchronous Event Request, Keep Alive scheduling.</li>
+    <li>For each I/O queue: transport connect, then Connect with QID = n and the CNTLID learned in step 2.</li>
+    <li>Identify Namespace list / Identify Namespace → block devices appear.</li>
+  </ol>
+  <aside class="callout insight">
+    <p>Notice what is <em>missing</em> compared with PCIe. You will see no AQA/ASQ/ACQ programming, since the admin queue's size comes from the admin Connect. You will see no doorbell stride, no MSI-X table setup and no Create I/O CQ/SQ commands. If a fabric trace seems to be "missing steps", check this list before assuming something failed.</p>
+  </aside>
+
+  <h3>SQ flow control and SQHD</h3>
+  <p>Over PCIe, the host learns how far the controller has consumed the SQ through the SQ Head Pointer (SQHD) in each CQE, and must not overrun the ring. Over fabrics the same mechanism exists, with the "ring" now a controller-side buffer of capsules. A host may ask, through the Connect command, to <strong>disable SQ flow control</strong>. In that case the host promises never to have more commands outstanding than the queue depth, and the controller does not need to report meaningful SQHD values. Linux typically requests this when the controller allows it. <span class="badge impl">Implementation-dependent</span> When SQ flow control is disabled, SQHD in captures may look frozen. That is expected, not a bug.</p>
+
+  <h3>The central concept on the ladder: the capsule</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>A sealed envelope that carries the request slip, and sometimes a small parcel, to a library across town. The reply comes back in another envelope.</p></div>
+    <div class="rung" data-rung="B"><p>A command capsule is a 64-byte NVMe SQE plus optional SGL descriptors and in-capsule data. A response capsule is a 16-byte CQE. Sending a capsule submits a command. Receiving a response capsule completes it.</p></div>
+    <div class="rung" data-rung="C"><p>The host's NIC (or RDMA NIC) transmits the capsule from a host buffer. On the target, a NIC receives it into target memory, where target software or an offload engine parses the SQE and dispatches it to a backing device, often a PCIe NVMe SSD. No PCIe traffic crosses between host and target.</p></div>
+    <div class="rung" data-rung="D"><p>The NVM Express Base Specification defines command and response capsules, the Fabrics commands and the message-based queueing model. Transport specifications (TCP 1.3, RDMA 1.3) define how capsules are framed. Capsule size limits come from Identify Controller (IOCCSZ, IORCSZ) and transport rules for the admin queue.</p></div>
+    <div class="rung" data-rung="E"><p>On TCP: CapsuleCmd PDU (common header + SQE + optional data + optional digests) → optional R2T/H2CData or C2HData → CapsuleResp PDU. On RDMA: SEND (command capsule) → optional RDMA READ/WRITE → SEND (response capsule).</p></div>
+    <div class="rung" data-rung="F"><p>A packet capture shows TCP segments to port 4420 that a dissector decodes as "NVMe/TCP CapsuleCmd, Read, CID 0x0042". The CID ties the C2HData and CapsuleResp rows to that command. On PCIe the same CID would tie an SQE fetch to a CQE write.</p></div>
+    <div class="rung" data-rung="G"><p>A missing CapsuleResp after C2HData with full data, combined with a host timeout and abort, points to the target's completion path or to a lost PDU. Digest errors point to corruption in transit. A Connect response with Connect Invalid Host points to configuration, not the network. Always find the first capsule whose content or timing deviates.</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for the capsule</h3>
+  <table>
+    <caption>Capsule: sixteen questions</caption>
+    <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>What is it?</td><td>The transport-independent message unit of NVMe-oF: an SQE (+SGLs + data) host→controller, or a CQE (+data) controller→host.</td></tr>
+      <tr><td>Why was it created?</td><td>To carry NVMe commands where host and controller share no memory.</td></tr>
+      <tr><td>What problem does it solve?</td><td>It lets one command set run over many networks without per-network command definitions.</td></tr>
+      <tr><td>What existed before it?</td><td>SCSI over networks (iSCSI, FC-SCSI/FCP, iSER, SRP), with SCSI Command Descriptor Blocks in their own PDU formats. For NVMe itself, only memory-based queues over PCIe.</td></tr>
+      <tr><td>Why is the current design better?</td><td>The SQE/CQE stay identical end to end, so host drivers and targets share code paths with local NVMe. The multi-queue model maps one queue to one connection and avoids SCSI translation.</td></tr>
+      <tr><td>Who creates it?</td><td>Command capsule: the host NVMe-oF driver. Response capsule: the controller (target).</td></tr>
+      <tr><td>Who consumes it?</td><td>The opposite end: the controller parses command capsules, the host matches response capsules by CID.</td></tr>
+      <tr><td>Where does it live?</td><td>In transport buffers: host socket or registered RDMA buffers, then on the wire, then in target receive buffers.</td></tr>
+      <tr><td>What memory/registers are involved?</td><td>No NVMe doorbell registers. Capsule size limits come from Identify Controller (IOCCSZ/IORCSZ). For RDMA, pre-posted receive buffers sized for capsules.</td></tr>
+      <tr><td>What happens before it?</td><td>Transport connection, Connect on that queue, and for the first command, controller enablement through Property Set.</td></tr>
+      <tr><td>What happens after it?</td><td>The data phase, if any, then the response capsule, then the host completes the block request.</td></tr>
+      <tr><td>What happens if it is wrong?</td><td>Malformed framing → transport error (TCP: C2HTermReq/H2CTermReq and connection close). Bad SQE fields → normal NVMe error status in the response capsule. Oversized in-capsule data → error status or transport error.</td></tr>
+      <tr><td>What does the protocol analyzer show?</td><td>A network analyzer (e.g., Wireshark with its NVMe/TCP or InfiniBand dissectors) shows the transport PDU/message and the decoded SQE/CQE inside. A PCIe analyzer on the host shows only NIC DMA traffic.</td></tr>
+      <tr><td>What does Linux show?</td><td><code>nvme list-subsys</code>, <code>/sys/class/nvme/nvmeX/transport</code> and <code>address</code>, and kernel messages from the <code>nvme_tcp</code>/<code>nvme_rdma</code>/<code>nvme_fabrics</code> modules. Linux does not show individual capsules unless you enable tracing.</td></tr>
+      <tr><td>What would a validation engineer test?</td><td>Maximum in-capsule size boundaries, ICDOFF handling, SGL descriptor types, digest on/off, out-of-order CIDs, malformed PDU lengths and capsule arrival when the queue is full.</td></tr>
+      <tr><td>What would a senior engineer suspect when it fails?</td><td>Capsule-size negotiation mismatch, SGL descriptor type mismatched to transport, MTU/segmentation issues, digest mismatch, or target CPU starvation delaying response capsules.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>Draw the boxes before you draw the arrows. A fabric deployment has <em>two</em> hardware domains joined by a network, and NVMe appears in both of them in different roles.</p>
+  <figure>
+<pre class="diagram">
+  HOST (initiator)                         NETWORK                 TARGET (NVM subsystem)
++-------------------------+                                  +----------------------------------+
+| CPU: app, block layer,  |                                  | CPU: target software (e.g. nvmet)|
+|  nvme-core, nvme-tcp or |                                  |   - fabric controller (CNTLID 1) |
+|  nvme-rdma, NIC driver  |                                  |   - namespace -> backing device  |
+|                         |    Ethernet / InfiniBand         |                                  |
+| Host memory: I/O bufs,  |   switches, links, (ToR, spine)  | Target memory: capsule buffers,  |
+|  socket or registered   |<===============================> |  data staging buffers            |
+|  RDMA buffers           |     TCP segments or RDMA         |                                  |
+|          |  PCIe        |     packets; NO PCIe TLPs        |        |  PCIe          |  PCIe   |
+|   +------+------+       |                                  |  +-----+-----+  +-------+------+  |
+|   | NIC / RNIC  |       |                                  |  | NIC/RNIC  |  | Lab SSD      |  |
+|   +-------------+       |                                  |  +-----------+  | 0000:01:00.0 |  |
++-------------------------+                                  |                 +--------------+  |
+                                                             +----------------------------------+
+</pre>
+    <figcaption>Two PCIe domains, one network. The fabric controller the host talks to is a target-software object. The Lab SSD behind it is a separate NVMe-over-PCIe controller. Synthetic example for teaching.</figcaption>
+  </figure>
+  <h3>What must participate</h3>
+  <ul>
+    <li><strong>Host network adapter.</strong> A standard Ethernet NIC for NVMe/TCP, or an RDMA-capable NIC (RNIC) for RoCE, iWARP or InfiniBand. The NIC talks to the host CPU and memory over PCIe, so a PCIe analyzer on the host side sees NIC descriptor fetches and packet buffer DMA, not NVMe commands.</li>
+    <li><strong>The network.</strong> Links and switches. NVMe/TCP tolerates loss through TCP retransmission, with a latency cost. RoCEv2 performs best on a lossless or well-tuned Ethernet configuration using Priority Flow Control (PFC) and/or Explicit Congestion Notification (ECN). <span class="badge impl">Implementation-dependent</span></li>
+    <li><strong>Target network adapter and target software or hardware.</strong> This might be Linux <code>nvmet</code>, a storage array's firmware, a SmartNIC/DPU offload, or an all-in-one "Ethernet SSD" where the controller itself speaks the fabric.</li>
+    <li><strong>Backing media.</strong> Often a PCIe NVMe SSD, but it can be anything: a RAID volume, a file, RAM, a remote volume.</li>
+  </ul>
+  <h3>What may participate</h3>
+  <ul>
+    <li>TCP offload features: TSO/GSO (segmentation offload), LRO/GRO (receive coalescing), checksum offload, and on some NICs, NVMe/TCP digest and data-placement offload. <span class="badge impl">Implementation-dependent</span></li>
+    <li>Kernel TLS offload (kTLS) when NVMe/TCP uses TLS.</li>
+    <li>On the target, peer-to-peer DMA between RNIC and SSD (e.g., through the SSD's Controller Memory Buffer), which avoids target CPU memory. <span class="badge impl">Implementation-dependent</span></li>
+  </ul>
+  <h3>What is observable and what is not</h3>
+  <table>
+    <caption>Observation points in a fabric deployment</caption>
+    <thead><tr><th>Point</th><th>Tool</th><th>Shows</th><th>Cannot show</th></tr></thead>
+    <tbody>
+      <tr><td>Host wire / switch mirror port</td><td>Network capture (tcpdump, Wireshark, hardware tap)</td><td>Capsules, PDUs, timing, retransmissions</td><td>Host software queueing before transmit; target internal latency split</td></tr>
+      <tr><td>Host PCIe (host ↔ NIC)</td><td>PCIe analyzer</td><td>NIC DMA, NIC doorbells (the NIC's own, not NVMe's), MSI-X to the host</td><td>NVMe structure, unless you decode NIC descriptors</td></tr>
+      <tr><td>Target PCIe (target ↔ Lab SSD)</td><td>PCIe analyzer</td><td>A <em>separate</em> NVMe-over-PCIe conversation with different CIDs and queues</td><td>Which host command caused which SSD command, without correlation by LBA/time</td></tr>
+      <tr><td>Host kernel</td><td>tracepoints, <code>nvme</code> sysfs, logs</td><td>Request issue/complete, reconnects, keep alive failures</td><td>Network loss detail</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout insight" data-title="Two NVMe conversations, not one">
+    <p>When a host reads from <code>nqn.2026-10.org.example:lab-ssd</code>, there are two separate NVMe command lifecycles. One runs between the host and the target's <em>fabric</em> controller (capsules, CID chosen by the host). The other runs between the target's local NVMe driver and the Lab SSD over PCIe (SQE in target memory, doorbell, a different CID chosen by the target driver). Many debugging mistakes come from trying to match CIDs across them. Correlate by namespace, LBA, length and time instead.</p>
+  </aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>The architecture of NVMe-oF is normative text in the <cite class="spec">NVM Express Base Specification, Revision 2.4 — NVMe over Fabrics / message-based transport and Fabrics command sections</cite>. The framing for each transport is normative text in the <cite class="spec">NVMe over TCP Transport Specification, Revision 1.3</cite> and the <cite class="spec">NVMe over RDMA Transport Specification, Revision 1.3</cite>. Explanatory figures and overview text in these documents are informative. Requirements stated with "shall" are normative.</p>
+  <aside class="callout verified">
+    <ul>
+      <li>Fabrics commands share opcode 7Fh and are distinguished by the Fabrics Command Type field.</li>
+      <li>A command capsule contains an SQE and optionally SGLs and data. A response capsule contains a CQE and optionally data.</li>
+      <li>NVMe over Fabrics uses SGLs, not PRPs, to describe data.</li>
+      <li>Over fabrics, each I/O SQ is paired with exactly one CQ, and queues are created by the Connect command.</li>
+      <li>Controller properties CAP (00h), VS (08h), CC (14h) and CSTS (1Ch) are accessed with Property Get/Set over fabrics.</li>
+      <li>Fabrics architecture moved into the Base specification with NVMe 2.0. Transports have separate specifications.</li>
+    </ul>
+  </aside>
+  <aside class="callout derived">
+    <p>Because a capsule's arrival is the submission signal, the "doorbell write → SQE fetch" latency of PCIe is replaced by "transmit → receive" latency on the fabric. A fabric command therefore cannot be "submitted but not fetched" in the PCIe sense. A command that never produces a response capsule was either lost in transit, discarded by the target, or stuck in target processing. The capture tells you which.</p>
+  </aside>
+  <aside class="callout impl">
+    <ul>
+      <li>Number of I/O queues per association, queue depth and in-capsule data size, as advertised by the target.</li>
+      <li>Whether SQ flow control is disabled.</li>
+      <li>Whether a target is a software target, a hardware offload, or a native fabric-attached drive.</li>
+      <li>How the target maps fabric namespaces to backing storage, and how it schedules work across CPUs.</li>
+      <li>Host reconnect timers (Linux <code>ctrl_loss_tmo</code>, <code>reconnect_delay</code>) are host policy, not specification.</li>
+    </ul>
+  </aside>
+  <aside class="callout version">
+    <ul>
+      <li>The original NVMe over Fabrics 1.0 (2016) defined the RDMA and FC bindings. NVMe/TCP was added later as a ratified Technical Proposal and is now its own transport specification.</li>
+      <li>TLS 1.3 support and secure channel concatenation evolved across TCP transport revisions. Check TCP Transport 1.3 for current requirements.</li>
+      <li>The 2026 (2.4) release updated the asymmetric key-exchange options used by authentication to prepare for post-quantum cryptography. See <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a>. Algorithm identifiers are not reproduced here. Read them in the Base 2.4 specification.</li>
+      <li>The Disconnect Fabrics command and some Connect attributes appeared in later revisions than the original Fabrics specification.</li>
+    </ul>
+  </aside>
+  <aside class="callout notsaid">
+    <ul>
+      <li>The specification does not say what latency or throughput a fabric must achieve.</li>
+      <li>It does not mandate a backing device type. A namespace over fabrics need not be an SSD.</li>
+      <li>It does not specify Linux behaviour: kernel module parameters, reconnect policy and multipath I/O policy are implementation choices.</li>
+      <li>Exact field offsets of Connect data, Discovery Log entries and PDU headers must be read from the specifications themselves. This chapter names them and gives values only where we are confident. Before you build tools, check them against the specification's figures.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn">
+    <ul>
+      <li>Never assume a fabric controller's CNTLID or CIDs relate to the backing SSD's.</li>
+      <li>Never assume Phase Tag or SQHD values in fabric CQEs carry the same diagnostic meaning they carry over PCIe.</li>
+      <li>Never assume the in-capsule data size of the admin queue equals that of the I/O queues.</li>
+      <li>Never assume the target honours every Connect attribute you request. Read the response.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>Below is the same 4 KiB Read (NSID 1, SLBA 0x1000, 8 × 512-byte LBAs) issued three ways. Compare the shape of the three sequences more than the details. The details come in the following chapters.</p>
+  <h3>Over PCIe (memory-based)</h3>
+  <figure>
+    <ol class="seq" data-actors="Host driver|Host memory|Lab SSD controller">
+      <li data-from="Host driver" data-to="Host memory">write SQE (CID 0x0042) at SQ1 tail</li>
+      <li data-from="Host driver" data-to="Lab SSD controller" data-t="0 ns">MWr: SQ1TDBL (BAR0+0x1008)</li>
+      <li data-from="Lab SSD controller" data-to="Host memory">MRd 64 B: fetch SQE</li>
+      <li data-from="Host memory" data-to="Lab SSD controller" class="dashed">CplD: SQE</li>
+      <li data-note="Lab SSD controller">read NAND, tens of µs</li>
+      <li data-from="Lab SSD controller" data-to="Host memory">MWr ×16 (256 B MPS): 4 KiB data</li>
+      <li data-from="Lab SSD controller" data-to="Host memory">MWr 16 B: CQE into CQ1</li>
+      <li data-from="Lab SSD controller" data-to="Host driver">MWr: MSI-X vector 1</li>
+      <li data-from="Host driver" data-to="Lab SSD controller">MWr: CQ1HDBL</li>
+    </ol>
+    <figcaption>Memory-based model: the controller pulls the command and pushes data and completion into host memory. Synthetic example for teaching.</figcaption>
+  </figure>
+  <h3>Over TCP (message-based)</h3>
+  <figure>
+    <ol class="seq" data-actors="Host nvme-tcp|TCP connection|Target controller">
+      <li data-from="Host nvme-tcp" data-to="Target controller" data-t="0 µs">CapsuleCmd PDU: Read CID 0x0042</li>
+      <li data-note="Target controller">parse SQE, issue to backing device</li>
+      <li data-from="Target controller" data-to="Host nvme-tcp" class="dashed">C2HData PDU: 4096 B, DATAO 0</li>
+      <li data-from="Target controller" data-to="Host nvme-tcp" class="dashed">CapsuleResp PDU: CQE CID 0x0042</li>
+      <li data-note="Host nvme-tcp">complete block request</li>
+    </ol>
+    <figcaption>Message-based model over TCP: no doorbell, no SQE fetch, no interrupt from the target. Synthetic example for teaching.</figcaption>
+  </figure>
+  <h3>Over RDMA (message-based commands, memory-semantic data)</h3>
+  <figure>
+    <ol class="seq" data-actors="Host nvme-rdma|Host RNIC + memory|Target RNIC + controller">
+      <li data-note="Host nvme-rdma">register 4 KiB buffer, get rkey</li>
+      <li data-from="Host RNIC + memory" data-to="Target RNIC + controller">SEND: capsule, keyed SGL (addr, len, rkey)</li>
+      <li data-note="Target RNIC + controller">execute Read on backing device</li>
+      <li data-from="Target RNIC + controller" data-to="Host RNIC + memory">RDMA WRITE 4 KiB to addr/rkey</li>
+      <li data-from="Target RNIC + controller" data-to="Host RNIC + memory" class="dashed">SEND (w/ Invalidate): response capsule</li>
+    </ol>
+    <figcaption>Message-based commands, memory-semantic data: the target RNIC writes directly into host memory using the key the host advertised. Synthetic example for teaching.</figcaption>
+  </figure>
+  <h3>Directions, requests and ordering</h3>
+  <table>
+    <caption>Direction and ordering properties by transport</caption>
+    <thead><tr><th>Property</th><th>PCIe</th><th>TCP</th><th>RDMA</th></tr></thead>
+    <tbody>
+      <tr><td>Command direction</td><td>Controller pulls from host memory</td><td>Host pushes to controller</td><td>Host pushes (SEND)</td></tr>
+      <tr><td>Read data direction</td><td>Controller MWr into host memory</td><td>C2HData PDUs (controller→host)</td><td>Target RDMA WRITE into host memory</td></tr>
+      <tr><td>Write data direction</td><td>Controller MRd from host memory</td><td>In-capsule, or R2T then H2CData</td><td>In-capsule, or target RDMA READ from host memory</td></tr>
+      <tr><td>Completion direction</td><td>Controller MWr CQE + MSI-X</td><td>CapsuleResp PDU</td><td>SEND carrying response capsule</td></tr>
+      <tr><td>In-order delivery within a queue</td><td>PCIe ordering rules</td><td>TCP byte stream: strictly in order per connection</td><td>RC QP: in order per QP</td></tr>
+      <tr><td>Command completion order</td><td>Any order (match by CID)</td><td>Any order (match by CID)</td><td>Any order (match by CID)</td></tr>
+      <tr><td>Data integrity on the path</td><td>LCRC, ECRC optional</td><td>TCP checksum + optional header/data digest (CRC32C)</td><td>Transport ICRC/CRC (RoCE ICRC, IB ICRC/VCRC, iWARP CRC)</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout remember">
+    <p>A single TCP connection or RDMA queue pair carries one NVMe queue pair. In-order delivery is guaranteed within that connection. Commands still complete out of order, and the CID is what matches them, exactly as on PCIe.</p>
+  </aside>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>The traces below use the course's synthetic fabric setup: host <code>192.0.2.10</code>, target <code>192.0.2.20</code> (documentation addresses), NVMe/TCP I/O port 4420, jumbo frames (MTU 9000), no digests, no TLS. The target exports namespace 1, backed by the Lab SSD at 0000:01:00.0 (512-byte LBAs). Columns follow Wireshark's default layout, plus a "Meaning" column. Frame lengths assume Ethernet + IPv4 + TCP with timestamps (66 bytes of headers).</p>
+  <h3>Normal: a 4 KiB Read over NVMe/TCP, with the target's PCIe side alongside</h3>
+  <div class="trace" data-kind="synthetic" data-title="NVMe/TCP 4 KiB Read, host view of the wire">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time (s)</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Length</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>0.000000</td><td>192.0.2.10</td><td>192.0.2.20</td><td>NVMe/TCP</td><td>138</td><td>CapsuleCmd, Read, CID 0x0042, NSID 1, SLBA 0x1000, NLB 7, SGL 5Ah len 4096</td><td>Command capsule (72-byte PDU). This is the "doorbell".</td></tr>
+        <tr class="dir-up"><td>2</td><td>0.000011</td><td>192.0.2.20</td><td>192.0.2.10</td><td>TCP</td><td>66</td><td>4420 → 51234 [ACK]</td><td>Transport acknowledgement, not NVMe</td></tr>
+        <tr class="dir-up"><td>3</td><td>0.000094</td><td>192.0.2.20</td><td>192.0.2.10</td><td>NVMe/TCP</td><td>4186</td><td>C2HData, CID 0x0042, DATAO 0, DATAL 4096, flags LAST_PDU</td><td>Read data (24-byte header + 4096 data)</td></tr>
+        <tr class="dir-up"><td>4</td><td>0.000096</td><td>192.0.2.20</td><td>192.0.2.10</td><td>NVMe/TCP</td><td>90</td><td>CapsuleResp, CID 0x0042, Status 0x0000 (Success), SQHD 0x0000</td><td>Response capsule. SQHD frozen because SQ flow control is disabled.</td></tr>
+        <tr class="dir-down"><td>5</td><td>0.000102</td><td>192.0.2.10</td><td>192.0.2.20</td><td>TCP</td><td>66</td><td>51234 → 4420 [ACK]</td><td>Host TCP ACK</td></tr>
+      </tbody>
+    </table>
+    <p>Total 96 µs from command capsule to response capsule. Nothing in the network capture looks like a doorbell or an interrupt. Frame 1 is the submission and frame 4 is the completion.</p>
+  </div>
+  <div class="trace" data-kind="synthetic" data-title="Same moment, target side: target driver to Lab SSD over PCIe Gen4 x4">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs, rel. to frame 1)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Target-side SQ/CQ live in <em>target</em> memory. CID is chosen by the target's NVMe driver (0x0107), not the remote host.</td></tr>
+        <tr class="dir-down"><td>1</td><td>RC→Dev</td><td>14.2</td><td>MWr32</td><td>Addr=0xFE60_1008 Len=1 Data=0x0000_0037</td><td>Target driver rings SQ1 tail doorbell</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→RC</td><td>14.9</td><td>MRd64</td><td>Addr=0x1_2340_0D80 Len=16 Tag=0x11 ReqID=0x0100</td><td>SSD fetches SQE (CID 0x0107, SLBA 0x1000, NLB 7)</td></tr>
+        <tr class="dir-down"><td>3</td><td>RC→Dev</td><td>15.5</td><td>CplD</td><td>Len=16 Tag=0x11 Status=SC</td><td>SQE delivered</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→RC</td><td>78.0–79.6</td><td>MWr64 ×16</td><td>Addr=0x2_0000_0000… Len=64 (256 B) each</td><td>4 KiB read data into the target's staging buffer</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→RC</td><td>79.8</td><td>MWr64</td><td>Addr=0x1_2341_0370 Len=4</td><td>CQE (CID 0x0107, Success)</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→RC</td><td>80.1</td><td>MWr32</td><td>Addr=0xFEE0_xxxx MSI-X vector 1</td><td>Interrupt to the <em>target</em> CPU</td></tr>
+        <tr class="note"><td colspan="6">~14 µs later, frame 3 (C2HData) leaves the target NIC. The fabric response follows the local completion.</td></tr>
+      </tbody>
+    </table>
+    <p>Reading the two traces together: of the 96 µs, roughly 14 µs passed before the target submitted to its SSD (network + target receive + parse), about 66 µs went to the SSD (mostly NAND), and about 16 µs went to send the data and response back. All numbers are illustrative.</p>
+  </div>
+
+  <h3>Abnormal: Connect rejected</h3>
+  <p>An engineer adds a new host to the lab. <code>nvme connect</code> fails immediately. Here is the capture of the admin queue connection.</p>
+  <div class="trace" data-kind="synthetic" data-title="NVMe/TCP admin Connect rejected">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time (s)</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Length</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>0.000000</td><td>192.0.2.11</td><td>192.0.2.20</td><td>TCP</td><td>74</td><td>51900 → 4420 [SYN]</td><td>New admin queue connection</td></tr>
+        <tr class="dir-up"><td>2</td><td>0.000052</td><td>192.0.2.20</td><td>192.0.2.11</td><td>TCP</td><td>74</td><td>4420 → 51900 [SYN, ACK]</td><td>Target listening: network path is fine</td></tr>
+        <tr class="dir-down"><td>3</td><td>0.000071</td><td>192.0.2.11</td><td>192.0.2.20</td><td>TCP</td><td>66</td><td>51900 → 4420 [ACK]</td><td></td></tr>
+        <tr class="dir-down"><td>4</td><td>0.000102</td><td>192.0.2.11</td><td>192.0.2.20</td><td>NVMe/TCP</td><td>194</td><td>ICReq, PFV 0, HPDA 0, DGST none, MAXR2T 0</td><td>Initialize connection request (128-byte PDU)</td></tr>
+        <tr class="dir-up"><td>5</td><td>0.000160</td><td>192.0.2.20</td><td>192.0.2.11</td><td>NVMe/TCP</td><td>194</td><td>ICResp, PFV 0, CPDA 0, DGST none, MAXH2CDATA 131072</td><td>Transport-level negotiation succeeds</td></tr>
+        <tr class="dir-down"><td>6</td><td>0.000214</td><td>192.0.2.11</td><td>192.0.2.20</td><td>NVMe/TCP</td><td>1162</td><td>CapsuleCmd, Fabrics Connect, QID 0, SQSIZE 31, KATO 5000, CNTLID 0xFFFF</td><td>Connect with 1024 bytes of in-capsule data (SUBNQN, HOSTNQN)</td></tr>
+        <tr class="abnormal"><td>7</td><td>0.000298</td><td>192.0.2.20</td><td>192.0.2.11</td><td>NVMe/TCP</td><td>90</td><td>CapsuleResp, CID 0x0000, Status: SCT 1h SC 84h (Connect Invalid Host), DNR=1</td><td><strong>First abnormal event</strong></td></tr>
+        <tr class="dir-down"><td>8</td><td>0.000420</td><td>192.0.2.11</td><td>192.0.2.20</td><td>TCP</td><td>66</td><td>51900 → 4420 [FIN, ACK]</td><td>Host gives up and closes</td></tr>
+        <tr class="dir-up"><td>9</td><td>0.000455</td><td>192.0.2.20</td><td>192.0.2.11</td><td>TCP</td><td>66</td><td>4420 → 51900 [FIN, ACK]</td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h4>Reasoning</h4>
+  <ol>
+    <li><strong>Layer by layer.</strong> TCP connected (frames 1–3), so routing, firewall and listener are fine. ICReq/ICResp succeeded (4–5), so NVMe/TCP transport parameters are compatible. The failure is inside NVMe, in the Connect command's response.</li>
+    <li><strong>The status.</strong> Status Code Type 1h (command specific) with the Connect Invalid Host value says the subsystem rejected the <em>host identity</em>, not the request format or the queue parameters.</li>
+    <li><strong>Hypotheses.</strong> (a) The new host's NQN is not on the subsystem's allowed host list. (b) The host NQN is malformed or empty. (c) Authentication is required and the host is not configured for it. A Connect would normally succeed in that case and return authentication requirements, so this is less likely.</li>
+    <li><strong>Evidence to collect.</strong> Decode frame 6's in-capsule data at offset 512 (HOSTNQN). Compare it with the target's configuration (<code>/sys/kernel/config/nvmet/subsystems/&lt;nqn&gt;/allowed_hosts/</code> on a Linux target) and with <code>/etc/nvme/hostnqn</code> on the host.</li>
+    <li><strong>Likely conclusion.</strong> The host was cloned from another machine's image, so it presents the other machine's NQN, or a new NQN that was never added to the allow list. DNR=1 (Do Not Retry) confirms that retrying without a change will not help.</li>
+  </ol>
+  <aside class="callout debug">
+    <p>The discipline is the same as on PCIe. Find the lowest layer that worked, then the first event that deviates. Here the lowest layer that worked is NVMe/TCP initialization, and the first deviation is an NVMe status. Packet loss, MTU and switch configuration are already ruled out by frames 1–5.</p>
+  </aside>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Every command in this section only reads state. None of them connect, disconnect or write anything.</p></aside>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Which fabric modules are loaded?</span>
+lsmod | grep -E '^nvme(_core|_fabrics|_tcp|_rdma|_fc)?\b'
+
+<span class="cm"># This host's identity as an NVMe-oF initiator</span>
+cat /etc/nvme/hostnqn
+cat /etc/nvme/hostid
+
+<span class="cm"># All subsystems and the paths (controllers) to them, with transport and address</span>
+sudo nvme list-subsys
+sudo nvme list -v
+
+<span class="cm"># Per-controller attributes in sysfs</span>
+for c in /sys/class/nvme/nvme*; do
+  echo "$c: transport=$(cat $c/transport) state=$(cat $c/state) cntlid=$(cat $c/cntlid)"
+  echo "   address=$(cat $c/address 2&gt;/dev/null)"
+  echo "   subsysnqn=$(cat $c/subsysnqn)"
+done
+
+<span class="cm"># Kernel messages from the fabrics stack</span>
+sudo dmesg | grep -iE 'nvme(_tcp|_rdma|_fabrics)?|nvmf' | tail -n 50</code></pre>
+  <table>
+    <caption>What these outputs prove and cannot prove</caption>
+    <thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>transport</code> = <code>tcp</code>, <code>rdma</code>, <code>fc</code>, <code>loop</code> or <code>pcie</code></td><td>Which binding the host driver uses for this controller</td><td>What the target uses for its backing storage</td></tr>
+      <tr><td><code>address</code> (e.g. <code>traddr=192.0.2.20,trsvcid=4420</code>)</td><td>The network endpoint this controller was connected to</td><td>That the network path is healthy right now</td></tr>
+      <tr><td><code>state</code> = <code>live</code></td><td>The host considers the association up</td><td>That I/O is completing promptly</td></tr>
+      <tr><td><code>state</code> = <code>connecting</code> / <code>resetting</code></td><td>The host is in reconnect or reset logic</td><td>Why: correlate with dmesg and captures</td></tr>
+      <tr><td><code>cntlid</code></td><td>The CNTLID the target assigned at Connect</td><td>Anything about the backing SSD's controller</td></tr>
+      <tr><td><code>nvme list-subsys</code> showing two paths</td><td>Multipath: two controllers to one subsystem</td><td>Which path I/O actually uses (see <a href="ch68.html">Fabric Architecture</a>)</td></tr>
+    </tbody>
+  </table>
+  <p>Output formats of <code>nvme-cli</code> vary between versions, so this chapter does not reproduce them. Run the commands and compare against the table. For a lab target you can build yourself, see the lab in <a href="ch68.html">Fabric Architecture</a>.</p>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>The program below builds two NVMe/TCP CapsuleCmd PDUs from scratch: an admin Connect with in-capsule data and an I/O Read whose data will arrive in C2HData PDUs. It then decodes them back. It uses only the Python standard library and runs as written. It never touches a network or a device.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="capsule_build.py"><code>#!/usr/bin/env python3
+"""capsule_build.py - build NVMe-oF capsules and NVMe/TCP PDUs (synthetic, teaching only)."""
+import struct, uuid
+
+OPC_FABRICS, OPC_READ, OPC_WRITE = 0x7F, 0x02, 0x01
+FCTYPE_CONNECT = 0x01
+PSDT_SGL = 0x40                       # CDW0 flags bits 7:6 = 01b -&gt; SGL used
+PDU_CAPSULE_CMD = 0x04
+
+def sgl_offset_desc(offset, length):
+    """Data Block descriptor, Offset subtype: data sits inside the capsule."""
+    return struct.pack("&lt;QI3xB", offset, length, (0x0 &lt;&lt; 4) | 0x1)
+
+def sgl_transport_desc(length):
+    """Transport SGL Data Block descriptor (type 5h, subtype Ah, as Linux nvme-tcp uses)."""
+    return struct.pack("&lt;QI3xB", 0, length, (0x5 &lt;&lt; 4) | 0xA)
+
+def connect_sqe(cid, qid, sqsize, kato_ms, data_len=1024):
+    sqe = bytearray(64)
+    struct.pack_into("&lt;BBH", sqe, 0, OPC_FABRICS, PSDT_SGL, cid)
+    sqe[4] = FCTYPE_CONNECT
+    sqe[24:40] = sgl_offset_desc(0, data_len)
+    struct.pack_into("&lt;HHHBxI", sqe, 40, 0, qid, sqsize - 1, 0, kato_ms)  # RECFMT, QID, SQSIZE(0's based), CATTR, KATO
+    return bytes(sqe)
+
+def connect_data(hostid, cntlid, subnqn, hostnqn):
+    d = bytearray(1024)
+    d[0:16] = hostid.bytes
+    struct.pack_into("&lt;H", d, 16, cntlid)
+    d[256:256 + len(subnqn)] = subnqn.encode()
+    d[512:512 + len(hostnqn)] = hostnqn.encode()
+    return bytes(d)
+
+def read_sqe(cid, nsid, slba, nlb, nbytes):
+    sqe = bytearray(64)
+    struct.pack_into("&lt;BBHI", sqe, 0, OPC_READ, PSDT_SGL, cid, nsid)
+    sqe[24:40] = sgl_transport_desc(nbytes)
+    struct.pack_into("&lt;QI", sqe, 40, slba, nlb - 1)    # CDW10-11 SLBA, CDW12 NLB (0's based)
+    return bytes(sqe)
+
+def tcp_capsule_cmd(sqe, data=b""):
+    hlen = 8 + len(sqe)
+    pdo = hlen if data else 0
+    plen = hlen + len(data)
+    return struct.pack("&lt;BBBBI", PDU_CAPSULE_CMD, 0, hlen, pdo, plen) + sqe + data
+
+def hexdump(b, limit=96):
+    for off in range(0, min(len(b), limit), 16):
+        chunk = b[off:off + 16]
+        print(f"  {off:04x}: {chunk.hex(' ')}")
+    if len(b) &gt; limit:
+        print(f"  ... ({len(b) - limit} more bytes)")
+
+def decode_sqe(sqe):
+    opc, flags, cid = struct.unpack_from("&lt;BBH", sqe, 0)
+    addr, length, _, _, _, sglid = struct.unpack_from("&lt;QIBBBB", sqe, 24)
+    kind = {0x01: "Data Block / Offset (in-capsule)", 0x5A: "Transport Data Block"}.get(sglid, "other")
+    print(f"  opcode={opc:02X}h PSDT={(flags &gt;&gt; 6) &amp; 3:02b}b CID=0x{cid:04X}"
+          f" SGL1: id={sglid:02X}h ({kind}) addr/offset=0x{addr:X} len={length}")
+    if opc == OPC_FABRICS:
+        recfmt, qid, sqsize, cattr, kato = struct.unpack_from("&lt;HHHBxI", sqe, 40)
+        print(f"  Fabrics FCTYPE={sqe[4]:02X}h RECFMT={recfmt} QID={qid} SQSIZE={sqsize} (0's based) KATO={kato} ms")
+
+if __name__ == "__main__":
+    hostid = uuid.UUID("5f1c0a2e-0000-4000-8000-00000000c0de")   # synthetic
+    hostnqn = "nqn.2014-08.org.nvmexpress:uuid:" + str(hostid)
+    subnqn = "nqn.2026-10.org.example:lab-ssd"
+
+    sqe = connect_sqe(cid=0x0000, qid=0, sqsize=32, kato_ms=5000)
+    pdu = tcp_capsule_cmd(sqe, connect_data(hostid, 0xFFFF, subnqn, hostnqn))
+    print(f"Admin Connect CapsuleCmd PDU: {len(pdu)} bytes (8 CH + 64 SQE + 1024 in-capsule data)")
+    decode_sqe(pdu[8:72]); hexdump(pdu)
+
+    sqe = read_sqe(cid=0x0042, nsid=1, slba=0x1000, nlb=8, nbytes=4096)
+    pdu = tcp_capsule_cmd(sqe)
+    print(f"\nRead CapsuleCmd PDU: {len(pdu)} bytes (no in-capsule data; data returns in C2HData)")
+    decode_sqe(pdu[8:72]); hexdump(pdu)
+</code></pre>
+  <p>Illustrative output (your run will match, because everything is deterministic):</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>Admin Connect CapsuleCmd PDU: 1096 bytes (8 CH + 64 SQE + 1024 in-capsule data)
+  opcode=7Fh PSDT=01b CID=0x0000 SGL1: id=01h (Data Block / Offset (in-capsule)) addr/offset=0x0 len=1024
+  Fabrics FCTYPE=01h RECFMT=0 QID=0 SQSIZE=31 (0's based) KATO=5000 ms
+  0000: 04 00 48 48 48 04 00 00 7f 40 00 00 01 00 00 00
+  0010: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0020: 00 00 00 00 00 00 00 00 00 04 00 00 00 00 00 01
+  0030: 00 00 00 00 1f 00 00 00 88 13 00 00 00 00 00 00
+  0040: 00 00 00 00 00 00 00 00 5f 1c 0a 2e 00 00 40 00
+  0050: 80 00 00 00 00 00 c0 de ff ff 00 00 00 00 00 00
+  ... (1000 more bytes)
+
+Read CapsuleCmd PDU: 72 bytes (no in-capsule data; data returns in C2HData)
+  opcode=02h PSDT=01b CID=0x0042 SGL1: id=5Ah (Transport Data Block) addr/offset=0x0 len=4096
+  0000: 04 00 48 00 48 00 00 00 02 40 42 00 01 00 00 00
+  0010: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0020: 00 00 00 00 00 00 00 00 00 10 00 00 00 00 00 5a
+  0030: 00 10 00 00 00 00 00 00 07 00 00 00 00 00 00 00
+  0040: 00 00 00 00 00 00 00 00</code></pre>
+  <h4>What to notice</h4>
+  <ul>
+    <li>The common header's first byte is 04h (CapsuleCmd). HLEN is 48h (72 = 8 + 64). For the Connect PDU, PDO is also 48h, because in-capsule data starts right after the header, and PLEN is 0448h (1096).</li>
+    <li>The SQE starts at byte 8 and looks exactly like a PCIe SQE, except that byte 1 (flags) is 40h: PSDT = 01b, SGL in use.</li>
+    <li>The Connect's SGL1 identifier is 01h (Data Block, Offset subtype), so its "address" is an offset into the capsule. The Read's is 5Ah (Transport Data Block, transport-specific subtype), so its address is zero and the transport moves the data.</li>
+    <li>SQSIZE is 1Fh for 32 entries, because it is 0's based. NLB 7 means 8 blocks for the same reason.</li>
+  </ul>
+  <h4>Pseudocode: what a target does with a capsule</h4>
+  <pre class="code" data-kind="pseudocode" data-lang="text"><code>on_capsule(queue, capsule):
+    sqe = capsule[0:64]
+    if not queue.connected and not (sqe.opcode == 7Fh and sqe.fctype == CONNECT):
+        respond(queue, sqe.cid, status = COMMAND_SEQUENCE_ERROR)   # nothing before Connect
+        return
+    if sqe.psdt != SGL:
+        respond(queue, sqe.cid, status = INVALID_FIELD)            # PRPs not allowed on fabrics
+        return
+    sgl = sqe.dptr
+    switch sgl.type:
+        case DATA_BLOCK_OFFSET:   data = capsule[64 + icdoff + sgl.offset : ... + sgl.length]
+        case TRANSPORT_DATA_BLOCK: data = transport.pull_from_host(sgl.length)   # TCP: R2T/H2CData
+        case KEYED_DATA_BLOCK:     data = rdma_read(sgl.addr, sgl.length, sgl.key) if is_write
+    result = execute(sqe, data)                                   # same command logic as local NVMe
+    if is_read: transport.push_to_host(result.data, sgl)          # C2HData or RDMA WRITE
+    respond(queue, sqe.cid, status = result.status)               # response capsule</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Problem.</strong> An application writes 8 KiB (16 × 512-byte LBAs) to namespace 1 over NVMe/TCP. The controller reports IOCCSZ = 260 (in 16-byte units) and ICDOFF = 0. Will the data travel in-capsule? How many PDUs cross the wire, and how many round trips does the write take before the completion?</p>
+  <h4>Step 1: maximum in-capsule data</h4>
+  <div class="formula">
+    <div class="eq"><var>D</var><sub>max</sub> = <var>IOCCSZ</var> × 16 − 64</div>
+    <dl class="vars">
+      <dt>D<sub>max</sub></dt><dd>maximum bytes of in-capsule data on an I/O queue</dd>
+      <dt>IOCCSZ</dt><dd>I/O Queue Command Capsule Supported Size from Identify Controller, in 16-byte units</dd>
+      <dt>16</dt><dd>bytes per IOCCSZ unit</dd>
+      <dt>64</dt><dd>bytes occupied by the SQE inside the capsule</dd>
+    </dl>
+  </div>
+  <p>260 × 16 − 64 = 4160 − 64 = <strong>4096 bytes</strong>. The 8 KiB write does not fit. (Linux <code>nvmet</code> commonly advertises a few kilobytes of in-capsule data on I/O queues. <span class="badge impl">Implementation-dependent</span>)</p>
+  <h4>Step 2: the PDU sequence</h4>
+  <ol>
+    <li>Host → target: CapsuleCmd (Write, CID 0x0051, SGL 5Ah length 8192). 1 PDU.</li>
+    <li>Target → host: R2T (CCCID 0x0051, R2TO 0, R2TL 8192, TTAG 0x0003). The target has buffer space. 1 PDU.</li>
+    <li>Host → target: H2CData (DATAO 0, DATAL 8192, LAST_PDU), assuming MAXH2CDATA ≥ 8192. 1 PDU (several TCP segments at a 1500-byte MTU).</li>
+    <li>Target → host: CapsuleResp (CID 0x0051, Success). 1 PDU.</li>
+  </ol>
+  <p>That is 4 NVMe/TCP PDUs and <strong>two</strong> host↔target round trips: command→R2T, then data→response. For a 4 KiB write the data would have fit in-capsule, giving 2 PDUs and <strong>one</strong> round trip. This explains why small-write latency over fabrics depends heavily on the in-capsule size.</p>
+  <h4>Step 3: compare with PCIe</h4>
+  <p>Over PCIe the same 8 KiB write is: doorbell MWr → SQE MRd/CplD → data MRd (16 × 512-byte MRRS requests) → CplDs → CQE MWr → MSI-X. The "R2T" step has a PCIe analogue: the controller issues the data reads when it is ready. That is the same pull model, with the transport doing the pulling.</p>
+  <aside class="callout derived">
+    <p>R2T is to NVMe/TCP what the controller's data MRd is to NVMe over PCIe. Both let the controller pace incoming data to its own buffer availability.</p>
+  </aside>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <table>
+    <caption>Mistakes engineers make when moving from NVMe/PCIe to NVMe-oF</caption>
+    <thead><tr><th>Mistake</th><th>Why it is wrong</th><th>Correct view</th></tr></thead>
+    <tbody>
+      <tr><td>Looking for doorbell writes in a fabric capture</td><td>There is no doorbell register on a fabric controller</td><td>The command capsule's arrival is the submission</td></tr>
+      <tr><td>Expecting PRP entries in fabric SQEs</td><td>Fabrics use SGLs only. PRPs name host memory addresses a remote target cannot reach.</td><td>Expect PSDT = SGL and descriptor types Data Block/Offset, Transport Data Block, or Keyed Data Block</td></tr>
+      <tr><td>Sending Create I/O SQ/CQ over a fabric admin queue</td><td>Queues are created by Connect on their own transport connection</td><td>One Connect per queue, QID chosen by the host</td></tr>
+      <tr><td>Matching host CIDs to backing-SSD CIDs</td><td>They are separate NVMe conversations</td><td>Correlate by NSID/LBA/length/time</td></tr>
+      <tr><td>Reading SQHD in fabric CQEs as progress</td><td>When SQ flow control is disabled, SQHD carries no flow control meaning</td><td>Check the Connect attributes first</td></tr>
+      <tr><td>Treating TCP retransmissions as NVMe errors</td><td>TCP recovers loss below NVMe. NVMe sees only extra latency.</td><td>NVMe errors are status codes or transport termination PDUs</td></tr>
+      <tr><td>Assuming "NVMe-oF adds only a few µs"</td><td>Overhead depends on transport, CPU, NIC offloads, network load and target design</td><td>Measure. The specification promises no latency.</td></tr>
+      <tr><td>Confusing the subsystem NQN with the host NQN</td><td>One names the storage, the other names the initiator</td><td>Connect carries both. Allow lists match the host NQN.</td></tr>
+      <tr><td>Assuming a fabric namespace is an SSD</td><td>Targets may back namespaces with files, RAM, RAID or remote storage</td><td>Identify data describes the fabric namespace, not the medium behind it</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>Fabric debugging adds layers <em>below</em> NVMe that PCIe engineers are used to treating as perfect. Use this layer stack and always find the lowest failing layer first.</p>
+  <div class="flow">
+    <div>Application / block layer<small>timeouts, I/O errors, latency</small></div>
+    <div>NVMe command and status<small>CQE status, Connect status, Identify contents</small></div>
+    <div class="hl">NVMe-oF association<small>Connect, authentication, keep alive, CNTLID</small></div>
+    <div>Transport binding<small>TCP: ICReq/ICResp, PDUs, digests, TLS. RDMA: QP state, keys</small></div>
+    <div>Network transport<small>TCP retransmissions, RDMA retries, congestion</small></div>
+    <div>Link and switch<small>MTU, PFC/ECN, errors, port flaps</small></div>
+  </div>
+  <table>
+    <caption>Symptom → first layer to check</caption>
+    <thead><tr><th>Symptom</th><th>First layer to check</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td><code>nvme connect</code> hangs, then times out</td><td>Network / transport</td><td>No SYN-ACK (TCP) or RDMA_CM reject/timeouts. Check firewall, address, port 4420.</td></tr>
+      <tr><td><code>nvme connect</code> fails instantly with a status</td><td>NVMe-oF association</td><td>Connect response status (Invalid Host, Invalid Parameters)</td></tr>
+      <tr><td>Controller resets every few seconds</td><td>Association: keep alive</td><td>dmesg keep alive timeout messages. Gap in Keep Alive commands in capture.</td></tr>
+      <tr><td>Data corruption detected by application</td><td>Transport integrity</td><td>Enable header/data digests on TCP. Check NIC offloads.</td></tr>
+      <tr><td>High tail latency only under load</td><td>Network congestion or target CPU</td><td>Retransmissions, PFC pause storms, target CPU saturation</td></tr>
+      <tr><td>Some namespaces missing after connect</td><td>NVMe (target config)</td><td>Identify Active Namespace List, target namespace enable flags</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight" data-title="Think in associations, not devices">
+    <p>On PCIe, a controller exists as long as the device is enumerated. Over fabrics, a controller exists only as long as an <em>association</em> exists. It is created by an admin Connect, kept alive by keep alive traffic, and destroyed by disconnect, keep alive expiry or connection loss. When the association dies, every queue, every outstanding command, every Asynchronous Event Request and every per-controller feature setting goes with it. With the dynamic model, a reconnect creates a <em>new</em> controller, possibly with a new CNTLID. Senior engineers ask "what happened to the association?" before they ask "what happened to the drive?"</p>
+  </aside>
+  <aside class="callout insight" data-title="The transport is a design choice, not a detail">
+    <p>TCP gives you reach (any IP network), mature tooling and tolerance of loss, at the cost of CPU copies and stack latency. RDMA gives you lower latency and CPU offload, at the cost of more demanding networks and memory registration complexity. The NVMe layer is identical, so a principal engineer evaluates fabrics on operational properties: failure domains, congestion behaviour, observability, security, and CPU cost per I/O. The command set does not decide between them.</p>
+  </aside>
+  <aside class="callout insight" data-title="Capsule size is a latency knob">
+    <p>In-capsule data removes a full round trip for small writes. If a workload is dominated by 4–16 KiB writes and the target advertises only 4 KiB of in-capsule space, most writes pay an R2T (TCP) or RDMA READ round trip. That is visible in captures as a command→R2T gap. Raising the target's in-capsule size trades target memory per queue entry for latency.</p>
+  </aside>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab: Same command, three envelopes</h3>
+  <h4>Objective</h4>
+  <p>Build NVMe/TCP command capsules by hand, prove that the embedded SQE is byte-identical to the PCIe SQE except for the data pointer, and predict the PDU sequence for writes of different sizes.</p>
+  <h4>Skills</h4>
+  <ul><li>Reading and writing SQE bytes</li><li>SGL descriptor selection for fabrics</li><li>In-capsule size reasoning</li><li>Translating between PCIe and fabric traces</li></ul>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Pure software. Nothing touches a network, a device or the kernel.</p></aside>
+  <h4>Hardware required</h4>
+  <p>Any computer.</p>
+  <h4>Software required</h4>
+  <p>Python 3.8 or newer. The <code>capsule_build.py</code> program from the Code section.</p>
+  <h4>Input</h4>
+  <p>A Write of 3 KiB (6 LBAs) at SLBA 0x2000, NSID 1, CID 0x0060. A Write of 64 KiB (128 LBAs) at SLBA 0x3000, CID 0x0061. IOCCSZ = 260, ICDOFF = 0, MAXH2CDATA = 32768.</p>
+  <h4>Expected output</h4>
+  <p>Two CapsuleCmd PDUs with correct headers, and a written prediction of the full PDU sequence for each write.</p>
+  <h4>Background</h4>
+  <p>In-capsule data uses the Data Block/Offset descriptor. Transport-moved data uses the Transport Data Block descriptor. For an NVMe/TCP write that does not fit in the capsule, the target sends one or more R2T PDUs. The host answers each with H2CData PDUs no larger than MAXH2CDATA.</p>
+  <h4>Step 1</h4>
+  <p>Add a function <code>write_sqe(cid, nsid, slba, nlb, nbytes, inline)</code> to the program. It should set opcode 01h and choose the descriptor: <code>sgl_offset_desc(0, nbytes)</code> if <code>inline</code>, else <code>sgl_transport_desc(nbytes)</code>.</p>
+  <h4>Step 2</h4>
+  <p>Build the 3 KiB write as an in-capsule PDU, filling the data with a repeating byte pattern. Print the header and confirm HLEN = 72, PDO = 72 and PLEN = 72 + 3072 = 3144 (0C48h).</p>
+  <h4>Step 3</h4>
+  <p>Build the 64 KiB write without in-capsule data. Then, on paper, write the PDU sequence assuming the target issues a single R2T for the whole 64 KiB.</p>
+  <h4>Observation</h4>
+  <p>Compare bytes 8–71 of your write PDU with a PCIe Write SQE you decoded in <a href="ch33.html">WRITE</a>. Every field except byte 1 (PSDT) and bytes 24–39 (DPTR) should match.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Why can the 3 KiB write go in-capsule while the 64 KiB cannot?</li>
+    <li>How many H2CData PDUs does the 64 KiB write need, and what are their DATAO values?</li>
+    <li>What would change if the target sent two R2Ts of 32 KiB each?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Write a decoder that takes a CapsuleCmd PDU and prints a Wireshark-style "Info" string, e.g. <code>CapsuleCmd, Write, CID 0x0060, NSID 1, SLBA 0x2000, NLB 5, SGL 01h len 3072</code>.</p>
+  <details class="hint"><summary>Hint</summary><p>Maximum in-capsule data = 260 × 16 − 64 = 4096. For the H2CData count, divide R2TL by MAXH2CDATA and round up.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <pre class="code" data-kind="executable" data-lang="python" data-title="lab_write_capsules.py (append to capsule_build.py)"><code>def write_sqe(cid, nsid, slba, nlb, nbytes, inline):
+    sqe = bytearray(64)
+    struct.pack_into("&lt;BBHI", sqe, 0, OPC_WRITE, PSDT_SGL, cid, nsid)
+    sqe[24:40] = sgl_offset_desc(0, nbytes) if inline else sgl_transport_desc(nbytes)
+    struct.pack_into("&lt;QI", sqe, 40, slba, nlb - 1)
+    return bytes(sqe)
+
+small = tcp_capsule_cmd(write_sqe(0x0060, 1, 0x2000, 6, 3072, True), bytes([0xA5]) * 3072)
+big = tcp_capsule_cmd(write_sqe(0x0061, 1, 0x3000, 128, 65536, False))
+for name, pdu in (("3 KiB", small), ("64 KiB", big)):
+    t, f, hlen, pdo, plen = struct.unpack_from("&lt;BBBBI", pdu, 0)
+    print(f"{name}: type={t:02X}h hlen={hlen} pdo={pdo} plen={plen}")
+    decode_sqe(pdu[8:72])</code></pre>
+    <p>Expected: the 3 KiB PDU prints <code>hlen=72 pdo=72 plen=3144</code> with SGL id 01h. The 64 KiB PDU prints <code>hlen=72 pdo=0 plen=72</code> with SGL id 5Ah.</p>
+    <p>Answers: (1) 3072 ≤ 4096, but 65536 &gt; 4096. (2) 65536 / 32768 = 2 H2CData PDUs with DATAO 0 and 32768, the second carrying LAST_PDU. (3) Two R2Ts, each with its own TTAG and R2TO (0 and 32768). Each R2T is answered by one 32 KiB H2CData PDU carrying that R2T's TTAG. The total PDU count is the same, but the target can pace them.</p>
+    <p>Sequence for the 64 KiB write: CapsuleCmd → R2T(R2TO 0, R2TL 65536) → H2CData(DATAO 0, 32768) → H2CData(DATAO 32768, 32768, LAST_PDU) → CapsuleResp.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>The 64 KiB write is gated by the target's willingness to issue R2T. That depends on target buffer availability, which is a common source of write-latency spikes under load. The host's MAXR2T (sent in ICReq) bounds how many R2Ts may be outstanding per command.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>A host that sends in-capsule data larger than IOCCSZ allows: expect an error status or a transport termination.</li>
+    <li>A host that uses descriptor 5Ah but also appends data to the capsule: the PLEN/PDO mismatch is a framing error.</li>
+    <li>An H2CData whose DATAO does not match the R2T's R2TO: the target should treat it as a transport error.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Extend the decoder to the CapsuleResp PDU (common header + 16-byte CQE) and to C2HData. You will need these in <a href="ch66.html">NVMe/TCP</a>.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>List five PCIe-specific NVMe mechanisms and name the fabric replacement for each.</li>
+    <li>A colleague says "NVMe/RDMA is memory-based because RDMA writes to memory." Write a two-paragraph correction.</li>
+    <li>A controller advertises IOCCSZ = 4 (64 bytes). What does that imply about in-capsule data on I/O queues?</li>
+    <li>Explain why the admin Connect must be the first command on a new admin queue connection.</li>
+    <li>Sketch the initialization sequence over fabrics and mark each step that touches a controller property.</li>
+    <li>Given the normal read trace above, compute what fraction of the 96 µs the Lab SSD itself accounted for.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <ol>
+      <li>Doorbell → capsule arrival. MSI-X → response capsule arrival. PRP → SGL (offset/transport/keyed). Create I/O SQ/CQ → Connect. MMIO register access → Property Get/Set. (Also: PCIe enumeration → discovery.)</li>
+      <li>Commands and completions still travel as messages (SEND operations carrying capsules), so queue semantics are message-based. Only the data phase uses memory semantics, and only against memory the host explicitly registered and advertised with a key. The controller has no access to arbitrary host memory and there are no doorbells.</li>
+      <li>64 bytes is just the SQE. No in-capsule data is supported on I/O queues, so every write uses the transport's data phase.</li>
+      <li>Until Connect succeeds, the queue is not bound to any controller or host. The target does not know which subsystem, which controller or which queue the connection represents.</li>
+      <li>Transport connect → Connect (QID 0) → [authentication] → Property Get CAP* → Property Get VS* → Property Set CC* → Property Get CSTS* (poll) → Identify → Set Features → I/O connects. The steps marked * touch properties.</li>
+      <li>About 66 µs of 96 µs ≈ 69%. The remaining ~31% is network, target software and response transmission (synthetic numbers).</li>
+    </ol>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>Over NVMe/TCP, what tells the controller that a new command is available?</p>
+      <ul class="options" data-answer="3">
+        <li>A write to the SQ Tail doorbell property via Property Set</li>
+        <li>An MSI-X message from the host NIC</li>
+        <li>The arrival of a CapsuleCmd PDU</li>
+        <li>A Keep Alive command</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Fabric controllers have no doorbells. The capsule's arrival is the submission. Doorbells are not properties over fabrics.</p></details>
+    </li>
+    <li>
+      <p>Which opcode do all Fabrics commands share?</p>
+      <ul class="options" data-answer="4">
+        <li>06h</li><li>18h</li><li>01h</li><li>7Fh</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>7Fh. The Fabrics Command Type field distinguishes Connect, Property Get/Set, Authentication Send/Receive and Disconnect. 06h is Identify, 18h is Keep Alive, 01h is Create I/O SQ (admin) or Write (NVM).</p></details>
+    </li>
+    <li>
+      <p>Which data-pointer mechanism is used over fabrics?</p>
+      <ul class="options" data-answer="2">
+        <li>PRP only</li><li>SGL only</li><li>Either PRP or SGL, chosen per command</li><li>Neither: data always travels in the capsule</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>SGLs only. PRPs name host memory pages that a remote controller cannot address.</p></details>
+    </li>
+    <li>
+      <p>What does a response capsule contain at minimum?</p>
+      <ul class="options" data-answer="1">
+        <li>A 16-byte CQE</li><li>A 64-byte SQE</li><li>The read data</li><li>An R2T</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The completion queue entry. Read data travels separately before it, in C2HData PDUs or RDMA WRITEs.</p></details>
+    </li>
+    <li>
+      <p>How is an I/O queue created over a fabric?</p>
+      <ul class="options" data-answer="3">
+        <li>Create I/O CQ then Create I/O SQ on the admin queue</li>
+        <li>Property Set to the AQA property</li>
+        <li>A Connect command with a non-zero QID on a new transport connection</li>
+        <li>It exists automatically after the admin Connect</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Each I/O queue gets its own transport connection (TCP connection or RDMA QP) and its own Connect with the CNTLID returned by the admin Connect.</p></details>
+    </li>
+    <li>
+      <p>A controller reports IOCCSZ = 516. What is the maximum in-capsule data on its I/O queues?</p>
+      <ul class="options" data-answer="2">
+        <li>516 bytes</li><li>8192 bytes</li><li>8256 bytes</li><li>4096 bytes</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>516 × 16 = 8256 bytes per capsule, minus 64 bytes for the SQE, leaves 8192 bytes.</p></details>
+    </li>
+    <li>
+      <p>In which specification does the Connect command live in the 2.4 set?</p>
+      <ul class="options" data-answer="1">
+        <li>NVM Express Base Specification 2.4</li><li>NVMe over TCP Transport 1.3</li><li>NVM Command Set 1.3</li><li>NVMe over PCIe Transport 1.4</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Fabrics commands are transport-independent and live in the Base specification. Transport specifications define framing.</p></details>
+    </li>
+    <li>
+      <p>A capture shows TCP connected and ICReq/ICResp succeeded, then a CapsuleResp with Connect Invalid Host. Which layer failed?</p>
+      <ul class="options" data-answer="4">
+        <li>Link/MTU</li><li>TCP</li><li>NVMe/TCP framing</li><li>NVMe-oF association (host authorization)</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Every lower layer demonstrably worked. The subsystem rejected the host identity.</p></details>
+    </li>
+    <li>
+      <p>Open question: why is the Phase Tag in a fabric CQE not useful for diagnosing completions?</p>
+      <details class="answer"><summary>Model answer</summary><p>Over PCIe the phase tag lets the host find new entries in a ring it polls in its own memory. Over fabrics there is no host-memory CQ ring. Each response capsule is a discrete message, delivered once, so the host never needs to tell new entries from old by phase.</p></details>
+    </li>
+    <li>
+      <p>Open question: name two things a reconnect with the dynamic controller model does <em>not</em> preserve.</p>
+      <details class="answer"><summary>Model answer</summary><p>Outstanding commands (they must be retried or failed), Asynchronous Event Requests, per-controller feature settings and possibly the CNTLID. The host must re-issue AERs and re-apply features. Namespace data persists, because it belongs to the subsystem.</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> What is NVMe over Fabrics and why does it exist?</p>
+      <details class="answer"><summary>Model answer</summary><p>It carries the NVMe command set over networks such as TCP/IP, RDMA and Fibre Channel, so hosts can use remote NVMe storage with the same commands, queues and status model as local NVMe, without translating to SCSI. It exists to disaggregate storage from compute while keeping NVMe's low-overhead, multi-queue design.</p></details></li>
+    <li><p><strong>Beginner:</strong> What is a capsule?</p>
+      <details class="answer"><summary>Model answer</summary><p>The NVMe-oF message unit. A command capsule is an SQE plus optional SGLs and data. A response capsule is a CQE plus optional data. Transports wrap capsules in their own framing.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Compare queue creation over PCIe and over fabrics.</p>
+      <details class="answer"><summary>Model answer</summary><p>Over PCIe the host allocates rings in its memory, programs AQA/ASQ/ACQ for the admin queue, and creates I/O queues with Create I/O CQ (05h) and Create I/O SQ (01h), passing ring addresses. Over fabrics each queue has its own transport connection. The host sends Connect with the QID and size. The admin Connect creates the association and returns the CNTLID, which I/O Connects then reference. There are no ring addresses, and SQ:CQ is strictly 1:1.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Why are PRPs not used over fabrics?</p>
+      <details class="answer"><summary>Model answer</summary><p>PRPs are lists of host memory page addresses that the controller DMAs to and from. A remote controller cannot address host memory, except under RDMA, and even then it needs a key, which PRPs have no field for. SGL descriptors can express in-capsule offsets, transport-managed transfers, and keyed remote memory.</p></details></li>
+    <li><p><strong>Advanced:</strong> A host's fabric reads show 150 µs latency while the same SSD locally shows 70 µs. How do you split the 80 µs?</p>
+      <details class="answer"><summary>Model answer</summary><p>Capture on the host wire and, if possible, the target's PCIe side or target tracepoints. Measure host submit→capsule on wire (host stack), capsule→target submits to SSD (network + target receive + parse), SSD time (target PCIe trace), SSD completion→C2HData (target data path), and C2HData→CapsuleResp→host completion (network + host receive). Then compare with idle conditions to separate queueing from fixed cost. Check offloads, interrupt coalescing and CPU affinity on both sides.</p></details></li>
+    <li><p><strong>Advanced:</strong> What is the significance of disabling SQ flow control?</p>
+      <details class="answer"><summary>Model answer</summary><p>The host promises never to exceed the queue depth, so the controller does not have to report SQ head progress in SQHD. This simplifies target implementation and saves bookkeeping. The cost is that SQHD in captures is meaningless, so analyzers and engineers must not read progress from it.</p></details></li>
+    <li><p><strong>Senior:</strong> How would you design an observability plan for an NVMe/TCP deployment?</p>
+      <details class="answer"><summary>Model answer</summary><p>Layered: switch and NIC counters (drops, pauses, retransmissions), host and target per-queue latency histograms (block layer and nvme tracepoints), keep alive and reconnect events with timestamps, periodic capture samples with digests enabled in test environments, ANA state change logging, and target-side backing-device latency so fabric overhead can be separated from media latency. Correlate with a common clock (PTP) where possible.</p></details></li>
+    <li><p><strong>Senior:</strong> What failure modes exist over fabrics that do not exist over PCIe?</p>
+      <details class="answer"><summary>Model answer</summary><p>Partial network failure (one path down, another up), split-brain path states, keep alive expiry under CPU starvation, authentication and authorization failures, congestion collapse, MTU mismatches, discovery inconsistencies, reconnect storms, and security attacks (spoofed NQNs, man-in-the-middle without TLS). PCIe failures tend to be local and hard. Fabric failures are often partial, transient and caused by configuration.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain why the librarian across town does not need a bell.</li>
+    <li><strong>To a junior engineer:</strong> explain, using one diagram, what stays the same and what changes between NVMe/PCIe and NVMe/TCP for a single Read.</li>
+    <li><strong>To a senior engineer:</strong> argue whether NVMe/RDMA is "memory-based" or "message-based", and defend the answer with reference to commands, data and completions.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "When the librarian lived next door, the teacher rang a bell so she'd come look in the box. Now the teacher mails letters. When the letter arrives at the library, the librarian already knows there's work, because the letter is right in her hands."</p>
+    <p><strong>Junior:</strong> "The 64-byte command and 16-byte completion are identical. Over PCIe, the command sits in host memory, a doorbell write tells the SSD, the SSD fetches the command, writes the data and completion into host memory, and interrupts. Over TCP, the host sends the command in a CapsuleCmd PDU. The target sends the data in a C2HData PDU and the completion in a CapsuleResp PDU. There are no doorbells, no fetches and no interrupts, and the data pointer is an SGL that tells the transport to move the data."</p>
+    <p><strong>Senior:</strong> "Message-based. Commands and completions are messages, and queue state is not shared memory. RDMA adds memory semantics only to the data phase, and only for host-registered regions named by keys in Keyed SGL descriptors. The controller cannot fetch commands or walk host-memory structures. The Base specification's model calls this message-based, and the debugging consequences follow from that."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <ul>
+    <li>NVMe-oF keeps the NVMe language (commands, completions, status, namespaces, controllers, subsystems) and replaces the PCIe delivery mechanism with transport bindings for TCP, RDMA and FC.</li>
+    <li>The unit of exchange is the capsule: an SQE plus optional SGLs and data, or a CQE plus optional data.</li>
+    <li>PCIe is memory-based: shared rings, doorbells, DMA, interrupts. Fabrics are message-based: capsules push commands and completions. RDMA adds memory semantics for data only.</li>
+    <li>Fabrics have no doorbells, no interrupts from the target, no PRPs and no Create I/O SQ/CQ. Connect, Property Get/Set and authentication commands (opcode 7Fh) replace or extend them.</li>
+    <li>In-capsule data saves a round trip and is bounded by IOCCSZ. Larger data uses R2T/H2CData (TCP) or RDMA READ (RDMA).</li>
+    <li>A fabric controller lives inside an association. Think in associations when debugging.</li>
+  </ul>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>draw command and response capsules from memory and say what each part is for</li>
+      <li>list everything that disappears and everything that appears when NVMe moves from PCIe to a fabric</li>
+      <li>explain memory-based vs message-based, and where RDMA sits</li>
+      <li>name the Fabrics commands and say what each replaces</li>
+      <li>compute maximum in-capsule data from IOCCSZ</li>
+      <li>map every row of an NVMe/TCP read capture to its PCIe equivalent</li>
+      <li>locate the first abnormal event in a failed Connect and name its layer</li>
+      <li>cite the Base 2.4, TCP 1.3 and RDMA 1.3 documents for the right topics</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — NVMe over Fabrics architecture, capsules, Fabrics commands, Connect</cite></li>
+    <li><cite class="spec">NVMe over TCP Transport Specification, Revision 1.3</cite></li>
+    <li><cite class="spec">NVMe over RDMA Transport Specification, Revision 1.3</cite></li>
+    <li><cite class="spec">NVM Express Revision Changes (2026.07.30)</cite>: what changed in the 2.4 set</li>
+    <li>Linux kernel source: <code>drivers/nvme/host/fabrics.c</code>, <code>tcp.c</code>, <code>rdma.c</code>, and <code>drivers/nvme/target/</code>. These are useful as a reference implementation, but they are not normative.</li>
+    <li>nvme-cli documentation (<code>man nvme-connect</code>, <code>man nvme-discover</code>).</li>
+  </ul>
+  <p>Deep dives: <a href="dd50.html">NVMe/TCP module</a>, <a href="dd51.html">NVMe/RDMA module</a>, <a href="dd22.html">NVMe Subsystem</a>.</p>
+  <p><strong>Next:</strong> <a href="ch66.html">NVMe/TCP</a>. We open the CapsuleCmd envelope and look at every PDU, digest and TLS option on the wire.</p>
+</section>

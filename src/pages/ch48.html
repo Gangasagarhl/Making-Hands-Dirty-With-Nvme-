@@ -1,0 +1,864 @@
+<p class="lead">A reset is the most violent thing a host can do to a working Non-Volatile Memory Express (NVMe) controller, and also the most common recovery tool in every driver. This chapter teaches exactly what each NVMe reset destroys, what it keeps, how long the host must wait, how shutdown differs from reset, and how a driver rebuilds queues and recovers outstanding commands afterwards.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>Every production NVMe stack eventually resets a controller: after a command timeout, after a fatal controller status, after a firmware activation, during suspend and resume, during hot plug, and every time the machine boots. Engineers who treat reset as "turn it off and on again" are surprised when commands vanish without completions, when the controller takes eleven seconds to come back, when a namespace's settings revert, or when the Peripheral Component Interconnect Express (PCIe) link drops because someone wrote the wrong register.</p>
+  <p>The NVM Express Base Specification describes a whole <em>family</em> of resets that differ in scope: a queue-level reset touches one queue, a controller-level reset touches one controller, an NVM subsystem reset touches every controller in the subsystem, and transport resets (PCIe resets, taught in <a href="ch49.html">Chapter 49</a>) reach the controller from underneath. Shutdown is a separate mechanism with a different purpose: it is about making data durable before power goes away, not about recovering from a fault.</p>
+  <p>This chapter turns those words into register writes, timeouts, Transaction Layer Packet (TLP) traces and Linux behaviour you can reason about.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Name every kind of reset that affects an NVMe controller and order them by scope.</li>
+    <li>Perform (on paper and in a simulator) a controller reset through the Controller Configuration enable bit (CC.EN) and the Controller Status ready bit (CSTS.RDY), using the Capabilities timeout field (CAP.TO) correctly.</li>
+    <li>List what a controller reset destroys (queues, outstanding commands, most volatile state) and what it preserves (admin queue attributes and base addresses, namespace data, persistent features).</li>
+    <li>Explain an NVM Subsystem Reset (NSSR), why it requires a magic value, and why it can take a PCIe link down.</li>
+    <li>Perform a normal and an abrupt shutdown notification and interpret the Shutdown Status field (CSTS.SHST).</li>
+    <li>Describe the reinitialization sequence after reset, including queue recreation and features that must be set again.</li>
+    <li>Explain what happens to commands that were outstanding at reset time and how a host must account for them.</li>
+    <li>Read a trace of a reset and find the first abnormal event when a reset goes wrong.</li>
+    <li>Explain how the Linux NVMe driver escalates from a timeout to an abort to a controller reset.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>You need the controller register map from <a href="ch24.html">Chapter 24 — NVMe Registers</a> (CAP at 00h, CC at 14h, CSTS at 1Ch, AQA at 24h, ASQ at 28h, ACQ at 30h), the queue model from <a href="ch25.html">Chapter 25</a>, <a href="ch26.html">Chapter 26 (Admin Queue)</a> and <a href="ch27.html">Chapter 27 (I/O Queues)</a>, doorbells from <a href="ch28.html">Chapter 28</a>, and the error vocabulary from <a href="ch44.html">Chapter 44 — NVMe Errors</a>. Controller bring-up was introduced in <a href="ch23.html">Chapter 23 — NVMe Controller</a>; reset is that bring-up run in reverse and then forwards again.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Imagine the school library has a librarian who takes request slips from a box and puts answers into another box. One day the librarian freezes and stops answering. The teacher can't fix the librarian's brain, so she says: "Stop. Put down everything. Empty both boxes. Stand by the door until you're ready to start fresh." The librarian drops every slip she was holding — those slips are simply gone, nobody gets an answer for them. When she is standing by the door with the green "ready" light off, the teacher sets up two brand-new, empty boxes and says "start". The green light comes on, and the teacher writes all the lost requests again.</p>
+    <p>At the end of the school day there is a different instruction: "We're turning off the lights soon. Put every book back on its shelf properly and tell me when you're done." That is not starting over — it is tidying up so nothing is lost when the lights go out.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>Think of an air-traffic control tower that loses its picture of the sky. The supervisor orders a <em>ground stop</em>: every flight plan that was being worked is cancelled from the tower's point of view, the strip boards are cleared, and the tower reports "not ready". Only when the tower reports "ready" again do airlines re-file their flight plans, one by one, starting with the most important (the admin channel), then the bulk traffic (I/O). A planned end-of-day closure is different: the tower lands everything in the air, writes up its logs and only then reports "closed" — the equivalent of a shutdown notification.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p>The analogy hides three things. First, a controller does not "cancel" commands by telling anyone: after a controller reset no completion queue entry is posted for commands that were in flight, so the host itself must decide those commands failed. Second, the "re-file" step is entirely the host's job; the controller has no memory of the queues it had. Third, data the controller had already written to media is not undone — a reset is not a transaction rollback. A write that was outstanding may be fully written, partially written or not written at all, and the host cannot tell which from the reset alone.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>An NVMe controller has an on/off switch inside its registers: the <strong>Enable</strong> bit in the Controller Configuration register (CC.EN). It also has a status light: the <strong>Ready</strong> bit in the Controller Status register (CSTS.RDY).</p>
+  <ul>
+    <li>When the host writes CC.EN = 1, the controller starts up and eventually sets CSTS.RDY = 1. Now it will fetch commands.</li>
+    <li>When the host writes CC.EN = 0, the controller stops, throws away all its queues and all the commands it was working on, and eventually sets CSTS.RDY = 0.</li>
+  </ul>
+  <p>The second step is a <strong>controller reset</strong>. "Eventually" matters: the controller may take time, and the host must wait for the light to change before doing anything else. The controller tells the host how long it might take, in the Timeout field of the Capabilities register (CAP.TO), counted in units of 500 milliseconds.</p>
+  <p>A bigger hammer is the <strong>NVM Subsystem Reset</strong>. An NVM subsystem can contain several controllers (for example, a dual-port SSD or a device using virtualization). Writing a special value — the ASCII letters "NVMe" — into the NVM Subsystem Reset register resets all of them together.</p>
+  <p>Separate from reset is <strong>shutdown</strong>. Before power is removed, the host writes the Shutdown Notification field (CC.SHN) and waits until the Shutdown Status field (CSTS.SHST) reports "complete". That gives the controller a chance to save its internal tables to non-volatile media so the next power-on is clean and fast.</p>
+  <p>After any reset, the host must build everything again: admin queue, Identify, features, I/O queues, interrupts. Commands that were in flight have no answers and must be retried or failed by the host.</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>The reset family, ordered by scope</h3>
+  <p>The NVMe Base Specification groups resets into <strong>controller level</strong> and <strong>queue level</strong>. Transport-specific resets (for PCIe: conventional reset and Function Level Reset) are listed among the events that cause a controller-level reset, because the transport reset reaches the controller from below.</p>
+  <table>
+    <caption>NVMe-relevant resets, widest scope first (PCIe transport)</caption>
+    <thead><tr><th>Reset</th><th>Initiated by</th><th>Scope</th><th>PCIe link affected?</th><th>Taught in</th></tr></thead>
+    <tbody>
+      <tr><td>Main power cycle (cold reset)</td><td>Platform</td><td>Everything, including sticky PCIe bits</td><td>Yes — link is retrained from Detect</td><td><a href="ch49.html">Ch 49</a></td></tr>
+      <tr><td>PCIe conventional reset (warm reset via PERST#, hot reset)</td><td>Platform or upstream port</td><td>Whole device below the link: all functions, all controllers on it</td><td>Yes</td><td><a href="ch49.html">Ch 49</a></td></tr>
+      <tr><td>NVM Subsystem Reset (NSSR)</td><td>Host writes "NVMe" (4E564D65h) to the NSSR register at offset 20h; also possibly via management interfaces</td><td>Every controller in the NVM subsystem</td><td>On PCIe, typically yes (see below) <span class="badge impl">Implementation-dependent</span></td><td>This chapter</td></tr>
+      <tr><td>PCIe Function Level Reset (FLR)</td><td>Host writes Initiate FLR in the function's Device Control register</td><td>One PCIe function, hence the controller it hosts</td><td>No — the link stays up</td><td><a href="ch49.html">Ch 49</a></td></tr>
+      <tr><td>Controller reset (CC.EN 1→0)</td><td>Host writes CC.EN = 0</td><td>One controller</td><td>No</td><td>This chapter</td></tr>
+      <tr><td>Queue-level reset (delete and re-create a queue)</td><td>Host: Delete I/O Submission Queue / Delete I/O Completion Queue admin commands</td><td>One I/O queue</td><td>No</td><td>This chapter</td></tr>
+    </tbody>
+  </table>
+  <p>The important engineering idea: <strong>every reset at or above the controller level has the same effect on NVMe state</strong> (queues gone, outstanding commands gone, CC.EN = 0, CSTS.RDY = 0) — they differ in what <em>else</em> they reset (PCIe configuration space, link state, other controllers, sticky error status).</p>
+
+  <h3>Controller reset through CC.EN</h3>
+  <p>The Controller Configuration register (CC, offset 14h) bit 0 is Enable (EN). The Controller Status register (CSTS, offset 1Ch) bit 0 is Ready (RDY). The handshake is asymmetric in time: the host's write is instant, the controller's response is not.</p>
+  <figure>
+    <ol class="seq" data-actors="Host driver|Controller registers|Controller firmware">
+      <li data-from="Host driver" data-to="Controller registers" data-t="0 ms">MWr CC: EN=0 (other fields kept)</li>
+      <li data-from="Controller registers" data-to="Controller firmware">EN 1→0 event</li>
+      <li data-note="Controller firmware">stop fetching; abandon in-flight commands; delete all queues</li>
+      <li data-from="Host driver" data-to="Controller registers">MRd CSTS (poll)</li>
+      <li data-from="Controller registers" data-to="Host driver" class="dashed">CplD: RDY=1 (still busy)</li>
+      <li data-from="Controller firmware" data-to="Controller registers" data-t="t1">set CSTS.RDY=0</li>
+      <li data-from="Host driver" data-to="Controller registers">MRd CSTS (poll)</li>
+      <li data-from="Controller registers" data-to="Host driver" class="dashed">CplD: RDY=0 — reset complete</li>
+      <li data-from="Host driver" data-to="Controller registers">MWr AQA, ASQ, ACQ (if changed)</li>
+      <li data-from="Host driver" data-to="Controller registers">MWr CC: EN=1, IOSQES, IOCQES, MPS, CSS</li>
+      <li data-from="Controller firmware" data-to="Controller registers" data-t="t2">set CSTS.RDY=1</li>
+      <li data-from="Host driver" data-to="Controller registers">MRd CSTS → RDY=1; start admin commands</li>
+    </ol>
+    <figcaption>Conceptual sequence of a controller reset and re-enable. t1 and t2 must each be no longer than the CAP.TO worst case.</figcaption>
+  </figure>
+  <p>Rules the host must follow (wording paraphrased; confirm in the NVMe Base Specification, "Controller Registers" and "Resets" sections):</p>
+  <ul>
+    <li><span class="badge normative">Normative</span> After writing CC.EN = 0, the host waits for CSTS.RDY = 0 before writing CC.EN = 1. Writing EN = 1 while RDY is still 1 produces undefined results.</li>
+    <li><span class="badge normative">Normative</span> CAP.TO (bits 31:24 of CAP) is the worst-case time the host should wait for CSTS.RDY to change in either direction, in 500 ms units. A value of 20 (14h) means 10 seconds.</li>
+    <li><span class="badge normative">Normative</span> The admin queue registers AQA, ASQ and ACQ must be programmed while CC.EN = 0; changing them while enabled is not allowed.</li>
+    <li><span class="badge derived">Derived</span> The host should treat a timeout waiting for RDY to fall as an escalation trigger: try a transport reset (FLR or PCIe reset) next, because the controller is not obeying its own register interface.</li>
+  </ul>
+
+  <h3>CAP.TO, CRTO and why "timeout" became two numbers</h3>
+  <p>CAP.TO is 8 bits of 500 ms units, so it can express up to 127.5 seconds. NVMe 2.0 introduced controller ready modes: a controller may report that it can become ready before its attached namespaces are ready to process I/O ("ready independent of media"). For this, NVMe 2.0 added the Controller Ready Timeouts register (CRTO) with two values — a wait time for "ready with media" and a wait time for "ready independent of media" — and a CC field (Controller Ready Independent of Media Enable, CC.CRIME) that selects the mode. CAP reports which modes are supported (Controller Ready Modes Supported, CAP.CRMS).</p>
+  <aside class="callout version">
+    <p>CRTO, CC.CRIME and CAP.CRMS are NVMe 2.0-era additions. A 1.4-era driver knows only CAP.TO. When both exist, the specification describes how CAP.TO relates to the CRTO values (in short, CAP.TO is kept for older hosts). Confirm the field positions and the CRTO register offset in <cite class="spec">NVM Express Base Specification 2.4 — Controller Registers</cite> before decoding them; this course does not state them as verified.</p>
+  </aside>
+  <div class="formula">
+    <div class="eq"><var>T</var><sub>max</sub> = <var>CAP.TO</var> × 500 ms</div>
+    <dl class="vars">
+      <dt>T<sub>max</sub></dt><dd>worst-case time the host waits for CSTS.RDY to reach the requested value</dd>
+      <dt>CAP.TO</dt><dd>unsigned 8-bit value from CAP bits 31:24 (Timeout)</dd>
+    </dl>
+  </div>
+  <p>Synthetic example for teaching: the Lab SSD reports CAP = 0x0000_0030_1401_03FF. Bits 31:24 of the low DWORD 0x1401_03FF are 0x14 = 20, so T<sub>max</sub> = 10 s. Bit 36 (NVM Subsystem Reset Supported, CAP.NSSRS) is bit 4 of the high DWORD 0x0000_0030, which is 1 — the Lab SSD supports NSSR. (Bit 5 of the high DWORD is part of the Command Sets Supported field.) The doorbell stride field CAP.DSTRD (bits 35:32) is 0.</p>
+
+  <h3>What a controller reset destroys and what survives</h3>
+  <table>
+    <caption>State across a controller-level reset (PCIe transport, NVMe 2.x)</caption>
+    <thead><tr><th>State</th><th>After controller reset</th><th>Why it matters to the host</th></tr></thead>
+    <tbody>
+      <tr><td>I/O Submission and Completion Queues</td><td>Deleted</td><td>All Create I/O CQ / Create I/O SQ commands must be re-issued.</td></tr>
+      <tr><td>Admin queue contents and head/tail pointers</td><td>Reset; the admin queue is re-established from AQA/ASQ/ACQ when EN goes to 1</td><td>Host must reset its own head/tail/phase variables to match (tail = 0, head = 0, expected phase = 1).</td></tr>
+      <tr><td>AQA, ASQ, ACQ registers</td><td>Not reset by CC.EN 1→0 <span class="badge verified">Verified</span></td><td>A host may reuse the same admin queue memory, but it must zero the completion queue memory (old entries carry stale phase tags).</td></tr>
+      <tr><td>Outstanding admin and I/O commands</td><td>Aborted silently — no completion entries posted</td><td>Host must complete them itself (retry or fail).</td></tr>
+      <tr><td>Asynchronous Event Request commands</td><td>Gone with the other outstanding commands</td><td>Host must resubmit them or it will miss events.</td></tr>
+      <tr><td>Interrupt configuration inside the controller (coalescing, vector mapping per CQ)</td><td>Gone with the queues</td><td>MSI-X table entries in PCIe space are <em>not</em> touched by CC.EN; the per-queue vector binding is re-made at Create I/O CQ.</td></tr>
+      <tr><td>Features set with Set Features (non-saved values)</td><td>Most revert to default or saved values <span class="badge version">Version-dependent</span></td><td>Host must re-apply e.g. Number of Queues, Interrupt Coalescing, Power Management, Autonomous Power State Transition (APST), Host Memory Buffer enablement. Check each feature's "scope" and "persistence across reset" in the Base spec feature tables.</td></tr>
+      <tr><td>Saved feature values, namespace data, user data on media</td><td>Survive</td><td>A reset is not a format.</td></tr>
+      <tr><td>Error log, SMART / Health log contents</td><td>Survive (they are subsystem or controller logs kept in non-volatile or retained memory) <span class="badge impl">Implementation-dependent</span> in detail</td><td>Read them after the reset to understand why you reset.</td></tr>
+      <tr><td>PCIe configuration space, BARs, MSI-X table, AER status</td><td>Not touched by CC.EN</td><td>Unlike FLR or conventional reset (Chapter 49), there is no need to restore config space after a pure controller reset.</td></tr>
+      <tr><td>Data written by in-flight Write commands</td><td>Unknown: may be complete, partial (at block granularity), or absent</td><td>Atomicity guarantees (Atomic Write Unit Normal / Power Fail) govern torn writes; see <a href="ch33.html">Chapter 33</a>.</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout warn">
+    <p>The Number of Queues feature can be set only once after a controller-level reset (a second Set Features for it before the next reset is rejected). Drivers that forget this, or that assume the previous allocation survives, fail with a "command sequence error" status on bring-up after a reset. Confirm the exact status in the Set Features description for Number of Queues.</p>
+  </aside>
+
+  <h3>Outstanding commands at reset time</h3>
+  <p>The defining property of an NVMe reset is that it is <strong>completion-less</strong>. The controller does not post "aborted" entries; it cannot, because the completion queues themselves are deleted. The host is the only party that knows which command identifiers were outstanding, so the host must walk its own tracking structures and complete every one of them.</p>
+  <ul>
+    <li><strong>Reads</strong>: safe to retry. The data buffer may have been partially written by the controller's Direct Memory Access (DMA) before the reset, so the host must not hand that buffer to the application until a retry succeeds.</li>
+    <li><strong>Writes</strong>: retry is usually safe because writing the same data to the same Logical Block Addresses (LBAs) is idempotent, but ordering with other writes matters for file systems and databases; most stacks retry in the order the block layer re-queues them.</li>
+    <li><strong>Non-idempotent commands</strong>: Compare and Write-style fused operations, Zone Append in Zoned Namespaces (ZNS), Reservation commands, Format NVM, Sanitize, firmware commit. A blind retry may do something twice or something different. These need command-specific recovery.</li>
+    <li><strong>DMA after reset</strong>: <span class="badge normative">Normative</span> intent — once CSTS.RDY = 0 after a reset, the controller is no longer processing commands. <span class="badge derived">Derived</span> — the safe host practice is still to keep data buffers and queue memory mapped until RDY reads 0, because a controller that is slow to stop may still be issuing DMA. Freeing memory as soon as you <em>write</em> CC.EN = 0 is a classic use-after-free with an IOMMU fault (or worse, silent corruption without an IOMMU).</li>
+  </ul>
+
+  <h3>Queue-level reset: deleting and recreating one queue</h3>
+  <p>The smallest reset is deleting an I/O queue pair. The rules:</p>
+  <ol>
+    <li>Delete I/O Submission Queue (admin opcode 00h) first. <span class="badge normative">Normative</span> On deletion, commands that were submitted to that SQ and not yet completed are aborted by the controller; the specification describes them as being completed with an aborted status ("Command Aborted due to SQ Deletion") — unlike a controller reset, a queue delete <em>does</em> produce completions, because the associated CQ still exists.</li>
+    <li>Then Delete I/O Completion Queue (admin opcode 04h). A CQ cannot be deleted while any SQ still maps to it (the controller returns an invalid-queue-deletion error).</li>
+    <li>Re-create with Create I/O Completion Queue (05h) then Create I/O Submission Queue (01h).</li>
+  </ol>
+  <p>Linux uses queue deletion during orderly shutdown (to let in-flight I/O complete) but uses a full controller reset for error recovery, because a misbehaving controller cannot be trusted to process admin commands correctly.</p>
+
+  <h3>Reinitialization: the rebuild sequence</h3>
+  <ol>
+    <li>Wait for CSTS.RDY = 0 (bounded by CAP.TO, or the CRTO value for the selected mode).</li>
+    <li>Optionally check CSTS.CFS (Controller Fatal Status, bit 1) and CSTS.NSSRO (NVM Subsystem Reset Occurred, bit 4) — they explain why you are here. NSSRO is cleared by writing 1 to it.</li>
+    <li>Zero admin CQ memory; program AQA (sizes, 0's based), ASQ, ACQ.</li>
+    <li>Write CC with CSS, MPS, AMS, IOSQES = 6 (64-byte entries), IOCQES = 4 (16-byte entries) and EN = 1.</li>
+    <li>Wait for CSTS.RDY = 1. If CSTS.CFS = 1 instead, the controller failed to initialize.</li>
+    <li>Identify Controller (Identify, opcode 06h, CNS 01h) — firmware may have changed (e.g. after a firmware commit that activates on reset).</li>
+    <li>Set Features: Number of Queues; then re-apply other features (Interrupt Coalescing, Power Management, APST, Host Memory Buffer, Keep Alive Timer if used, Asynchronous Event Configuration).</li>
+    <li>Create I/O CQs, then I/O SQs, binding each CQ to its MSI-X vector.</li>
+    <li>Submit Asynchronous Event Requests.</li>
+    <li>Re-scan namespaces (Identify active namespace list): the set of namespaces may have changed.</li>
+    <li>Release the requeued I/O.</li>
+  </ol>
+  <aside class="callout insight">
+    <p>Step 6 is easy to skip and expensive to forget. A firmware image committed with the "activate at next reset" action becomes active at a controller-level reset. Any cached Identify data — maximum data transfer size, supported features, power state table — may now be stale.</p>
+  </aside>
+
+  <h3>NVM Subsystem Reset</h3>
+  <p>The NVM Subsystem Reset register (NSSR, offset 20h) exists if CAP.NSSRS = 1. Writing the value 4E564D65h — the bytes of the ASCII string "NVMe" — initiates an NVM Subsystem Reset. Any other value has no effect. The magic value is a guard against stray writes: resetting a whole subsystem by accident (for example from a buggy tool writing zeros across BAR0) would take every controller, possibly every host path, offline.</p>
+  <ul>
+    <li><strong>Scope</strong>: every controller in the NVM subsystem, including controllers seen by other hosts on other ports.</li>
+    <li><strong>Evidence afterwards</strong>: CSTS.NSSRO = 1 in each controller (set by the NSSR, cleared by host write-1-to-clear). A host that finds NSSRO set on initialization knows a subsystem reset happened, possibly initiated by someone else.</li>
+    <li><strong>PCIe consequence</strong>: <span class="badge impl">Implementation-dependent</span> / transport-defined. The NVMe over PCIe Transport specification describes the NSSR effect for PCIe. In practice an NSSR on a PCIe SSD commonly causes the PCIe link to go down and retrain, so the host sees a Surprise Down or a hot-plug event and must restore configuration space as well as reinitialize the controller. Confirm in <cite class="spec">NVMe over PCIe Transport Specification 1.4 — NVM Subsystem Reset</cite>.</li>
+  </ul>
+  <aside class="callout version">
+    <p>NVMe 2.0 also added an <strong>NVM Subsystem Shutdown</strong> capability (a register-level way to shut down all controllers in the subsystem) and a Shutdown Type field in CSTS. Their presence is advertised in CAP. Treat these as 2.x features and confirm their offsets and capability bits in the 2.4 Base specification before using them.</p>
+  </aside>
+
+  <h3>Shutdown notification: normal and abrupt</h3>
+  <p>CC.SHN (bits 15:14) tells the controller power is about to be removed. CSTS.SHST (bits 3:2) reports progress.</p>
+  <table>
+    <caption>CC.SHN and CSTS.SHST encodings</caption>
+    <thead><tr><th>Field</th><th>Value</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="4">CC.SHN</td><td>00b</td><td>No notification; no effect</td></tr>
+      <tr><td>01b</td><td>Normal shutdown notification</td></tr>
+      <tr><td>10b</td><td>Abrupt shutdown notification</td></tr>
+      <tr><td>11b</td><td>Reserved</td></tr>
+      <tr><td rowspan="4">CSTS.SHST</td><td>00b</td><td>Normal operation (no shutdown requested)</td></tr>
+      <tr><td>01b</td><td>Shutdown processing occurring</td></tr>
+      <tr><td>10b</td><td>Shutdown processing complete</td></tr>
+      <tr><td>11b</td><td>Reserved</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Normal shutdown</strong> is the polite path. The recommended host procedure: stop submitting new I/O, let outstanding commands complete, delete I/O SQs then I/O CQs, then write CC.SHN = 01b and poll CSTS.SHST until 10b. The controller flushes its volatile write cache, writes its mapping tables and metadata, and marks the shutdown clean.</p>
+  <p><strong>Abrupt shutdown</strong> (10b) is for when power is going away soon and the host cannot wait: the controller does the minimum needed to protect data integrity. The host does not first drain I/O.</p>
+  <p><strong>How long to wait</strong>: Identify Controller reports RTD3 Entry Latency (RTD3E, in microseconds) — the typical time to reach shutdown-complete from a normal shutdown notification — and RTD3 Resume Latency (RTD3R). RTD3 stands for Runtime D3, the PCIe low-power device state in which main power is removed (see <a href="ch50.html">Chapter 50</a>). If RTD3E is 0 the controller does not report it, and the host falls back to its own default.</p>
+  <aside class="callout warn">
+    <p><strong>Shutdown is not reset.</strong> After SHST = 10b, the controller may not process new commands. To use it again without a power cycle, the host should perform a controller reset (CC.EN 1→0, wait RDY = 0) and reinitialize. A host that sets CC.SHN and then keeps submitting I/O will see commands that never complete.</p>
+  </aside>
+  <p>What happens if the host never sends a shutdown notification and power simply disappears? The controller treats the next power-on as recovery from an unexpected power loss: SMART / Health "Unsafe Shutdowns" count increments, start-up can take much longer (rebuilding mapping tables from media), and data in a volatile write cache that was not protected by power-loss capacitors may be lost. That counter is one of the most useful pieces of field evidence in this whole chapter.</p>
+
+  <h3>Transport resets reaching the controller</h3>
+  <p>On PCIe, a conventional reset (cold, warm or hot) and an FLR are both controller-level resets for the NVMe controller(s) they reach. Two extra consequences compared with CC.EN:</p>
+  <ul>
+    <li>PCIe configuration space is reset (BARs, Command register Memory Space Enable and Bus Master Enable, MSI-X enable). Until the host restores it, the controller's registers are not even reachable by Memory Read/Write TLPs, and the controller cannot DMA.</li>
+    <li>For conventional reset, the link itself goes down; Data Link Layer and Physical Layer state is lost.</li>
+  </ul>
+  <p>The details, including readiness timing after a PCIe reset, are in <a href="ch49.html">Chapter 49 — PCIe Reset</a>.</p>
+
+  <h3>The ladder for controller reset</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>The teacher tells the frozen librarian to drop everything, empty both boxes and wait at the door until the light turns off; then new empty boxes are set up and lost requests are written again.</p></div>
+    <div class="rung" data-rung="B"><p>The host writes CC.EN = 0, waits for CSTS.RDY = 0, reprograms admin queue registers, writes CC.EN = 1, waits for RDY = 1, then rebuilds features and I/O queues and resubmits outstanding commands.</p></div>
+    <div class="rung" data-rung="C"><p>Inside the controller, firmware stops the SQ fetch engines, quiesces the DMA engines and media back-end, discards command contexts, clears queue tables, and only then drops RDY. The register block and the PCIe endpoint stay alive throughout; BARs and MSI-X are untouched.</p></div>
+    <div class="rung" data-rung="D"><p>NVMe Base Specification: CC.EN transition 1→0 is a Controller Reset (a controller-level reset). CAP.TO bounds RDY transitions. AQA/ASQ/ACQ are not reset. Outstanding commands are not completed. NVMe 2.x adds CRTO and ready modes.</p></div>
+    <div class="rung" data-rung="E"><p>On the wire: one Memory Write (MWr) TLP from the Root Complex to BAR0+0x14, a train of Memory Read (MRd) TLPs to BAR0+0x1C with Completion with Data (CplD) replies, and silence from the device — no SQE fetches, no CQE writes, no MSI-X — between EN = 0 and the new doorbells.</p></div>
+    <div class="rung" data-rung="F"><p>In an analyzer you see the CC write, the polling reads whose CplD data changes from ...01h to ...00h in bit 0, the AQA/ASQ/ACQ writes, the CC write with EN = 1, polls until RDY = 1, then the first admin SQ tail doorbell (BAR0+0x1000) and the controller's first SQE fetch from the admin SQ base.</p></div>
+    <div class="rung" data-rung="G"><p>If RDY never falls, the first abnormal event is the poll that is still 1 after CAP.TO. If RDY rises but no SQE fetch follows the admin doorbell, suspect Bus Master Enable or IOMMU mappings, not the controller. If DMA writes appear after RDY = 0, the controller violated reset semantics.</p></div>
+  </div>
+
+  <h3>The sixteen questions, applied to controller reset</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>A controller-level reset initiated by clearing CC.EN, which returns the controller to its idle, unconfigured state.</dd>
+    <dt>2. Why was it created?</dt><dd>To give software a guaranteed way to bring a controller back to a known state without a power cycle or a transport reset.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Recovery from hung commands, inconsistent queue state, firmware activation, and orderly re-configuration (e.g. changing queue entry sizes or memory page size).</dd>
+    <dt>4. What existed before it?</dt><dd>Advanced Host Controller Interface (AHCI) used a similar enable bit plus port-level resets; legacy storage relied on bus resets and device-specific reset commands (e.g. ATA soft reset via the device control register).</dd>
+    <dt>5. Why is the current design better?</dt><dd>One register bit, a published timeout, and precisely defined state effects; no in-band command is needed, so it works even when the queues are broken.</dd>
+    <dt>6. Who creates it?</dt><dd>The host driver (or the platform, indirectly, through transport resets).</dd>
+    <dt>7. Who consumes it?</dt><dd>The controller's firmware and hardware state machines.</dd>
+    <dt>8. Where does it live?</dt><dd>In controller registers in BAR0: CC at 14h, CSTS at 1Ch, CAP at 00h.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>CC.EN, CSTS.RDY, CSTS.CFS, CAP.TO, CRTO (2.x), AQA/ASQ/ACQ, and the host memory of all queues and data buffers.</dd>
+    <dt>10. What happens before it?</dt><dd>Usually a fault detection: command timeout, CSTS.CFS = 1, an AER event, a user request, a firmware commit, a resume.</dd>
+    <dt>11. What happens after it?</dt><dd>Reinitialization and resubmission of host-tracked outstanding commands.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>EN = 1 before RDY = 0 gives undefined behaviour; freeing memory early causes stray DMA; forgetting to zero the CQ gives phantom completions; forgetting AERs loses events.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>An MWr to CC, MRd polls of CSTS with changing data, a gap of device-initiated traffic, then the bring-up pattern.</dd>
+    <dt>14. What does Linux show?</dt><dd>Controller state "resetting" then "connecting" then "live" in sysfs; kernel log lines from the nvme driver about timeouts or resets (exact strings are version-dependent).</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>RDY timing versus CAP.TO across temperatures and fill levels; reset under maximum queue depth; reset during each admin command; reset during firmware download; reset storms; no DMA after RDY = 0.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>Firmware stuck in a media operation, a power or thermal problem, the link not actually delivering the CC write (check AER and link status), or a host that polled the wrong BAR after a re-enumeration.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>Inside an SSD controller, "reset" is not one wire. Different blocks are reset by different events, and the art of controller design is choosing which blocks a given reset touches.</p>
+  <figure>
+<pre class="diagram">
+ +-----------------------------------------------------------------------+
+ |                       NVMe SSD (one NVM subsystem)                    |
+ |                                                                       |
+ |  PCIe PHY + Link (LTSSM, DLL)   &lt;-- reset by: power, PERST#, hot reset |
+ |        |                                                              |
+ |  PCIe function config space      &lt;-- + FLR                           |
+ |  (BARs, MSI-X, AER, PM cap)                                           |
+ |        |                                                              |
+ |  NVMe register block (CAP/CC/CSTS/AQA/ASQ/ACQ/doorbells)              |
+ |        |                         &lt;-- + CC.EN 1-&gt;0 (controller reset)  |
+ |  Queue engines: SQ fetch, CQ post, interrupt generation               |
+ |  Command contexts, DMA engines, PRP/SGL walkers                       |
+ |        |                                                              |
+ |  Flash Translation Layer (FTL), write cache, media back-end           |
+ |        |                         &lt;-- NSSR reaches all controllers;    |
+ |  NAND channels / media                 media is never "reset"         |
+ +-----------------------------------------------------------------------+
+</pre>
+    <figcaption>Conceptual reset domains in an NVMe SSD. Each arrow names the reset events that reach that layer (each lower layer is also reached by everything listed above it, except that CC.EN does not reach PCIe config space or the link).</figcaption>
+  </figure>
+  <p>What the hardware must do when CC.EN falls:</p>
+  <ul>
+    <li><strong>Stop the front end</strong>: the SQ fetch arbiter stops issuing Memory Read requests for SQEs. Doorbell writes may still arrive (the BAR is alive) but must be ignored.</li>
+    <li><strong>Quiesce DMA</strong>: in-flight PCIe reads for write data must either complete or be abandoned; completions arriving for abandoned tags must be dropped without being treated as errors. In-flight posted writes (read data, CQEs) that already left are gone — the host may still receive them a few hundred nanoseconds after its CC write.</li>
+    <li><strong>Drain or abandon the back end</strong>: NAND program operations in progress cannot be aborted mid-pulse; firmware typically lets them finish while discarding the host-facing context. This is a major reason RDY takes time to fall.</li>
+    <li><strong>Clear queue tables</strong>: all SQ/CQ descriptors, head/tail pointers and phase state.</li>
+    <li><strong>Keep the register block and PCIe endpoint alive</strong>: the host must be able to read CSTS throughout.</li>
+  </ul>
+  <p>For a shutdown, the hardware path is different: the front end keeps running until the host stops it, and the back end must write out the volatile write cache and FTL metadata. Drives with power-loss protection capacitors can make abrupt shutdown nearly as safe as normal shutdown; consumer drives without them rely heavily on the host sending a normal shutdown.</p>
+  <aside class="callout hw">
+    <p>Why can RDY take seconds to <em>rise</em>? On power-up or after a reset, firmware may need to load its mapping tables from NAND, replay a journal, or check for an unclean shutdown. A drive that was not shut down cleanly can take many seconds longer — exactly what CAP.TO (and, in 2.x, the "ready with media" CRTO value) must cover. The "ready independent of media" mode exists so the admin queue can come up quickly while media initialization continues.</p>
+  </aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>Documents: <cite class="spec">NVM Express Base Specification 2.4 — Controller Registers; Resets; Controller Initialization; Controller Shutdown</cite> (the section names are stable across 2.x; numbers change between revisions, so search by name). Transport-specific reset mapping: <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite>. PCIe resets themselves: <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Reset Rules</cite>.</p>
+  <p>The register definitions and the reset effects are <span class="badge normative">Normative</span>. Host procedures such as "delete I/O queues before a normal shutdown" are mostly written as recommendations ("should"), which the specification treats as normative recommendations rather than absolute requirements. Diagrams and examples in the specification are <span class="badge informative">Informative</span>.</p>
+
+  <aside class="callout verified">
+    <p>CC is at offset 14h and CC.EN is bit 0; CSTS is at 1Ch with RDY bit 0, CFS bit 1, SHST bits 3:2, NSSRO bit 4; CC.SHN is bits 15:14 with 01b normal and 10b abrupt; CAP.TO is CAP bits 31:24 in 500 ms units; CAP.NSSRS is CAP bit 36; NSSR is at offset 20h and the reset value is 4E564D65h ("NVMe"). AQA, ASQ and ACQ are not reset by a CC.EN 1→0 controller reset. Outstanding commands are not completed by a controller-level reset.</p>
+  </aside>
+  <aside class="callout derived">
+    <p>Because completion queues are deleted by the reset, the absence of completions for outstanding commands is a logical consequence, not just a rule. Because PCIe posted writes already in the fabric cannot be recalled, a host may observe a small number of device writes <em>after</em> its CC write but before RDY falls; host memory must remain valid until RDY = 0.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>How long RDY takes to change (within CAP.TO), whether NSSR drops the PCIe link, how much metadata is flushed on abrupt shutdown, how long start-up takes after an unsafe shutdown, and whether the controller preserves internal debug state across reset — all implementation-dependent.</p>
+  </aside>
+  <aside class="callout version">
+    <p>Controller ready modes (CRTO register, CC.CRIME, CAP.CRMS), NVM Subsystem Shutdown and the CSTS Shutdown Type field are NVMe 2.0-era. Feature persistence rules across reset were clarified over several revisions. Older (1.x) drivers ignore all of these; a 2.4 controller must still work with them.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p>The specification does not say how long a controller reset <em>typically</em> takes, how a host should choose between retrying and failing an outstanding command, whether data from an in-flight write reached media, or which reset a driver should escalate to next. Those are host policy. It also does not define Linux's timeout values. Confirm in the 2.4 text: the full list of events that constitute a controller-level reset for PCIe, the per-feature persistence across reset, and the exact CRTO field layout.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume: that RDY falls immediately; that a controller reset also resets PCIe configuration space (it does not) or that FLR does not reset the controller (it does); that an aborted command produced a completion entry; that NSSR is harmless to other hosts; that a controller which reached SHST = 10b will accept commands.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>A controller reset is carried entirely by register accesses — PCIe memory transactions to BAR0 — plus the absence of normal traffic.</p>
+  <table>
+    <caption>Transactions involved in a controller reset (PCIe transport)</caption>
+    <thead><tr><th>Step</th><th>Direction</th><th>TLP</th><th>Posted?</th><th>Target</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Disable</td><td>Host→Device</td><td>MWr (1 DW)</td><td>Posted</td><td>BAR0+14h (CC)</td><td>No completion; the host cannot know when it arrived except by reading.</td></tr>
+      <tr><td>Poll</td><td>Host→Device</td><td>MRd (1 DW)</td><td>Non-posted</td><td>BAR0+1Ch (CSTS)</td><td>The read cannot pass the earlier posted write (PCIe ordering, <a href="ch14.html">Ch 14</a>), so the first poll result is guaranteed to reflect a controller that has <em>received</em> EN = 0.</td></tr>
+      <tr><td>Poll reply</td><td>Device→Host</td><td>CplD (1 DW)</td><td>—</td><td>Requester = RC</td><td>Bit 0 shows RDY.</td></tr>
+      <tr><td>Program admin queue</td><td>Host→Device</td><td>MWr</td><td>Posted</td><td>BAR0+24h, 28h, 30h</td><td>ASQ/ACQ are 64-bit; may arrive as two 32-bit writes or one 64-bit write depending on the CPU and driver.</td></tr>
+      <tr><td>Enable</td><td>Host→Device</td><td>MWr</td><td>Posted</td><td>BAR0+14h</td><td>EN = 1 plus configuration fields.</td></tr>
+      <tr><td>First admin command</td><td>Host→Device then Device→Host</td><td>MWr doorbell; MRd SQE fetch; CplD; MWr CQE; MWr MSI-X</td><td>Mixed</td><td>BAR0+1000h; host memory</td><td>The normal command flow from <a href="ch39.html">Chapter 39</a>.</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Shutdown</strong> looks similar: an MWr to CC with SHN set, then polling reads of CSTS whose SHST field goes 00b → 01b → 10b. Before that, an orderly host shows Delete I/O SQ and Delete I/O CQ admin commands on the admin queue.</p>
+  <p><strong>NSSR</strong> is one MWr of 4E564D65h to BAR0+20h. If the implementation drops the link, the next thing a PCIe analyzer shows is electrical idle followed by link training (ordered sets, no TLPs) and then configuration requests from the host — and possibly completions with Configuration Request Retry Status while the device is still initializing (<a href="ch49.html">Chapter 49</a>).</p>
+  <aside class="callout proto">
+    <p>Ordering detail that matters: if the host writes CC.EN = 0 and then immediately rings a doorbell (a bug), both are posted writes and arrive in order; the controller sees the doorbell after EN = 0 and ignores it. If the host instead reads CSTS before releasing memory, PCIe ordering guarantees the read reaches the controller after the CC write — but it does <em>not</em> guarantee device-to-host writes already in flight have landed. Those are in the opposite direction and are unordered with respect to the host's read request.</p>
+  </aside>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Both traces use the course's synthetic Lab SSD: Requester ID 0x0100, BAR0 = 0xFE60_0000, Gen4 x4, admin SQ at IOVA 0x1_0000_0000 and admin CQ at 0x1_0000_1000. Times are illustrative.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Normal controller reset and re-enable (Lab SSD)">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 µs</td><td>MWr32</td><td>Addr=0xFE60_0014 Len=1 Data=0x0046_0000 Req=RC</td><td>CC: EN=0, IOSQES=6, IOCQES=4 kept</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.6 µs</td><td>MWr64</td><td>Addr=0x1_2341_03A0 Len=4 Req=0x0100</td><td>A CQE for CQ1 that was already in flight — legal, host memory must still be valid</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.2 µs</td><td>MRd32</td><td>Addr=0xFE60_001C Len=1 Tag=0x10 Req=RC</td><td>Poll CSTS</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>2.0 µs</td><td>CplD</td><td>Tag=0x10 Status=SC Data=0x0000_0001</td><td>RDY=1, still stopping</td></tr>
+        <tr class="note"><td colspan="6">Host polls roughly every millisecond (Linux sleeps between polls). Rows 5–40 omitted: all RDY=1. No SQE fetches, no data DMA, no MSI-X from the device.</td></tr>
+        <tr class="dir-down"><td>41</td><td>Host→Dev</td><td>38.1 ms</td><td>MRd32</td><td>Addr=0xFE60_001C Tag=0x0B</td><td>Poll CSTS</td></tr>
+        <tr class="dir-up"><td>42</td><td>Dev→Host</td><td>38.1 ms</td><td>CplD</td><td>Tag=0x0B Status=SC Data=0x0000_0000</td><td>RDY=0, CFS=0, SHST=00b — controller reset complete after ~38 ms (CAP.TO allows 10 s)</td></tr>
+        <tr class="dir-down"><td>43</td><td>Host→Dev</td><td>38.2 ms</td><td>MWr32</td><td>Addr=0xFE60_0024 Data=0x001F_001F</td><td>AQA: ACQS=31, ASQS=31 (32 entries each, 0's based)</td></tr>
+        <tr class="dir-down"><td>44</td><td>Host→Dev</td><td>38.2 ms</td><td>MWr64</td><td>Addr=0xFE60_0028 Len=2 Data=0x0000_0001_0000_0000</td><td>ASQ</td></tr>
+        <tr class="dir-down"><td>45</td><td>Host→Dev</td><td>38.2 ms</td><td>MWr64</td><td>Addr=0xFE60_0030 Len=2 Data=0x0000_0001_0000_1000</td><td>ACQ</td></tr>
+        <tr class="dir-down"><td>46</td><td>Host→Dev</td><td>38.3 ms</td><td>MWr32</td><td>Addr=0xFE60_0014 Data=0x0046_0001</td><td>CC: EN=1, IOSQES=6, IOCQES=4, MPS=0, CSS=000b</td></tr>
+        <tr class="note"><td colspan="6">Polls omitted: RDY=0 for ~410 ms while firmware rebuilds its context.</td></tr>
+        <tr class="dir-up"><td>71</td><td>Dev→Host</td><td>451.0 ms</td><td>CplD</td><td>Tag=0x24 Status=SC Data=0x0000_0001</td><td>RDY=1</td></tr>
+        <tr class="dir-down"><td>72</td><td>Host→Dev</td><td>451.4 ms</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x0000_0001</td><td>Admin SQ tail doorbell = 1 (Identify Controller)</td></tr>
+        <tr class="dir-up"><td>73</td><td>Dev→Host</td><td>452.1 ms</td><td>MRd64</td><td>Addr=0x1_0000_0000 Len=16 Tag=0x00 Req=0x0100</td><td>Fetch admin SQE 0 (64 bytes) — the controller's first DMA after reset</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the reset is healthy because (a) RDY fell well within CAP.TO, (b) the only device-initiated traffic after row 1 is a write that was already in flight (row 2), (c) no SQE fetches appear while EN = 0, and (d) the first DMA after re-enable targets the admin SQ base the host just programmed. Note the CC value: 0x0046_0001 decodes as IOCQES = 4 (bits 23:20), IOSQES = 6 (bits 19:16), SHN = 00b, AMS = 000b, MPS = 0, CSS = 000b, EN = 1.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: controller reset that never completes, then fatal status">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Context: the Linux driver hit an I/O timeout on SQ1 (command ID 0x01A2, a 128 KiB Write) and an Abort did not help; it decides to reset.</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 s</td><td>MWr32</td><td>Addr=0xFE60_0014 Data=0x0046_0000</td><td>CC: EN=0</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.9 ms</td><td>MRd64</td><td>Addr=0x2_0004_3000 Len=128 Tag=0x47 Req=0x0100</td><td>Controller still fetching write data for the stuck command after EN=0</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>0.9 ms</td><td>CplD</td><td>Tag=0x47 Len=128 Status=SC</td><td>Host still provides the data (buffer still mapped — good host behaviour)</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>1.0 ms</td><td>MRd32</td><td>Addr=0xFE60_001C</td><td>Poll CSTS</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1.0 ms</td><td>CplD</td><td>Data=0x0000_0001</td><td>RDY=1</td></tr>
+        <tr class="note"><td colspan="6">Polls continue for 10 s. RDY stays 1. Device-initiated traffic stops after row 3.</td></tr>
+        <tr class="abnormal"><td>612</td><td>Dev→Host</td><td>10.000 s</td><td>CplD</td><td>Data=0x0000_0001</td><td>First abnormal event: RDY still 1 at CAP.TO (10 s) — controller did not obey CC.EN=0</td></tr>
+        <tr class="dir-up"><td>640</td><td>Dev→Host</td><td>10.4 s</td><td>CplD</td><td>Data=0x0000_0003</td><td>Now CFS=1 and RDY=1: controller declares fatal status</td></tr>
+        <tr class="dir-down"><td>641</td><td>Host→Dev</td><td>10.5 s</td><td>CfgWr0</td><td>Device Control: Initiate FLR=1 Req=RC</td><td>Driver/PCI core escalates to Function Level Reset</td></tr>
+        <tr class="dir-down"><td>642</td><td>Host→Dev</td><td>10.6 s</td><td>CfgRd0</td><td>Vendor ID</td><td>Readiness check after FLR</td></tr>
+        <tr class="dir-up"><td>643</td><td>Dev→Host</td><td>10.6 s</td><td>Cpl</td><td>Status=CRS (RRS)</td><td>Device not ready yet — expected for a while</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Walk-through.</strong> Row 2 is suspicious but not yet abnormal: in-flight work can legitimately continue briefly after EN = 0. The decisive evidence is row 612 — a controller that keeps RDY = 1 for the full CAP.TO after EN = 0 is violating the controller-reset contract. Row 640 (CFS = 1) is a consequence, not a cause: the firmware's watchdog probably gave up on the stuck back-end operation. The original timeout and this reset failure point the same way — a firmware hang in the media path for the 128 KiB write, with the front end still alive enough to fetch data. Hypotheses to separate next: a NAND channel hang (vendor log, telemetry log), a thermal throttle stall (SMART temperature, thermal management counters), or a power-delivery problem (2.4 voltage monitoring data, if supported). The host's escalation to FLR is correct; the readiness Configuration Request Retry Status responses after FLR are normal and are covered in <a href="ch49.html">Chapter 49</a>.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>The Linux NVMe PCIe driver (drivers/nvme/host/pci.c with common code in drivers/nvme/host/core.c) implements reset and shutdown with a small number of well-named functions. Names below are stable across recent kernels but the details are <span class="badge version">Version-dependent</span>; read the source of the kernel you are running.</p>
+  <table>
+    <caption>Linux NVMe reset and shutdown building blocks (conceptual map)</caption>
+    <thead><tr><th>Function / knob</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td><code>nvme_disable_ctrl()</code></td><td>Clears CC.EN (or sets CC.SHN for a shutdown) and waits for RDY = 0 (or SHST = complete), bounded by CAP.TO / the shutdown timeout.</td></tr>
+      <tr><td><code>nvme_enable_ctrl()</code></td><td>Programs CC with EN = 1 and waits for RDY = 1, using CAP.TO (and CRTO on 2.x controllers in newer kernels).</td></tr>
+      <tr><td><code>nvme_dev_disable()</code></td><td>Quiesces block-layer queues, disables the controller (shutdown or reset), frees IRQs, and cancels outstanding requests so they can be requeued or failed.</td></tr>
+      <tr><td><code>nvme_reset_ctrl()</code> / <code>nvme_reset_work()</code></td><td>Moves the controller to the RESETTING state and runs the full rebuild: disable, configure admin queue, enable, Identify, set queue count, create I/O queues, restart queues.</td></tr>
+      <tr><td><code>nvme_timeout()</code></td><td>Block-layer timeout handler for one request; escalates (see below).</td></tr>
+      <tr><td><code>nvme_core.io_timeout</code>, <code>nvme_core.admin_timeout</code></td><td>Module parameters: per-command timeouts (defaults historically 30 s and 60 s).</td></tr>
+      <tr><td><code>nvme_core.shutdown_timeout</code></td><td>Default wait for shutdown completion (historically 5 s); the driver may use RTD3E from Identify when larger, with an upper cap.</td></tr>
+    </tbody>
+  </table>
+  <h3>The timeout escalation ladder</h3>
+  <ol>
+    <li>A request exceeds its timeout. The handler first reads CSTS: if CFS = 1, it logs that the controller is down and schedules a reset immediately.</li>
+    <li>It checks whether the completion is actually sitting in the CQ (a lost interrupt); if so it completes it and logs that the completion was polled — evidence of an interrupt problem, not a controller problem (see <a href="ch43.html">Chapter 43</a>).</li>
+    <li>Otherwise, for an I/O command, it sends an Abort admin command (opcode 08h) for that command identifier and re-arms the timer.</li>
+    <li>If the request times out again (or the Abort itself times out, or it was an admin command), it resets the controller.</li>
+    <li>If the reset fails (RDY never changes, CFS on enable, Identify fails), the controller is marked dead and its namespaces are removed — the "disk vanished" symptom.</li>
+  </ol>
+  <aside class="callout linux">
+    <p>Kernel log wording for these steps differs between kernel versions (some print the queue ID and command ID, newer ones print the opcode and tag). Search the log for "timeout", "reset", "controller is down" and "CSTS=" rather than for an exact sentence. Do not trust a blog's exact string; trust your kernel's source.</p>
+  </aside>
+  <h3>Safe inspection</h3>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Controller state as Linux sees it: live, resetting, connecting, deleting, dead ...</span>
+cat /sys/class/nvme/nvme0/state
+
+<span class="cm"># Controller registers (CAP, VS, CC, CSTS, AQA ...) decoded; read-only</span>
+sudo nvme show-regs /dev/nvme0 -H
+
+<span class="cm"># RTD3 entry/resume latency and other Identify Controller fields</span>
+sudo nvme id-ctrl /dev/nvme0 | grep -i -E 'rtd3|^fr |^mdts'
+
+<span class="cm"># Unsafe shutdown count and power-cycle count from the SMART / Health log</span>
+sudo nvme smart-log /dev/nvme0 | grep -i -E 'unsafe|power_cycles'
+
+<span class="cm"># Timeouts in effect</span>
+cat /sys/module/nvme_core/parameters/io_timeout /sys/module/nvme_core/parameters/shutdown_timeout
+
+<span class="cm"># Reset history in the kernel log</span>
+sudo dmesg -T | grep -i -E 'nvme.*(timeout|reset|csts|down)'</code></pre>
+  <p>What this output can prove: the current state, the register values at the moment you read them, the drive's declared shutdown latency, and the count of unsafe shutdowns. What it cannot prove: why a reset happened (you need the log sequence), whether an individual write reached media, or timing below a millisecond (you need an analyzer).</p>
+  <h3>Actions that change state</h3>
+  <aside class="callout safety">
+    <p><span class="badge caution">Caution lab</span> <code>nvme reset /dev/nvme0</code> (or writing 1 to <code>/sys/class/nvme/nvme0/reset_controller</code>) performs a controller reset. In-flight I/O is requeued, so it is normally non-destructive, but never do it on the disk holding your root file system or swap on a machine you care about. <span class="badge expert">Expert lab</span> <code>nvme subsystem-reset /dev/nvme0</code> writes NSSR: it affects every controller in the subsystem and commonly drops the PCIe link; the device may not return without a rescan or reboot. Use only on a dedicated test drive in a test machine.</p>
+  </aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>First, the host-side reset and rebuild as pseudocode. It deliberately shows the bookkeeping most toy drivers skip.</p>
+<pre class="code" data-kind="pseudocode" data-lang="c" data-title="controller_reset.c (pseudocode)"><code>int nvme_controller_reset(struct ctrl *c)
+{
+    quiesce_submission_paths(c);              <span class="cm">/* no new doorbells from any CPU */</span>
+    uint64_t cap = mmio_read64(c-&gt;bar0 + 0x00);
+    uint32_t to_ms = ((cap &gt;&gt; 24) &amp; 0xff) * 500;   <span class="cm">/* CAP.TO */</span>
+
+    uint32_t cc = mmio_read32(c-&gt;bar0 + 0x14);
+    mmio_write32(c-&gt;bar0 + 0x14, cc &amp; ~1u);   <span class="cm">/* CC.EN = 0 */</span>
+    if (wait_csts(c, /*mask*/0x1, /*want*/0x0, to_ms) != 0)
+        return escalate_to_transport_reset(c); <span class="cm">/* FLR, then hot reset */</span>
+
+    <span class="cm">/* Only now is it safe to forget DMA mappings of the old queues. */</span>
+    fail_or_requeue_all_outstanding(c);       <span class="cm">/* no CQEs will ever arrive for these */</span>
+    reset_host_queue_state(c);                <span class="cm">/* heads, tails, phase = 1 */</span>
+    memset(c-&gt;admin_cq_mem, 0, c-&gt;admin_cq_bytes);
+
+    uint32_t csts = mmio_read32(c-&gt;bar0 + 0x1C);
+    if (csts &amp; (1u &lt;&lt; 4))                     <span class="cm">/* NSSRO: someone did an NSSR */</span>
+        mmio_write32(c-&gt;bar0 + 0x1C, 1u &lt;&lt; 4); <span class="cm">/* write 1 to clear */</span>
+
+    mmio_write32(c-&gt;bar0 + 0x24, ((ACQ_ENTRIES-1) &lt;&lt; 16) | (ASQ_ENTRIES-1));
+    mmio_write64(c-&gt;bar0 + 0x28, c-&gt;asq_iova);
+    mmio_write64(c-&gt;bar0 + 0x30, c-&gt;acq_iova);
+    cc = (4u &lt;&lt; 20) | (6u &lt;&lt; 16) | (0u &lt;&lt; 7) | 1u; <span class="cm">/* IOCQES, IOSQES, MPS=4KiB, EN */</span>
+    mmio_write32(c-&gt;bar0 + 0x14, cc);
+    if (wait_csts(c, 0x3, 0x1, to_ms) != 0)   <span class="cm">/* RDY=1 and CFS=0 */</span>
+        return mark_dead(c);
+
+    identify_controller(c);                   <span class="cm">/* firmware may have changed */</span>
+    set_number_of_queues(c);                  <span class="cm">/* allowed once per reset */</span>
+    reapply_features(c);                      <span class="cm">/* coalescing, APST, HMB, AEN config */</span>
+    create_io_queues(c);                      <span class="cm">/* CQs first, then SQs */</span>
+    submit_async_event_requests(c);
+    rescan_namespaces(c);
+    unquiesce_and_resubmit(c);
+    return 0;
+}</code></pre>
+
+  <p>Second, a runnable model of the CC/CSTS state machine. It is a simulation, not a driver: it lets you see what happens if the host violates the rules.</p>
+<pre class="code" data-kind="executable" data-lang="python" data-title="nvme_reset_sim.py"><code>#!/usr/bin/env python3
+"""Toy model of NVMe controller reset and shutdown handshakes (teaching only)."""
+
+class ToyController:
+    def __init__(self, cap_to=20, stop_ms=38, start_ms=410, shut_ms=120):
+        self.cap_to = cap_to          # CAP.TO in 500 ms units
+        self.stop_ms, self.start_ms, self.shut_ms = stop_ms, start_ms, shut_ms
+        self.en = 0; self.rdy = 0; self.cfs = 0; self.shst = 0
+        self.pending = None           # (deadline_ms, action)
+        self.now = 0
+        self.queues = {}
+        self.outstanding = set()
+
+    def tick(self, ms):
+        self.now += ms
+        if self.pending and self.now &gt;= self.pending[0]:
+            _, action = self.pending
+            self.pending = None
+            action()
+
+    def write_cc(self, en, shn=0):
+        if shn and self.rdy:
+            self.shst = 1
+            self.pending = (self.now + self.shut_ms, self._shutdown_done)
+            return
+        if self.en == 1 and en == 0:
+            self.en = 0
+            self.pending = (self.now + self.stop_ms, self._stopped)
+        elif self.en == 0 and en == 1:
+            if self.rdy == 1:
+                self.cfs = 1          # model "undefined results" as a fatal status
+                print(f"[{self.now} ms] EN=1 written while RDY=1 -&gt; undefined, model sets CFS")
+                return
+            self.en = 1
+            self.pending = (self.now + self.start_ms, self._started)
+
+    def _stopped(self):
+        lost = sorted(self.outstanding)
+        self.queues.clear(); self.outstanding.clear()
+        self.rdy = 0; self.shst = 0
+        print(f"[{self.now} ms] RDY=0; queues deleted; {len(lost)} commands dropped without CQEs: {lost}")
+
+    def _started(self):
+        self.rdy = 1
+        self.queues["admin"] = True
+        print(f"[{self.now} ms] RDY=1; admin queue live")
+
+    def _shutdown_done(self):
+        self.shst = 2
+        print(f"[{self.now} ms] SHST=10b (shutdown complete)")
+
+    def csts(self):
+        return self.rdy | (self.cfs &lt;&lt; 1) | (self.shst &lt;&lt; 2)
+
+
+def wait_for(c, mask, want, poll_ms=1):
+    limit = c.cap_to * 500
+    waited = 0
+    while (c.csts() &amp; mask) != want:
+        if waited &gt;= limit:
+            return False
+        c.tick(poll_ms); waited += poll_ms
+    return True
+
+
+def main():
+    c = ToyController()
+    c.write_cc(1); assert wait_for(c, 1, 1)
+    c.queues.update({"sq1": True, "cq1": True})
+    c.outstanding.update({0x01A0, 0x01A1, 0x01A2})
+
+    print("--- correct controller reset ---")
+    c.write_cc(0); ok = wait_for(c, 1, 0)
+    print("RDY fell within CAP.TO:", ok)
+    c.write_cc(1); wait_for(c, 1, 1)
+    print("queues after reset:", sorted(c.queues))
+
+    print("--- buggy host: re-enable without waiting ---")
+    c.write_cc(0)
+    c.write_cc(1)                      # RDY is still 1 here
+    print(f"CSTS=0x{c.csts():02x} CFS={c.cfs}")
+
+    print("--- normal shutdown ---")
+    d = ToyController(); d.write_cc(1); wait_for(d, 1, 1)
+    d.write_cc(1, shn=1)
+    wait_for(d, 0b1100, 0b1000)
+    print(f"CSTS=0x{d.csts():02x} (RDY may stay 1; SHST=10b)")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+  <p>Expected output (deterministic, because the model has fixed delays): a line reporting RDY = 0 after 38 ms with three commands dropped, "RDY fell within CAP.TO: True", the admin queue only after re-enable, a CFS line for the buggy host, and a final CSTS of 0x09 for the shutdown case (RDY = 1, SHST = 10b).</p>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Scenario</strong> (synthetic): the Lab SSD reports CAP.TO = 20 and RTD3E = 8,000,000 µs (8 s). Linux runs with <code>io_timeout = 30</code> s and <code>shutdown_timeout = 5</code> s. An application issues a 1 MiB write that the drive never completes because of a firmware hang. How long until the application sees an error, and what happens at the next system shutdown?</p>
+  <ol>
+    <li><strong>First timeout</strong>: 30 s after submission. CSTS shows CFS = 0, the CQ has no entry, so the driver sends an Abort and re-arms the timer.</li>
+    <li><strong>Second timeout</strong>: another 30 s (the Abort is answered with "not aborted" or not at all). Now the driver resets: CC.EN = 0, waits up to CAP.TO = 20 × 500 ms = 10 s.</li>
+    <li><strong>Case A — reset succeeds</strong> in 40 ms; re-enable takes 0.4 s; the request is requeued and retried. If the hang was transient, the retry succeeds and the application never sees an error, only ~60.5 s of latency. If the retry hangs too, the cycle repeats until the block layer's retry limit is exhausted, then the application gets an I/O error.</li>
+    <li><strong>Case B — reset fails</strong> (RDY stuck at 1 for 10 s): the controller is removed. Total ≈ 30 + 30 + 10 = 70 s, then the application gets an I/O error and the namespace block device disappears.</li>
+    <li><strong>Shutdown</strong>: the driver chooses its shutdown wait as the larger of RTD3E (8 s) and the module default (5 s), subject to the kernel's cap — so about 8 s. <span class="badge version">Version-dependent</span> If an older kernel ignored RTD3E and waited only 5 s, it would cut power while SHST was still 01b on a slow drive, and the drive would count an unsafe shutdown even though the host "did shut it down".</li>
+  </ol>
+  <div class="formula">
+    <div class="eq"><var>T</var><sub>err</sub> ≈ <var>N</var><sub>to</sub> × <var>T</var><sub>io</sub> + <var>T</var><sub>reset</sub></div>
+    <dl class="vars">
+      <dt>T<sub>err</sub></dt><dd>time from submission until the application receives an error (single attempt, failed reset)</dd>
+      <dt>N<sub>to</sub></dt><dd>number of command timeouts before the driver resets (2 here: one before Abort, one after)</dd>
+      <dt>T<sub>io</sub></dt><dd>per-command timeout (nvme_core.io_timeout)</dd>
+      <dt>T<sub>reset</sub></dt><dd>time the reset attempt takes before being declared failed (bounded by CAP.TO × 500 ms)</dd>
+    </dl>
+  </div>
+  <aside class="callout insight">
+    <p>This arithmetic is why storage teams tune <code>io_timeout</code> differently for boot disks, database disks, and disks behind multipath: the default is designed to tolerate slow drives, not to fail over fast.</p>
+  </aside>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Writing CC.EN = 1 immediately after CC.EN = 0.</strong> Undefined behaviour; some controllers happen to tolerate it, so the bug survives until a slower drive arrives.</li>
+    <li><strong>Polling with no timeout, or with a hard-coded 500 ms.</strong> Use CAP.TO (and CRTO on 2.x).</li>
+    <li><strong>Freeing queue memory or unmapping IOMMU entries before RDY = 0.</strong> Produces IOMMU faults or corrupts reused memory.</li>
+    <li><strong>Not zeroing the admin CQ</strong> before re-enable: old entries with phase tag 1 look like new completions.</li>
+    <li><strong>Waiting for completions of commands that were outstanding at reset.</strong> They will never come.</li>
+    <li><strong>Forgetting Asynchronous Event Requests</strong> after reset: the host silently stops learning about namespace changes, firmware events and health warnings.</li>
+    <li><strong>Assuming features survive reset</strong>, especially interrupt coalescing, APST and Host Memory Buffer.</li>
+    <li><strong>Calling Set Features Number of Queues twice</strong> after one reset.</li>
+    <li><strong>Treating shutdown as reset</strong>: submitting I/O after SHST = 10b, or never resetting before reuse.</li>
+    <li><strong>Using NSSR to "fix" one controller</strong> on a multi-controller subsystem shared with other hosts.</li>
+    <li><strong>Confusing "controller reset" with FLR in bug reports.</strong> They reset different things; say which one happened.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>Reset-related failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>First check</th><th>Disambiguating evidence</th><th>Likely layer</th></tr></thead>
+    <tbody>
+      <tr><td>Disk disappears after a timeout</td><td>Kernel log sequence: timeout → abort → reset → failure reason</td><td>CSTS read during reset: RDY stuck at 1 (firmware), all-ones 0xFFFF_FFFF (link down / device gone)</td><td>Firmware vs PCIe</td></tr>
+      <tr><td>CSTS reads 0xFFFF_FFFF</td><td>Link status (lspci LnkSta), AER log</td><td>All-ones means the MRd got no valid completion (UR or completer gone) — not a controller state</td><td>PCIe (<a href="ch45.html">Ch 45</a>)</td></tr>
+      <tr><td>Reset succeeds but first admin command times out</td><td>Bus Master Enable, IOMMU faults, MSI-X enable</td><td>Analyzer: is there an SQE fetch after the doorbell? If no, the controller isn't fetching; if yes but no MSI-X, interrupt path</td><td>Host configuration</td></tr>
+      <tr><td>Phantom completions right after reset</td><td>Was the CQ memory zeroed? Does the host phase start at 1?</td><td>CQEs with command IDs from before the reset</td><td>Host driver</td></tr>
+      <tr><td>Unsafe Shutdowns count increases on every reboot</td><td>Shutdown timeout vs RTD3E; platform cutting power early</td><td>Analyzer or log: SHST still 01b when power drops</td><td>Host/platform</td></tr>
+      <tr><td>Resume from suspend slow (seconds)</td><td>Was the drive shut down (CC.SHN) or kept in a low-power state?</td><td>Time from CC.EN = 1 to RDY = 1 vs RTD3R</td><td>Power policy (<a href="ch50.html">Ch 50</a>)</td></tr>
+      <tr><td>Other host loses its paths</td><td>Did anyone issue an NSSR?</td><td>CSTS.NSSRO = 1 on every controller of the subsystem</td><td>Operations</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight">
+    <p><strong>A reset destroys evidence.</strong> Before resetting a misbehaving controller in a lab, capture what you can: CSTS, the Error Information log, the SMART log, the telemetry log (Telemetry Host-Initiated, if supported) and an analyzer trigger. Production drivers reset first because availability matters; validation engineers configure the driver or analyzer to preserve state first.</p>
+  </aside>
+  <ul>
+    <li>Reset time is a product requirement. Data-center buyers specify maximum time-to-ready after reset and after unsafe power loss; CAP.TO is the contract, not the typical value.</li>
+    <li>Reset during every admin command is a mandatory validation matrix entry. The interesting bugs are resets during Format NVM, Sanitize, firmware download/commit, and namespace management, where the controller must leave persistent state consistent.</li>
+    <li>Reset storms (a reset that triggers the condition that caused it) are a host-side failure as much as a device one. Back-off and a reset budget belong in the driver.</li>
+    <li>On multi-path systems, a controller reset on one path must not corrupt reservations or in-flight writes on another path. Know which state is per-controller and which is per-subsystem.</li>
+    <li>When a report says "the SSD reset", ask: which reset, initiated by whom, and what did CSTS say before and after?</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab: observe and reason about an NVMe controller reset</h2>
+  <h4>Objective</h4>
+  <p>Inspect reset-related registers and logs on a real (test) system, run the reset simulator, and — optionally on a dedicated test drive — trigger a controller reset and correlate it with kernel and register evidence.</p>
+  <h4>Skills</h4>
+  <p>Decoding CAP/CC/CSTS; computing reset timeouts; reading kernel reset sequences; separating controller reset from transport reset.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety">
+    <p>Steps 1–3 are <span class="badge safe">Safe lab</span> (read-only and simulation). Step 4 is a <span class="badge caution">Caution lab</span>: only on a non-boot, non-production test drive with no mounted file systems. NVM Subsystem Reset is <strong>not</strong> part of this lab.</p>
+  </aside>
+  <h4>Hardware required</h4>
+  <p>Any Linux machine with an NVMe SSD for steps 1–3; a spare NVMe test drive for step 4. No analyzer required (an analyzer turns step 4 into a trace lab).</p>
+  <h4>Software required</h4>
+  <p>Linux, nvme-cli, Python 3.</p>
+  <h4>Input</h4>
+  <p>Your controller's registers and Identify data; <code>nvme_reset_sim.py</code> from the Code section.</p>
+  <h4>Expected output</h4>
+  <p>A short table: CAP.TO in seconds, NSSRS yes/no, RTD3E/RTD3R, unsafe shutdown count, and (step 4) the time the reset took according to the kernel log, plus your explanation.</p>
+  <h4>Background</h4>
+  <p>Re-read the CC.EN sequence and the "destroys / survives" table in this chapter.</p>
+  <h4>Step 1 — decode the registers</h4>
+  <p>Run <code>sudo nvme show-regs /dev/nvme0 -H</code>. Record CAP.TO, CAP.NSSRS, CC.EN, CC.SHN, CSTS.RDY, CSTS.SHST, CSTS.NSSRO. Compute T<sub>max</sub>.</p>
+  <h4>Step 2 — shutdown latency and history</h4>
+  <p>Run <code>sudo nvme id-ctrl /dev/nvme0</code> and find rtd3e and rtd3r. Run <code>sudo nvme smart-log /dev/nvme0</code> and record unsafe shutdowns and power cycles. Compare RTD3E with <code>/sys/module/nvme_core/parameters/shutdown_timeout</code>.</p>
+  <h4>Step 3 — simulate</h4>
+  <p>Run the simulator. Change <code>stop_ms</code> to 11000 (longer than CAP.TO) and observe the result of <code>wait_for</code>. Then make the buggy re-enable happen after the controller has stopped and see that it no longer fails.</p>
+  <h4>Step 4 (caution) — trigger a controller reset on the test drive</h4>
+  <p>Note <code>cat /sys/class/nvme/nvmeX/state</code>, run <code>sudo nvme reset /dev/nvmeX</code>, then read <code>dmesg -T | tail</code> and the state again.</p>
+  <h4>Observation</h4>
+  <p>Record what changed (state transitions, any log lines) and what did not (PCIe link status in <code>lspci -vv</code>, BAR addresses, MSI-X configuration).</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Why did the PCIe link status not change during step 4?</li>
+    <li>If your unsafe shutdown count is much higher than you expect, what are the two most likely explanations?</li>
+    <li>Your simulator run with stop_ms = 11000: what should a real driver do next?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Extend the simulator so a configurable set of outstanding commands are writes with a random "fraction written to media" at reset time. Have the host retry them and assert the final media state is correct regardless of the fraction.</p>
+  <details class="hint"><summary>Hints</summary><p>CAP.TO is bits 31:24 of the low 32 bits of CAP. A controller reset is a register operation inside the function; the link and config space are a different reset domain. For the challenge, idempotent writes make the final state independent of partial progress — that is the property you are testing.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>Q1: CC.EN is a controller-level reset that does not reach the PCIe function's configuration space or the Physical/Data Link layers, so the link stays in L0 and BARs/MSI-X are untouched. Q2: the platform removes power before shutdown completes (shutdown timeout shorter than the drive needs, or firmware/BIOS cuts power), or the system crashes/loses power often (watchdog resets, power events). Some drives also count abrupt-shutdown notifications as unsafe. Q3: escalate to a transport reset — FLR if supported, otherwise a secondary bus reset of the upstream port — then restore configuration space and retry initialization; if that fails, mark the controller dead and report. Challenge: the retry of an idempotent write overwrites any partially written blocks with the full payload; non-idempotent commands (e.g. Zone Append) would break this assertion, which is the lesson.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>Whether the reset time in the log is close to CAP.TO (a drive that routinely uses most of its timeout is one bad day away from being declared dead), whether the drive's RTD3E is honoured by the kernel, and whether unsafe shutdowns correlate with kernel versions or platform firmware updates.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>Reset hangs and the device is removed: capture the log, then try <code>echo 1 &gt; /sys/bus/pci/devices/0000:01:00.0/reset</code> only on a test machine (Chapter 49).</li>
+    <li>After reset, fewer I/O queues are created than before: the controller now reports a different Number of Queues allocation (firmware change, or a different interrupt allocation).</li>
+    <li>Reset succeeds but namespaces change: an Asynchronous Event or a namespace attach happened in between.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>With a PCIe analyzer, capture step 4 and produce the trace table from the Trace view for your drive, measuring EN-to-RDY times. Compare at idle and under a 32-deep random-write load.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>CAP reads 0x0000_0020_3C01_0FFF. Decode MQES, CQR, TO and NSSRS. How long may RDY take to change?</li>
+    <li>Write the exact CC value to enable a controller with 4 KiB pages, NVM command set, round-robin arbitration, 64-byte SQEs and 16-byte CQEs. Then the value to request a normal shutdown while keeping the rest.</li>
+    <li>List, in order, every admin command Linux-style bring-up sends after a controller reset, up to and including the first I/O queue pair.</li>
+    <li>A colleague says "FLR is lighter than a controller reset". Correct the statement precisely.</li>
+    <li>Design a validation test that proves a controller performs no DMA after CSTS.RDY = 0.</li>
+    <li>Explain why NSSR requires a 32-bit magic value but CC.EN is a single bit.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p>1. Low DWORD 0x3C01_0FFF: MQES = 0x0FFF (4096 entries), CQR = 1, AMS = 00b, TO = 0x3C = 60 → 30 s. High DWORD 0x20: DSTRD = 0, NSSRS (bit 36 = high-DWORD bit 4) = 0, and bit 5 (CSS bit 0, NVM command set) = 1. So NSSR is not supported. RDY may take up to 30 s.</p>
+    <p>2. EN: (4 &lt;&lt; 20) | (6 &lt;&lt; 16) | 1 = 0x0046_0001. Normal shutdown: set SHN = 01b in bits 15:14 → 0x0046_4001.</p>
+    <p>3. Identify Controller (06h, CNS 01h); Set Features Number of Queues (09h); possibly Identify for namespaces / command-set specific data; Set Features for other features; Create I/O Completion Queue (05h); Create I/O Submission Queue (01h); Asynchronous Event Request (0Ch). Exact order and extra commands are driver-dependent.</p>
+    <p>4. FLR resets the whole PCIe function including its configuration space (BARs, Bus Master Enable, MSI-X enable) <em>and</em> the NVMe controller inside it; a CC.EN reset touches only the controller. FLR is lighter than a conventional reset (the link stays up), not lighter than a controller reset.</p>
+    <p>5. Under load, write CC.EN = 0; poll until RDY = 0; record the timestamp; then use an analyzer trigger on any device-initiated TLP (MRd/MWr from Requester ID 0x0100) after that timestamp and before the next CC.EN = 1. Also repeat with the IOMMU unmapping all buffers right after RDY = 0 and check for IOMMU faults. Vary load, transfer size and temperature.</p>
+    <p>6. CC.EN affects only the controller the host owns; a stray clear is recoverable. NSSR affects every controller in the subsystem, possibly owned by other hosts, and on PCIe may drop the link; a 32-bit pattern makes accidental triggering from a wild write astronomically unlikely.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>After the host writes CC.EN = 0, when may it write CC.EN = 1?</p>
+      <ul class="options" data-answer="3">
+        <li>Immediately</li>
+        <li>After 500 ms</li>
+        <li>After CSTS.RDY reads 0</li>
+        <li>After CSTS.SHST reads 10b</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The host must observe RDY = 0 first; writing EN = 1 while RDY = 1 has undefined results. 500 ms is one CAP.TO unit, not a rule. SHST relates to shutdown, not reset.</p></details>
+    </li>
+    <li>
+      <p>CAP.TO = 0x28. What is the worst-case wait?</p>
+      <ul class="options" data-answer="2">
+        <li>40 ms</li>
+        <li>20 s</li>
+        <li>40 s</li>
+        <li>2.8 s</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>0x28 = 40 units × 500 ms = 20 s.</p></details>
+    </li>
+    <li>
+      <p>Which register values survive a CC.EN 1→0 controller reset?</p>
+      <ul class="options" data-answer="1">
+        <li>AQA, ASQ and ACQ</li>
+        <li>All I/O queue head and tail pointers</li>
+        <li>The Number of Queues allocation</li>
+        <li>Outstanding Asynchronous Event Requests</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The admin queue attribute and base address registers are not reset; everything about I/O queues and outstanding commands (including AERs) is gone, and Number of Queues must be set again.</p></details>
+    </li>
+    <li>
+      <p>What value written to NSSR initiates an NVM Subsystem Reset?</p>
+      <ul class="options" data-answer="4">
+        <li>0x0000_0001</li>
+        <li>0xFFFF_FFFF</li>
+        <li>0x6D65_564E</li>
+        <li>0x4E56_4D65</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>4E564D65h is "NVMe" in ASCII read as N=4Eh, V=56h, M=4Dh, e=65h from most to least significant byte. Option 3 is the byte-reversed value — a classic endianness mistake when building the value from a string.</p></details>
+    </li>
+    <li>
+      <p>During a controller reset, what happens to commands that were outstanding?</p>
+      <ul class="options" data-answer="2">
+        <li>They receive completions with an "aborted" status</li>
+        <li>They are dropped with no completion; the host must account for them</li>
+        <li>They are completed after the controller becomes ready again</li>
+        <li>They are moved to the admin queue</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The CQs are deleted by the reset, so no completion can be posted. Contrast with Delete I/O SQ, which does produce "aborted due to SQ deletion" completions in the still-existing CQ.</p></details>
+    </li>
+    <li>
+      <p>The host wrote CC.SHN = 01b and SHST now reads 10b. The host wants to submit more I/O without power cycling. What must it do?</p>
+      <details class="answer"><summary>Model answer</summary><p>Perform a controller reset (CC.EN = 0, wait RDY = 0, clearing SHN in the process) and reinitialize the controller fully. A shut-down controller is not required to process commands.</p></details>
+    </li>
+    <li>
+      <p>CSTS reads 0xFFFF_FFFF during a reset. What does this tell you?</p>
+      <details class="answer"><summary>Model answer</summary><p>Nothing about NVMe state. All-ones is what the host sees when a memory read gets no successful completion (link down, device removed, Unsupported Request, completion timeout). The problem is at the PCIe layer; check link status and AER before anything else.</p></details>
+    </li>
+    <li>
+      <p>Why must host memory for queues and data buffers stay mapped until RDY = 0, not merely until the CC write?</p>
+      <details class="answer"><summary>Model answer</summary><p>The CC write is posted and takes time to arrive; the controller needs time to stop; and device-to-host writes already in flight are not ordered against the host's later reads. Until RDY = 0 the controller may still DMA. Unmapping early causes IOMMU faults or, without an IOMMU, writes into memory that has been reused.</p></details>
+    </li>
+    <li>
+      <p>Which reset will most likely cause the Linux PCI hot-plug or AER code to see a link-down event?</p>
+      <ul class="options" data-answer="3">
+        <li>Controller reset (CC.EN)</li>
+        <li>Delete I/O SQ</li>
+        <li>NVM Subsystem Reset on a typical PCIe SSD</li>
+        <li>Set Features Power Management</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>NSSR on PCIe implementations commonly takes the link down (transport-defined, implementation-dependent detail). The others do not touch the link.</p></details>
+    </li>
+    <li>
+      <p>Explain why the Unsafe Shutdowns counter is useful evidence in a field investigation.</p>
+      <details class="answer"><summary>Model answer</summary><p>It increments when the controller starts after power was lost without a completed shutdown. Rising counts that correlate with crashes, power events, or a kernel/firmware update point to the platform cutting power early or the host not waiting long enough, which explains slow starts and possible loss of volatile cache contents — without needing an analyzer.</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> What does CSTS.RDY mean?</p>
+      <details class="answer"><summary>Model answer</summary><p>Controller Status Ready: 1 means the controller is enabled and ready to process admin (and, once created, I/O) submission queue entries; 0 means it is disabled or still transitioning. It is the controller's answer to CC.EN.</p></details></li>
+    <li><p><strong>Beginner:</strong> What is the difference between shutdown and reset?</p>
+      <details class="answer"><summary>Model answer</summary><p>Shutdown (CC.SHN) prepares for power removal by making data and metadata durable and reports progress in CSTS.SHST. Reset (CC.EN 1→0 and friends) returns the controller to an idle unconfigured state for recovery or reconfiguration. A shutdown controller needs a reset before reuse.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Walk me through recovering from an I/O timeout on Linux.</p>
+      <details class="answer"><summary>Model answer</summary><p>Check CSTS for fatal status; check for a missed completion (poll the CQ); send Abort for the command; on a second timeout reset the controller: quiesce, disable, cancel outstanding requests for requeue, re-enable, Identify, Number of Queues, features, create queues, AERs, rescan namespaces, unquiesce. If reset fails, remove the controller.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Why can a CQ not be deleted before its SQs?</p>
+      <details class="answer"><summary>Model answer</summary><p>The SQ's commands complete into that CQ. Deleting the CQ first would leave an SQ with nowhere to post completions, including the aborted completions produced by the SQ deletion itself. The controller rejects it with an invalid queue deletion status.</p></details></li>
+    <li><p><strong>Advanced:</strong> What changed with controller ready modes in NVMe 2.0, and why?</p>
+      <details class="answer"><summary>Model answer</summary><p>Large drives can need a long time to make media ready. 2.0 lets a controller become ready "independent of media", so the admin queue is usable quickly while namespaces finish initializing, with separate timeouts reported in CRTO and the mode chosen through CC. CAP.TO remains for legacy hosts. Field positions should be checked in the 2.4 text.</p></details></li>
+    <li><p><strong>Advanced:</strong> You see device-initiated MWr TLPs 200 µs after the host wrote CC.EN = 0. Bug?</p>
+      <details class="answer"><summary>Model answer</summary><p>Not necessarily. Until CSTS.RDY = 0, the controller is still stopping, and writes already in flight must drain. It is a bug if they appear after RDY = 0 was reported, or if they are new SQE fetches after EN = 0 arrived (fetches indicate the front end ignored EN).</p></details></li>
+    <li><p><strong>Senior:</strong> Design the reset escalation policy for a hyperscale fleet.</p>
+      <details class="answer"><summary>Model answer</summary><p>Tiered: abort → controller reset → FLR → secondary bus reset/slot power cycle → remove and alert. Each tier has a bounded time from the device's declared limits (CAP.TO/CRTO, readiness rules) plus margin; a per-device reset budget prevents storms; evidence capture (CSTS, error log, telemetry, AER) happens before destructive tiers when policy allows; multipath fails over first so availability doesn't depend on the slow tiers; metrics record which tier recovered each event so firmware regressions are visible fleet-wide.</p></details></li>
+    <li><p><strong>Senior:</strong> A customer reports data corruption after a power event despite a clean OS shutdown. How do you investigate?</p>
+      <details class="answer"><summary>Model answer</summary><p>Check the Unsafe Shutdowns counter before and after; check the OS log for the shutdown wait and whether SHST reached complete; compare RTD3E with the host's timeout; check whether the platform removes power before the OS finishes (firmware/BMC sequencing); verify the volatile write cache setting and Flush usage by the application; check power-loss-protection capability; reproduce with an analyzer on CC/CSTS and a power-rail monitor.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain why the librarian's dropped slips have to be written again by the teacher and why the teacher waits for the light to go off.</li>
+    <li><strong>To a junior engineer:</strong> explain the CC.EN/CSTS.RDY handshake, CAP.TO, and the three things you must do to host-side state before re-enabling.</li>
+    <li><strong>To a senior engineer:</strong> argue which state is per-controller versus per-subsystem, and how that shapes reset choice on a dual-ported drive in a two-host cluster.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "The librarian threw away the slips she was holding and emptied the answer box, so nobody will ever get those answers unless the teacher asks again. The teacher waits for the light because if she hands over new boxes while the librarian is still cleaning up, things get mixed up."</p>
+    <p><strong>Junior:</strong> "Write CC.EN = 0, poll CSTS.RDY until 0 for at most CAP.TO × 500 ms. Then: complete every outstanding request yourself because no CQEs are coming; reset your heads, tails and phase and zero the CQ memory; reprogram AQA/ASQ/ACQ if needed. Then EN = 1, wait RDY = 1, and rebuild features and queues."</p>
+    <p><strong>Senior:</strong> "Queues, outstanding commands and most features are per-controller; namespaces, media, reservations, logs and NSSR are per-subsystem. On a dual-ported drive, each host should only reset its own controller (CC.EN or FLR of its function). NSSR or a conventional reset that reaches the whole device takes the other host's paths down too, so it belongs only in coordinated maintenance."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>NVMe resets come in scopes: queue, controller, NVM subsystem, plus transport resets that reach the controller from below. A controller reset is CC.EN 1→0 followed by waiting for CSTS.RDY = 0 within CAP.TO; it deletes all I/O queues, drops outstanding commands without completions, and keeps AQA/ASQ/ACQ. The host rebuilds everything and accounts for every outstanding command itself. NSSR writes "NVMe" to offset 20h and resets all controllers in the subsystem, often with link consequences on PCIe. Shutdown (CC.SHN, CSTS.SHST) is about durability before power loss, has its own latency (RTD3E), and must be followed by a reset before reuse. Linux escalates from timeout to abort to reset to removal.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>order every NVMe-relevant reset by scope and say which ones touch PCIe config space and the link</li>
+      <li>write the CC/CSTS handshake with correct timeouts from CAP.TO</li>
+      <li>list what a controller reset destroys and what survives</li>
+      <li>explain why outstanding commands get no completions and what the host must do</li>
+      <li>perform normal and abrupt shutdown on paper and decode SHST</li>
+      <li>find the first abnormal event in a failed-reset trace</li>
+      <li>describe the Linux timeout → abort → reset → remove escalation</li>
+      <li>cite the Base specification sections by name for reset, initialization and shutdown</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification 2.4 — Controller Registers; Resets; Controller Initialization; Controller Shutdown; Set Features (Number of Queues)</cite></li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification 1.4 — reset and NVM Subsystem Reset behaviour on PCIe</cite></li>
+    <li>NVM Express Revision Changes document (2026.07.30) for what changed in 2.4.</li>
+    <li>Linux source: drivers/nvme/host/core.c and drivers/nvme/host/pci.c (functions named in the Linux view); nvme-cli documentation for <code>show-regs</code>, <code>reset</code>, <code>subsystem-reset</code>.</li>
+    <li>Deeper treatment: <a href="dd41.html">Deep-Dive Module 41 — Reset</a>; feature labs in <a href="me-feature-labs.html">Feature Labs</a>.</li>
+  </ul>
+  <p>Next: <a href="ch49.html">Chapter 49 — PCIe Reset</a>, where the reset comes from underneath the controller and takes configuration space and the link with it.</p>
+</section>

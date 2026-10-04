@@ -1,0 +1,743 @@
+<p class="lead">Flush is the shortest NVMe command you will ever decode — an opcode, a namespace identifier and nothing else — and one of the most consequential. It is the host's way of saying "everything you have told me is done, make it permanent now". This chapter teaches exactly what that promise covers, what it does not, and what it costs.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>In <a href="ch33.html">Chapter 33</a> you learned that a successful Write completion does not, by itself, mean the data would survive a power cut when the controller has an enabled volatile write cache. Something must close that gap. Non-Volatile Memory Express (NVMe) gives the host two tools: the per-command Force Unit Access (FUA) bit, and the Flush command. Flush is the general one: it reaches back over everything already completed.</p>
+  <p>Every serious storage stack depends on Flush. Journaling filesystems use it to order their journal against their commit records; databases use it on every transaction commit (often through <code>fsync()</code> or <code>fdatasync()</code>); virtual machine hypervisors must forward it from the guest or silently break the guest's durability. When Flush is wrong — not issued, not forwarded, not honored, or misunderstood — the result is the worst kind of bug: everything works perfectly until the power goes out.</p>
+  <p>Flush is also a performance topic. A Flush can take microseconds or many milliseconds depending on how much dirty data the cache holds and how the device protects it. Applications that flush too often crawl; applications that flush too rarely lose data. Engineers who understand the cost model can design commit protocols that are both safe and fast.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>State precisely what a completed Flush guarantees, including its scope in time (which writes it covers) and in space (which namespaces).</li>
+    <li>Explain what Flush does not guarantee: ordering of in-flight commands, a barrier for later commands, protection against torn writes, or anything when the device lies about its cache.</li>
+    <li>Find and interpret the Volatile Write Cache (VWC) field of Identify Controller, including its report of Flush support for the broadcast namespace identifier FFFFFFFFh, and the Volatile Write Cache feature.</li>
+    <li>Relate Flush to orderly shutdown (CC.SHN / CSTS.SHST), power-loss protection, and the SMART "unsafe shutdowns" counter.</li>
+    <li>Predict and measure Flush latency; reason about its effect on concurrent I/O.</li>
+    <li>Read normal, slow and failed Flush traces and debug durability incidents with evidence.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>Read <a href="ch33.html">Chapter 33 — WRITE</a> first, especially "What completion means for durability". You also need the command structure (<a href="ch29.html">Chapter 29</a>), the controller registers CC and CSTS (<a href="ch24.html">Chapter 24</a>), and the Admin commands Identify, Get Features and Set Features (<a href="ch30.html">Chapter 30</a>).</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Back at the bakery, the helper carries recipes in an apron and takes them to the vault in batches. Most of the time that is fine. But tonight there is a thunderstorm and the lights might go out. So you call out: "Before you do anything else for me, take <em>everything</em> you've already told me you have into the vault, and tell me when it's done." That call is FLUSH. The helper empties the apron into the vault and says "all safe".</p>
+    <p>Notice two things. First, "everything you've already told me you have" — if you hand the helper a new recipe while they are walking to the vault, that new one is not part of the deal. Second, if the helper never had an apron (some helpers walk every recipe straight to the vault), FLUSH is easy: "all safe" right away.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A restaurant kitchen's order spike. Cooks clip finished orders on a rail (the volatile cache) and runners carry them to tables (the non-volatile media) in batches. The manager can shout "clear the rail!" (Flush): every plate already on the rail goes out now, before the manager reports to the owner that those tables are served. Plates the cooks finish <em>during</em> the clearing might or might not go with that batch — the manager's report only covers plates that were on the rail when the shout went out.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What it hides.</strong> A rail is visible; a controller's cache is not. You cannot look at it to see if it is empty, and the controller may move data to media at any time without being asked — the Flush just forces it to finish. Some "rails" are actually protected by capacitors, so a power cut does not drop the plates at all.</p>
+    <p><strong>Where it misleads.</strong> Shouting "clear the rail" in a kitchen stops cooking. Flush does not stop the controller: it may continue executing other commands, including writes submitted after the Flush, and those writes may even become durable before the Flush completes — but the host must not rely on that. The analogy also suggests Flush is about speed; it is about the <em>promise</em>, and a controller may satisfy it instantly if it can already keep the promise.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>Many SSDs have a small, fast memory (usually DRAM) where they collect written data before storing it in flash. This memory loses its contents when power disappears — that is what <em>volatile</em> means. It is called the <span class="g" data-term="vwc">volatile write cache</span>.</p>
+  <p>When the SSD says a write is "complete", it means it has the data, and if you read it back you will get the new data. It does not necessarily mean the data is in flash yet. If power is lost at the wrong moment, completed writes that were still only in the cache can be lost.</p>
+  <p>The Flush command fixes that. You send Flush for a namespace. The SSD makes sure that every write it had already completed for that namespace before you sent the Flush is stored in non-volatile media, and only then tells you the Flush is complete. After that, those writes will survive a power cut.</p>
+  <p>Three simple rules capture most of what you need:</p>
+  <ol>
+    <li><strong>Flush covers the past, not the future.</strong> Only writes that completed before the Flush was submitted are covered.</li>
+    <li><strong>No cache, nothing to do.</strong> If the SSD has no volatile write cache, a Flush completes successfully and does nothing.</li>
+    <li><strong>Flush costs time.</strong> The more data is waiting in the cache, the longer the Flush takes, and frequent flushes reduce the SSD's ability to batch writes efficiently.</li>
+  </ol>
+  <figure>
+    <pre class="diagram">
+   time ─────────────────────────────────────────────────────────────►
+
+   Write A  [submit──────complete]
+   Write B        [submit─────────complete]
+   Write C                         [submit───────────────complete]
+   FLUSH                     [submit═══════════════════complete]
+                              ▲
+                              └─ the Flush covers writes completed BEFORE this point:
+                                 A  → covered (completed before Flush submitted)
+                                 B  → NOT guaranteed (still in flight at submission)
+                                 C  → NOT guaranteed (submitted after the Flush)
+    </pre>
+    <figcaption>Flush's time scope. Conceptual diagram; B and C may become durable anyway, but the host may not rely on it.</figcaption>
+  </figure>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>What Flush means</h3>
+  <p>Flush (opcode 00h) asks the controller to commit data and metadata associated with the specified namespace to non-volatile media. It carries no data pointer and no LBA range: it applies to the whole namespace. Its scope is defined by completion: it covers all write-type commands for that namespace that the controller completed before the Flush command was submitted. A controller is allowed to flush more than that — other namespaces, writes that arrived later — but the host may rely only on the defined scope. <span class="badge normative">Normative</span> (confirm wording in the Flush command section of the Base specification for your revision).</p>
+  <table>
+    <caption>The Flush command — everything in its 64 bytes</caption>
+    <thead><tr><th>Dword</th><th>Field</th><th>Value / meaning</th></tr></thead>
+    <tbody>
+      <tr><td>CDW0 bits 7:0</td><td>Opcode</td><td>00h — Flush. Low two bits 00b: no data transfer.</td></tr>
+      <tr><td>CDW0 bits 31:16</td><td>CID</td><td>Command Identifier, as for any command</td></tr>
+      <tr><td>CDW1</td><td>NSID</td><td>Namespace to flush; FFFFFFFFh means all namespaces attached to this controller, if the controller supports that use</td></tr>
+      <tr><td>CDW2–CDW9</td><td>MPTR, DPTR</td><td>Not used (no data, no metadata)</td></tr>
+      <tr><td>CDW10–CDW15</td><td>—</td><td>No command-specific fields defined</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Why it matters</h3>
+  <p>Durability protocols are built from two primitives: <em>ordering</em> ("B must not become durable before A") and <em>durability</em> ("A is durable now"). NVMe does not order commands, so the host builds ordering from waiting plus durability: write A, wait for A's completion, Flush, wait for the Flush, then write B. If power fails at any point, B can only be on media if A is. This is how a journal protects its commit record; it is how a database protects the link between its log and its data pages.</p>
+  <p>Without Flush, the host's only alternatives are FUA on every write (expensive: each write waits for media) or disabling the cache (very expensive for small writes, and it may not even be possible). Flush lets the device batch writes most of the time and pay the media cost only at commit points.</p>
+
+  <h3>What Flush guarantees</h3>
+  <ul>
+    <li>When the Flush completes successfully, data and metadata of commands for that namespace completed before the Flush was submitted are on non-volatile media. <span class="badge normative">Normative</span></li>
+    <li>If no volatile write cache is present, Flush has no effect and completes successfully. <span class="badge normative">Normative</span> (the specification's handling of a cache that is present but <em>disabled</em> should be confirmed in your revision's text; in practice a disabled cache holds no dirty data and Flush completes quickly).</li>
+    <li>With NSID FFFFFFFFh, on a controller that reports support for it, the flush applies to all namespaces attached to the controller processing the command.</li>
+  </ul>
+
+  <h3>What Flush does not necessarily guarantee</h3>
+  <ul>
+    <li><strong>No coverage of in-flight commands.</strong> A write that has been submitted but not completed when the Flush is submitted is outside the guarantee, even if it completes before the Flush does.</li>
+    <li><strong>Not a barrier.</strong> Commands submitted after the Flush may be executed, completed and even made durable before the Flush completes. Flush does not hold them back.</li>
+    <li><strong>No atomicity.</strong> Flush says nothing about writes torn by a power failure that happens <em>before</em> the Flush completes. Atomicity comes from AWUPF/NAWUPF and the host's write sizes.</li>
+    <li><strong>No media integrity.</strong> Flush makes data non-volatile; it does not promise the media will never fail later. Retention and error correction are separate.</li>
+    <li><strong>No cross-controller promise by default.</strong> In a subsystem with several controllers sharing a namespace, the guarantee is framed around commands completed by the controller processing the Flush. Whether writes completed through another controller are also flushed is something to confirm in the specification and the product; do not assume. <span class="badge uncertain">Uncertain</span></li>
+    <li><strong>No protection against a dishonest device or layer.</strong> If firmware, a RAID controller, a hypervisor or a USB bridge acknowledges Flush without doing it, the host cannot tell from the completion.</li>
+  </ul>
+  <aside class="callout warn" data-title="The single most common durability bug">
+    <p>Submitting the Flush while the writes it is meant to protect are still outstanding. The Flush may complete successfully and protect nothing you cared about. Always wait for the writes' completions, then submit the Flush.</p>
+  </aside>
+
+  <h3>Discovering the cache: VWC and the Volatile Write Cache feature</h3>
+  <p>Identify Controller contains a field named <strong>VWC</strong> (Volatile Write Cache). Its bit 0 reports whether a volatile write cache is present. Since NVMe 1.4, bits 2:1 report how the controller handles Flush with NSID FFFFFFFFh: <code>00b</code> support not indicated, <code>01b</code> reserved, <code>10b</code> Flush with FFFFFFFFh not supported, <code>11b</code> supported. <span class="badge version">Version-dependent</span> — a controller implementing an older revision reports 00b, and the host cannot infer support.</p>
+  <p>If a cache is present, the host can enable or disable it with Set Features using the <strong>Volatile Write Cache</strong> feature (Feature Identifier 06h); bit 0 of the feature value is the Volatile Write Cache Enable (WCE) bit. Get Features reads the current state. Whether the setting is saveable across power cycles is reported by the feature's capabilities (Get Features with the "supported capabilities" select value).</p>
+  <aside class="callout notsaid" data-title="Check these in the Base specification">
+    <p>The byte offset of VWC within Identify Controller, the precise status code returned when NSID FFFFFFFFh is used on a controller that does not support it (commonly described as Invalid Namespace or Format — verify), and the exact text about Flush when the cache is present but disabled.</p>
+  </aside>
+
+  <h3>Power-loss implications</h3>
+  <p>Three mechanisms decide what survives a power failure:</p>
+  <ol>
+    <li><strong>Host-driven commit points</strong> — Flush and FUA — cover exactly what the specification says, no more.</li>
+    <li><strong>Orderly shutdown.</strong> Before removing power, a well-behaved host writes Shutdown Notification (CC.SHN, bits 15:14 of the Controller Configuration register: 01b normal, 10b abrupt) and waits for CSTS.SHST (bits 3:2 of Controller Status) to report shutdown processing complete (10b). A controller completing normal shutdown processing commits its cache. Linux does this on reboot and power-off. If power is removed without it, the controller counts an <strong>unsafe shutdown</strong> in the SMART / Health Information log page.</li>
+    <li><strong>Power-loss protection (PLP).</strong> Enterprise SSDs typically have capacitors holding enough energy to program the cache's contents after external power vanishes. With working PLP, completed writes survive even without Flush. Many such drives report no volatile write cache at all (VWC bit 0 = 0), which tells the host that Flush is unnecessary. Client SSDs generally lack full PLP.</li>
+  </ol>
+  <table>
+    <caption>What a sudden power loss can destroy</caption>
+    <thead><tr><th>Device configuration</th><th>Completed, flushed writes</th><th>Completed, unflushed writes</th><th>In-flight writes</th></tr></thead>
+    <tbody>
+      <tr><td>No volatile cache (incl. PLP drives reporting none)</td><td>Safe</td><td>Safe</td><td>May be old, new, or torn beyond AWUPF</td></tr>
+      <tr><td>Volatile cache enabled, no PLP</td><td>Safe</td><td><strong>May be lost</strong> (old data returns)</td><td>May be old, new, or torn beyond AWUPF</td></tr>
+      <tr><td>Volatile cache disabled</td><td>Safe</td><td>Safe</td><td>May be old, new, or torn beyond AWUPF</td></tr>
+      <tr><td>Any device whose firmware mishandles Flush</td><td><strong>Unknown</strong></td><td>Unknown</td><td>Unknown</td></tr>
+    </tbody>
+  </table>
+  <p>"Old data returns" is a subtle failure. The LBA reads back without error but contains the previous version, so checksums at the application level are the only way to detect it. A filesystem that wrote a commit record pointing at blocks that reverted to old content will happily serve inconsistent data.</p>
+
+  <h3>Performance consequences</h3>
+  <p>Flush latency has three main components: draining the dirty data in the cache to NAND, persisting the FTL's own metadata (mapping table updates) that the controller requires for the data to be retrievable after power loss, and firmware overhead. The first is roughly proportional to the amount of dirty data and inversely to the number of NAND dies available; the second is implementation-specific and can dominate on drives that keep large mapping journals in DRAM.</p>
+  <div class="formula">
+    <div class="eq"><var>T</var><sub>flush</sub> ≈ <var>T</var><sub>fw</sub> + <var>D</var><sub>dirty</sub> ÷ <var>R</var><sub>prog</sub> + <var>T</var><sub>meta</sub></div>
+    <dl class="vars">
+      <dt>T<sub>flush</sub></dt><dd>time from Flush submission to its completion</dd>
+      <dt>T<sub>fw</sub></dt><dd>fixed firmware overhead of handling the command (microseconds)</dd>
+      <dt>D<sub>dirty</sub></dt><dd>bytes in the volatile cache not yet on non-volatile media for the affected namespaces</dd>
+      <dt>R<sub>prog</sub></dt><dd>aggregate NAND program bandwidth the controller can apply, in bytes per second</dd>
+      <dt>T<sub>meta</sub></dt><dd>time to persist the FTL metadata needed to make that data recoverable</dd>
+    </dl>
+  </div>
+  <p>This is a <span class="badge derived">Derived</span> model, not a specification formula. Plugging in illustrative numbers — 8 MiB dirty, 2 GB/s program bandwidth, 300 µs metadata, 20 µs firmware — gives about 4.5 ms. A PLP drive that reports no volatile cache completes the same Flush in tens of microseconds because there is nothing to wait for.</p>
+  <p>Wider consequences:</p>
+  <ul>
+    <li><strong>Commit rate ceiling.</strong> A single-threaded application that does write+flush per transaction is bounded at roughly 1/(write latency + flush latency) transactions per second. Group commit (batching many transactions per flush) is the standard escape.</li>
+    <li><strong>Interference.</strong> While draining, the controller's NAND dies are busy; concurrent reads may see higher latency. Some controllers prioritise flush draining over new writes; others continue accepting writes into the cache. <span class="badge impl">Implementation-dependent</span></li>
+    <li><strong>Smaller program units.</strong> Frequent flushes force the controller to program partially filled pages or use padding, increasing write amplification and wearing the drive faster.</li>
+    <li><strong>Queue effects.</strong> Linux does not hold all other I/O while a flush is outstanding; it sequences flush and the writes that depend on it with a dedicated flush state machine. Flushes from many threads may be merged.</li>
+  </ul>
+
+  <h3>The central concept on the ladder: Flush as a durability fence over the past</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>"Take everything you already told me you have into the vault, then tell me." New recipes handed over meanwhile are not part of the deal.</p></div>
+    <div class="rung" data-rung="B"><p>Flush makes every write the controller completed for that namespace before the Flush was submitted non-volatile, then completes. With no volatile cache it is a no-op that succeeds.</p></div>
+    <div class="rung" data-rung="C"><p>The controller drains dirty cache lines from DRAM to NAND across dies, persists FTL mapping updates, then posts the CQE. Capacitor-backed drives may treat it as nearly free.</p></div>
+    <div class="rung" data-rung="D"><p>NVMe Base 2.4: Flush command (opcode 00h), Identify Controller VWC field (presence; NSID FFFFFFFFh support since 1.4), Volatile Write Cache feature (FID 06h). NVM Command Set: FUA on Write. Base: shutdown notification in CC/CSTS.</p></div>
+    <div class="rung" data-rung="E"><p>Doorbell MWr, one SQE MRd/CplD, no data transfer, then — after a variable delay — a CQE MWr and MSI-X. Nothing else crosses the link for the Flush itself.</p></div>
+    <div class="rung" data-rung="F"><p>A 64-byte SQE with opcode byte 00h and NSID 1; a long silence specific to this CID; a CQE with the matching CID. Other queues' traffic may continue during the silence.</p></div>
+    <div class="rung" data-rung="G"><p>Durability lost? Prove Flush was issued after the writes completed, that the controller reported success, and whether the device has an honest VWC report — then power-cut test. Flush timeouts? Look for device-internal stalls (GC, thermal) and the size of the dirty set.</p></div>
+  </div>
+
+  <h3>The sixteen questions for Flush</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>An I/O command (opcode 00h) that commits previously completed writes for a namespace to non-volatile media.</dd>
+    <dt>2. Why was it created?</dt><dd>Volatile caches make writes fast but not durable; hosts need a way to obtain durability at chosen points.</dd>
+    <dt>3. What problem does it solve?</dt><dd>It lets the host build ordered, durable commit protocols without paying media latency on every write.</dd>
+    <dt>4. What existed before it?</dt><dd>ATA FLUSH CACHE / FLUSH CACHE EXT and SCSI SYNCHRONIZE CACHE, plus FUA bits in ATA and SCSI write commands. NVMe kept the concept with a simpler command.</dd>
+    <dt>5. Why is the current design better?</dt><dd>It is a normal queued command (no special serialisation), its scope is defined by completion, and Identify reports whether it is needed at all.</dd>
+    <dt>6. Who creates it?</dt><dd>The host driver, usually on behalf of filesystem preflush requests, <code>fsync()</code>, or block-device flush requests.</dd>
+    <dt>7. Who consumes it?</dt><dd>The controller's command processor and cache manager.</dd>
+    <dt>8. Where does it live?</dt><dd>In an I/O Submission Queue slot like any I/O command.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>SQ/CQ rings, doorbells; Identify Controller VWC; the Volatile Write Cache feature; CC.SHN/CSTS.SHST for the related shutdown path.</dd>
+    <dt>10. What happens before it?</dt><dd>The writes it is meant to protect complete; the host waits for them.</dd>
+    <dt>11. What happens after it?</dt><dd>The host writes data that depends on the flushed data (a commit record), often with FUA.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Missing or mis-ordered Flush → data loss or inconsistency after power failure; Flush with unsupported NSID → error; excessive Flush → poor performance and extra wear.</dd>
+    <dt>13. What does the analyzer show?</dt><dd>An SQE with opcode 00h, no data MRds, and a CQE after a delay that reflects the dirty data.</dd>
+    <dt>14. What does Linux show?</dt><dd><code>nvme_cmd_flush</code> in tracepoints, write-cache mode in sysfs, VWC in <code>nvme id-ctrl</code>, feature 06h state, unsafe shutdown count in the SMART log.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>Power-cut durability of flushed vs unflushed data; Flush latency vs dirty size; NSID FFFFFFFFh handling vs VWC bits 2:1; Flush with cache disabled; Flush during heavy I/O; shutdown notification behavior.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>Host ordering bugs (flush before writes completed), layers that swallow flushes, an incorrect VWC report, firmware that acknowledges without committing, and FTL metadata not persisted with the data.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>Inside the SSD, Flush touches the parts of the controller you cannot see from the link:</p>
+  <table>
+    <caption>What does the work during a Flush (generic SSD architecture)</caption>
+    <thead><tr><th>Block</th><th>What it does for Flush</th><th>Observable?</th></tr></thead>
+    <tbody>
+      <tr><td>Command processor</td><td>Recognises opcode 00h, determines the namespace(s), records the set of writes completed so far (a "flush epoch")</td><td>Only via latency</td></tr>
+      <tr><td>Cache manager (DRAM/SRAM buffer)</td><td>Identifies dirty buffers belonging to the epoch and schedules them to NAND</td><td>No</td></tr>
+      <tr><td>Back end (flash channels, dies, planes)</td><td>Programs the data; may pad partial pages</td><td>No; NAND write counters in vendor logs</td></tr>
+      <tr><td>FTL metadata journal</td><td>Persists mapping updates so the data can be found after power loss</td><td>No</td></tr>
+      <tr><td>Power-loss protection circuit (if present)</td><td>Holds up the drive long enough to dump the cache on power loss; lets firmware treat Flush as cheap</td><td>No; health may appear in vendor logs</td></tr>
+      <tr><td>PCIe endpoint</td><td>SQE fetch and CQE/MSI-X posting only</td><td>Yes</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw" data-title="Why FTL metadata matters as much as data">
+    <p>Writing user data to a fresh NAND page is useless after a power failure if the mapping "LBA 0x100000 now lives at die 3, block 812, page 47" was only in DRAM. Controllers either persist mapping deltas in a journal, write reverse-mapping information alongside the data in the page's spare area so the map can be rebuilt on power-up, or both. Either way, a correct Flush must make the data <em>findable</em>, not just written. Bugs here produce the strangest power-loss failures: data is physically on the NAND but the LBA returns old content.</p>
+  </aside>
+  <p>On the host side, nothing special happens: Flush carries no data, so the IOMMU and memory controller are idle for it apart from the SQE fetch and CQE post.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>Flush is defined in the <cite class="spec">NVM Express Base Specification, Revision 2.4 — I/O commands: Flush command</cite>. In the NVMe 2.x document family it lives in the Base specification because it applies across I/O command sets; in NVMe 1.x it was part of the single combined specification's NVM command set chapter. <span class="badge version">Version-dependent</span> The Identify Controller VWC field and the Volatile Write Cache feature are in the Base specification too. FUA, the per-command alternative, is defined with the Write command in the <cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3</cite>. Shutdown notification is in the Base specification's controller register and controller shutdown descriptions.</p>
+  <aside class="callout verified">
+    <p>Flush opcode 00h, no data transfer. Volatile Write Cache feature identifier 06h with enable bit 0. VWC bit 0 indicates presence of a volatile write cache. CC.SHN encodes 01b normal and 10b abrupt shutdown notification; CSTS.SHST reports 10b when shutdown processing is complete. The SMART / Health Information log reports a count of unsafe shutdowns.</p>
+  </aside>
+  <aside class="callout derived">
+    <p>The latency model, the claim that frequent flushes increase write amplification, and the interpretation that Flush is "a fence over the past, not a barrier for the future" are reasoned from the normative scope rule and SSD architecture.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>How the cache is organised and drained, whether Flush blocks or slows other commands, how fast Flush completes, whether a PLP drive reports a volatile cache, whether a Flush for one namespace also drains others, and the controller's behavior if power fails during a Flush are implementation-dependent.</p>
+  </aside>
+  <aside class="callout version">
+    <p>VWC bits 2:1 (Flush with NSID FFFFFFFFh support reporting) appeared in NVMe 1.4; earlier controllers report 00b. The move of Flush into the Base specification came with the 2.0 document restructuring. Always match behavior to the revision the controller reports.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <ul>
+      <li>The specification does not bound Flush latency.</li>
+      <li>It does not require Flush to act as a barrier for later commands.</li>
+      <li>It does not say how the device makes data non-volatile.</li>
+      <li>Check in the specification: the exact status for NSID FFFFFFFFh when unsupported; the wording for a present-but-disabled cache; whether and how the scope rule refers to commands completed by other controllers in the subsystem.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume that a successful Flush completion proves the data is on media if any intermediate layer (hypervisor, RAID adapter, USB/Thunderbolt bridge, network storage gateway) sits between your software and the controller. Each layer must forward Flush faithfully; any of them can lie.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>Flush is the purest example of a command whose PCIe footprint tells you nothing about its work: four packets on the link for possibly milliseconds of internal activity.</p>
+  <figure>
+    <ol class="seq" data-actors="Driver (CPU)|Host memory|NVMe controller|NAND back end">
+      <li data-note="Driver (CPU)">writes A, B complete (CQEs seen)</li>
+      <li data-from="Driver (CPU)" data-to="Host memory">Flush SQE (opc 00h, NSID 1)</li>
+      <li data-from="Driver (CPU)" data-to="NVMe controller" data-t="0 µs">MWr: SQ1 tail doorbell</li>
+      <li data-from="NVMe controller" data-to="Host memory" data-t="0.75 µs">MRd 64 B: fetch SQE</li>
+      <li data-from="Host memory" data-to="NVMe controller" class="dashed" data-t="1.3 µs">CplD: Flush SQE</li>
+      <li data-note="NVMe controller">mark flush epoch</li>
+      <li data-from="NVMe controller" data-to="NAND back end">program dirty data (A, B, …)</li>
+      <li data-from="NVMe controller" data-to="NAND back end">persist FTL metadata</li>
+      <li data-from="NAND back end" data-to="NVMe controller" class="dashed" data-t="≈600 µs">programs done</li>
+      <li data-from="NVMe controller" data-to="Host memory" data-t="612 µs">MWr 16 B: CQE (success)</li>
+      <li data-from="NVMe controller" data-to="Driver (CPU)">MWr: MSI-X</li>
+      <li data-note="Driver (CPU)">now write commit record</li>
+    </ol>
+    <figcaption>Synthetic example for teaching: Flush with about 1 MiB of dirty data. Times are illustrative.</figcaption>
+  </figure>
+  <h3>Request, response and ordering</h3>
+  <ul>
+    <li><strong>Request.</strong> The SQE; no data, no PRP or SGL.</li>
+    <li><strong>Response.</strong> One CQE with status. Success means the guarantee holds. An error status (for example an internal error, or Invalid Namespace or Format for an NSID problem) means the host must treat durability as not achieved for that namespace and escalate.</li>
+    <li><strong>Ordering.</strong> PCIe ordering does not enter into it: there is no data to order. The NVMe ordering that matters is the host's own: wait for writes, then submit Flush, then wait for Flush, then submit dependent writes.</li>
+    <li><strong>Concurrency.</strong> Other commands on the same or other queues keep flowing during the Flush. A trace often shows reads and writes from other queues completing while the Flush is outstanding.</li>
+  </ul>
+  <h3>Flush versus FUA versus shutdown</h3>
+  <table>
+    <caption>Three ways to get data onto non-volatile media</caption>
+    <thead><tr><th></th><th>Flush</th><th>FUA write</th><th>Normal shutdown (CC.SHN = 01b)</th></tr></thead>
+    <tbody>
+      <tr><td>Scope</td><td>All writes to the namespace completed before submission</td><td>Only that command's data</td><td>Entire controller, everything</td></tr>
+      <tr><td>Carried by</td><td>I/O command, opcode 00h</td><td>Write CDW12 bit 30</td><td>Controller register write (MMIO)</td></tr>
+      <tr><td>Completion signal</td><td>CQE</td><td>The write's CQE</td><td>CSTS.SHST = 10b</td></tr>
+      <tr><td>Typical use</td><td>Commit points, fsync</td><td>Commit records, small metadata</td><td>Reboot, power-off, driver unload</td></tr>
+      <tr><td>Cost</td><td>Proportional to dirty data</td><td>One media program per write</td><td>Drain everything plus controller teardown</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>All traces are synthetic, from the lab system (Gen4 x4, I/O queue pair 1, namespace 1). Times are illustrative; real values depend on the device and how much data is dirty.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 34-A — normal Flush after a burst of cached writes">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Before row 1: 256 Write commands (4 KiB each, CIDs 0x0001–0x0100) have all completed with success; about 1 MiB is dirty in the cache.</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.00</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000031 Req=RC</td><td>SQ1 tail doorbell (Flush in slot 0x30)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.75</td><td>MRd64</td><td>Addr=0x1_2340_0C00 Len=16 Tag=0x30 Req=0x0100</td><td>Fetch SQE: 0x30 × 64 = 0xC00</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.31</td><td>CplD</td><td>Len=16 Tag=0x30 BC=64 SC</td><td>SQE: opc=00h CID=0x0160 NSID=0x00000001, all other Dwords zero</td></tr>
+        <tr class="note"><td colspan="6">No data MRds follow. The link carries only DLLPs (ACK, UpdateFC) and other queues' traffic for the next ~610 µs.</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>612.40</td><td>MWr64</td><td>Addr=0x1_2341_0300 Len=4 SQHD=0x31 SQID=1 CID=0x0160 P=1 SC=00h</td><td>CQE: Flush success</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>612.55</td><td>MWr32</td><td>Addr=0xFEE0_0000 vector 1</td><td>MSI-X</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>615.10</td><td>MWr32</td><td>Addr=0xFE60_100C Data=0x00000031</td><td>CQ1 head doorbell</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>616.00</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000032</td><td>Next command: the dependent commit write (FUA)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reading it.</strong> Recognise Flush by the SQE content (opcode byte 00h, NSID set, DPTR zero) and the absence of data traffic between rows 3 and 4. The 611 µs gap is the controller draining about 1 MiB and persisting metadata: about 1.7 GB/s effective, plausible for a mid-range device. The host correctly waits for the Flush CQE before submitting the commit write (row 7).</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 34-B — slow Flush on a client drive; reads on another queue suffer">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ms)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Context: a log-structured application has written 96 MiB in the last 2 s without flushing. SQ2 (doorbell 0xFE60_1010) carries 4 KiB random reads from another process.</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.000</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000201</td><td>SQ1 doorbell: Flush CID=0x0207 in slot 0x200</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.001</td><td>MRd64 / CplD</td><td>Addr=0x1_2340_8000 Tag=0x51</td><td>Flush SQE fetched</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>0.120</td><td>MWr32</td><td>Addr=0xFE60_1010 Data=0x00000045</td><td>SQ2 doorbell: a 4 KiB read</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>0.121</td><td>MRd64 / CplD</td><td>SQ2 slot 0x44 Tag=0x52</td><td>Read SQE fetched promptly</td></tr>
+        <tr class="abnormal"><td>5</td><td>Dev→Host</td><td>2.950</td><td>MWr64 ×16</td><td>Data for the SQ2 read (256 B each)</td><td>First abnormal event: read data 2.8 ms after fetch (normal: ≈80 µs)</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>2.952</td><td>MWr64</td><td>CQ2 CQE CID=0x0044 SC=00h</td><td>Read completes successfully but slowly</td></tr>
+        <tr class="note"><td colspan="6">Further reads on SQ2 show 1.5–3 ms latency for the next 40 ms.</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>47.800</td><td>MWr64</td><td>CQ1 CQE CID=0x0207 SC=00h</td><td>Flush completes after 47.8 ms</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> Nothing is wrong at the protocol level: every command completes with success. The first abnormal observation is the read latency on an unrelated queue starting right after the Flush is fetched. The best hypothesis: the Flush made the controller drain a large dirty set (tens of MiB) to NAND, occupying dies that reads also need. Supporting evidence: the effect lasts as long as the Flush is outstanding and ends with it; the dirty set estimate (96 MiB unflushed) divided by the flush time gives about 2 GB/s, a plausible program rate. Disambiguating experiment: have the writer flush every 4 MiB instead of every 96 MiB and confirm the read latency spikes shrink. This is a host design issue (unbounded dirty data) interacting with an implementation choice (the device prioritises draining). <span class="badge impl">Implementation-dependent</span></p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 34-C — failed Flush: broadcast NSID on a controller that does not support it">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Earlier, during initialisation, Identify Controller returned VWC = 05h (bit 0 = 1: cache present; bits 2:1 = 10b: Flush with NSID FFFFFFFFh not supported).</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.00</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000081</td><td>SQ1 doorbell</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.76</td><td>MRd64</td><td>Addr=0x1_2340_2000 Len=16 Tag=0x61</td><td>Fetch SQE slot 0x80</td></tr>
+        <tr class="abnormal"><td>3</td><td>Host→Dev</td><td>1.30</td><td>CplD</td><td>Len=16 Tag=0x61 BC=64 SC — SQE: opc=00h CID=0x0099 NSID=0xFFFFFFFF</td><td>First abnormal event: the host asked for a broadcast flush the controller said it does not support</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>3.90</td><td>MWr64</td><td>Addr=0x1_2341_0800 CID=0x0099 SCT=0h SC=0Bh DNR=1</td><td>CQE: error, Invalid Namespace or Format (verify the status your revision mandates)</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>4.05</td><td>MWr32</td><td>Addr=0xFEE0_0000 vector 1</td><td>MSI-X</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The first abnormal event is the host's command, not the device's response: VWC bits 2:1 = 10b told the host not to use NSID FFFFFFFFh with Flush. The device's fast error completion (under 3 µs, no draining) is consistent with rejecting the command during validation. The dangerous part is what the host software does next. If a custom user-space driver or a test tool ignores the error, the application believes its data is durable when nothing was flushed. Fix: flush each active namespace by its own NSID, or check VWC bits 2:1 before using the broadcast form. Validation should include this case for every VWC encoding.</p>
+  </div>
+
+  <aside class="callout trace" data-title="The trace you cannot see">
+    <p>The most important Flush failure is invisible in a PCIe trace: a device (or intermediate layer) that completes Flush successfully without committing data. On the link it looks identical to Trace 34-A, perhaps just faster. Only a power-cut test, or a suspiciously short Flush latency with megabytes dirty on a drive that reports a volatile cache, gives it away.</p>
+  </aside>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Commands below are read-only except <code>nvme flush</code>, which is non-destructive (it asks the device to persist data it already has) but does briefly cost performance. <span class="badge safe">Safe lab</span></p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Cache presence and broadcast-flush support (decoded by -H)</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -iA3 '^vwc'
+
+<span class="cm"># Is the cache enabled now? (Feature 06h)</span>
+sudo nvme get-feature /dev/nvme0 -f 0x06 -H
+
+<span class="cm"># What the block layer believes</span>
+cat /sys/block/nvme0n1/queue/write_cache
+
+<span class="cm"># How often power was removed without shutdown notification</span>
+sudo nvme smart-log /dev/nvme0 | grep -i unsafe
+
+<span class="cm"># Issue one Flush to namespace 1 and time it (non-destructive)</span>
+time sudo nvme flush /dev/nvme0n1 -n 1
+
+<span class="cm"># Watch flushes the kernel issues (remember to disable afterwards)</span>
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_setup_cmd/enable'
+sudo grep -m 10 nvme_cmd_flush /sys/kernel/tracing/trace_pipe
+sudo sh -c 'echo 0 &gt; /sys/kernel/tracing/events/nvme/nvme_setup_cmd/enable'</code></pre>
+  <aside class="callout warn" data-title="Do not write to queue/write_cache to make a drive &quot;safe&quot;">
+    <p>Writing <code>write through</code> into <code>/sys/block/nvme0n1/queue/write_cache</code> does <em>not</em> disable the drive's cache. It tells the kernel to <em>stop sending flushes</em>, because it now believes there is no cache. On a drive with an enabled volatile cache and no PLP, that is how you manufacture data loss. Changing the device's actual cache state is done with Set Features (feature 06h), and is a <span class="badge caution">Caution lab</span> operation on any machine you care about.</p>
+  </aside>
+  <table>
+    <caption>What Linux output can and cannot prove about Flush</caption>
+    <thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>VWC in id-ctrl</td><td>What the controller claims about its cache and broadcast-flush support</td><td>That the claim is honest; whether PLP exists</td></tr>
+      <tr><td>Feature 06h</td><td>Cache enabled or disabled now</td><td>That the setting survives a power cycle</td></tr>
+      <tr><td><code>nvme_cmd_flush</code> tracepoint</td><td>The driver built a Flush, and when; the completion status (with <code>nvme_complete_rq</code>)</td><td>That the device actually committed anything</td></tr>
+      <tr><td><code>time nvme flush</code></td><td>Round-trip latency of one Flush including user-space overhead</td><td>Internal breakdown; latency under your real dirty set</td></tr>
+      <tr><td>Unsafe shutdowns count</td><td>Power was lost without notification N times</td><td>Whether data was lost on those occasions</td></tr>
+    </tbody>
+  </table>
+  <p>On the kernel side, the relevant pieces are the block layer's flush machinery (preflush/postflush sequencing for requests marked <code>REQ_PREFLUSH</code> and <code>REQ_FUA</code>) and the NVMe driver's translation of a flush request into an NVMe Flush command with the namespace's own NSID. The kernel document <code>Documentation/block/writeback_cache_control.rst</code> describes the contract between filesystems and drivers. If a command times out (by default the NVMe I/O timeout is 30 seconds, controlled by the <code>nvme_core.io_timeout</code> module parameter), the driver logs a timeout for the command's tag and queue, attempts an Abort (Admin opcode 08h), and may reset the controller.</p>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>First, the host-side commit protocol in pseudocode. The waiting is the whole point.</p>
+  <pre class="code" data-kind="pseudocode" data-lang="c"><code>/* commit(): make a transaction durable, then publish it */
+for each data block d in txn:
+    submit_write(d);                       /* FUA clear: let the device batch */
+wait_for_all_completions(txn.writes);      /* (1) every write must be COMPLETED ... */
+
+if (ctrl.vwc_present &amp;&amp; ctrl.vwc_enabled) {
+    status = submit_and_wait(FLUSH, nsid);  /* (2) ... before the Flush is SUBMITTED */
+    if (status != SUCCESS)
+        return FAIL_NOT_DURABLE;            /* never ignore a Flush error */
+}
+
+status = submit_and_wait(WRITE_FUA, commit_record);  /* (3) the record itself */
+return status == SUCCESS ? COMMITTED : FAIL_NOT_DURABLE;
+
+/* Broadcast flush only if the controller says it is supported */
+bool can_broadcast_flush(uint8_t vwc) {
+    return (vwc &amp; 0x1) &amp;&amp; ((vwc &gt;&gt; 1) &amp; 0x3) == 0x3;   /* bits 2:1 == 11b */
+}</code></pre>
+  <p>Second, a runnable toy model of a volatile cache, Flush, FUA and power loss. It shows which completed writes survive under four configurations. The randomised background destaging stands in for the controller's freedom to move data whenever it likes; the seed makes the run repeatable.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="flush_sim.py"><code>#!/usr/bin/env python3
+"""flush_sim.py - a toy model of a volatile write cache, Flush, FUA and power loss.
+
+Simulation only (standard library). It models the *guarantees* a host may rely on,
+not how any real controller schedules its cache. Times are abstract ticks.
+"""
+import random
+
+
+class ToyController:
+    def __init__(self, vwc_enabled=True, seed=1):
+        self.vwc = vwc_enabled
+        self.cache = {}          # lba -&gt; data, volatile
+        self.media = {}          # lba -&gt; data, non-volatile
+        self.rng = random.Random(seed)
+
+    def write(self, lba, data, fua=False):
+        """Returns when the command 'completes'."""
+        if fua or not self.vwc:
+            self.media[lba] = data           # durable before completion
+            self.cache.pop(lba, None)
+        else:
+            self.cache[lba] = data           # completion only means 'accepted'
+
+    def background_destage(self):
+        """The controller may destage cached data whenever it likes (implementation choice)."""
+        for lba in list(self.cache):
+            if self.rng.random() &lt; 0.3:
+                self.media[lba] = self.cache.pop(lba)
+
+    def flush(self):
+        """Everything completed before this Flush was submitted becomes non-volatile."""
+        self.media.update(self.cache)
+        self.cache.clear()
+
+    def read(self, lba):
+        return self.cache.get(lba, self.media.get(lba))
+
+    def power_loss(self):
+        lost = sorted(self.cache)
+        self.cache.clear()                   # no power-loss protection in this model
+        return lost
+
+
+def scenario(name, vwc, use_flush, use_fua):
+    c = ToyController(vwc_enabled=vwc)
+    for lba in range(8):
+        c.write(lba, f"v1-{lba}", fua=use_fua)
+        if lba % 3 == 0:
+            c.background_destage()
+    if use_flush:
+        c.flush()
+    c.write(100, "journal-commit", fua=use_fua)   # written after the Flush completed
+    before = {lba: c.read(lba) for lba in list(range(8)) + [100]}
+    lost = c.power_loss()
+    after = {lba: c.read(lba) for lba in before}
+    survived = sum(1 for k in before if before[k] == after[k])
+    print(f"{name:&lt;34} completed=9 survived={survived} lost LBAs={lost}")
+
+
+if __name__ == "__main__":
+    scenario("VWC on, no Flush, no FUA", True, False, False)
+    scenario("VWC on, Flush after LBAs 0-7", True, True, False)
+    scenario("VWC on, every write FUA", True, False, True)
+    scenario("VWC off (or not present)", False, False, False)</code></pre>
+  <p>Expected output:</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>VWC on, no Flush, no FUA           completed=9 survived=3 lost LBAs=[1, 2, 4, 5, 7, 100]
+VWC on, Flush after LBAs 0-7       completed=9 survived=8 lost LBAs=[100]
+VWC on, every write FUA            completed=9 survived=9 lost LBAs=[]
+VWC off (or not present)           completed=9 survived=9 lost LBAs=[]</code></pre>
+  <p>Notice the second line: the Flush protected LBAs 0–7, but the "journal-commit" write to LBA 100 came after the Flush and was lost. That is correct behavior — and a reminder that the commit record itself needs FUA or a second Flush.</p>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Scenario (synthetic).</strong> A key-value store on the lab system commits transactions of 8 KiB of data plus a 4 KiB commit record. Measured on the lab SSD (illustrative values): cached 4 KiB write 12 µs, cached 8 KiB write 15 µs, FUA 4 KiB write 180 µs, Flush with ≤ 16 KiB dirty 220 µs. The device reports VWC bit 0 = 1 and no PLP.</p>
+  <h4>Design 1 — Flush per transaction</h4>
+  <p>Write data (15 µs) → wait → Flush (220 µs) → wait → FUA commit (180 µs) → wait. Per-transaction latency ≈ 415 µs plus host overhead; a single thread achieves at most about 1 / 415 µs ≈ 2,400 commits per second.</p>
+  <h4>Design 2 — Group commit of 32 transactions</h4>
+  <p>Write 32 × 8 KiB of data concurrently (at queue depth 32 the batch might finish in ≈ 60 µs on this device), Flush (with 256 KiB dirty, perhaps ≈ 400 µs), FUA write of one commit record covering all 32 (180 µs). ≈ 640 µs for 32 commits → about 50,000 commits per second per thread, at the cost of each transaction waiting up to one batch period.</p>
+  <h4>Design 3 — Rely on a PLP drive</h4>
+  <p>On a drive that reports no volatile write cache, the kernel suppresses flushes and FUA. Per-transaction cost is just the writes: ≈ 30 µs. The durability now rests entirely on the drive's protection circuitry and firmware.</p>
+  <h4>What we learned</h4>
+  <ul>
+    <li>Flush cost is amortised by batching; the specification's scope rule (completed-before-submission) is exactly what makes batching correct.</li>
+    <li>The correct order — data completions, then Flush, then commit — is non-negotiable in Designs 1 and 2.</li>
+    <li>Numbers like 220 µs and 180 µs are illustrative; measure your own device at your own dirty-set sizes. <span class="badge derived">Derived</span></li>
+  </ul>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <table>
+    <caption>Mistakes engineers make about Flush</caption>
+    <thead><tr><th>Mistake</th><th>Why it is wrong</th><th>Correct model</th></tr></thead>
+    <tbody>
+      <tr><td>Submitting Flush right after submitting the writes</td><td>In-flight writes are outside the Flush's scope</td><td>Wait for write completions, then submit Flush</td></tr>
+      <tr><td>"Flush is a barrier: later writes wait for it"</td><td>Later commands may run and complete before the Flush</td><td>Wait for the Flush's completion before submitting dependent writes</td></tr>
+      <tr><td>Using NSID FFFFFFFFh everywhere</td><td>Support is reported by VWC bits 2:1 and may be absent</td><td>Flush per namespace unless VWC bits 2:1 = 11b</td></tr>
+      <tr><td>"Flush took 10 µs, the device is broken"</td><td>No volatile cache, an empty cache, or PLP all make Flush fast legitimately</td><td>Interpret latency against VWC and the dirty set</td></tr>
+      <tr><td>Setting <code>queue/write_cache</code> to "write through" for safety</td><td>It only stops the kernel issuing flushes</td><td>Use Set Features 06h to change the device; or keep flushing</td></tr>
+      <tr><td>"O_DIRECT means durable"</td><td>O_DIRECT bypasses the page cache, not the device cache</td><td>Use fsync/fdatasync or O_DSYNC</td></tr>
+      <tr><td>Ignoring a Flush error</td><td>Durability was not achieved</td><td>Treat as a failed commit; retry or fail the transaction</td></tr>
+      <tr><td>"FUA and Flush are interchangeable"</td><td>Different scope</td><td>FUA = this command; Flush = everything completed before it</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>Flush bugs announce themselves in three ways: data loss after power failure, Flush latency or timeouts, and Flush errors. Each has a disciplined path.</p>
+  <h3>Data loss or inconsistency after power failure</h3>
+  <ol>
+    <li><strong>Establish the claim.</strong> Which data was lost? Was it old content (reverted) or garbage (torn or corrupted)? Reverted content points to unflushed cache; garbage points to atomicity or media.</li>
+    <li><strong>Prove the host asked.</strong> Using tracepoints (or an analyzer), show a Flush (or FUA writes) after the lost data's write completed and before the power cut. Many investigations end here: no Flush was ever sent, because an application, filesystem option or hypervisor dropped it.</li>
+    <li><strong>Prove the device acknowledged.</strong> The Flush CQE with success must exist.</li>
+    <li><strong>Check the report.</strong> VWC bit 0, feature 06h state, SMART unsafe shutdowns increment.</li>
+    <li><strong>Reproduce.</strong> Power-cut test with a signature-writing tool that records which completions it observed. If flushed data is lost on a device that acknowledged Flush, the device (or a layer below the host's tracepoint) is at fault.</li>
+  </ol>
+  <h3>Flush latency or timeout</h3>
+  <p>Measure dirty data at Flush time (bytes written since the last Flush). If latency scales with it, the device is behaving normally and the host should flush more often or smaller. If latency is long even with little dirty data, suspect device internals: garbage collection, thermal throttling (check temperature and throttling counters in the SMART log), or firmware issues. A Flush that never completes leads to the Linux timeout and abort path; capture the kernel log and, if possible, an analyzer trace showing that the SQE was fetched (the device knows about the command) and no CQE followed.</p>
+  <h3>Flush errors</h3>
+  <p>Decode Status Code Type and Status Code. An NSID-related error points at host use of FFFFFFFFh or a detached namespace. An internal error on Flush is serious: durability of previously completed writes is now uncertain. Pull the Error Information log page and the SMART log; consider the device suspect.</p>
+  <p>See <a href="ch44.html">Chapter 44 — NVMe Errors</a> for status decoding and <a href="ch48.html">Chapter 48 — NVMe Reset</a> for what happens after a timeout.</p>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight" data-title="Flush is a contract between layers, and every layer can break it">
+    <p>The NVMe specification defines one link in a long chain: application → language runtime → filesystem → block layer → (device mapper, RAID, hypervisor, virtual disk format) → driver → controller → firmware → media. The guarantee the application wants exists only if every layer forwards flushes and honors their ordering. When I review a storage design, I ask for each layer: "Show me where flush requests enter, where they leave, and what this layer acknowledges before the layer below has."</p>
+    <p>The second thing I look at is the honesty of VWC. A drive that reports no volatile cache is promising that every completed write survives power loss. That promise should be verified by power-cut testing on every firmware release, because a regression there is invisible to every functional test.</p>
+    <p>The third is the scope rule's interaction with multi-queue drivers. Linux spreads writes across per-CPU queues. "Completed before the Flush was submitted" is about completions, not queues, so a Flush on queue 3 covers completed writes from queue 7 — but only if the host waited for those completions. Custom user-space drivers (for example built on SPDK-style polling) sometimes track completions per queue and get this wrong.</p>
+  </aside>
+  <p>A final senior observation: when you see Flush latencies that are suspiciously constant and tiny on a drive that reports a volatile cache with no PLP, treat it as a red flag worthy of a power-cut test, not as good news.</p>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 34 — Durability configuration audit and Flush cost curve</h3>
+  <dl>
+    <dt>Objective</dt><dd>Use a simulation to internalise Flush's scope rule; then audit a real drive's durability configuration and measure how Flush latency depends on dirty data.</dd>
+    <dt>Skills</dt><dd>Scope reasoning; reading VWC and feature 06h; tracepoint use; latency measurement and interpretation.</dd>
+    <dt>Safety</dt><dd><span class="badge safe">Safe lab</span>: simulation, read-only inspection, <code>nvme flush</code>, and writes to a scratch file you delete afterwards. Do not change feature 06h or <code>queue/write_cache</code> in this lab.</dd>
+    <dt>Hardware required</dt><dd>Any computer with Python 3; optionally a Linux machine with an NVMe SSD and a filesystem on it with a few GiB free.</dd>
+    <dt>Software required</dt><dd>Python 3; nvme-cli; <code>dd</code>; root access for nvme-cli and tracefs.</dd>
+    <dt>Input</dt><dd><code>flush_sim.py</code>; your device.</dd>
+    <dt>Expected output</dt><dd>Modified simulation demonstrating the in-flight rule; a one-page durability audit; a table of Flush latency against dirty bytes.</dd>
+    <dt>Background</dt><dd>"What Flush guarantees", "What Flush does not necessarily guarantee", "Performance consequences".</dd>
+  </dl>
+  <h4>Step 1 — Extend the simulation</h4>
+  <p>Add a method <code>write_inflight(lba, data)</code> that records a write as submitted but not completed, and make <code>flush()</code> cover only completed writes. Add a scenario where LBA 50 is in flight when the Flush is submitted and completes afterwards; then power is lost. Show that LBA 50 may be lost under the model's rules even though the Flush succeeded.</p>
+  <h4>Step 2 — Audit the device</h4>
+  <p>Run the read-only commands in the Linux view. Record: VWC value and its decoded bits, cache enabled state, block-layer write-cache mode, unsafe shutdowns. Write a three-sentence conclusion: "On this system, a completed write is durable when …".</p>
+  <h4>Step 3 — Measure the cost curve</h4>
+  <p>On the NVMe filesystem, for N in 0, 1, 8, 64, 256 (MiB): write N MiB to a scratch file with <code>dd if=/dev/zero of=./lab34.bin bs=1M count=N oflag=direct</code> (no sync), then immediately run <code>time sudo nvme flush /dev/nvme0n1 -n 1</code>. Repeat each point three times. Delete <code>lab34.bin</code>.</p>
+  <h4>Observation</h4>
+  <p>Plot or tabulate Flush time against N. Note the shape: flat, linear, or stepped.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Why might the curve be flat even with a volatile cache?</li>
+    <li>Why is <code>oflag=direct</code> used without <code>dsync</code>?</li>
+    <li>What does it mean if Flush time for N = 0 is already several milliseconds?</li>
+    <li>Your filesystem may have issued its own flushes during <code>dd</code>. How could you check with tracepoints?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Repeat Step 3 with concurrent 4 KiB random reads (for example with <code>fio</code> in read-only mode on the same device) and measure read latency percentiles with and without the flushes running.</p>
+  <details class="hint"><summary>Hints</summary><p>The controller can destage in the background; waiting longer between <code>dd</code> and Flush should reduce Flush time if background draining is active. In Step 1, keep a separate dictionary for in-flight writes and move entries to the cache on completion.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p><strong>Step 1.</strong> Keep <code>self.inflight = {}</code>; <code>write_inflight</code> stores there; <code>complete(lba)</code> moves it into <code>self.cache</code> (or media if FUA). In the scenario, call <code>flush()</code> while LBA 50 is in <code>inflight</code>, then <code>complete(50)</code>, then <code>power_loss()</code>: LBA 50 is in the cache and is lost. That is allowed by the specification's scope rule.</p>
+    <p><strong>Questions.</strong> (1) PLP or no volatile cache reported (then the kernel and device treat Flush as trivial); very aggressive background destaging; or a cache much smaller than N so data was already on NAND. (2) Direct I/O puts the data in the device (not the page cache) without asking for durability, so the Flush has real work. (3) A fixed metadata-persist cost, firmware overhead, or a device busy with garbage collection; compare across repeated runs and idle periods. (4) Enable <code>nvme_setup_cmd</code> during the <code>dd</code> and count <code>nvme_cmd_flush</code> lines; filesystems flush on journal commits and with certain mount options.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>The intercept and slope of the curve. The intercept is the fixed Flush cost (firmware plus metadata); the slope is the effective drain bandwidth. Comparing those against the drive's sequential write rating says whether the drive drains with full parallelism. A curve that jumps at a particular N reveals the cache size or an SLC cache boundary.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li><code>nvme flush</code> returns an error for NSID 1: wrong device node, or namespace not attached; check <code>nvme list</code>.</li>
+    <li>All points identical within noise: the device reports no volatile cache — check VWC first.</li>
+    <li>Very noisy results: background garbage collection; let the drive idle for a minute between points.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Read <a href="dd32.html">Deep-Dive Module 32 — FLUSH</a> and design a power-cut validation test using a programmable power supply: what signatures you write, what you record before the cut, and what you verify after.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Decode VWC values 00h, 01h, 05h, 07h and say whether the host should send Flush at all and whether it may use NSID FFFFFFFFh.</li>
+    <li>A trace shows Write CID 0x10 submitted at t = 0 and completed at t = 50 µs, Flush CID 0x11 submitted at t = 40 µs and completed at t = 300 µs. Is the Write covered?</li>
+    <li>Explain how a hypervisor that caches guest writes in host RAM must handle guest Flush commands to preserve the guest's durability.</li>
+    <li>Why might frequent Flush commands shorten an SSD's life?</li>
+    <li>Write the CC and CSTS register sequence for a normal shutdown, naming the fields.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p><strong>1.</strong> 00h: no volatile cache; Flush unnecessary (harmless, completes successfully); broadcast support not indicated. 01h: cache present; flush per namespace; broadcast support not indicated (pre-1.4 behavior) so do not rely on it. 05h: cache present; broadcast not supported. 07h: cache present; broadcast supported.</p>
+    <p><strong>2.</strong> No. The write completed (50 µs) after the Flush was submitted (40 µs), so it was in flight at submission and is outside the guarantee.</p>
+    <p><strong>3.</strong> It must, on a guest Flush, write all guest data it has acknowledged into the host's storage and then issue a real Flush (e.g. fsync on the image file) to the physical device, and only then complete the guest's Flush. Alternatively it must report no volatile cache to the guest and write through with durability on every write.</p>
+    <p><strong>4.</strong> Each Flush may force the controller to program partially filled pages (with padding) or close blocks early, increasing NAND writes per host write (write amplification).</p>
+    <p><strong>5.</strong> Host writes CC.SHN = 01b (normal shutdown notification); host polls CSTS.SHST until it reads 10b (shutdown processing complete); then power may be removed. During processing CSTS.SHST reads 01b.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>Which writes does a successful Flush guarantee are on non-volatile media?</p>
+      <ul class="options" data-answer="2">
+        <li>All writes submitted before the Flush completes</li>
+        <li>Writes to the namespace that completed before the Flush was submitted</li>
+        <li>All writes in the same Submission Queue</li>
+        <li>Only writes with FUA set</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The scope is defined by completion before submission. In-flight and later writes may happen to be flushed but are not guaranteed.</p></details>
+    </li>
+    <li>
+      <p>What is the opcode of Flush, and how many data bytes does it transfer?</p>
+      <ul class="options" data-answer="1">
+        <li>00h, none</li>
+        <li>01h, none</li>
+        <li>00h, 4 KiB</li>
+        <li>09h, 16 bytes per range</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Flush is 00h; its low bits 00b indicate no data. 01h is Write; 09h is Dataset Management.</p></details>
+    </li>
+    <li>
+      <p>Identify Controller VWC = 01h. What should a host conclude?</p>
+      <ul class="options" data-answer="3">
+        <li>No cache is present</li>
+        <li>A cache is present and Flush with NSID FFFFFFFFh is supported</li>
+        <li>A cache is present; broadcast flush support is not indicated</li>
+        <li>The cache is power-loss protected</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Bit 0 = 1 means present; bits 2:1 = 00b means support for FFFFFFFFh is not indicated. VWC never reports PLP directly.</p></details>
+    </li>
+    <li>
+      <p>Which Feature Identifier controls the volatile write cache?</p>
+      <ul class="options" data-answer="4">
+        <li>01h</li>
+        <li>02h</li>
+        <li>07h</li>
+        <li>06h</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Volatile Write Cache is Feature 06h; bit 0 of its value enables the cache.</p></details>
+    </li>
+    <li>
+      <p>Writing "write through" to <code>/sys/block/nvme0n1/queue/write_cache</code> does what?</p>
+      <ul class="options" data-answer="2">
+        <li>Disables the SSD's volatile cache with Set Features</li>
+        <li>Makes the kernel stop issuing flushes and FUA for that device</li>
+        <li>Enables FUA on every write</li>
+        <li>Nothing</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>It changes only the kernel's belief about the device. If the device really has a volatile cache, durability is lost.</p></details>
+    </li>
+    <li>
+      <p>True or false: commands submitted after a Flush cannot complete before the Flush completes.</p>
+      <ul class="options" data-answer="2">
+        <li>True</li>
+        <li>False</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>False. Flush is not a barrier. NVMe does not order separate commands.</p></details>
+    </li>
+    <li>
+      <p>Why can an SSD with power-loss protection reasonably report no volatile write cache?</p>
+      <details class="answer"><summary>Model answer</summary><p>Because the specification's meaning of "volatile" is about what survives power loss from the host's point of view. If capacitors guarantee buffered data reaches non-volatile media after power is lost, completed writes are effectively durable, so there is nothing for Flush to do; reporting no volatile cache lets hosts skip flushes and FUA.</p></details>
+    </li>
+    <li>
+      <p>After an outage, a database finds a committed transaction's data pages contain old content, but the commit record is present. List the likely causes in order of suspicion.</p>
+      <details class="answer"><summary>Model answer</summary><p>(1) The host did not Flush between the data writes completing and writing the commit record (or submitted the Flush before data completions). (2) A layer between the database and the drive dropped or acknowledged flushes falsely (hypervisor, virtual disk cache mode, RAID controller cache without battery). (3) The device acknowledged Flush without committing or without persisting FTL metadata. Evidence: tracepoints/analyzer for Flush ordering; configuration of intermediate layers; power-cut reproduction.</p></details>
+    </li>
+    <li>
+      <p>Give a formula-level explanation for why Flush latency grows with the time since the previous Flush.</p>
+      <details class="answer"><summary>Model answer</summary><p>T<sub>flush</sub> ≈ T<sub>fw</sub> + D<sub>dirty</sub>/R<sub>prog</sub> + T<sub>meta</sub>. Dirty data D<sub>dirty</sub> accumulates with write rate × time since last Flush (minus whatever background destaging removed), so longer intervals mean more to drain.</p></details>
+    </li>
+    <li>
+      <p>Which register fields does a host use to perform an orderly shutdown that commits the cache?</p>
+      <details class="answer"><summary>Model answer</summary><p>CC.SHN (write 01b for normal shutdown) and CSTS.SHST (poll until 10b, shutdown processing complete).</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner.</strong> What does the NVMe Flush command do?</p>
+      <details class="answer"><summary>Model answer</summary><p>It commits data and metadata of previously completed writes for the specified namespace from any volatile cache to non-volatile media, completing only when that is done. With no volatile cache it does nothing and succeeds.</p></details></li>
+    <li><p><strong>Beginner.</strong> How does a host know whether it needs to send Flush?</p>
+      <details class="answer"><summary>Model answer</summary><p>Identify Controller's VWC field bit 0 reports a volatile write cache; Get Features 06h reports whether it is enabled. If no volatile cache is present (or it is disabled), Flush is unnecessary.</p></details></li>
+    <li><p><strong>Intermediate.</strong> Difference between Flush and FUA?</p>
+      <details class="answer"><summary>Model answer</summary><p>FUA (Write CDW12 bit 30) makes that write durable before its completion; it does not affect other cached data. Flush makes all writes completed before its submission durable for the namespace. Filesystems combine them: Flush to make earlier writes durable, then FUA for the commit record.</p></details></li>
+    <li><p><strong>Intermediate.</strong> What do VWC bits 2:1 mean and why were they added?</p>
+      <details class="answer"><summary>Model answer</summary><p>They report whether Flush with NSID FFFFFFFFh (all namespaces) is supported: 10b not supported, 11b supported, 00b not indicated. Added in NVMe 1.4 because controllers differed in handling the broadcast form, and hosts need a reliable way to know.</p></details></li>
+    <li><p><strong>Advanced.</strong> A Flush takes 40 ms on a client SSD. Is that a bug?</p>
+      <details class="answer"><summary>Model answer</summary><p>Not necessarily. Compute the dirty data at Flush time; at ~2 GB/s program bandwidth, 80 MiB takes ~40 ms. If the dirty set was small, investigate GC, thermal throttling and firmware. Also check whether concurrent I/O was slowed; that tells you the device prioritised draining.</p></details></li>
+    <li><p><strong>Advanced.</strong> How does Linux ensure the journal is durable before the commit record?</p>
+      <details class="answer"><summary>Model answer</summary><p>The filesystem waits for the journal writes to complete, then issues the commit write marked REQ_PREFLUSH | REQ_FUA. The block layer's flush machinery issues a Flush first (if the device has a write-back cache), waits for it, then sends the commit write with FUA (or a post-flush if FUA is not supported).</p></details></li>
+    <li><p><strong>Senior.</strong> How would you prove that a device honors Flush?</p>
+      <details class="answer"><summary>Model answer</summary><p>A power-cut test harness: write unique, checksummed signatures; record exactly which writes and Flushes completed before the cut, using a host whose own logging is durable (e.g. on another device or a network log); cut power at random times, including during Flush and immediately after Flush completion; on restore verify that every write completed before a completed Flush is present and intact. Run thousands of cycles across temperatures, fill levels and firmware versions. Also check SMART unsafe shutdown counts increment as expected.</p></details></li>
+    <li><p><strong>Senior.</strong> A cloud provider wants to report no volatile cache to guests while using host RAM caching for speed. What do you tell them?</p>
+      <details class="answer"><summary>Model answer</summary><p>That reporting no volatile cache promises guests that every completed write survives power loss. Host RAM caching breaks that promise unless the host RAM is itself protected (battery/UPS with orderly flush on outage, replicated cache) with failure modes analysed. Otherwise report a volatile cache and honor guest Flush by flushing to stable storage.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> why calling "empty your apron into the vault" protects recipes you already handed over, but not the one you hand over while the helper is walking.</li>
+    <li><strong>To a junior engineer:</strong> how to write a commit routine that is correct on any NVMe drive, and why it waits where it does.</li>
+    <li><strong>To a senior engineer:</strong> why Flush latency spikes on client drives can harm unrelated readers and what host-side policies mitigate it.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "The helper takes everything that was already in the apron when you called. A recipe you hand over afterwards might go in too, or might wait for the next trip — you can't count on it. So hand over everything first, wait for 'got it', then call."</p>
+    <p><strong>Junior:</strong> "Write the data; wait for all those completions; send Flush; wait for it; then write the commit record with FUA. Flush only covers writes that completed before it was submitted, and it doesn't stop later writes from overtaking it, so each wait is required."</p>
+    <p><strong>Senior:</strong> "Flush drains dirty data across the same dies reads use; a large dirty set means milliseconds of die contention. Bound dirty data with periodic or size-triggered flushes, use group commit, separate latency-sensitive readers onto other devices or namespaces with isolation features, or choose PLP drives where Flush is free."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>Flush (opcode 00h, no data) commits to non-volatile media the data and metadata of writes to the namespace that completed before the Flush was submitted. It is not a barrier, does not cover in-flight commands, and says nothing about atomicity. Identify Controller's VWC field reports whether a volatile cache exists (bit 0) and, since 1.4, whether Flush with NSID FFFFFFFFh is supported (bits 2:1); feature 06h enables or disables the cache. Orderly shutdown (CC.SHN/CSTS.SHST) and power-loss protection are the other paths to durability. Flush latency grows with dirty data and can disturb other I/O; batching and group commit amortise it. The most dangerous Flush failures are invisible on the link: layers or firmware that acknowledge without committing.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>state the Flush scope rule and draw the timeline that shows which writes it covers</li>
+      <li>decode VWC bit 0 and bits 2:1 and say what the host should do for each value</li>
+      <li>explain the difference between Flush, FUA and orderly shutdown</li>
+      <li>write a correct commit protocol and justify every wait</li>
+      <li>recognise a Flush in a trace and interpret its latency</li>
+      <li>investigate a post-power-loss inconsistency with evidence from each layer</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Flush command; Identify Controller data structure (VWC); Volatile Write Cache feature; Controller Configuration and Controller Status registers; SMART / Health Information log page</cite></li>
+    <li><cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3 — Write command (Force Unit Access)</cite></li>
+    <li><cite class="spec">NVM Express Revision Changes (2026.07.30) — to track changes to these fields across revisions</cite></li>
+    <li>Linux kernel documentation: <code>Documentation/block/writeback_cache_control.rst</code>; the block layer flush implementation (<code>block/blk-flush.c</code>); the NVMe driver (<code>drivers/nvme/host/core.c</code>).</li>
+    <li>Deeper treatment: <a href="dd32.html">Deep-Dive Module 32 — FLUSH</a>. Related: <a href="ch57.html">Chapter 57 — SMART / Health</a> (unsafe shutdowns), <a href="ch50.html">Chapter 50 — Power Management</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch35.html">Chapter 35 — Dataset Management</a>, where the host tells the SSD which data it no longer needs — the other half of keeping a flash device healthy and fast.</p>
+</section>

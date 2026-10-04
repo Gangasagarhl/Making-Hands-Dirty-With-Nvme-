@@ -1,0 +1,715 @@
+<p class="lead">Chapter 48 reset the NVMe controller from above, through its own registers. This chapter resets it from below: through the Peripheral Component Interconnect Express (PCIe) link, the slot's reset signal, and the function's configuration space. You will learn the reset taxonomy of the PCI Express Base Specification, what each reset does to the link and to configuration space, how long software must wait before the device is ready again, and how Linux chooses and performs these resets.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>When an NVMe controller stops obeying its own Controller Configuration enable bit (CC.EN), the only remaining tools are PCIe resets. They are also what every boot, every hot plug, every virtual machine device assignment, and every Downstream Port Containment recovery uses. Getting them wrong produces some of the most confusing symptoms in storage engineering: devices that read back all-ones, drives that "vanish" for exactly one second, virtual machines that get a device with stale state, and recovery code that works on one platform and hangs on another because of a 100 ms rule.</p>
+  <p>PCIe resets also differ from NVMe resets in a fundamental way: they reset <em>transport</em> state — link training, flow-control credits, configuration space, Base Address Registers (BARs), interrupt configuration — which the NVMe driver depends on but does not own.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Classify PCIe resets: Conventional Reset (Fundamental Reset — cold and warm — and Hot Reset), Function Level Reset (FLR), and the link-down events that behave like resets.</li>
+    <li>Explain PERST#, how a Hot Reset propagates in-band in training ordered sets, and what Secondary Bus Reset and Link Disable do.</li>
+    <li>List what each reset clears: link state, configuration space, sticky bits, other functions, the NVMe controller.</li>
+    <li>Apply the readiness rules after reset (the 100 ms waits, Configuration Request Retry Status) and know which details must be checked in your specification revision.</li>
+    <li>Recognize hot plug and surprise removal on a trace and in Linux.</li>
+    <li>Use Linux safely to inspect reset capability and, on test hardware, perform resets.</li>
+    <li>Debug "the device came back wrong" by finding the first abnormal event after a reset.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>Link Training and Status State Machine (LTSSM) states from <a href="ch08.html">Chapter 8</a> and <a href="ch09.html">Chapter 9</a>; configuration space and capabilities from <a href="ch17.html">Chapter 17</a> and <a href="ch18.html">Chapter 18</a>; BARs and Memory-Mapped I/O (MMIO) from <a href="ch19.html">Chapter 19</a>; PCIe errors and Advanced Error Reporting (AER) from <a href="ch45.html">Chapter 45</a> and <a href="ch46.html">Chapter 46</a>; and the NVMe reset family from <a href="ch48.html">Chapter 48</a>.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>The library is in a building with a road leading to it. There are four ways to start the library over. You can switch off the whole town's electricity and switch it back on — everything restarts, even the clocks. You can keep the electricity on but press the big red "everyone restart" button at the building door. You can phone down the road and shout the secret word "RESTART!" — the road workers repeat it to every building on that road. Or you can walk into one room and tell just that one librarian to start over, while the road and the other rooms carry on.</p>
+    <p>After any of these, the librarian needs a moment to put her coat on. If you ask her a question too soon, she says "come back later" — and you are supposed to wait, not give up.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A ship's engine room has several levels of restart. A dead-ship recovery (cold start) brings up generators from nothing. A main switchboard reset (warm) restarts every system while generators keep running. The bridge can ring "finished with engines" down the telegraph, and each station along the chain relays it (hot reset, propagated hop by hop). Or a single machine can be isolated and restarted by its own breaker (FLR) while the rest of the ship keeps steaming. After every restart, the crew follows a minimum warm-up time before the officer may demand full power — and a station may answer "not yet" during warm-up.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p>Where it breaks: a PCIe Hot Reset is not a message a device can choose to ignore; it is a link-training state that forces reset. An FLR is not perfectly isolated: it is designed to leave the shared link alone, but a function that is mid-transaction can still leave completions in flight that the rest of the system must tolerate. And "come back later" (Configuration Request Retry Status) only applies to configuration requests: a memory read to a device that is not ready does not politely retry — it fails.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>PCIe defines two big families of reset.</p>
+  <p><strong>Conventional Reset</strong> resets a whole device (all its functions) and the link to it. It has three flavours:</p>
+  <ul>
+    <li><strong>Cold reset</strong> — main power is applied after being off. Everything starts from zero.</li>
+    <li><strong>Warm reset</strong> — power stays on, but the platform asserts the reset signal PERST# (PCI Express Reset; the # means active-low) on the slot.</li>
+    <li><strong>Hot reset</strong> — a reset sent <em>in-band</em> over the link itself, using special training patterns. Software triggers it by setting the Secondary Bus Reset bit in the bridge above the device.</li>
+  </ul>
+  <p>Cold and warm are together called <strong>Fundamental Reset</strong> (hardware-driven). Hot reset is the non-fundamental member of the conventional family.</p>
+  <p><strong>Function Level Reset (FLR)</strong> resets one function of a device — for an NVMe SSD, typically the function hosting the NVMe controller — without touching the link or other functions.</p>
+  <p>After a reset, the device needs time. Software must wait before it talks to the device, and even then the device may answer configuration reads with a "retry later" status for a while. Once it answers normally, software restores the configuration (BARs, enables, interrupts) and only then can the NVMe driver start its own initialization from <a href="ch48.html">Chapter 48</a>.</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>The taxonomy, precisely</h3>
+  <figure>
+<pre class="diagram">
+                      PCIe resets
+                          |
+        +-----------------+----------------------+
+        |                                        |
+ Conventional Reset                      Function Level Reset (FLR)
+ (whole device, all functions,           (one function; link and other
+  link goes down)                         functions unaffected)
+        |
+  +-----+---------------------+
+  |                           |
+ Fundamental Reset          Hot Reset (in-band)
+ (hardware mechanism)        - Secondary Bus Reset bit in a bridge
+  |                          - propagated in TS1/TS2 ordered sets
+  +-- Cold: power cycle      - also: Link Disable / link down
+  +-- Warm: PERST# with        events cause equivalent reset of
+      power kept on            the downstream component
+</pre>
+    <figcaption>Conceptual reset taxonomy, following the terms used by the PCI Express Base Specification, "Reset Rules".</figcaption>
+  </figure>
+
+  <h3>Fundamental Reset and PERST#</h3>
+  <p>A Fundamental Reset is applied by hardware. On add-in cards and M.2/U.2 form factors the mechanism is the PERST# sideband signal defined by the form-factor (electromechanical) specification, such as the PCI Express Card Electromechanical (CEM) Specification. The platform holds PERST# asserted while power rails ramp and the reference clock (REFCLK) stabilizes, then deasserts it; the device's internal reset logic releases and the LTSSM starts in Detect.</p>
+  <ul>
+    <li><strong>Cold</strong>: power off → on. Everything including "sticky" register bits and auxiliary-power state is lost.</li>
+    <li><strong>Warm</strong>: PERST# asserted with main power maintained. Sticky bits (registers marked as sticky, such as AER error status, which survive non-cold resets for post-mortem logging) are preserved if the device kept auxiliary power to them.</li>
+  </ul>
+  <aside class="callout version">
+    <p>Timing between power-stable, REFCLK-stable and PERST# deassertion is specified in the form-factor specification (for CEM, a parameter commonly quoted as at least 100 ms from power stable to PERST# deassertion). <span class="badge uncertain">Uncertain</span> — confirm the exact parameter names and values in the CEM or M.2 specification for your form factor and revision; they are not in the NVMe specifications.</p>
+  </aside>
+
+  <h3>Hot Reset: an in-band command carried by link training</h3>
+  <p>Training Sequence ordered sets (TS1 and TS2, from <a href="ch09.html">Chapter 9</a>) carry a Training Control field with bits for Hot Reset, Disable Link, Loopback, Disable Scrambling and Compliance Receive. A Downstream Port triggers a Hot Reset by:</p>
+  <ol>
+    <li>Software sets <strong>Secondary Bus Reset</strong> (SBR) in the Bridge Control register of the Root Port or switch Downstream Port (the bridge above the device).</li>
+    <li>The port's LTSSM goes through Recovery into the <strong>Hot Reset</strong> state and transmits TS1 ordered sets with the Hot Reset bit set.</li>
+    <li>The device's Upstream Port receives two consecutive TS1s with Hot Reset set, enters its own Hot Reset state, and resets everything except sticky state. If it is a switch, it propagates Hot Reset out of all its Downstream Ports.</li>
+    <li>When software clears SBR (after at least the minimum hold time, commonly cited as 1 ms — <span class="badge uncertain">Uncertain</span>, check "Reset Rules"), the link goes to Detect and retrains.</li>
+  </ol>
+  <p>A Hot Reset reaches every function of every device below that bridge. For a single-function NVMe SSD directly under a Root Port, that is exactly the SSD; below a switch Downstream Port, it is the device on that port; on a switch Upstream Port, it is the switch and everything below it.</p>
+
+  <h3>Link Disable and link down</h3>
+  <p>Setting <strong>Link Disable</strong> in a Downstream Port's Link Control register drives the LTSSM to the Disabled state (TS1s with Disable Link set, then electrical idle). The link stays down until software clears the bit. Separately, whenever a link goes down — the Data Link Layer reports DL_Down — the component below it is reset as if by a Hot Reset. <span class="badge derived">Derived</span> from the specification's rule that a link-down condition resets downstream components; confirm the wording in "Reset Rules" and "Data Link Control and Management State Machine". Consequence for NVMe: any event that drops the link (a surprise removal, a link failure, a Downstream Port Containment trigger, an NVM Subsystem Reset that the device implements by dropping the link) is a controller-level reset for the NVMe controller.</p>
+  <aside class="callout warn">
+    <p><strong>Retrain Link is not a reset.</strong> Link Control's Retrain Link bit sends the LTSSM through Recovery and back to L0 (for example after changing the target speed). Configuration space, the Data Link Layer's active state and the device are not reset; Transaction Layer Packets (TLPs) in flight are protected by the replay mechanism. People confuse "retrain" with "hot reset" in bug reports constantly.</p>
+  </aside>
+
+  <h3>Function Level Reset</h3>
+  <p>FLR was introduced so that software — especially a hypervisor assigning a function to a virtual machine — can reset one function to a clean state without disturbing the link or other functions.</p>
+  <ul>
+    <li><strong>Capability</strong>: Device Capabilities register, Function Level Reset Capability bit. If clear, the function does not support FLR.</li>
+    <li><strong>Trigger</strong>: write 1 to <strong>Initiate Function Level Reset</strong> (bit 15) in the Device Control register of the PCI Express Capability. The bit always reads as 0.</li>
+    <li><strong>Before</strong>: software should stop the driver and wait for outstanding non-posted requests issued by the function to finish — the <strong>Transactions Pending</strong> bit in Device Status shows whether any are outstanding. An FLR with requests outstanding may produce completions that arrive for a function that no longer expects them (Unexpected Completions, <a href="ch52.html">Chapter 52</a>).</li>
+    <li><strong>During</strong>: the function must complete the FLR within a time bound (commonly quoted as 100 ms) and software must not access it before then (unless readiness notification says otherwise).</li>
+    <li><strong>Effect</strong>: function state returns to its post-reset defaults, except sticky bits, hardware-initialized fields, and fields that control the shared link (which belong to the port, not just this function). BARs, the Command register (Memory Space Enable, Bus Master Enable), MSI/MSI-X configuration and the NVMe controller state are reset.</li>
+  </ul>
+  <aside class="callout spec">
+    <p>The exact list of fields an FLR must preserve, and the exact behaviour for requests in flight during an FLR, are in the PCI Express Base Specification section on Function Level Reset. Read it once in full; this course summarizes rather than quotes it.</p>
+  </aside>
+  <p>Single-root I/O virtualization (SR-IOV, <a href="ch56.html">Chapter 56</a>) adds a twist: an FLR of a Physical Function also resets its Virtual Functions; an FLR of a Virtual Function affects only that VF. NVMe controllers exposed as VFs rely on VF FLR for safe reassignment between virtual machines.</p>
+
+  <h3>When FLR is unavailable: other function and bus resets</h3>
+  <table>
+    <caption>Reset methods a host operating system may use for one device</caption>
+    <thead><tr><th>Method</th><th>Mechanism</th><th>Scope</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>FLR</td><td>Device Control: Initiate FLR</td><td>One function</td><td>Preferred when supported.</td></tr>
+      <tr><td>Power Management reset</td><td>Transition D0 → D3hot → D0 via the PCI Power Management Capability</td><td>One function</td><td>Only resets the function if the PM Control/Status register's No_Soft_Reset bit is 0. Many devices set No_Soft_Reset = 1, making this method useless. Requires 10 ms recovery after D3hot → D0.</td></tr>
+      <tr><td>Secondary Bus Reset</td><td>Bridge Control: Secondary Bus Reset on the upstream bridge</td><td>All devices below that bridge</td><td>Hot Reset; link retrains.</td></tr>
+      <tr><td>Slot power cycle</td><td>Hot-plug slot Power Controller Control</td><td>The slot</td><td>Cold reset of the device; needs a slot with power control.</td></tr>
+      <tr><td>Link Disable / enable</td><td>Link Control: Link Disable</td><td>Device below the link</td><td>Equivalent reset via link down.</td></tr>
+      <tr><td>Device-specific</td><td>Vendor quirk</td><td>Varies</td><td>Linux has per-device quirks for broken FLR or SBR.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Reset effects, side by side</h3>
+  <table>
+    <caption>What each reset does (conceptual summary; confirm details in the Base specification)</caption>
+    <thead><tr><th>Effect</th><th>Cold</th><th>Warm (PERST#)</th><th>Hot reset / link down</th><th>FLR</th><th>NVMe CC.EN (Ch 48)</th></tr></thead>
+    <tbody>
+      <tr><td>Link retrains from Detect</td><td>Yes</td><td>Yes</td><td>Yes</td><td>No</td><td>No</td></tr>
+      <tr><td>Flow-control credits re-initialized</td><td>Yes</td><td>Yes</td><td>Yes</td><td>No</td><td>No</td></tr>
+      <tr><td>All functions of the device reset</td><td>Yes</td><td>Yes</td><td>Yes</td><td>No (one function; PF FLR includes its VFs)</td><td>No</td></tr>
+      <tr><td>Configuration space (BARs, Command, MSI-X enable)</td><td>Reset</td><td>Reset</td><td>Reset</td><td>Reset (for that function)</td><td>Untouched</td></tr>
+      <tr><td>Sticky bits (e.g. AER status)</td><td>Lost</td><td>Kept if aux power maintained</td><td>Kept</td><td>Kept</td><td>Untouched</td></tr>
+      <tr><td>NVMe controller (queues, outstanding commands)</td><td>Reset</td><td>Reset</td><td>Reset</td><td>Reset</td><td>Reset</td></tr>
+      <tr><td>Bus/device number assignment</td><td>Lost (re-captured on first config write)</td><td>Lost</td><td>Lost</td><td>Kept</td><td>Kept</td></tr>
+      <tr><td>Readiness wait required</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td><td>CAP.TO only</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout derived">
+    <p>The "bus/device number" row deserves a sentence: an endpoint captures its Bus and Device Number from the first Type 0 Configuration Write it receives after reset. Until then, the Completer ID in its completions may be stale or zero. Analyzer users sometimes see completions with odd Completer IDs immediately after a reset; this is the reason.</p>
+  </aside>
+
+  <h3>Readiness after reset: the rules to check in your revision</h3>
+  <p>After a reset, a device may be internally busy (loading firmware, initializing media controllers). PCIe gives it two tools: a <strong>mandatory waiting period</strong> during which software must not send it requests, and a <strong>retry status</strong> it may return for Configuration Requests while it is still initializing.</p>
+  <p>The retry status was historically called Configuration Request Retry Status (CRS). In the PCIe 6.0 era it was generalized and renamed Request Retry Status (RRS) <span class="badge version">Version-dependent</span>. If the Root Port has CRS Software Visibility enabled (Root Control register), a configuration read of the Vendor ID that receives CRS returns the special value 0001h to software instead of being retried automatically by hardware, so software can poll without stalling the CPU.</p>
+  <table>
+    <caption>Readiness timing rules commonly cited from the PCI Express Base Specification — <span class="badge uncertain">Uncertain</span>: verify each value in "Reset Rules" of your revision</caption>
+    <thead><tr><th>Rule (paraphrased)</th><th>Commonly cited value</th><th>Status in this course</th></tr></thead>
+    <tbody>
+      <tr><td>After Conventional Reset, on a Downstream Port supporting at most 5.0 GT/s, software waits before the first Configuration Request</td><td>100 ms after exit from reset</td><td>To be checked in the spec revision</td></tr>
+      <tr><td>On a Downstream Port supporting more than 5.0 GT/s, the wait is measured from link training completion instead</td><td>100 ms after the link is up (software uses Data Link Layer Link Active to know)</td><td>To be checked in the spec revision</td></tr>
+      <tr><td>A device may return CRS/RRS to Configuration Requests after reset, but only for a bounded time</td><td>Up to 1.0 s after Conventional Reset</td><td>To be checked in the spec revision</td></tr>
+      <tr><td>After initiating FLR, software waits before accessing the function</td><td>100 ms</td><td>To be checked in the spec revision</td></tr>
+      <tr><td>After a D3hot → D0 transition, software waits before accessing the function</td><td>10 ms</td><td>To be checked in the spec revision</td></tr>
+      <tr><td>Link must enter the LTSSM Detect state shortly after Fundamental Reset ends</td><td>Within 20 ms</td><td>To be checked in the spec revision</td></tr>
+    </tbody>
+  </table>
+  <p>Newer revisions also give devices ways to shorten these waits: <strong>Readiness Notifications</strong> (Device Readiness Status and Function Readiness Status messages), a <strong>Readiness Time Reporting</strong> extended capability through which a function reports how long it actually needs, and an Immediate Readiness indication for functions that are ready at once. Operating systems use these only if both the device and the software support them <span class="badge version">Version-dependent</span>.</p>
+  <aside class="callout warn">
+    <p>CRS/RRS protects only <em>configuration</em> requests. After the device answers configuration reads, the NVMe controller may still not be ready — that is what CSTS.RDY and CAP.TO are for. The two readiness layers are independent: PCIe readiness (can I talk to the function?) then NVMe readiness (is the controller ready for commands?).</p>
+  </aside>
+
+  <h3>Hot plug and surprise removal</h3>
+  <p>A <strong>hot-plug</strong> capable Downstream Port has a Slot Capabilities register (presence detect, power controller, attention button, Data Link Layer State Changed events). Two removal styles exist:</p>
+  <ul>
+    <li><strong>Orderly removal</strong>: an operator requests removal (attention button or software); the OS stops the driver, which shuts the NVMe controller down (CC.SHN), then the slot is powered off.</li>
+    <li><strong>Surprise removal</strong>: the device disappears without warning (pulled out, power failure, link death). The Downstream Port sees the link go down; if it supports Surprise Down Error reporting it may log a Surprise Down error (an uncorrectable Data Link Layer error); presence-detect or link-state-change interrupts fire. All in-flight requests to the device fail: memory reads return Unsupported Request or time out, and software sees all-ones (0xFFFF_FFFF).</li>
+  </ul>
+  <p><strong>Downstream Port Containment (DPC)</strong> is a related mechanism: on a configured uncorrectable error, the Downstream Port deliberately takes the link down and blocks traffic to contain the error. To the NVMe controller below, DPC looks exactly like a surprise link-down followed (after software releases containment) by a Hot-Reset-equivalent retrain. See <a href="ch55.html">Chapter 55 — Advanced Error Handling</a>.</p>
+
+  <h3>The ladder for a Hot Reset (Secondary Bus Reset)</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Someone shouts the secret word down the road; every building on it restarts, and the librarian needs time to put her coat on.</p></div>
+    <div class="rung" data-rung="B"><p>Software sets Secondary Bus Reset in the bridge above the SSD, waits, clears it, waits for the link and readiness, restores configuration space, then the NVMe driver reinitializes the controller.</p></div>
+    <div class="rung" data-rung="C"><p>The Root Port's LTSSM enters Hot Reset and transmits TS1s with the Hot Reset bit; the SSD's PHY recognizes them and drives its internal reset; everything except sticky state is reset; when the bit clears, both ends retrain from Detect.</p></div>
+    <div class="rung" data-rung="D"><p>PCI Express Base Specification: Hot Reset is a Conventional Reset that is not Fundamental; it is signalled in-band; after it, the readiness rules apply. NVMe Base / PCIe Transport: a PCIe Conventional Reset is a controller-level reset.</p></div>
+    <div class="rung" data-rung="E"><p>No TLPs flow during the reset. Ordered sets (TS1 with Hot Reset, then electrical idle, then TS1/TS2 training) carry the event. After training, the first TLPs are Configuration Requests from the Root Complex, possibly answered with CRS/RRS.</p></div>
+    <div class="rung" data-rung="F"><p>An analyzer shows L0 traffic stop, TS1 ordered sets with Hot Reset set, electrical idle, Detect/Polling/Configuration training, Data Link Layer initialization (InitFC DLLPs), then CfgRd0 to Vendor ID with CRS completions, then successful completions, then CfgWr0 to BARs and Command.</p></div>
+    <div class="rung" data-rung="G"><p>If the device never leaves CRS, the device firmware is stuck in early boot. If the link never trains, look at REFCLK, power and PHY. If config works but NVMe CSTS reads all-ones, Memory Space Enable or BARs were not restored — a host bug.</p></div>
+  </div>
+
+  <h3>The sixteen questions, applied to Function Level Reset</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>A reset of one PCIe function triggered through its Device Control register.</dd>
+    <dt>2. Why was it created?</dt><dd>To reset a single function, especially for virtualization, without disturbing the link or sibling functions.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Clean hand-off of a device between owners (VMs, containers), and recovery without collateral damage.</dd>
+    <dt>4. What existed before it?</dt><dd>Bus-level resets (PCI RST#, PCIe Hot Reset) that reset everything below a bridge, and PM-based soft resets that many devices did not implement.</dd>
+    <dt>5. Why is the current design better?</dt><dd>Targeted, discoverable (capability bit), with a defined completion time and preserved link.</dd>
+    <dt>6. Who creates it?</dt><dd>System software (OS PCI core, hypervisor, VFIO).</dd>
+    <dt>7. Who consumes it?</dt><dd>The function's hardware/firmware.</dd>
+    <dt>8. Where does it live?</dt><dd>PCI Express Capability: Device Capabilities (FLR Capability) and Device Control (Initiate FLR).</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>Device Control, Device Status (Transactions Pending), Command register, BARs, MSI-X capability and table, and every NVMe register behind the BAR.</dd>
+    <dt>10. What happens before it?</dt><dd>Driver unbinds or quiesces; software saves configuration state; waits for Transactions Pending to clear.</dd>
+    <dt>11. What happens after it?</dt><dd>Wait for readiness; restore configuration; driver reinitializes NVMe from CC.EN = 0.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Accessing too early gives CRS/UR/all-ones; forgetting to restore gives no MMIO and no DMA; FLR with pending requests gives Unexpected Completions on the host side or lost data.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>A CfgWr0 to Device Control, a quiet period, then config reads (possibly CRS), then config writes restoring state, then NVMe register traffic. The link stays in L0 throughout.</dd>
+    <dt>14. What does Linux show?</dt><dd><code>FLReset+</code> in <code>lspci -vv</code> DevCap; <code>flr</code> in <code>reset_method</code>; log lines when a device is slow to become ready after reset (wording version-dependent).</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>FLR completion time; FLR under maximum outstanding DMA; NVMe state fully reset; sticky bits preserved; no traffic from the function during FLR; sibling functions unaffected.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>Firmware that does not truly reset the NVMe back end, an FLR implemented as a PERST#-like full reset that drops the link (non-compliant), or host software that skipped the readiness wait.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <figure>
+<pre class="diagram">
+  Platform / Root Complex                           NVMe SSD (endpoint)
+  +-----------------------+                         +--------------------------+
+  | Power sequencer       |--- 3.3 V / 12 V ------&gt; | Power rails, PMIC        |
+  | (BMC / chipset GPIO)  |--- PERST# ------------&gt; | Reset synchronizer       |--+
+  | Clock generator       |--- REFCLK -----------&gt; | PLLs for PHY             |  |
+  |                       |&lt;-- CLKREQ# ---------- | (optional, for L1 subst.)|  |
+  | Root Port             |                         |                          |  v
+  |  Bridge Control: SBR  |== Tx/Rx lanes x4 =====&gt; | PCIe PHY  -&gt; LTSSM      |  reset domains:
+  |  Link Control: LD,RL  |&lt;= TS1(Hot Reset) ===== | Data Link Layer          |  - PHY/link
+  |  Slot Ctl/Sts (HP)    |                         | Config space per function|  - per-function cfg
+  |  DPC, AER             |                         | NVMe controller (BAR0)   |  - controller
+  +-----------------------+                         | Firmware CPU(s), FTL     |  - firmware/media
+                                                    +--------------------------+
+</pre>
+    <figcaption>Conceptual hardware involved in PCIe resets. LD = Link Disable, RL = Retrain Link, HP = hot plug. Exact signal sets differ by form factor (CEM add-in card, M.2, U.2/U.3, E1/E3).</figcaption>
+  </figure>
+  <ul>
+    <li><strong>PERST#</strong> is a wire; nothing the device does can ignore it. While it is asserted, the device's PCIe logic is held in reset.</li>
+    <li><strong>REFCLK</strong> must be stable before PERST# deasserts, or PLLs may lock badly and link training fails intermittently — a classic board-bring-up bug.</li>
+    <li><strong>Hot Reset</strong> needs a working link: it is carried by ordered sets. If the link is already dead, software must fall back to a slot power cycle or a platform-controlled PERST#.</li>
+    <li><strong>FLR</strong> is implemented inside the device: firmware or hardware resets the function's register state and the NVMe controller logic, but must keep the PHY, the Data Link Layer and flow control running.</li>
+    <li><strong>Firmware CPUs</strong>: on many SSDs a Fundamental Reset restarts the controller firmware from its boot ROM, which is why the device needs hundreds of milliseconds and uses CRS/RRS. An FLR may only reset the host-interface firmware tasks. That is why FLR is often faster.</li>
+  </ul>
+  <aside class="callout hw">
+    <p>U.2/U.3 and EDSFF drive bays add drive-presence and power-disable sideband signals (for example a power-disable pin that lets the platform cold-reset one drive without pulling it). Their exact names and timings are defined by the form-factor specifications (SFF-TA family), not PCIe Base — check those documents for your bay.</p>
+  </aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>Primary source: <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Reset Rules; Function Level Reset; Link Training and Status State Machine (Hot Reset, Disabled states); Configuration Request Retry Status / Request Retry Status; Readiness Notifications</cite>. This is a PCI-SIG members' document. Form-factor timing: <cite class="spec">PCI Express Card Electromechanical Specification</cite> (or M.2 / SFF-TA documents). NVMe mapping: <cite class="spec">NVM Express Base Specification 2.4 — Resets</cite> and <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite>.</p>
+  <aside class="callout verified">
+    <p>The family names (Conventional Reset, Fundamental Reset with cold and warm forms, Hot Reset, FLR), the Initiate Function Level Reset bit in Device Control (bit 15), the FLR Capability bit in Device Capabilities, the Secondary Bus Reset bit in Bridge Control, the Link Disable and Retrain Link bits in Link Control, and the use of TS1/TS2 ordered sets to signal Hot Reset are stable PCIe concepts. The NVMe Base specification lists PCIe conventional reset and FLR among the events that cause a controller-level reset.</p>
+  </aside>
+  <aside class="callout derived">
+    <p>Because every conventional reset retrains the link and every FLR resets the function's configuration, a host must restore configuration space after either; this is why Linux saves state before a reset and restores it afterward. Because CRS applies only to configuration requests, MMIO to an unready function cannot be "retried" by hardware.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>How long a device actually takes to become ready, whether FLR also restarts firmware, whether NVMe-level state like the Host Memory Buffer is released cleanly, whether a device implements the PM reset (No_Soft_Reset = 0), and how a Root Port behaves while a link is down (completion timeout vs immediate UR for MMIO) are implementation-dependent — and platform-dependent on the Root Complex side.</p>
+  </aside>
+  <aside class="callout version">
+    <p>CRS was generalized to RRS in the 6.0 era; Readiness Notifications, Readiness Time Reporting and Immediate Readiness were added in later 3.x/4.0-era revisions; Flit Mode (6.0) changed the ordered-set and TLP framing used on the link but not the reset concepts. When reading a trace or a spec quote, note which revision the device and analyzer software implement.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p>The specifications do not say which reset an operating system should choose, how long a driver should wait for NVMe readiness beyond CAP.TO, or how a hypervisor must sanitize a device between virtual machines. Things to check in the spec revision before relying on them: every timing value in the readiness table above; the precise list of registers preserved across FLR; the minimum Secondary Bus Reset assertion time; and the exact rule for when a device may first return CRS/RRS.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume: that FLR is supported (check the capability); that a PM reset resets anything (check No_Soft_Reset); that a device is ready after the 100 ms wait (it may legally return CRS/RRS longer); that a link-up means the NVMe controller is ready; that Secondary Bus Reset affects only your device (it affects everything below the bridge, including other functions and devices behind a switch).</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>What crosses the link for each reset</caption>
+    <thead><tr><th>Reset</th><th>Trigger traffic</th><th>During</th><th>Recovery traffic</th></tr></thead>
+    <tbody>
+      <tr><td>Cold/warm</td><td>None (sideband power/PERST#)</td><td>Electrical idle; no link</td><td>Full training from Detect (receiver detect, Polling, Configuration, equalization phases at higher rates), InitFC DLLPs, then CfgRd/CfgWr TLPs</td></tr>
+      <tr><td>Hot Reset (SBR)</td><td>CfgWr to the bridge's Bridge Control (on a Root Port, an internal register write; no TLP on the device link)</td><td>TS1 with Hot Reset bit; then electrical idle</td><td>As above, starting from Detect</td></tr>
+      <tr><td>Link Disable</td><td>Write to Link Control of the Downstream Port</td><td>TS1 with Disable Link bit; electrical idle until cleared</td><td>As above</td></tr>
+      <tr><td>FLR</td><td>CfgWr0 to the function's Device Control (Initiate FLR = 1), which receives a Cpl like any configuration write</td><td>Link stays in L0; DLLPs (Ack, UpdateFC) continue; function sends no TLPs</td><td>CfgRd0 polling (possibly CRS/RRS), CfgWr0 restoring state, then MRd/MWr to BAR0</td></tr>
+      <tr><td>Surprise removal</td><td>None</td><td>Link drops; Downstream Port may log Surprise Down</td><td>Host requests fail: UR or Completion Timeout → all-ones; hot-plug interrupts</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout proto">
+    <p>Configuration Write requests are non-posted, so an FLR trigger is acknowledged with a Completion. The completion is generated as part of accepting the write; the reset itself proceeds after. Never interpret the successful completion as "FLR finished".</p>
+  </aside>
+  <h4>Configuration Request Retry Status in a completion</h4>
+  <p>A CRS/RRS response is a Completion without data whose Completion Status field carries the retry encoding (010b in the classic encoding). It carries the Requester ID and Tag of the configuration read, like any completion. With CRS Software Visibility enabled and the request being a read of the Vendor ID register, the Root Complex returns 0001h as Vendor ID to software; otherwise the Root Complex re-issues the request itself, which can stall the CPU for a long time.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>All traces are synthetic and use the course's Lab SSD (Requester ID 0x0100 at 01:00.0) below Root Port 00:01.1 (Requester ID 0x0009), Gen4 x4. Times are illustrative.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Normal Secondary Bus Reset of the Lab SSD, then readiness">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Before row 1: Linux has saved 01:00.0 configuration state and disabled the NVMe controller. SBR set on the Root Port (internal register write, not visible on the device link).</td></tr>
+        <tr class="dir-down"><td>1</td><td>RP→Dev</td><td>0 ms</td><td>Ordered set</td><td>TS1, Training Control: Hot Reset=1</td><td>Hot Reset signalled in-band</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→RP</td><td>0.002 ms</td><td>Ordered set</td><td>TS1, Hot Reset=1</td><td>Device echoes; enters Hot Reset state</td></tr>
+        <tr class="note"><td colspan="6">Electrical idle. Software holds SBR for ~2 ms, then clears it.</td></tr>
+        <tr class="dir-down"><td>3</td><td>RP↔Dev</td><td>2.1 ms</td><td>LTSSM</td><td>Detect → Polling → Configuration → Recovery (EQ phases) → L0</td><td>Link trains to Gen4 x4</td></tr>
+        <tr class="dir-down"><td>4</td><td>RP↔Dev</td><td>24 ms</td><td>DLLP</td><td>InitFC1/InitFC2 P, NP, Cpl</td><td>Flow control re-initialized; Data Link Layer Link Active = 1</td></tr>
+        <tr class="note"><td colspan="6">Software waits 100 ms after link active (Gen4 is above 5.0 GT/s).</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>124 ms</td><td>CfgRd0</td><td>BDF=01:00.0 Reg=0x000 Tag=0x03 Req=0x0009</td><td>Read Vendor/Device ID</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>124 ms</td><td>Cpl</td><td>Tag=0x03 Status=CRS Cmpl ID=0x0000</td><td>Not ready; note Completer ID not yet captured</td></tr>
+        <tr class="note"><td colspan="6">Rows 7–40: software polls every few ms (CRS Software Visibility gives it Vendor ID 0001h); device answers CRS.</td></tr>
+        <tr class="dir-down"><td>41</td><td>Host→Dev</td><td>311 ms</td><td>CfgRd0</td><td>Reg=0x000 Tag=0x1C</td><td>Poll</td></tr>
+        <tr class="dir-up"><td>42</td><td>Dev→Host</td><td>311 ms</td><td>CplD</td><td>Tag=0x1C Status=SC Data=Device/Vendor ID</td><td>Ready for configuration (~187 ms after first poll)</td></tr>
+        <tr class="dir-down"><td>43</td><td>Host→Dev</td><td>312 ms</td><td>CfgWr0</td><td>Reg=0x010 Data=0xFE60_0004</td><td>Restore BAR0 low (64-bit, non-prefetchable)</td></tr>
+        <tr class="dir-down"><td>44</td><td>Host→Dev</td><td>312 ms</td><td>CfgWr0</td><td>Reg=0x004 Data=0x0006</td><td>Command: Memory Space Enable + Bus Master Enable</td></tr>
+        <tr class="dir-down"><td>45</td><td>Host→Dev</td><td>312 ms</td><td>CfgWr0</td><td>MSI-X Message Control: Enable=1</td><td>Restore MSI-X</td></tr>
+        <tr class="dir-down"><td>46</td><td>Host→Dev</td><td>313 ms</td><td>MRd32</td><td>Addr=0xFE60_001C Len=1 Req=RC</td><td>NVMe CSTS: driver starts Chapter 48 sequence</td></tr>
+        <tr class="dir-up"><td>47</td><td>Dev→Host</td><td>313 ms</td><td>CplD</td><td>Data=0x0000_0000 Cmpl ID=0x0100</td><td>RDY=0 (controller reset by the hot reset); Completer ID now correct</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: every step is in order — in-band Hot Reset, retrain, flow-control initialization, the 100 ms wait from link active, a bounded CRS period, then restoration of BARs and Command before any MMIO. Row 6 shows Completer ID 0x0000 because the device has not yet captured its bus/device number; row 47 shows 0x0100 after the configuration writes.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Normal FLR of the Lab SSD">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 ms</td><td>CfgRd0</td><td>Device Status</td><td>Check Transactions Pending</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0 ms</td><td>CplD</td><td>Transactions Pending=0</td><td>No outstanding non-posted requests from the function</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>0.01 ms</td><td>CfgWr0</td><td>Device Control: Initiate FLR=1</td><td>FLR requested</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>0.01 ms</td><td>Cpl</td><td>Status=SC</td><td>Write accepted (not "FLR done")</td></tr>
+        <tr class="note"><td colspan="6">Link stays in L0. Only DLLPs (UpdateFC, Ack) for 100 ms.</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>100 ms</td><td>CfgRd0</td><td>Reg=0x000</td><td>Readiness check</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>100 ms</td><td>CplD</td><td>Status=SC</td><td>Ready</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>101 ms</td><td>CfgWr0 ×n</td><td>BARs, Command, MSI-X, Device Control (MPS/MRRS)</td><td>Restore saved state</td></tr>
+      </tbody>
+    </table>
+    <p>Note that after an FLR the host restores Device Control's Max Payload Size and Max Read Request Size too: these are function fields in Device Control and are reset, and an NVMe controller left at default sizes works but performs differently from before.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: driver touches BAR0 after FLR before restoring configuration">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 ms</td><td>CfgWr0</td><td>Device Control: Initiate FLR=1</td><td>FLR initiated by a custom recovery tool</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.01 ms</td><td>Cpl</td><td>Status=SC</td><td>Accepted</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>100 ms</td><td>CfgRd0</td><td>Reg=0x000</td><td>Readiness check</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>100 ms</td><td>CplD</td><td>Status=SC</td><td>Function ready</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>100.2 ms</td><td>MWr32</td><td>Addr=0xFE60_0014 Data=0x0046_0000</td><td>Tool writes NVMe CC directly — config not restored yet</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>100.3 ms</td><td>MRd32</td><td>Addr=0xFE60_001C Tag=0x22</td><td>Tool reads CSTS</td></tr>
+        <tr class="abnormal"><td>7</td><td>Dev→Host</td><td>100.3 ms</td><td>Cpl</td><td>Tag=0x22 Status=UR</td><td>First abnormal event: Unsupported Request — Memory Space Enable is 0 and BAR0 was reset, so the function does not claim the address</td></tr>
+        <tr class="note"><td colspan="6">Software sees CSTS = 0xFFFF_FFFF. The MWr in row 5 was silently dropped (posted, may be logged as UR by the device). AER on the device may log an Unsupported Request; the root port may log a received UR.</td></tr>
+        <tr class="dir-down"><td>8</td><td>Host→Dev</td><td>100.5 ms</td><td>MRd32</td><td>Addr=0xFE60_001C</td><td>Tool keeps polling for RDY, gets all-ones, eventually reports "controller fatal"</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Walk-through.</strong> The tool interpreted all-ones as "CSTS.CFS = 1 and RDY = 1" (bits 1 and 0 set) and declared the controller dead. The first abnormal event is the UR completion in row 7, and the cause is visible in rows 4–5: no configuration write between "ready" and the first MMIO. The fix is to restore configuration space (Linux: <code>pci_restore_state()</code>) before any BAR access. Generalization: <strong>CSTS = 0xFFFF_FFFF is never an NVMe state</strong> — always check the PCIe layer first.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: surprise removal under I/O">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0 µs</td><td>MWr64</td><td>Addr=0x2_0000_8000 Len=64 Req=0x0100</td><td>Read data DMA in progress</td></tr>
+        <tr class="abnormal"><td>2</td><td>Link</td><td>3 µs</td><td>PHY</td><td>Electrical idle, no ordered sets</td><td>First abnormal event: link lost with no Hot Reset or Disable Link signalling</td></tr>
+        <tr class="note"><td colspan="6">Root Port: LTSSM to Detect; Data Link Layer Link Active = 0; Surprise Down error logged (if supported); DPC may trigger; hot-plug interrupt (Data Link Layer State Changed / Presence Detect Changed).</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>8 µs</td><td>MWr32</td><td>Addr=0xFE60_1008</td><td>SQ1 doorbell from another CPU — goes nowhere</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>10 µs</td><td>MRd32</td><td>Addr=0xFE60_001C</td><td>Driver timeout handler reads CSTS</td></tr>
+        <tr class="dir-up"><td>5</td><td>RP→Host</td><td>10 µs</td><td>Cpl</td><td>Status=UR (generated by Root Port, link down)</td><td>Software sees 0xFFFF_FFFF</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: unlike a hot reset, there is no in-band signalling before the link loss. The Root Port answers requests on the device's behalf (here with UR; some platforms instead let requests time out, which takes milliseconds and may raise a Completion Timeout). Linux's NVMe driver detects the disconnected device, fails all I/O immediately rather than retrying, and removes the controller. In-flight read data (row 1) may have partially landed — the block layer reports errors for those requests.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <h3>Read-only inspection</h3>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># FLR capability, Device Control, link state, Transactions Pending (TransPend)</span>
+sudo lspci -vvv -s 01:00.0 | grep -E 'DevCap:|DevCtl:|DevSta:|LnkCap:|LnkSta:|FLReset'
+
+<span class="cm"># The bridge above: Secondary Bus Reset state and link/slot capabilities</span>
+sudo lspci -vvv -s 00:01.1 | grep -E 'BridgeCtl|LnkCtl|SltCap|SltCtl|SltSta'
+
+<span class="cm"># Reset methods the kernel will try for this device, in order (newer kernels)</span>
+cat /sys/bus/pci/devices/0000:01:00.0/reset_method
+
+<span class="cm"># Physical topology: which devices share the bridge (all would be hit by SBR)</span>
+lspci -tv
+
+<span class="cm"># History: link down/up, hot plug, DPC, reset waits</span>
+sudo dmesg -T | grep -i -E 'pciehp|dpc|link (up|down)|not ready|reset|surprise'</code></pre>
+  <p><code>lspci</code> shows FLR support as <code>FLReset+</code> in DevCap, Secondary Bus Reset as <code>BusReset+/-</code> in BridgeCtl, and Data Link Layer Link Active as <code>DLActive+</code> in LnkSta on capable ports. The <code>reset_method</code> attribute lists methods such as <code>flr</code>, <code>pm</code>, <code>bus</code> and <code>device_specific</code> (exact names and availability are <span class="badge version">Version-dependent</span>; the attribute appeared in Linux 5.15-era kernels).</p>
+  <p>What this proves: capabilities and current state. What it cannot prove: how long the device actually needs to become ready, or whether an FLR fully resets the NVMe back end.</p>
+  <h3>How the kernel performs a reset</h3>
+  <p>The PCI core's <code>pci_reset_function()</code> family saves configuration state, tries the device's reset methods in order (device-specific quirk, FLR, PM reset, bus/slot reset), waits for readiness, and restores state. Readiness waiting polls the Vendor ID and tolerates CRS for a long, bounded time (the PCI core has used a timeout on the order of a minute); the log reports when a device is slow, using wording that changes between versions. The NVMe driver's reset path (<code>nvme_reset_work</code>) runs on top of this when the PCI core or AER/DPC recovery resets the device, through the driver's PCI error-handler callbacks (<code>error_detected</code>, <code>slot_reset</code>, <code>resume</code>) and reset-prepare/done hooks.</p>
+  <h3>Actions that change state</h3>
+  <aside class="callout safety">
+    <p><span class="badge caution">Caution lab</span> <code>echo 1 | sudo tee /sys/bus/pci/devices/0000:01:00.0/reset</code> performs a function reset using the kernel's preferred method; the NVMe driver is notified and recovers. Never on a device holding mounted file systems you need. <span class="badge caution">Caution lab</span> <code>echo 1 | sudo tee /sys/bus/pci/devices/0000:01:00.0/remove</code> followed by <code>echo 1 | sudo tee /sys/bus/pci/rescan</code> simulates an orderly removal and re-enumeration. <span class="badge expert">Expert lab</span> Toggling Secondary Bus Reset by hand with <code>setpci</code> on a bridge bypasses the kernel's save/restore and resets <em>every</em> device below that bridge; on the wrong bridge it can hang the machine. Do not do it outside a dedicated test system with remote power control.</p>
+  </aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+<pre class="code" data-kind="pseudocode" data-lang="c" data-title="safe_flr.c (pseudocode, OS-agnostic)"><code>int safe_function_reset(struct pcidev *d)
+{
+    if (!(cfg_read32(d, PCIE_CAP + DEVCAP) &amp; DEVCAP_FLR))
+        return try_other_methods(d);           <span class="cm">/* PM reset if No_Soft_Reset == 0, else bus reset */</span>
+
+    driver_quiesce(d);                          <span class="cm">/* NVMe: stop queues, CC.SHN or CC.EN=0 */</span>
+    save_config_space(d);                       <span class="cm">/* BARs, Command, MSI-X, DevCtl, LnkCtl, ... */</span>
+    cfg_clear_bits16(d, COMMAND, BUS_MASTER);   <span class="cm">/* stop new DMA */</span>
+
+    for (int t = 0; t &lt; 4; t++) {               <span class="cm">/* wait for Transactions Pending to clear */</span>
+        if (!(cfg_read16(d, PCIE_CAP + DEVSTA) &amp; DEVSTA_TRPND)) break;
+        sleep_ms(100 &lt;&lt; t);
+    }
+    cfg_set_bits16(d, PCIE_CAP + DEVCTL, DEVCTL_BCR_FLR);   <span class="cm">/* Initiate FLR */</span>
+    sleep_ms(100);                              <span class="cm">/* readiness rule: check your spec revision */</span>
+
+    if (wait_config_ready(d, /*timeout_ms*/ 60000) != 0) <span class="cm">/* tolerate CRS/RRS */</span>
+        return -ETIMEDOUT;
+    restore_config_space(d);                    <span class="cm">/* BEFORE any BAR access */</span>
+    return driver_reinit(d);                    <span class="cm">/* NVMe: Chapter 48 sequence from CC.EN=0 */</span>
+}</code></pre>
+  <p>A runnable simulation of readiness polling, so you can see why "wait 100 ms then give up" is wrong:</p>
+<pre class="code" data-kind="executable" data-lang="python" data-title="readiness_sim.py"><code>#!/usr/bin/env python3
+"""Simulate post-reset readiness: CRS/RRS period, then config OK, then NVMe CSTS.RDY."""
+import random
+
+def simulate(seed, pcie_ready_ms, nvme_ready_ms, poll_ms=10, give_up_ms=None):
+    random.seed(seed)
+    t = 100                      # mandatory wait already done (check your spec revision)
+    crs = 0
+    while t &lt; pcie_ready_ms:
+        crs += 1
+        if give_up_ms is not None and t &gt;= give_up_ms:
+            return f"gave up at {t} ms after {crs} CRS replies (device was fine!)"
+        t += poll_ms
+    t_cfg = t
+    t += 2                       # restore BARs, Command, MSI-X
+    t_rdy = t + nvme_ready_ms    # NVMe layer: CC.EN=1 -&gt; CSTS.RDY=1 (bounded by CAP.TO)
+    return (f"config ready at {t_cfg} ms after {crs} CRS replies; "
+            f"NVMe RDY at {t_rdy} ms")
+
+if __name__ == "__main__":
+    print("robust host :", simulate(1, pcie_ready_ms=310, nvme_ready_ms=410))
+    print("naive host  :", simulate(1, pcie_ready_ms=310, nvme_ready_ms=410, give_up_ms=200))
+    print("fast device :", simulate(1, pcie_ready_ms=90, nvme_ready_ms=40))</code></pre>
+  <p>Expected output: the robust host sees configuration ready at 310 ms after 21 CRS replies and NVMe ready at 722 ms; the naive host gives up at 200 ms although the device was healthy; the fast device needs no CRS polling at all because it was ready before the mandatory wait ended.</p>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Question</strong> (synthetic): A hypervisor resets the Lab SSD between two virtual machines. FLR is supported. The device needs 180 ms of internal time after FLR before answering configuration reads successfully, and CAP.TO = 20, with EN→RDY typically 410 ms. What is the minimum and maximum time from "start reset" until the new VM's driver can submit its first admin command, and what dominates?</p>
+  <ol>
+    <li>Quiesce the old owner's controller: normal shutdown takes up to RTD3E — but a hypervisor typically just disables (CC.EN = 0): ~40 ms typical, up to 10 s (CAP.TO).</li>
+    <li>Transactions Pending check: usually immediate after the controller is disabled.</li>
+    <li>FLR + mandatory wait: 100 ms. Then CRS polling until 180 ms: +80 ms.</li>
+    <li>Restore configuration: ~1 ms.</li>
+    <li>NVMe enable: typical 410 ms, worst case 10 s.</li>
+  </ol>
+  <div class="formula">
+    <div class="eq"><var>T</var><sub>handoff</sub> = <var>T</var><sub>quiesce</sub> + max(<var>T</var><sub>wait</sub>, <var>T</var><sub>flr</sub>) + <var>T</var><sub>restore</sub> + <var>T</var><sub>en→rdy</sub></div>
+    <dl class="vars">
+      <dt>T<sub>handoff</sub></dt><dd>time from start of reset to the new owner's first admin command</dd>
+      <dt>T<sub>quiesce</sub></dt><dd>time to stop the old controller (CC.EN = 0 to RDY = 0)</dd>
+      <dt>T<sub>wait</sub></dt><dd>mandatory post-FLR wait required by the specification (commonly 100 ms; check revision)</dd>
+      <dt>T<sub>flr</sub></dt><dd>time the device actually needs before answering configuration requests successfully</dd>
+      <dt>T<sub>restore</sub></dt><dd>configuration restore time</dd>
+      <dt>T<sub>en→rdy</sub></dt><dd>NVMe enable time, bounded by CAP.TO × 500 ms</dd>
+    </dl>
+  </div>
+  <p>Typical: 40 + 180 + 1 + 410 ≈ 631 ms. Worst case allowed by the device's own declarations: 10,000 + (bounded CRS period, commonly 1 s for conventional reset; check the FLR rule) + 1 + 10,000 ≈ 21 s. The NVMe layer, not PCIe, dominates. This is why virtualization stacks measure "time to ready" per drive model.</p>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Treating the completion of the FLR configuration write as "reset done".</strong> It only means the write was accepted.</li>
+    <li><strong>Touching BARs before restoring configuration</strong> after FLR or conventional reset: UR, all-ones, misdiagnosed as a controller fatal error.</li>
+    <li><strong>Giving up on CRS/RRS too early.</strong> Retry status is a legal, bounded "not yet", not a failure.</li>
+    <li><strong>Using Secondary Bus Reset on a bridge that has several devices below it</strong> (a switch Upstream Port, or a multi-device slot). Everything below is reset, including devices owned by other drivers or other VMs.</li>
+    <li><strong>Calling Retrain Link a reset.</strong> It isn't.</li>
+    <li><strong>Assuming PM reset works.</strong> If No_Soft_Reset = 1, D3hot → D0 preserves state; nothing is reset.</li>
+    <li><strong>Ignoring Transactions Pending before FLR</strong>, leading to Unexpected Completions or completions for a reset function.</li>
+    <li><strong>Forgetting Device Control fields</strong> (MPS, MRRS, Relaxed Ordering enable, No Snoop enable) in restore code: the device works, but differently.</li>
+    <li><strong>Equating PCIe readiness with NVMe readiness.</strong> Config reads succeeding says nothing about CSTS.RDY.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>PCIe-reset-related failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Likely conclusion</th></tr></thead>
+    <tbody>
+      <tr><td>Device absent after warm reboot but present after cold boot</td><td>Does the link train after PERST#? (Root Port LnkSta, dmesg link-up)</td><td>Does the device answer config after 1 s?</td><td>Analyzer on PERST#/REFCLK timing; try a slot power cycle</td><td>Firmware does not handle warm reset, or PERST#/REFCLK sequencing violates the form-factor timing</td></tr>
+      <tr><td>After FLR, CSTS = 0xFFFF_FFFF</td><td>Command register: Memory Space Enable?</td><td>BAR0 value restored?</td><td>Read config space; restore; read CSTS again</td><td>Host forgot configuration restore</td></tr>
+      <tr><td>"Not ready after reset" messages, then device removed</td><td>How long CRS lasted (log timestamps)</td><td>Is the device stuck in boot ROM? Vendor tools / UART</td><td>Cold reset: does it recover?</td><td>Firmware boot hang after reset; capture vendor logs</td></tr>
+      <tr><td>Other devices glitch when the SSD is reset</td><td><code>lspci -tv</code>: what is below the reset bridge?</td><td>Kernel reset_method used (bus vs flr)</td><td>Force FLR, compare</td><td>SBR scope larger than intended</td></tr>
+      <tr><td>Data corruption after VM hand-off</td><td>Was an FLR (or stronger) done between owners?</td><td>Was the NVMe Host Memory Buffer or controller memory cleared?</td><td>Validation test: write pattern in VM A, reset, check nothing leaks to VM B</td><td>Insufficient reset or device FLR not fully resetting internal state</td></tr>
+      <tr><td>Surprise Down errors in AER at random</td><td>Physical: connector, cable, power</td><td>Correlate with link retrain and correctable error counts</td><td>Swap slot/cable</td><td>Signal integrity or power; see <a href="ch45.html">Ch 45</a></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight">
+    <p><strong>Every reset is a contract between three parties</strong>: the platform (power, PERST#, Root Port behaviour while the link is down), the device (PCIe readiness, then NVMe readiness), and the OS (save, wait, restore, reinitialize). When a reset "doesn't work", find which party broke its part of the contract first — the first abnormal event — before blaming the device.</p>
+  </aside>
+  <ul>
+    <li>Root Port behaviour while a link is down is platform-specific: some return UR quickly, some let requests time out (Completion Timeout ranges in <a href="ch52.html">Chapter 52</a>). That changes how long a CPU stalls on an MMIO read to a dead device — sometimes enough to trigger watchdogs.</li>
+    <li>Time-to-ready after each reset type is a product metric: VM hand-off latency, hot-plug service time, DPC recovery time. Measure it per firmware release.</li>
+    <li>Multi-function and SR-IOV devices make the scope of each reset an architecture decision. Document which resets the device supports per function and what each clears — your customers' hypervisors depend on it.</li>
+    <li>For security (device assignment), a reset must clear all tenant-visible state. Validation should prove it, not assume it.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab: map the reset options and readiness behaviour of your NVMe device</h2>
+  <h4>Objective</h4>
+  <p>Determine which PCIe resets your NVMe device supports, what scope each would have on your topology, and — on a test system — measure FLR and NVMe readiness times.</p>
+  <h4>Skills</h4>
+  <p>Reading Device Capabilities/Control/Status, Bridge Control and slot registers; reasoning about reset scope; correlating PCI core and NVMe driver logs.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p>Steps 1–3 <span class="badge safe">Safe lab</span> (read-only and simulation). Step 4 <span class="badge caution">Caution lab</span>: non-boot test drive, nothing mounted, test machine. Manual SBR via setpci is excluded.</p></aside>
+  <h4>Hardware required</h4>
+  <p>Linux machine with an NVMe SSD; a spare test SSD for step 4.</p>
+  <h4>Software required</h4>
+  <p>pciutils (lspci), nvme-cli, Python 3.</p>
+  <h4>Input</h4>
+  <p>The BDF of your SSD (from <code>lspci -nn | grep -i 'non-volatile'</code>) and its upstream bridge (from <code>lspci -tv</code>).</p>
+  <h4>Expected output</h4>
+  <p>A table: FLR supported?, No_Soft_Reset value, reset_method list, devices sharing the upstream bridge, Data Link Layer Link Active reporting capable?, hot-plug capable slot?, and measured FLR-to-NVMe-ready time (step 4).</p>
+  <h4>Background</h4>
+  <p>The taxonomy table and readiness rules in this chapter.</p>
+  <h4>Step 1</h4>
+  <p>Run <code>sudo lspci -vvv -s &lt;BDF&gt;</code>. Find FLReset in DevCap, the PM capability's NoSoftRst, and DevSta TransPend.</p>
+  <h4>Step 2</h4>
+  <p>Find the upstream bridge and run <code>sudo lspci -vvv</code> on it. Record BridgeCtl BusReset, LnkCap (Surprise Down reporting, DLActive reporting), SltCap (hot-plug).</p>
+  <h4>Step 3</h4>
+  <p>Read <code>reset_method</code>. Predict which method <code>/sys/bus/pci/devices/&lt;BDF&gt;/reset</code> would use and which devices it would affect. Run <code>readiness_sim.py</code> with your guess of timings.</p>
+  <h4>Step 4 (caution)</h4>
+  <p>On the test drive: note the time, write 1 to the device's <code>reset</code> attribute, and collect <code>dmesg -T</code>. Read <code>/sys/class/nvme/nvmeX/state</code> until it is live again.</p>
+  <h4>Observation</h4>
+  <p>Did the link retrain (look for link down/up messages)? Did the NVMe driver log a reset? How long until "live"?</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>If reset_method lists only <code>bus</code>, what is the risk on your topology?</li>
+    <li>Why might the measured time be much longer than 100 ms even though nothing failed?</li>
+    <li>Why is the BAR address usually the same after the reset?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Write a Python script that parses <code>lspci -vvv</code> text for a given BDF and prints a reset-capability report (FLR, NoSoftRst, upstream bridge, siblings below that bridge).</p>
+  <details class="hint"><summary>Hints</summary><p>The kernel restores the saved BAR values; it does not re-run resource assignment. Readiness includes both PCIe readiness and NVMe CC.EN→RDY. For the challenge, <code>lspci -tv</code> or <code>/sys/bus/pci/devices/&lt;BDF&gt;/..</code> (the parent directory) gives the upstream bridge.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>Q1: a bus reset resets every device below the upstream bridge; on a Root Port with only your SSD below, that is acceptable; below a switch port shared by functions of a multi-function device, or on a switch Upstream Port, it hits other devices. Q2: the device may return CRS/RRS for a while, the kernel polls with sleeps, the NVMe driver then waits for CSTS.RDY (bounded by CAP.TO), and runs Identify/queue setup — hundreds of milliseconds is normal. Q3: Linux saves configuration space before the reset and restores the same BAR values afterward; the resources were never released. Challenge: a model approach reads <code>/sys/bus/pci/devices/&lt;BDF&gt;</code> symlink target to get the parent bridge, lists other devices whose sysfs path shares that parent, and greps lspci output for <code>FLReset+</code> and <code>NoSoftRst+</code>.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>Whether the device supports FLR at all (consumer drives sometimes do not), whether NoSoftRst+ makes the PM method useless, whether the topology makes bus reset dangerous, and whether the NVMe ready time after FLR is suspiciously similar to the cold-boot time (suggesting FLR restarts all firmware).</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>The reset write returns an error: no usable method, or the device is bound to a driver that refuses.</li>
+    <li>The device never returns: firmware hang; capture logs and use a cold reset.</li>
+    <li>The device returns with a lower link speed or width: retraining produced a different result; check LnkSta and correctable errors (<a href="ch09.html">Ch 9</a>).</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>With an analyzer, trigger on TS1 ordered sets with Hot Reset set or on the CfgWr to Device Control, and build your own version of the traces in this chapter with real timings.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Classify: (a) the platform BMC toggles PERST# with power on; (b) Linux sets Secondary Bus Reset; (c) the SSD is yanked; (d) DPC triggers on a Root Port; (e) a hypervisor writes Initiate FLR.</li>
+    <li>For each reset in (1), state whether AER sticky status on the SSD survives.</li>
+    <li>Explain why a Root Port's link going down acts as a reset for the device below, using the Data Link Layer state machine.</li>
+    <li>An engineer says "after FLR wait 100 ms, then the controller is ready." List the two separate readiness checks they are missing.</li>
+    <li>Why does CRS Software Visibility only work for reads of the Vendor ID register?</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p>1. (a) Fundamental Reset — warm; (b) Conventional Reset — Hot Reset; (c) surprise link down → reset-equivalent when (if) it comes back, with a Surprise Down error; (d) link down by containment → reset-equivalent; (e) FLR.</p>
+    <p>2. Sticky bits survive warm reset (with aux power), hot reset, link down and FLR; they are lost only on cold reset (or if aux power was not maintained). For (c), the device lost power when removed, so its sticky bits are gone too.</p>
+    <p>3. When the Data Link Layer goes to DL_Inactive (DL_Down), the specification requires the component below to be reset as if by a Hot Reset, because flow-control state and in-flight transactions can no longer be trusted. Confirm the exact rule in the spec.</p>
+    <p>4. (i) PCIe readiness: configuration reads may still return CRS/RRS; poll until success. (ii) NVMe readiness: after restoring configuration, CC.EN = 1 and wait CSTS.RDY = 1 (CAP.TO). Plus restore configuration between the two.</p>
+    <p>5. The Vendor ID is never 0001h for a real device (it is a reserved value), so returning 0001h is an unambiguous in-band signal to software; other registers have no reserved value that could be used that way.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>Which reset is signalled in-band with TS1 ordered sets?</p>
+      <ul class="options" data-answer="2">
+        <li>Warm reset</li>
+        <li>Hot Reset</li>
+        <li>FLR</li>
+        <li>Cold reset</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Hot Reset uses the Hot Reset bit in TS1 Training Control. Warm and cold use sideband PERST#/power. FLR is a configuration write and the link stays in L0.</p></details>
+    </li>
+    <li>
+      <p>Which reset keeps the link in L0?</p>
+      <ul class="options" data-answer="3">
+        <li>Hot Reset</li>
+        <li>Link Disable</li>
+        <li>FLR</li>
+        <li>Warm reset</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>FLR resets the function, not the link; DLLPs continue throughout.</p></details>
+    </li>
+    <li>
+      <p>Which register bit triggers FLR?</p>
+      <ul class="options" data-answer="1">
+        <li>Initiate Function Level Reset in Device Control</li>
+        <li>Secondary Bus Reset in Bridge Control</li>
+        <li>Retrain Link in Link Control</li>
+        <li>CC.EN in NVMe CC</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Device Control (bit 15) of the PCI Express Capability.</p></details>
+    </li>
+    <li>
+      <p>A configuration read after reset receives a completion with retry status. What should software do?</p>
+      <ul class="options" data-answer="4">
+        <li>Declare the device dead</li>
+        <li>Issue a Hot Reset</li>
+        <li>Switch to MMIO reads</li>
+        <li>Retry until success or a bounded timeout</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>CRS/RRS is a legal "not yet". MMIO does not help — the function is not configured and memory requests are not retried.</p></details>
+    </li>
+    <li>
+      <p>Which reset can unintentionally hit devices other than the target?</p>
+      <ul class="options" data-answer="2">
+        <li>FLR of a single-function device</li>
+        <li>Secondary Bus Reset</li>
+        <li>NVMe CC.EN</li>
+        <li>Delete I/O SQ</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>SBR resets everything below the bridge.</p></details>
+    </li>
+    <li>
+      <p>Why does a completion from a just-reset device sometimes show Completer ID 0000h?</p>
+      <details class="answer"><summary>Model answer</summary><p>Endpoints capture their bus and device numbers from the first Type 0 Configuration Write after reset. Before that, they may not know their own ID.</p></details>
+    </li>
+    <li>
+      <p>Why can a PM-based reset be a no-op?</p>
+      <details class="answer"><summary>Model answer</summary><p>If the PM Control/Status register's No_Soft_Reset bit is 1, the function keeps its state across D3hot → D0, so the transition resets nothing.</p></details>
+    </li>
+    <li>
+      <p>Name two differences between Retrain Link and Hot Reset.</p>
+      <details class="answer"><summary>Model answer</summary><p>Retrain Link goes through Recovery and back to L0 keeping Data Link Layer state, configuration and the device intact; Hot Reset goes through the Hot Reset state to Detect, resets the device and its configuration, and requires flow-control re-initialization and readiness waits.</p></details>
+    </li>
+    <li>
+      <p>After an SBR, configuration reads succeed, BARs are restored, but CSTS.RDY stays 0 for 3 s. Is that a PCIe problem?</p>
+      <details class="answer"><summary>Model answer</summary><p>No. PCIe readiness is complete; the NVMe controller is initializing. It is acceptable if 3 s is within CAP.TO (or the applicable CRTO value). It becomes a problem only if RDY stays 0 beyond that, or CFS is set.</p></details>
+    </li>
+    <li>
+      <p>What is the first thing to check when CSTS reads 0xFFFF_FFFF after any PCIe reset?</p>
+      <details class="answer"><summary>Model answer</summary><p>Whether the function is configured and reachable: link up, Command.Memory Space Enable set, BAR0 restored. All-ones is a PCIe-layer symptom (UR or timeout), not an NVMe register value.</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> What is PERST#?</p><details class="answer"><summary>Model answer</summary><p>The active-low PCI Express Reset sideband signal from the platform to a device (defined in form-factor specifications) that applies Fundamental Reset; deasserting it after power and REFCLK are stable lets the device start link training.</p></details></li>
+    <li><p><strong>Beginner:</strong> Fundamental vs Hot Reset?</p><details class="answer"><summary>Model answer</summary><p>Fundamental is hardware-applied (power cycle or PERST#); Hot Reset is in-band over a working link via training ordered sets, triggered by a bridge's Secondary Bus Reset. Both are Conventional Resets.</p></details></li>
+    <li><p><strong>Intermediate:</strong> What must Linux do around an FLR?</p><details class="answer"><summary>Model answer</summary><p>Notify the driver (reset_prepare), save config, check Transactions Pending, initiate FLR, wait the required time, poll for readiness tolerating CRS/RRS, restore config, notify the driver (reset_done) which reinitializes the NVMe controller.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Why does an NVMe driver see all-ones after surprise removal?</p><details class="answer"><summary>Model answer</summary><p>MMIO reads no longer reach a completer; the Root Port returns UR or the request times out, and the Root Complex returns all-ones data to the CPU. Drivers treat all-ones from CSTS as "device gone or unreachable".</p></details></li>
+    <li><p><strong>Advanced:</strong> How does DPC interact with NVMe recovery?</p><details class="answer"><summary>Model answer</summary><p>DPC takes the link down on an uncorrectable error to contain it. The NVMe controller below is effectively reset. The OS's error recovery calls the driver's error handlers, waits for the link to come back after releasing DPC, restores config, and the driver reinitializes. In-flight I/O fails or is retried depending on driver policy. See <a href="ch55.html">Ch 55</a>.</p></details></li>
+    <li><p><strong>Advanced:</strong> Why did the specification introduce readiness notifications?</p><details class="answer"><summary>Model answer</summary><p>Fixed worst-case waits (100 ms, up to 1 s of CRS) slow down VM hand-off, resume and hot plug. Devices that are ready earlier can say so, and software can avoid fixed delays.</p></details></li>
+    <li><p><strong>Senior:</strong> A customer's hypervisor sometimes leaks data between tenants via an NVMe VF. Where do you look?</p><details class="answer"><summary>Model answer</summary><p>Whether VF FLR is issued between tenants; whether the device's FLR resets all tenant-visible state (queues, controller memory buffer, HMB references, namespaces attached to the VF, cached data in controller buffers); whether the hypervisor waits for FLR completion before reassigning; test with known patterns; check the device's documentation and, for 2.4 features such as exported NVM subsystems, what the spec requires on reset.</p></details></li>
+    <li><p><strong>Senior:</strong> Design a reset-validation plan for a new SSD.</p><details class="answer"><summary>Model answer</summary><p>Matrix: reset type (cold, warm, hot, link disable, FLR, NSSR, CC.EN) × device state (idle, max QD read/write, every admin command in progress, low-power states, firmware activation, during Format/Sanitize) × platform (several Root Ports and switches). Checks: link retrains at the expected speed/width, readiness within declared bounds, CRS behaviour, config defaults, sticky bit preservation, NVMe ready within CAP.TO, no DMA after reset, data integrity of completed writes, unsafe-shutdown accounting, repeatability over thousands of cycles.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>Child:</strong> the four ways to restart the library and why the librarian says "come back later".</li>
+    <li><strong>Junior engineer:</strong> what each PCIe reset clears and the two readiness checks before the NVMe driver can run.</li>
+    <li><strong>Senior engineer:</strong> how reset scope and readiness shape VM hand-off latency and tenant isolation.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "You can turn off the town's power, press the building's restart button, shout the restart word down the road, or ask one librarian to restart. Afterwards she needs to get ready, so if you ask too soon she says 'come back later', and you just wait and ask again."</p>
+    <p><strong>Junior:</strong> "Cold and warm resets restart everything; hot reset restarts the device below a bridge via the link; FLR restarts one function and keeps the link. All of them reset config space and the NVMe controller. After any of them: wait, poll config until it stops answering retry status, restore BARs and Command, then do the NVMe CC.EN/RDY sequence."</p>
+    <p><strong>Senior:</strong> "Hand-off latency is quiesce + PCIe readiness + NVMe readiness; NVMe readiness usually dominates. Isolation depends on FLR actually clearing tenant-visible state, which must be validated. Bus resets are too coarse in shared topologies; SR-IOV VF FLR is the right granularity."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>PCIe resets are Conventional (Fundamental: cold and warm via power and PERST#; Hot: in-band via TS1, triggered by Secondary Bus Reset, with link-down events acting similarly) or Function Level. All of them reset configuration space and the NVMe controller; conventional resets also retrain the link and reset every function on the device. After a reset, software waits the specified time (check the 100 ms rules and the CRS/RRS bounds in your revision), polls configuration reads tolerating retry status, restores configuration, and only then runs the NVMe initialization from Chapter 48. Hot plug and surprise removal look like link-down resets with no warning, produce all-ones reads, and are handled by pciehp, AER and DPC.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>draw the PCIe reset taxonomy from memory</li>
+      <li>state what each reset clears (link, config, sticky bits, other functions, NVMe state)</li>
+      <li>explain PERST#, Hot Reset signalling and Secondary Bus Reset</li>
+      <li>perform an FLR correctly on paper, including Transactions Pending and config restore</li>
+      <li>explain CRS/RRS and why it applies only to configuration requests</li>
+      <li>find the first abnormal event in a post-reset trace</li>
+      <li>separate PCIe readiness from NVMe readiness</li>
+      <li>name the PCIe Base specification sections to check for every timing value</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Reset Rules; Function Level Reset; LTSSM Hot Reset and Disabled; Request Retry Status; Readiness Notifications; Downstream Port Containment</cite></li>
+    <li><cite class="spec">PCI Express Card Electromechanical Specification — PERST# and power sequencing</cite></li>
+    <li><cite class="spec">NVM Express Base Specification 2.4 — Resets</cite>; <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite></li>
+    <li>Linux: Documentation/PCI/pci-error-recovery.rst, Documentation/ABI/testing/sysfs-bus-pci (reset, reset_method); drivers/pci/pci.c (reset methods and readiness wait); drivers/pci/hotplug/pciehp*.</li>
+    <li>Deeper: <a href="dd41.html">Deep-Dive Module 41 — Reset</a>, <a href="dd08.html">Module 08 — LTSSM</a>, <a href="dd18.html">Module 18 — AER</a>.</li>
+  </ul>
+  <p>Next: <a href="ch50.html">Chapter 50 — Power Management</a>, where the device is not reset but put to sleep — and must wake up fast.</p>
+</section>

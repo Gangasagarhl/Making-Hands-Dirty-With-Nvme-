@@ -1,0 +1,184 @@
+<p class="lead">This chapter follows one READ from the moment an application calls <code>read()</code> to the moment it wakes up with data: through the filesystem, the block layer, the NVMe driver, the 64-byte command, the submission queue, the doorbell, the controller, the flash, the DMA writes into host memory, the completion queue entry and the interrupt. At every layer you will see who acts, what changes, and what evidence it leaves — including the exact PCIe TLPs and what they look like when the read fails.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>Read is the simplest NVMe command that moves data, and the one that appears most often in every trace you will ever analyse. It is also the best vehicle for understanding the whole stack, because a read crosses every layer twice: down as a request and back up as data plus a completion. Once you can narrate a read end to end — and point to the evidence for each step — you have a template for every other command. <a href="ch33.html">WRITE</a> reverses the data direction; <a href="ch39.html">The Most Important Chapter</a> puts both on one timeline.</p>
+  <p>The READ is also where the three technologies of this course meet most visibly. The NVM Command Set defines the Read command's fields; the NVMe Base Specification defines the queues, the CQE and the status; the NVMe over PCIe Transport Specification maps it onto memory transactions; and PCI Express defines the TLPs that physically carry the doorbell, the command, the data, the completion and the interrupt. Keeping those four layers apart in your head, while seeing how they connect, is the skill this chapter trains.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Narrate a read through all twelve layers — application, filesystem, block layer, driver, command, SQ, doorbell, controller, flash, DMA, host memory, CQ, interrupt — and back up to the application.</li>
+    <li>Build a Read command: SLBA in CDW10–11, 0's based NLB in CDW12, FUA, Limited Retry, PRINFO, DSM hints, PI tags.</li>
+    <li>Predict the TLP sequence for a read of any size: doorbell MWr, SQE MRd/CplD, optional PRP-list MRd/CplD, data MWr split at Max Payload Size and 4 KiB boundaries, CQE MWr, MSI-X MWr, CQ head doorbell.</li>
+    <li>Estimate where the time goes in a 4 KiB read and compute the wire time of the data.</li>
+    <li>Analyse normal and failed synthetic traces, find the first abnormal event, and separate media errors, host DMA errors and controller hangs.</li>
+    <li>Observe a read on Linux with tracepoints and relate the output to the trace.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>Required: the SQE/CQE layout (<a href="ch29.html">NVMe Command Structure</a>), the NVM Command Set and LBA formats (<a href="ch31.html">NVM Command Set</a>), doorbells (<a href="ch28.html">Doorbells</a>), I/O queues (<a href="ch27.html">I/O Queues</a>), DMA and IOMMU basics (<a href="ch20.html">DMA</a>), posted vs non-posted TLPs (<a href="ch12.html">Posted vs Non-Posted Transactions</a>) and TLP headers (<a href="ch11.html">TLP Header Anatomy</a>). Helpful: PCIe ordering (<a href="ch14.html">PCIe Ordering</a>). PRP lists are introduced here and taught fully in <a href="ch36.html">Physical Region Pages</a>; MSI-X fully in <a href="ch43.html">MSI-X</a>.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>You are in class and want page 100 of a book in the giant library. You tell the teacher. The teacher writes a request slip — "please bring pages 100 to 107 of section 1 to table 7" — puts it in the request box, and rings the little bell. The librarian hears the bell, walks over, reads the slip, and goes into the stacks. Finding the pages takes the longest part of the whole job. Then she carries them straight to table 7 and puts them down — she doesn't hand them to the teacher. Then she drops an answer card in the answer box saying "slip 7 done, all fine", and taps the teacher on the shoulder. The teacher checks the answer box, sees the card, and tells you your pages are on table 7.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>An adult version: ordering a part from a warehouse with direct delivery. Your purchasing department (driver) fills in a standard order form (SQE) in a shared tray (SQ) and texts the warehouse "new order in the tray" (doorbell). The warehouse collects the form (SQE fetch), pulls the part from deep storage (NAND read — slow), drives it directly to your loading dock bay 7 (DMA to the buffer) in several van-loads (TLPs), then puts a delivery note in your inbox tray (CQE) and phones reception (interrupt). Reception checks the tray and tells the engineer who asked.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What it hides.</strong> The "walk" to the request box is a PCIe Memory Read, and the "carry" is many PCIe Memory Writes, each limited in size; the bell is a 4-byte write to a register, not a message containing the request. The pages are not taken from a single shelf: one 4 KiB read may assemble data from a NAND page shared with other data, after error correction. <strong>Where it misleads.</strong> The librarian does not walk back for each slip — the controller can have hundreds of reads in flight and complete them in any order; the teacher may never be "tapped" because interrupts can be coalesced or replaced by polling; and "all fine" in the answer box is only trustworthy because PCIe ordering guarantees the pages arrived on the table first.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>When a program reads a file, the operating system works out which blocks of the SSD hold that part of the file. If the data is not already in memory, the NVMe driver builds a Read command: "namespace 1, starting at block number X, this many blocks, put the data in these memory pages". It places the command in a submission queue in memory and writes the queue's new tail index to a doorbell register on the SSD.</p>
+  <p>The SSD's controller then reads the command from memory, looks up where those blocks physically live in its flash chips, reads them (this is the slow part — tens of microseconds), corrects any bit errors, and writes the data directly into the memory pages the driver named. That direct writing by the device is <span class="g" data-term="dma">Direct Memory Access (DMA)</span>. Finally the controller writes a 16-byte completion entry into the completion queue and sends an interrupt. The driver sees the completion, tells the operating system the data is ready, and the program continues.</p>
+  <figure>
+    <div class="flow">
+      <div>Application<small>read(fd, buf, 4096)</small></div>
+      <div>Filesystem<small>file offset → LBA</small></div>
+      <div>Block layer<small>bio → request, tag, hardware queue</small></div>
+      <div class="hl">NVMe driver<small>SQE in SQ, doorbell</small></div>
+      <div>PCIe link<small>TLPs</small></div>
+      <div class="hl">NVMe controller<small>fetch, parse, FTL lookup</small></div>
+      <div>NAND flash<small>page read, ECC</small></div>
+    </div>
+    <figcaption>The downward path of a read. Data and the completion come back up the same stack. Conceptual.</figcaption>
+  </figure>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+  <p>We follow a 4 KiB read of file data on the reference lab system: namespace 1 with 512-byte LBAs, I/O queue pair 1 (SQ1/CQ1, 1024 entries), Gen4 x4 link, MPS 256 bytes, IOMMU on. Every number is a synthetic example for teaching.</p>
+
+  <h3>Layer 1 — the application</h3>
+  <p>The program calls <code>read(fd, buf, 4096)</code> or submits an <code>io_uring</code> read. With buffered I/O, the kernel first looks in the page cache; a hit never reaches NVMe. With <code>O_DIRECT</code>, the page cache is bypassed and the user buffer itself becomes the DMA target (it must be suitably aligned, usually to the logical block size). The application's thread blocks (synchronous read) or continues (asynchronous).</p>
+  <p><strong>Evidence:</strong> <code>strace</code> shows the system call; <code>/proc/&lt;pid&gt;/io</code> counts bytes; the page-cache hit rate is visible with tools such as <code>cachestat</code> if installed.</p>
+
+  <h3>Layer 2 — the filesystem</h3>
+  <p>The filesystem (ext4, XFS, …) maps the file offset to a logical block on the block device using its extent tree or block map, possibly reading metadata first (which is itself more reads). It then issues a <code>bio</code> describing "read N sectors starting at sector S into these memory pages". Linux counts block-device sectors in 512-byte units regardless of the device's LBA size; the NVMe driver converts.</p>
+  <p><strong>Evidence:</strong> <code>filefrag -v</code> shows a file's extents; <code>blktrace</code> shows the bio as it enters the block layer.</p>
+
+  <h3>Layer 3 — the block layer</h3>
+  <p>The multi-queue block layer (blk-mq) may merge adjacent bios, splits requests that exceed the device's limits (derived from MDTS and segment limits), applies an I/O scheduler if one is configured (often "none" for NVMe), and allocates a <em>tag</em> from the hardware queue mapped to the submitting CPU. That hardware queue corresponds to one NVMe I/O SQ. The tag becomes the basis of the NVMe Command Identifier.</p>
+  <p><strong>Evidence:</strong> <code>/sys/block/nvme0n1/mq/</code> lists hardware queues and their CPU mappings; <code>blktrace</code>/<code>blkparse</code> show queue, merge, dispatch (<code>D</code>) and complete (<code>C</code>) events.</p>
+
+  <h3>Layer 4 — the NVMe driver</h3>
+  <p>The driver turns the request into an NVMe command. It:</p>
+  <ol>
+    <li>sets OPC = 02h, CID from the tag, NSID of the namespace;</li>
+    <li>converts the start sector to an SLBA (sector × 512 / LBA size) and the length to NLB − 1;</li>
+    <li>maps the data pages for DMA: with the IOMMU on, it obtains I/O virtual addresses (IOVAs) for the pages, so the device sees addresses such as 0x2_0000_0000 that the IOMMU translates to physical pages;</li>
+    <li>builds PRP1/PRP2 (and a PRP list if the buffer spans more than two pages) or an SGL;</li>
+    <li>copies the 64-byte SQE into the SQ slot at the current tail and advances the tail;</li>
+    <li>after a write barrier, writes the new tail to the SQ1 tail doorbell (possibly once for a batch of commands).</li>
+  </ol>
+
+  <h3>Layer 5 — the Read command</h3>
+  <figure>
+  <table class="packet">
+    <thead><tr><th class="row-label">Dword</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">CDW0</td><td colspan="16">CID = 0x0007</td><td colspan="2">PSDT 00b</td><td colspan="4" class="rsvd">0</td><td colspan="2">FUSE 00b</td><td colspan="8" class="hl">OPC = 02h</td></tr>
+      <tr><td class="row-label">CDW1</td><td colspan="32">NSID = 1</td></tr>
+      <tr><td class="row-label">CDW2–3</td><td colspan="32" class="rsvd">0 (or extended PI fields where the format uses them)</td></tr>
+      <tr><td class="row-label">CDW4–5</td><td colspan="32">MPTR = 0 (no separate metadata)</td></tr>
+      <tr><td class="row-label">CDW6–7</td><td colspan="32" class="hl">PRP1 = 0x0000_0002_0000_0000</td></tr>
+      <tr><td class="row-label">CDW8–9</td><td colspan="32">PRP2 = 0 (4 KiB fits in one page)</td></tr>
+      <tr><td class="row-label">CDW10</td><td colspan="32" class="hl">SLBA[31:0] = 0x0010_0000</td></tr>
+      <tr><td class="row-label">CDW11</td><td colspan="32" class="hl">SLBA[63:32] = 0</td></tr>
+      <tr><td class="row-label">CDW12</td><td colspan="1">LR 0</td><td colspan="1">FUA 0</td><td colspan="4">PRINFO 0</td><td colspan="10">command-specific (0)</td><td colspan="16" class="hl">NLB = 7 (8 blocks)</td></tr>
+      <tr><td class="row-label">CDW13</td><td colspan="24" class="rsvd">reserved</td><td colspan="8">DSM hints = 0</td></tr>
+      <tr><td class="row-label">CDW14</td><td colspan="32">Expected Initial Logical Block Reference Tag (PI only)</td></tr>
+      <tr><td class="row-label">CDW15</td><td colspan="16">Expected App Tag Mask (PI only)</td><td colspan="16">Expected App Tag (PI only)</td></tr>
+    </tbody>
+  </table>
+  <figcaption>The Read SQE for this walk-through (NVM Command Set Specification, Read command). Synthetic values.</figcaption>
+  </figure>
+  <table>
+    <caption>Read command fields</caption>
+    <thead><tr><th>Field</th><th>Where</th><th>Meaning</th><th>If wrong</th></tr></thead>
+    <tbody>
+      <tr><td>SLBA</td><td>CDW10–11</td><td>First LBA to read (64-bit)</td><td>Wrong data, or LBA Out of Range</td></tr>
+      <tr><td>NLB</td><td>CDW12 15:0</td><td>Number of blocks − 1</td><td>Too much/too little data; buffer overrun into neighbouring memory</td></tr>
+      <tr><td>PRINFO</td><td>CDW12 29:26</td><td>PRACT (bit 29) and PRCHK (bits 28:26) for protection information</td><td>PI check errors or PI delivered where the host expects none</td></tr>
+      <tr><td>FUA</td><td>CDW12 30</td><td>Read from non-volatile media (commit any cached write data for these LBAs first)</td><td>Only performance; but omitting it when a test requires media reads gives misleading results</td></tr>
+      <tr><td>LR</td><td>CDW12 31</td><td>Limited Retry: fail fast rather than apply lengthy error recovery</td><td>Set wrongly, a recoverable read fails; clear wrongly, a RAID host waits seconds for a block it could have rebuilt</td></tr>
+      <tr><td>DSM</td><td>CDW13 7:0</td><td>Access hints (frequency, latency, sequential, incompressible)</td><td>Hints only</td></tr>
+      <tr><td>EILBRT / ELBAT / ELBATM</td><td>CDW14–15</td><td>Expected reference tag, application tag and mask, when PI is checked</td><td>Reference or application tag check errors</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout remember"><p>NLB is 0's based. NLB = 7 reads 8 blocks: 8 × 512 = 4096 bytes on namespace 1, but 8 × 4096 = 32 KiB on namespace 2. Always multiply by the LBA size of the format in use.</p></aside>
+
+  <h3>Layer 6 — the submission queue</h3>
+  <p>SQ1 is a ring of 1024 × 64-byte entries at IOVA 0x1_2340_0000. The tail was 5, so the SQE is written at 0x1_2340_0000 + 5 × 64 = 0x1_2340_0140 and the tail becomes 6. Until the doorbell is written, the controller does not know the entry exists.</p>
+  <div class="ring" data-label="SQ1 (1024 entries, slots 0–7 shown)" data-size="8" data-head="5" data-tail="6" data-head-label="head 5 (controller)" data-tail-label="tail 6 (host)"></div>
+
+  <h3>Layer 7 — the doorbell</h3>
+  <p>The driver writes 6 to SQ1's tail doorbell at BAR0 + 0x1008 = 0xFE60_1008. The CPU's uncached store becomes a PCIe Memory Write TLP from the root complex with a 1-Dword payload. It is posted: the CPU does not wait for any acknowledgement at the NVMe level. See <a href="ch28.html">Doorbells</a>.</p>
+
+  <h3>Layer 8 — the controller</h3>
+  <p>The doorbell updates the controller's copy of SQ1's tail. Its fetch engine sees head (5) ≠ tail (6) and issues a Memory Read for 64 bytes at 0x1_2340_0140. The root complex answers with a Completion with Data containing the SQE. The controller increments its internal SQ1 head to 6, parses CDW0 (Read), checks NSID 1 is active, checks SLBA + NLB + 1 ≤ NSZE and the transfer ≤ MDTS, and hands the command to its read path. Its flash translation layer translates LBAs 0x10_0000–0x10_0007 to a physical location: for example one 4 KiB slice of a 16 KiB NAND page on channel 3, die 1, plane 0. <span class="badge impl">Implementation-dependent</span></p>
+
+  <h3>Layer 9 — the flash</h3>
+  <p>The NAND back-end issues a page read to the die. The die senses the cells into its page register — the array read time (often written tR), tens of microseconds for TLC NAND — then the data is clocked across the NAND interface into the controller. An LDPC or BCH error-correction engine corrects bit errors. If correction fails, the controller retries with different read voltages ("read retry"), soft-decision decoding, or RAID-like parity across dies; each step adds latency, potentially milliseconds. If everything fails, the read ends with an Unrecovered Read Error. Limited Retry asks the controller to stop early. If the LBAs were never written or were deallocated, there may be no NAND access at all.</p>
+
+  <h3>Layer 10 — DMA</h3>
+  <p>The controller's DMA engine writes the 4096 bytes to PRP1 = 0x2_0000_0000. A PCIe Memory Write may carry at most Max Payload Size (256 bytes here) and must not cross a 4 KiB address boundary, so the transfer becomes 16 MWr TLPs of 256 bytes (Length = 64 Dwords) at 0x2_0000_0000, 0x2_0000_0100, … 0x2_0000_0F00. Each carries the controller's Requester ID 0x0100. They are posted: no completion comes back.</p>
+  <p>If the buffer had spanned more than two pages, PRP2 would point to a PRP list and the controller would first read that list (MRd/CplD) to learn the remaining page addresses.</p>
+
+  <h3>Layer 11 — host memory</h3>
+  <p>The root complex receives each MWr, the IOMMU translates its IOVA to a physical address (using the mapping the driver created), and the data is written into memory — on many platforms snooping or updating CPU caches so the CPU sees fresh data. If the IOVA is not mapped, the IOMMU blocks the write and logs a fault; because MWr is posted, the controller is <em>not</em> told, which is one of the nastiest failure modes in this chapter.</p>
+
+  <h3>Layer 12 — the completion queue</h3>
+  <p>After the last data TLP, the controller writes the CQE — 16 bytes as one MWr — at CQ1 base + slot × 16. With the CQ's tail at slot 3, that is 0x1_2341_0030: DW0 = 0, DW1 = 0, DW2 = SQID 1 / SQHD 6 (0x0001_0006), DW3 = status 0 / P 1 / CID 7 (0x0001_0007). Because PCIe does not let a posted write pass an earlier posted write on the same path (without relaxed ordering), the CQE cannot become visible before the data.</p>
+
+  <h3>Layer 13 — the interrupt</h3>
+  <p>CQ1 was created with interrupts enabled on vector 1. Unless interrupt coalescing delays it, the controller sends the MSI-X message for vector 1: an MWr of a 32-bit data value to the address programmed in the MSI-X table entry (on x86, in the 0xFEE0_0000 range). The interrupt controller delivers it to a CPU.</p>
+
+  <h3>Back up the stack</h3>
+  <ol>
+    <li>The interrupt handler reads CQ1 at its head, sees P = 1 matching the expected phase, and reads the entry (after a barrier).</li>
+    <li>It updates SQ1's head from SQHD (6), looks up CID 7 on SQ1 and finds the request.</li>
+    <li>Status 0: it ends the request successfully, unmaps the DMA buffer (IOMMU mapping torn down or reused), and frees the tag.</li>
+    <li>It advances the CQ head and writes CQ1's head doorbell (BAR0 + 0x100C), telling the controller slot 3 can be reused.</li>
+    <li>The block layer completes the bio; the filesystem marks the page uptodate; the waiting thread is woken; <code>read()</code> returns 4096.</li>
+  </ol>
+  <aside class="callout insight"><p>Polling replaces steps 13 and 1: with <code>io_uring</code> polled I/O, the CQ is created without interrupts and a CPU spins on the phase bit. The trace then shows no MSI-X MWr at all — not a bug.</p></aside>
+
+  <h3>The ladder for the central concept: one READ</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>A slip in the request box, a bell, a long walk into the stacks, pages delivered straight to your table, an answer card, a tap on the shoulder.</p></div>
+    <div class="rung" data-rung="B"><p>The driver writes a Read SQE (OPC 02h, SLBA, NLB, PRP1) into SQ1, rings the SQ1 tail doorbell; the controller fetches, reads NAND, DMA-writes data to the PRP addresses, posts a CQE, raises MSI-X; the driver consumes the CQE and rings the CQ head doorbell.</p></div>
+    <div class="rung" data-rung="C"><p>CPU stores and an uncached MMIO write; controller fetch engine, FTL lookup, NAND die read and ECC, DMA engine; IOMMU translation in the root complex; MSI-X table entry; interrupt controller.</p></div>
+    <div class="rung" data-rung="D"><p>Read command (NVM Command Set 1.3); SQE/CQE, queues, Status Field (Base 2.4); doorbells, MSI-X use, PRP rules (NVMe over PCIe Transport 1.4); Memory Read/Write and Completion TLPs, ordering, MPS, 4 KiB boundary (PCI Express Base Specification).</p></div>
+    <div class="rung" data-rung="E"><p>MWr (doorbell) → MRd + CplD (SQE) → [MRd + CplD (PRP list)] → MWr × n (data) → MWr (CQE) → MWr (MSI-X) → MWr (CQ head doorbell).</p></div>
+    <div class="rung" data-rung="F"><p>In the analyzer: a 1-DW write to BAR0 + 0x1008; a 16-DW read from the SQ region; 64-DW writes marching through the data buffer; a 4-DW write into the CQ region; a 1-DW write to 0xFEE0_xxxx.</p></div>
+    <div class="rung" data-rung="G"><p>For a slow or failed read, find which arrow is late or missing: no SQE fetch (doorbell/controller), no data (media or rejection), data but no CQE (controller hang), CQE but no interrupt (MSI-X/coalescing), interrupt but no progress (host).</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for the READ</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>The NVM Command Set I/O command (opcode 02h) that transfers logical blocks from a namespace to host memory.</dd>
+    <dt>2. Why was it created?</dt><dd>It is the fundamental data-retrieval operation of a block device.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Moving data from non-volatile media to memory with minimal host CPU involvement (DMA) and high parallelism (many queues, many outstanding reads).</dd>
+    <dt>4. What existed before it?</dt><dd>SCSI READ(10/16) through a SAS HBA; ATA READ FPDMA QUEUED (NCQ) through AHCI with a single 32-deep queue.</dd>
+    <dt>5. Why is the current design better?</dt><dd>One 64-byte command fetched directly by the device, no HBA translation, per-CPU queues, 64-bit LBAs, and one interrupt (or none, with polling) per completion batch.</dd>
+    <dt>6. Who creates it?</dt><dd>The NVMe driver, on behalf of the block layer.</dd>
+    <dt>7. Who consumes it?</dt><dd>The controller's front-end and read path.</dd>
+    <dt>8. Where does it live?</dt><dd>SQE in SQ1 (host memory); data in the PRP-described buffer; completion in CQ1.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>SQ1/CQ1 rings, SQ1 tail and CQ1 head doorbells, data buffer and PRP list, IOMMU tables, MSI-X table entry for vector 1.</dd>
+    <dt>10. What happens before it?</dt><dd>Page-cache miss, filesystem mapping, block-layer splitting and tag allocation, DMA mapping.</dd>
+    <dt>11. What happens after it?</dt><dd>Completion handling, DMA unmap, request completion, page marked uptodate, task woken; possibly read-ahead of the next blocks.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Wrong data in memory, overwrite of neighbouring memory, LBA Out of Range, IOMMU faults, PI errors, timeouts.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>The TLP sequence above, with timing gaps showing where the time went.</dd>
+    <dt>14. What does Linux show?</dt><dd>nvme tracepoints (setup and complete with SLBA/length/status), blktrace events, iostat latency and throughput, kernel log messages on errors and timeouts.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>All sizes up to MDTS, unaligned PRP offsets, PRP lists across page boundaries, boundary LBAs, FUA/LR, PI types, deallocated LBAs, media errors (via Write Uncorrectable), interrupt coalescing, queue wrap, many concurrent reads.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>Depends on which arrow is missing: host mapping (IOMMU) for silent data loss; media for Unrecovered Read Error; controller firmware for missing CQEs; interrupt routing for "completion written but not seen".</dd>
+  </dl>
+</section>
