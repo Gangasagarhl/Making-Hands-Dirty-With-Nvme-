@@ -1,0 +1,150 @@
+<p class="lead">A real trace never contains one command. It contains hundreds, interleaved, completing out of order, on several queues, with PCIe tags being reused every few microseconds. This chapter teaches the method protocol analysts use to pull one command's thread out of that tangle: which key links each stage to the next, how long each key stays valid, and how to prove a match instead of guessing it.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>In <a href="ch39.html">The Most Important Chapter</a> and <a href="ch40.html">End-to-End Write</a> you followed single commands. The traces were easy to read because nothing else was happening. In practice an analyzer capture of a busy SSD shows thousands of TLPs per millisecond, and the question you are asked is never "what is a TLP?" but "which of these TLPs belong to the command that failed, and in what order did its stages happen?"</p>
+  <p>Answering that is the core skill of NVMe-over-PCIe protocol analysis. It is not hard once you see the structure: every stage of a command is linked to the next by a specific key (an address, an index, a tag, an identifier), and each key has a scope and a lifetime. Use the right key for each link, respect its lifetime, and the thread comes out cleanly. Use the wrong key, the tag to find the command, or the CID without its queue, and you will confidently connect TLPs that have nothing to do with each other.</p>
+  <p>This chapter trains that thinking until it is automatic. The method also underlies the automated tools in <a href="auto-trace.html">Automated Trace Analysis</a> and the forensic process in <a href="ch47.html">Error Correlation</a>.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>State the correlation chain: NVMe command ↔ queue location ↔ controller access ↔ PCIe requester/completer ↔ address ↔ tag ↔ completion ↔ interrupt, and the key that joins each pair.</li>
+    <li>Turn a doorbell write into (queue, new tail, number of new entries), and a fetch address into (queue, slot, number of entries).</li>
+    <li>Match non-posted requests to completions by Requester ID and tag, including split completions, and explain why tags must never be used to identify NVMe commands.</li>
+    <li>Identify a command by (SQ Identifier, Command Identifier) and explain why CID alone is ambiguous.</li>
+    <li>Attribute data TLPs to commands by address range from decoded PRP entries, for reads (device Memory Writes) and writes (device Memory Reads and Completions).</li>
+    <li>Link CQEs to commands and MSI-X messages to completion queues, handling many CQEs per interrupt and out-of-order completion.</li>
+    <li>Align host-side Linux tracepoints with analyzer time.</li>
+    <li>Untangle an interleaved trace of four concurrent commands on two queues by hand and with a script.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <ul>
+      <li>Both end-to-end journeys: <a href="ch39.html">The Most Important Chapter</a>, <a href="ch40.html">End-to-End Write</a>.</li>
+      <li>Tags and their reuse: <a href="ch13.html">PCIe Tags and Outstanding Requests</a>.</li>
+      <li>Queue creation (where SQ/CQ base addresses and interrupt vectors come from): <a href="ch27.html">I/O Queues</a>, <a href="ch30.html">Admin Commands</a>.</li>
+      <li>SQE and CQE fields: <a href="ch29.html">NVMe Command Structure</a>; PRP rules: <a href="ch36.html">Physical Region Pages</a>.</li>
+      <li>MSI-X table and vectors: <a href="ch43.html">MSI-X</a> (forward reference; the essentials are repeated here).</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>At a busy airport, many families check in at once. Every suitcase gets a sticker with a number, but the stickers are reused every day, so a sticker number alone does not tell you whose suitcase it is today. To find your bag you need to know which flight (the queue), which seat (the slot), and your family name on the booking (the command identifier). The bag belt does not care whose bag is whose; it just carries bags. The person at the lost-and-found desk solves puzzles: "This bag came off flight 1, seat 17, the booking says Garcia family, so it is the Garcias' bag, even though the Garcias' friends on flight 2 also have a booking called Garcia."</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A courier company's depot scanner log. Each line records "parcel scanned at door 3 at 10:02:17, route sticker 42." Route stickers are reused all day; customer orders are identified by account number plus order number; parcels for one order may come off several trucks and arrive in any order; and one "your delivery is ready" text message may announce several orders. To answer a customer complaint you work from the order (account plus order number) to the delivery addresses it lists, then to the scans at those addresses, using each sticker number only for the few minutes it was attached to one parcel.</p>
+  </aside>
+  <aside class="callout breaks">
+    <ul>
+      <li><strong>Addresses carry more meaning in NVMe.</strong> In the depot story an address is just a destination; on PCIe the address of a fetch also tells you which queue and which slot the command came from, and the address of a data write tells you which command it belongs to.</li>
+      <li><strong>Some events have no label at all.</strong> Posted writes (data for reads, CQEs, MSI-X, doorbells) have no tag that means anything. Every parcel in the analogy has a sticker.</li>
+      <li><strong>The order number is inside the parcel.</strong> The CID is visible only in payloads (the SQE fetch completion and the CQE), never in TLP headers. The analogy suggests it is on the outside.</li>
+      <li><strong>Some deliveries are invisible.</strong> An analyzer sees one link. Anything the IOMMU blocks, anything inside the SSD, and anything on another link is not in the log.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>Each NVMe command leaves a trail of packets on the PCIe link: a doorbell, a fetch, data, a completion entry, an interrupt, another doorbell. When many commands run at once, their trails overlap. Correlation is the job of saying which packets belong to which command.</p>
+  <p>The trick is that you cannot use one label for the whole trail. Different parts of the trail carry different labels:</p>
+  <ul>
+    <li>Doorbells and queue fetches are identified by <strong>addresses</strong>: which register was written, which slot in which queue was read.</li>
+    <li>A read request and its answer are tied together by a PCIe <strong>tag</strong>, but only until the answer arrives; then the tag is reused for something else.</li>
+    <li>The command itself is named by its <strong>Command Identifier (CID)</strong>, which you find inside the fetched 64-byte command, and which is only unique within its submission queue.</li>
+    <li>Data packets carry no command label at all. You recognize them by their <strong>address</strong>: they fall inside the buffer addresses the command listed.</li>
+    <li>The completion entry carries the queue and the CID again, which closes the loop.</li>
+    <li>The interrupt carries only a <strong>vector</strong>, which tells you which completion queue to look at, not which command finished.</li>
+  </ul>
+  <p>So correlation is a relay: address → slot → command (CID) → buffer addresses → data → completion (CID) → vector. Every hand-off uses the label that is valid at that point.</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+  <h3>The correlation chain</h3>
+  <p>The master prompt's chain, with the key for each link, written as a table you can carry into any trace.</p>
+  <table>
+    <caption>The correlation chain and its keys</caption>
+    <thead><tr><th>From</th><th>To</th><th>Key</th><th>Where you read it</th><th>Scope and lifetime</th><th>Trap</th></tr></thead>
+    <tbody>
+      <tr><td>Host intent</td><td>Queue</td><td>Doorbell register address → queue ID and SQ/CQ</td><td>MWr address: 0x1000 + (2y [+1]) × (4 &lt;&lt; CAP.DSTRD) from BAR0</td><td>Fixed while BAR and DSTRD are unchanged</td><td>Wrong DSTRD; BAR moved after reset or hot-plug</td></tr>
+      <tr><td>Doorbell</td><td>New SQ entries</td><td>New tail minus old tail, modulo queue size</td><td>MWr data of this and the previous SQ tail doorbell</td><td>Needs the previous value: capture from queue creation or infer</td><td>Wrap (tail 0x3 after 0x3FE means 5 entries); one doorbell, many commands</td></tr>
+      <tr><td>Queue</td><td>Controller access (fetch)</td><td>Fetch address → (queue, slot); length → entry count</td><td>Device MRd address and Length; slot = (addr − SQ base) / 64</td><td>SQ base fixed from Create I/O SQ until the queue is deleted</td><td>Several entries per fetch; fetch split across MRds; queue bases unknown if capture started late</td></tr>
+      <tr><td>Fetch request</td><td>Fetch completion</td><td>(Requester ID, Tag)</td><td>MRd header; CplD header (Requester ID, Tag); Byte Count and Lower Address for splits</td><td>From request until the completion with Byte Count equal to its payload; then the tag is free</td><td>Tag reused microseconds later for an unrelated request</td></tr>
+      <tr><td>Fetch completion</td><td>NVMe command</td><td>(SQ ID from the fetch address, CID from CDW0 bits 31:16)</td><td>CplD payload</td><td>From fetch until the CQE; then the host may reuse the CID</td><td>Same CID on another SQ is a different command</td></tr>
+      <tr><td>Command</td><td>Data TLPs</td><td>Address ∈ PRP-described ranges (and PRP list contents)</td><td>PRP1/PRP2 in the SQE; PRP list via further MRd/CplD</td><td>From fetch until CQE</td><td>Buffers reused right after completion; IOVA, not physical; SGL instead of PRP</td></tr>
+      <tr><td>Data read (WRITE command)</td><td>Data completion</td><td>(Requester ID, Tag), Byte Count</td><td>CplD headers</td><td>As for any non-posted request</td><td>Completions of different tags arrive in any order</td></tr>
+      <tr><td>Command</td><td>Completion entry</td><td>(SQID, CID) in CQE DW2/DW3</td><td>Device MWr to a CQ slot; slot = (addr − CQ base) / 16</td><td>CQ slot reused after the host's head doorbell passes it</td><td>Phase tag tells new from old; CQ shared by several SQs</td></tr>
+      <tr><td>Completion entry</td><td>Interrupt</td><td>CQ's Interrupt Vector (from Create I/O CQ) ↔ MSI-X table entry (address, data)</td><td>Device MWr to the MSI-X address window</td><td>Fixed while the table entry and queue are unchanged</td><td>One MSI-X for many CQEs; several CQs may share a vector; masked vectors defer messages</td></tr>
+      <tr><td>Interrupt</td><td>Host acknowledgement</td><td>CQ head doorbell value</td><td>Host MWr to the CQ head doorbell</td><td>Cumulative</td><td>One head doorbell for a batch; may lag far behind</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Keys, scopes and lifetimes</h3>
+  <p>Every key in the table is unique only within a scope and only for a time. Getting the scope wrong is the most common correlation error.</p>
+  <table>
+    <caption>Uniqueness of each identifier</caption>
+    <thead><tr><th>Identifier</th><th>Unique within</th><th>Unique for how long</th><th>Defined by</th></tr></thead>
+    <tbody>
+      <tr><td>PCIe Tag</td><td>One requester (Requester ID); per traffic class and function details aside</td><td>While the non-posted request is outstanding</td><td>PCI Express Base Specification <span class="badge normative">Normative</span></td></tr>
+      <tr><td>Command Identifier</td><td>One submission queue</td><td>While the command is outstanding (from submission until its completion is consumed)</td><td>NVMe Base Specification <span class="badge normative">Normative</span></td></tr>
+      <tr><td>(SQID, CID)</td><td>One controller</td><td>While outstanding</td><td>Derived from the above <span class="badge derived">Derived</span></td></tr>
+      <tr><td>SQ slot index</td><td>One submission queue</td><td>Until the controller consumes it and the host overwrites it</td><td>NVMe queue model</td></tr>
+      <tr><td>CQ slot index + phase</td><td>One completion queue</td><td>One pass of the ring</td><td>NVMe queue model</td></tr>
+      <tr><td>Buffer address (IOVA)</td><td>One IOMMU domain</td><td>While mapped for that command</td><td>Host software <span class="badge impl">Implementation-dependent</span></td></tr>
+      <tr><td>MSI-X vector</td><td>One function</td><td>While the table entry is unchanged</td><td>PCI Express Base Specification (MSI-X capability); assignment by host</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The method, as an algorithm</h3>
+  <ol>
+    <li><strong>Build the context.</strong> From the capture of controller initialization (or from Linux, see <a href="#linux">Linux view</a>): BAR0, CAP.DSTRD, each queue's base, size, its CQ and its interrupt vector, and the MSI-X table entries. Without this table, addresses are just numbers.</li>
+    <li><strong>Classify every TLP</strong> by address and direction: doorbell (host MWr into BAR0 doorbell range), SQ fetch (device MRd in an SQ range), PRP list fetch (device MRd in a PRP-list range), data (device MWr or MRd elsewhere in memory), CQE (device MWr in a CQ range), MSI-X (device MWr in the interrupt window), completion (CplD/Cpl, matched by tag).</li>
+    <li><strong>Track doorbells per queue</strong> to know how many entries each doorbell published.</li>
+    <li><strong>Match fetches</strong> to completions by (Requester ID, Tag); reassemble split completions by Byte Count; decode each 64-byte SQE; create a command record keyed by (SQID, CID) with its slot, opcode, LBA range and PRP ranges.</li>
+    <li><strong>Attribute data</strong> to commands by address range; for writes, attribute the device's data MRds by address and their completions by tag.</li>
+    <li><strong>Close commands</strong> with CQEs keyed by (SQID, CID); record status, SQHD and phase; check that all of the command's data preceded its CQE.</li>
+    <li><strong>Attribute interrupts</strong> to CQs by vector, and head doorbells to the CQEs they acknowledge.</li>
+    <li><strong>Report orphans</strong>: completions with no matching request, data with no matching command, CQEs with no matching outstanding command, commands with no CQE. Orphans are where bugs live.</li>
+  </ol>
+
+  <h3>The central concept on the ladder</h3>
+  <p>The central concept is the <strong>correlation key</strong>: the specific field that ties one stage of a command to the next, valid only within a scope and for a lifetime.</p>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Bag stickers are reused every day; to find your bag you need the flight, the seat and the family name, used at the right moments.</p></div>
+    <div class="rung" data-rung="B"><p>Each link between stages uses one key: doorbell address, fetch address, PCIe tag, (SQID, CID), buffer address, CQ slot, MSI-X vector. Use each key only for the link it belongs to.</p></div>
+    <div class="rung" data-rung="C"><p>The controller's queue engine turns doorbells into fetches at computed addresses; its DMA engines allocate tags per outstanding read; its completion engine writes CQEs to computed addresses; its interrupt logic maps CQs to vectors. Each hardware block creates exactly one kind of key.</p></div>
+    <div class="rung" data-rung="D"><p>NVMe Base Specification: CIDs unique per SQ while outstanding; CQE carries SQID and CID; queue and doorbell layout. PCI Express Base Specification: tags unique per requester while outstanding; completions matched by Requester ID and tag; split-completion rules; MSI-X table.</p></div>
+    <div class="rung" data-rung="E"><p>Only non-posted requests carry a meaningful tag. Doorbells, data for reads, CQEs and MSI-X are posted writes and are identified only by address and payload.</p></div>
+    <div class="rung" data-rung="F"><p>In an analyzer, filter by address ranges (SQ, CQ, PRP pages, MSI-X window, doorbell block) rather than by tag; use tags only to pair each MRd with its CplDs; decode payloads to get CIDs.</p></div>
+    <div class="rung" data-rung="G"><p>Orphans and duplicates are the evidence: a CQE whose (SQID, CID) has no outstanding command, a data write outside every outstanding command's PRP range, a completion for a tag with no outstanding request, or two outstanding commands with the same (SQID, CID).</p></div>
+  </div>
+
+  <h3>The sixteen questions, applied to the correlation key</h3>
+  <table>
+    <caption>The correlation key through the sixteen questions</caption>
+    <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>What is it?</td><td>A field or derived value that links one stage of a command's trail to the next.</td></tr>
+      <tr><td>Why was it created?</td><td>Each protocol layer needs its own way to match requests and responses: PCIe needs tags for split transactions; NVMe needs CIDs for out-of-order completion; queues need indices.</td></tr>
+      <tr><td>What problem does it solve?</td><td>Allowing many outstanding operations at once without confusing their responses.</td></tr>
+      <tr><td>What existed before?</td><td>Simpler interfaces with one outstanding operation per channel (or few, as in AHCI's 32 slots) where position alone identified the operation.</td></tr>
+      <tr><td>Why is the current design better?</td><td>Deep parallelism and out-of-order completion at both layers; but it makes analysis harder, which is why this chapter exists.</td></tr>
+      <tr><td>Who creates it?</td><td>Host: CID, queue placement, buffer addresses, vector assignment. Controller: PCIe tags for its requests, CQ slot choice (next tail). Root complex: tags for its own MMIO reads.</td></tr>
+      <tr><td>Who consumes it?</td><td>The opposite party: the controller matches completions by tag; the host matches CQEs by (SQID, CID); the analyst uses all of them.</td></tr>
+      <tr><td>Where does it live?</td><td>TLP headers (tag, Requester ID, address), payloads (CID, SQID, PRPs), configuration (queue bases, vectors).</td></tr>
+      <tr><td>What memory/registers are involved?</td><td>SQ/CQ memory, doorbell registers, MSI-X table, IOMMU mappings.</td></tr>
+      <tr><td>What happens before it?</td><td>Queue creation and MSI-X programming establish the static keys; submission assigns the dynamic ones.</td></tr>
+      <tr><td>What happens after it?</td><td>Each key is released (tag on final completion, CID on consumed CQE, buffer on unmap) and reused.</td></tr>
+      <tr><td>What happens if it is wrong?</td><td>Responses go to the wrong operation: wrong data placement, wrong command completed, stale completions, Unexpected Completion errors.</td></tr>
+      <tr><td>What does the protocol analyzer show?</td><td>Tags, addresses and payloads; it can pair MRd/CplD automatically but cannot know NVMe meaning without queue context.</td></tr>
+      <tr><td>What does Linux show?</td><td>qid and cmdid in NVMe tracepoints; queue and vector mapping in sysfs and <code>/proc/interrupts</code>; warnings for invalid CIDs.</td></tr>
+      <tr><td>What would a validation engineer test?</td><td>CID reuse at high depth, tag reuse at maximum outstanding requests, completion reordering, shared vectors, queue wrap, duplicate-CID handling (Command ID Conflict).</td></tr>
+      <tr><td>What would a senior engineer suspect when it fails?</td><td>Key reuse before release (tag or CID), stale state after reset or timeout, wrong queue context (BAR or base addresses changed), and analyzer visibility gaps.</td></tr>
+    </tbody>
+  </table>
+</section>

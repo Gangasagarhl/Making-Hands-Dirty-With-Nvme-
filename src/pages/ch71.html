@@ -215,3 +215,553 @@ sudo dmesg -w                                                <span class="cm"># 
   <p>Read: the requester (01:00.0, the SSD), the direction (a DMA write: the device writing to host memory, as for read data or a CQE), the IOVA (<code>0x1fff00000</code>), and the reason (no write permission or no mapping). On the wire the SSD sent a perfectly valid MWr TLP; the platform refused it. The device may receive an error completion for reads, and for writes the data is silently dropped; the NVMe command will then fail, hang or complete with corrupted host-side data. <span class="badge impl">Platform-dependent</span> The reason codes and flag bits are IOMMU-architecture-specific: decode them with the Intel VT-d or AMD IOMMU specification, not from memory.</p>
   <p>Typical causes: a driver bug (buffer unmapped before the device finished, use-after-free of a DMA buffer), a device bug (DMA to a stale PRP from a previous command, or to an address beyond the PRP list), or a passthrough misconfiguration. The faulting address is the key: compare it with the PRP entries in the command's SQE (from a trace) and with the queue base addresses.</p>
 </section>
+
+<section id="ladder">
+  <h2>The central concept on the ladder: a log line as evidence</h2>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Different helpers write in one diary when they notice trouble. Each line is true for its writer, but the writer may notice late, and the loudest line is not always the first problem.</p></div>
+    <div class="rung" data-rung="B"><p>Kernel subsystems (PCI core, AER, DPC, hot-plug, IOMMU, NVMe driver, block layer, filesystems) print templated messages with a monotonic timestamp and a device name. You order them, classify them by layer and find the earliest abnormal one.</p></div>
+    <div class="rung" data-rung="C"><p>Behind each message is a hardware event the kernel noticed: an error Message TLP arriving at the root port and raising an interrupt, a slot status change, an IOMMU fault record, a register read returning all ones, a CQE with a non-zero status, or a timer expiring because nothing happened.</p></div>
+    <div class="rung" data-rung="D"><p>The PCIe Base Specification defines the error types, their severities, the AER and DPC registers and the error Messages; the NVMe Base Specification 2.4 defines CSTS, status codes and Abort; IOMMU specifications define fault records. The log text itself is defined by nobody but the kernel source.</p></div>
+    <div class="rung" data-rung="E"><p>Error signalling travels as Message TLPs (ERR_COR, ERR_NONFATAL, ERR_FATAL) from the detecting function to the root complex; NVMe status travels inside CQEs; timeouts are the absence of a CQE.</p></div>
+    <div class="rung" data-rung="F"><p>On an analyzer, an AER line corresponds to an error Message TLP preceded by the actual problem (an LCRC failure and NAK, a malformed TLP, a missing completion, an LTSSM drop). Kernel timestamps lag the wire by the interrupt and handler latency, and timeouts lag by up to <code>io_timeout</code>.</p></div>
+    <div class="rung" data-rung="G"><p>A senior engineer builds a timeline, groups lines by device and layer, marks consequences (I/O errors, filesystem errors) separately from causes, finds the first abnormal event, and names the experiment that would distinguish the remaining hypotheses.</p></div>
+  </div>
+
+  <h3>The sixteen questions for "the kernel log in an NVMe/PCIe incident"</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>The kernel's ring buffer of messages, persisted by the journal, written by every subsystem that touches the device.</dd>
+    <dt>2. Why was it created?</dt><dd>To give administrators and developers a durable, low-cost record of significant kernel events.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Post-incident visibility without prior instrumentation.</dd>
+    <dt>4. What existed before?</dt><dd>Console output and syslog; vendor-specific hardware event logs; for PCI, almost nothing (parity errors and system errors with no detail before AER).</dd>
+    <dt>5. Why is the current design better?</dt><dd>AER gives typed, attributed errors with header logs; DPC adds containment; structured journal storage survives reboots and supports searching by time and pattern.</dd>
+    <dt>6. Who creates it?</dt><dd>Kernel code: drivers and core subsystems, triggered by hardware events or timers.</dd>
+    <dt>7. Who consumes it?</dt><dd>Engineers, monitoring (log shippers, rasdaemon), automated triage.</dd>
+    <dt>8. Where does it live?</dt><dd>Kernel memory (ring buffer), the systemd journal on disk (if persistent), remote log collectors, pstore after crashes.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>AER status/mask/severity/header log, Root Error Status, DPC status/source, Slot Status, CSTS, PCI Status, IOMMU fault recording registers.</dd>
+    <dt>10. What happens before?</dt><dd>The hardware event, its detection, signalling, and the handler or timer that notices it.</dd>
+    <dt>11. What happens after?</dt><dd>Recovery actions (driver callbacks, resets, retries), more messages describing them, and consequences up the stack.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Misordered or misattributed reading leads to the wrong team chasing the wrong layer; lost logs (no persistent journal) leave an incident unexplained.</dd>
+    <dt>13. What does the analyzer show?</dt><dd>The actual first abnormal event, often earlier and lower in the stack than the first log line.</dd>
+    <dt>14. What does Linux show?</dt><dd>The messages in this chapter, plus counters in sysfs and tracepoints if enabled.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>That each injected error (link down, poisoned TLP, completion timeout, CFS, media error) produces the expected log signature and successful recovery, and that no error goes unreported.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>That the first visible line is a consequence; that firmware-first handling hid the cause; that rate limiting hid the volume; that wall-clock conversion misordered events; that the "hint" lines are being mistaken for diagnoses.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>The hardware event behind each message family</caption>
+    <thead><tr><th>Message family</th><th>Hardware event</th><th>Detected by</th><th>How Linux learns of it</th></tr></thead>
+    <tbody>
+      <tr><td>AER correctable / uncorrectable</td><td>Receiver error, LCRC failure, replay timeout, malformed TLP, completion timeout…</td><td>The function's PCIe core (SSD, switch or root port)</td><td>Error Message TLP to the root port → Root Error Status → interrupt → AER service driver reads the source's AER registers</td></tr>
+      <tr><td>DPC containment</td><td>An uncorrectable error (or ERR_FATAL/ERR_NONFATAL received) at a downstream port with DPC enabled</td><td>The root port / switch downstream port</td><td>DPC interrupt; link held down until software releases it</td></tr>
+      <tr><td>pciehp Link Down/Up, Card present/not present</td><td>Data Link Layer State Changed, Presence Detect Changed</td><td>The downstream port's slot logic</td><td>Hot-plug interrupt</td></tr>
+      <tr><td>IOMMU fault</td><td>DMA to an unmapped or unpermitted IOVA</td><td>The IOMMU in the root complex</td><td>Fault recording registers + interrupt</td></tr>
+      <tr><td>"controller is down", CSTS values</td><td>Controller fatal error, controller unreachable</td><td>NVMe driver reading CSTS/PCI Status</td><td>Polling (a watchdog timer in the PCIe driver) or the timeout handler</td></tr>
+      <tr><td>Timeout / abort / reset</td><td>No CQE for a command</td><td>Nothing in hardware: it is an absence</td><td>Block-layer request timer</td></tr>
+      <tr><td>I/O error with sct/sc</td><td>The controller completed the command with an error status</td><td>Controller firmware/hardware</td><td>CQE status</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw">
+    <p>Two physical facts shape the log. First, a link-level problem is detected by the <em>receiver</em>, so errors on data flowing to the SSD are logged by the SSD and errors on data flowing to the host by the root port; the "(Receiver ID)" annotation tells you which. Second, when the link is down, the SSD cannot send an error Message at all, so the root port (via Surprise Down, DPC or hot-plug) becomes the only reporter. A log that contains only root-port lines is itself evidence that the endpoint could not speak.</p>
+  </aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>Sources: <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Error Signaling and Logging; Advanced Error Reporting Capability; Downstream Port Containment; Hot-Plug</cite>; <cite class="spec">NVM Express Base Specification 2.4 — Controller Status (CSTS); Status Field definition and status code tables; Abort command; Controller Reset</cite>; the Intel Virtualization Technology for Directed I/O and AMD I/O Virtualization Technology specifications for IOMMU fault records; the ACPI specification's APEI section for firmware-first reporting. The Linux messages are informative artefacts of the kernel source, which is the only authority on their wording.</p>
+  <aside class="callout verified">
+    <p>Verified, well-established: AER correctable status bits 0 Receiver Error, 6 Bad TLP, 7 Bad DLLP, 8 REPLAY_NUM Rollover, 12 Replay Timer Timeout, 13 Advisory Non-Fatal Error; uncorrectable bits 4 Data Link Protocol Error, 5 Surprise Down Error, 12 Poisoned TLP, 13 Flow Control Protocol Error, 14 Completion Timeout, 15 Completer Abort, 16 Unexpected Completion, 17 Receiver Overflow, 18 Malformed TLP, 19 ECRC Error, 20 Unsupported Request, 21 ACS Violation; error Message codes ERR_COR 30h, ERR_NONFATAL 31h, ERR_FATAL 33h; CSTS.RDY is bit 0 and CSTS.CFS is bit 1; generic status 00h Successful Completion, 07h Command Abort Requested, 80h LBA Out of Range; media status (SCT 2h) 81h Unrecovered Read Error.</p>
+  </aside>
+  <aside class="callout derived">
+    <p>Derived: a timeout line printed at time T implies the command was submitted at about T − io_timeout; a DPC event with no preceding endpoint AER line implies the endpoint could not or did not signal; CSTS = 0xFFFFFFFF together with PCI_STATUS = 0xFFFF implies that both a memory read and a configuration read failed, which places the fault at or below the link.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>Implementation-dependent: which errors a device detects and reports; Completion Timeout values; whether DPC is present, enabled and OS-owned; firmware-first versus OS-native handling; the NVMe driver's escalation policy and timeouts; the status Linux assigns to host-aborted commands; IOMMU fault formats.</p>
+  </aside>
+  <aside class="callout version">
+    <p>Version-dependent: message wording across kernel versions; availability of verbose NVMe error decoding; AER's "(First)" annotation and rate limiting; DPC and EDR support; status code tables (Path Related status codes were added in NVMe 1.4 and extended later).</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p>No specification says what Linux must log, or that an error must be logged at all. The PCIe specification does not say how software must recover from DPC; the NVMe specification does not define host timeouts. Check in the specifications: DPC Status and Error Source ID layouts, the exact AER bit names for your revision (including newer bits such as those for flit mode), the Abort command's completion DW0 semantics, and the Path Related status code table.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume: that the first line in the log is the first event; that "device recovery successful" means no data was lost; that an empty log means no errors (firmware-first, masking, rate limits, ring overflow); that a status printed in an I/O error came from the device; that the kernel's hint about power saving is the root cause.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <figure>
+    <ol class="seq" data-actors="Lab SSD 01:00.0|Root port 00:01.1|AER driver|NVMe driver">
+      <li data-from="Root port 00:01.1" data-to="Lab SSD 01:00.0" class="bad">TLP with LCRC error (corrupted on wire)</li>
+      <li data-from="Lab SSD 01:00.0" data-to="Root port 00:01.1" class="dashed">NAK DLLP</li>
+      <li data-from="Root port 00:01.1" data-to="Lab SSD 01:00.0">replay of the TLP (succeeds)</li>
+      <li data-from="Lab SSD 01:00.0" data-to="Root port 00:01.1">Msg ERR_COR (code 30h), Req=0x0100</li>
+      <li data-note="Root port 00:01.1">Root Error Status: ERR_COR received; interrupt</li>
+      <li data-from="Root port 00:01.1" data-to="AER driver">interrupt</li>
+      <li data-from="AER driver" data-to="Lab SSD 01:00.0">CfgRd: Correctable Error Status</li>
+      <li data-from="AER driver" data-to="Lab SSD 01:00.0">CfgWr: clear status (RW1C)</li>
+      <li data-note="AER driver">print 4 log lines; count++</li>
+      <li data-note="NVMe driver">nothing to do: I/O unaffected</li>
+    </ol>
+    <figcaption>Conceptual sequence behind a correctable-error log entry (Bad TLP shown; Receiver Error follows the same signalling path).</figcaption>
+  </figure>
+  <p>Key protocol facts for reading logs: error Messages are posted, routed to the root complex, and carry the requester ID of the reporting function, which is why the log can say "received from 0000:01:00.0"; a function sends at most one Message per error occurrence subject to masking; the root port aggregates and may record "multiple errors" when more than one arrives before software services the first; the AER driver's config writes that clear status are themselves visible on an analyzer as CfgWr0 TLPs, which gives you a marker to align kernel time with wire time.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>A kernel log excerpt and a correlated synthetic link trace for the same incident. Times on the link are relative to the first row; kernel timestamps are seconds since boot. Both are synthetic examples for teaching on the reference system.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Normal: correctable Bad TLP, replayed, logged, no effect on NVMe I/O">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 ns</td><td>CplD</td><td>Seq=0x512 Req=0x0100 Tag=0x31 Len=64 LCRC=bad</td><td>Read data to SSD corrupted on the wire</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>310 ns</td><td>DLLP Nak</td><td>AckNak_Seq=0x511</td><td>SSD rejects it</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>520 ns</td><td>CplD</td><td>Seq=0x512 Tag=0x31 Len=64 LCRC=ok</td><td>Replay succeeds</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>900 ns</td><td>Msg ERR_COR</td><td>Req=0x0100 Code=0x30 routed to RC</td><td>SSD reports Bad TLP</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>38 µs</td><td>CfgRd0</td><td>Reg=AER+0x10</td><td>AER driver reads Correctable Status (0x00000040)</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>41 µs</td><td>CfgWr0</td><td>Reg=AER+0x10 Data=0x00000040</td><td>AER driver clears bit 6</td></tr>
+        <tr class="note"><td colspan="6">Kernel: [4012.517802] … Correctable error message received from 0000:01:00.0 / severity=Correctable, type=Data Link Layer, (Receiver ID) / [ 6] BadTLP</td></tr>
+      </tbody>
+    </table>
+    <p>Everything worked as designed: the Data Link Layer corrected the error, the SSD reported it, Linux logged and cleared it. The NVMe command that was receiving that data (Tag 0x31's request) was unaffected except for a few hundred nanoseconds. Action: track the rate, not the single event.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: link drop under load; DPC; NVMe recovery; the log's loudest line is not the first event">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td>K1</td><td>Kernel</td><td>7300.912</td><td>log</td><td>pcieport 0000:00:01.1: AER: Correctable error … from 0000:01:00.0 / [ 0] RxErr (×3 within 50 ms; "callbacks suppressed")</td><td>Early warning: SSD receiver errors</td></tr>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0 µs (≈7301.0040)</td><td>MWr64</td><td>Req=0x0100 Addr=0x2_0004_1000 Len=64</td><td>Read data to host (normal)</td></tr>
+        <tr class="abnormal"><td>2</td><td>—</td><td>+3.1 µs</td><td>Physical</td><td>Lanes 0–3 lose symbol lock; LTSSM L0→Recovery; Recovery fails</td><td><strong>First abnormal event on the wire</strong></td></tr>
+        <tr class="note"><td>3</td><td>—</td><td>+40 µs</td><td>Link</td><td>Root port DL_Down; Surprise Down detected; DPC triggers, link held in Disabled</td><td>Containment</td></tr>
+        <tr class="note"><td>K2</td><td>Kernel</td><td>7301.004410</td><td>log</td><td>DPC: containment event, status:0x1f01 source:0x0000</td><td>First kernel line of the incident proper</td></tr>
+        <tr class="note"><td>K3</td><td>Kernel</td><td>7301.004439</td><td>log</td><td>[ 5] SDES (First)</td><td>Surprise Down</td></tr>
+        <tr class="note"><td>K4</td><td>Kernel</td><td>7301.004511</td><td>log</td><td>nvme nvme0: frozen state error detected, reset controller</td><td>Driver informed</td></tr>
+        <tr class="note"><td colspan="6">Software releases DPC; link retrains (≈ 0.9 s here); slot reset; NVMe controller re-enabled; queues recreated.</td></tr>
+        <tr class="note"><td>K5</td><td>Kernel</td><td>7302.402331</td><td>log</td><td>nvme nvme0: 32/0/0 default/read/poll queues</td><td>Controller back</td></tr>
+        <tr class="note"><td>K6</td><td>Kernel</td><td>7302.410822</td><td>log</td><td>AER: device recovery successful</td><td>Recovery complete</td></tr>
+        <tr class="note"><td>K7</td><td>Kernel</td><td>7302.41–7302.44</td><td>log</td><td>XFS (nvme0n1p1): metadata I/O error … ; I/O error, dev nvme0n1 … (12 lines)</td><td>Loudest lines: consequences of failed in-flight I/O</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> A reader scanning for "error" lands on the twelve XFS and block lines (K7) and opens a filesystem bug. The timeline says otherwise: correctable receiver errors on the SSD side (K1) preceded a physical link loss (row 2), which DPC contained (K2–K3); the NVMe driver and AER recovery worked (K4–K6); the filesystem lost the I/O that was in flight at the moment of containment (K7). Root-cause hypotheses: degraded signal integrity on the downstream path (RxErr at the SSD), power instability at the SSD, SSD PHY or firmware fault. Discriminating experiments: monitor <code>aer_dev_correctable</code> rate under load; swap slot and drive; check root port LnkSta2 equalization; analyzer with a trigger on LTSSM Recovery. Corrective action and regression test depend on the outcome; the filesystem is not a suspect.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <pre class="code" data-kind="read-only" data-lang="sh" data-title="Collecting kernel-log evidence for an NVMe/PCIe incident (read-only)"><code>uname -r; cat /proc/cmdline                         <span class="cm"># kernel version and parameters (pci=, pcie_aspm=, nvme_core.*)</span>
+journalctl --list-boots | tail -5
+journalctl -k -b 0  -o short-monotonic &gt; kern-this-boot.txt
+journalctl -k -b -1 -o short-monotonic &gt; kern-prev-boot.txt 2&gt;/dev/null
+sudo dmesg --time-format iso &gt; dmesg-iso.txt
+grep -E 'nvme|pcieport|AER|DPC|pciehp|DMAR|AMD-Vi|smmu|I/O error|medium error|GHES|Hardware Error' kern-this-boot.txt
+cat /sys/module/nvme_core/parameters/io_timeout /sys/module/nvme_core/parameters/admin_timeout
+for d in /sys/bus/pci/devices/0000:01:00.0 /sys/bus/pci/devices/0000:00:01.1; do
+  grep -H . $d/aer_dev_* $d/aer_rootport_total_* 2&gt;/dev/null
+done
+sudo ras-mc-ctl --errors 2&gt;/dev/null | tail -20    <span class="cm"># if rasdaemon is installed: persisted AER/MCE events</span></code></pre>
+  <table>
+    <caption>What the log can and cannot prove</caption>
+    <thead><tr><th>Line type</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>AER correctable</td><td>The named receiver detected and the link corrected an error</td><td>Cause; total count (rate limits)</td></tr>
+      <tr><td>AER uncorrectable + header log</td><td>An uncorrectable error of a type, and for some types the offending TLP header</td><td>Which NVMe command was affected (needs correlation)</td></tr>
+      <tr><td>DPC containment</td><td>The port disabled the link due to an error</td><td>Why the triggering error happened</td></tr>
+      <tr><td>pciehp Link Down / Card not present</td><td>Link state / presence changed</td><td>Power vs physical removal vs device reset (needs more evidence)</td></tr>
+      <tr><td>NVMe timeout</td><td>No completion within io_timeout</td><td>Where the command got stuck; when the real problem began</td></tr>
+      <tr><td>controller is down, CSTS=…</td><td>The driver's register reads at that moment</td><td>History; firmware internals</td></tr>
+      <tr><td>I/O error with sct/sc</td><td>The completion status the driver received or assigned</td><td>Whether the device or the host produced it, unless you know the code's origin</td></tr>
+      <tr><td>IOMMU fault</td><td>The device emitted a DMA the IOMMU rejected, with address</td><td>Whether the device or the driver was wrong</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout linux">
+    <p>Make logs survive the incident: enable a persistent journal (<code>Storage=persistent</code> in <code>journald.conf</code>, or create <code>/var/log/journal</code>), send logs to a remote collector, and consider pstore for crash capture. These are configuration changes: <span class="badge caution">Caution lab</span> on shared machines, routine on your own lab machine.</p>
+  </aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>A triage script that classifies kernel log lines by layer, builds an ordered timeline, marks the first abnormal event and the likely consequences, and computes the implied submission time of timed-out commands. It reads <code>dmesg</code> text (with <code>[seconds]</code> timestamps) or <code>journalctl -o short-monotonic</code> output from standard input, or uses an embedded synthetic log with <code>--selftest</code>. Standard library only.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="klog_triage.py"><code>#!/usr/bin/env python3
+"""Classify NVMe/PCIe kernel log lines and find the first abnormal event.
+
+  python3 klog_triage.py --selftest
+  sudo dmesg | python3 klog_triage.py
+  journalctl -k -o short-monotonic | python3 klog_triage.py
+"""
+import re
+import sys
+
+IO_TIMEOUT_S = 30.0   # nvme_core.io_timeout default; read yours from sysfs
+
+# (category, layer, is_cause_candidate, regex). Order matters: first match wins.
+RULES = [
+    ("iommu-fault",    "platform/IOMMU", True,  r"DMAR: \[DMA|AMD-Vi: Event logged|IO_PAGE_FAULT|smmu.*event"),
+    ("dpc",            "PCIe link",      True,  r"DPC: containment|DPC: .*error detected"),
+    ("surprise-down",  "PCIe link",      True,  r"\]\s*SDES|Surprise Down"),
+    ("link-down",      "PCIe link",      True,  r"pciehp: .*Link Down|Card not present"),
+    ("link-up",        "PCIe link",      False, r"pciehp: .*Link Up|Card present"),
+    ("aer-uncorr",     "PCIe",           True,  r"severity=Uncorrect|Uncorrected \((Non-)?Fatal\) error"),
+    ("aer-corr",       "PCIe",           True,  r"severity=Correctable|Correctable error message"),
+    ("aer-detail",     "PCIe",           False, r"error status/mask=|TLP Header:|\]\s+[A-Za-z]+\s+\(First\)|\[\s*\d+\]\s+\w+"),
+    ("nvme-ctrl-down", "NVMe controller",True,  r"controller is down|Device not ready|frozen state error"),
+    ("nvme-timeout",   "NVMe command",   True,  r"timeout, (aborting|reset controller)|I/O \d+ QID \d+ timeout"),
+    ("nvme-abort",     "NVMe command",   False, r"Abort status"),
+    ("nvme-reset",     "NVMe controller",False, r"default/read/poll queues|restart after slot reset"),
+    ("nvme-status",    "NVMe command",   True,  r"I/O Error \(sct|I/O Cmd\(0x"),
+    ("recovered",      "recovery",       False, r"recovery successful"),
+    ("io-error",       "consequence",    False, r"I/O error, dev|medium error|Buffer I/O error"),
+    ("fs-error",       "consequence",    False, r"EXT4-fs error|XFS \(.*\):.*error|BTRFS error"),
+    ("removed",        "consequence",    False, r"Removing after|capacity change from \d+ to 0"),
+]
+RULES = [(c, l, k, re.compile(r)) for c, l, k, r in RULES]
+TS = re.compile(r"^\s*\[\s*(\d+\.\d+)\]\s*(.*)$")
+TOUT = re.compile(r"(?:tag|I/O) (\d+).*?QID (\d+) timeout")
+
+SAMPLE = """\
+[ 7300.912001] pcieport 0000:00:01.1: AER: Correctable error message received from 0000:01:00.0
+[ 7300.912020] nvme 0000:01:00.0: PCIe Bus Error: severity=Correctable, type=Physical Layer, (Receiver ID)
+[ 7300.912024] nvme 0000:01:00.0:   device [10ab:c0de] error status/mask=00000001/0000e000
+[ 7300.912027] nvme 0000:01:00.0:    [ 0] RxErr                  (First)
+[ 7301.004410] pcieport 0000:00:01.1: DPC: containment event, status:0x1f01 source:0x0000
+[ 7301.004418] pcieport 0000:00:01.1: DPC: unmasked uncorrectable error detected
+[ 7301.004431] pcieport 0000:00:01.1: PCIe Bus Error: severity=Uncorrected (Fatal), type=Transaction Layer, (Receiver ID)
+[ 7301.004439] pcieport 0000:00:01.1:    [ 5] SDES                   (First)
+[ 7301.004511] nvme nvme0: frozen state error detected, reset controller
+[ 7301.452109] pcieport 0000:00:01.1: pciehp: Slot(1): Link Down
+[ 7301.903377] pcieport 0000:00:01.1: pciehp: Slot(1): Link Up
+[ 7302.118004] nvme nvme0: restart after slot reset
+[ 7302.402331] nvme nvme0: 32/0/0 default/read/poll queues
+[ 7302.410822] pcieport 0000:00:01.1: AER: device recovery successful
+[ 7302.412100] I/O error, dev nvme0n1, sector 18800640 op 0x1:(WRITE) flags 0x8800 phys_seg 1 prio class 0
+[ 7302.412377] XFS (nvme0n1p1): metadata I/O error in "xfs_buf_ioend" at daddr 0x11ee000 len 8 error 5
+[ 7340.118702] nvme nvme0: I/O tag 419 (01a3) opcode 0x2 (I/O Cmd) QID 2 timeout, aborting req_op:READ(0) size:131072
+[ 7340.118950] nvme nvme0: Abort status: 0x0
+"""
+
+
+def parse(lines):
+    events = []
+    for raw in lines:
+        m = TS.match(raw)
+        if not m:   # journalctl short-monotonic also uses [seconds]; others are skipped
+            continue
+        t, text = float(m.group(1)), m.group(2)
+        for cat, layer, cause, rx in RULES:
+            if rx.search(text):
+                events.append((t, cat, layer, cause, text))
+                break
+    return events
+
+
+def report(events):
+    if not events:
+        print("No NVMe/PCIe-related lines recognized.")
+        return
+    print(f"{'time(s)':&gt;12}  {'category':&lt;15} {'layer':&lt;16} message")
+    for t, cat, layer, cause, text in events:
+        mark = "*" if cause else " "
+        print(f"{t:12.6f} {mark}{cat:&lt;15} {layer:&lt;16} {text[:96]}")
+    first = next((e for e in events if e[3]), None)
+    if first:
+        print(f"\nFirst abnormal (cause-candidate) line: t={first[0]:.6f} [{first[1]}] {first[4][:100]}")
+    for t, cat, _, _, text in events:
+        m = TOUT.search(text)
+        if cat == "nvme-timeout" and m:
+            t0 = t - IO_TIMEOUT_S
+            print(f"Timeout tag {m.group(1)} QID {m.group(2)} at t={t:.3f}: submitted around "
+                  f"t={t0:.3f}. Look for causes in [{t0:.3f}, {t:.3f}].")
+            near = [e for e in events if t0 - 1 &lt;= e[0] &lt; t and e[3] and e[1] != "nvme-timeout"]
+            for e in near:
+                print(f"    candidate in window: t={e[0]:.6f} [{e[1]}]")
+            if not near:
+                print("    no cause candidate in the window: investigate separately")
+    cons = [e for e in events if e[2] == "consequence"]
+    if cons:
+        print(f"\n{len(cons)} consequence line(s) (I/O, filesystem, removal): "
+              "do not treat these as the root cause.")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) &gt; 1 and sys.argv[1] == "--selftest":
+        print("Synthetic example for teaching (embedded kernel log):\n")
+        report(parse(SAMPLE.splitlines()))
+    else:
+        report(parse(sys.stdin))</code></pre>
+  <p>Expected <code>--selftest</code> result: the first cause-candidate line is the correctable error at 7300.912001 (not the DPC line and not the XFS line); the timeout at 7340.12 is traced back to a submission around 7310.12, with no cause candidate in that window (so this later timeout is a separate event worth its own investigation: perhaps a command issued after recovery hit a different problem); two consequence lines are flagged. The rule list is deliberately simple; extend it with the exact strings of your kernel.</p>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <h4>Scenario</h4>
+  <p>A database host logs, over one minute (synthetic example for teaching):</p>
+  <pre class="code" data-kind="read-only" data-lang="text" data-title="Synthetic example for teaching: the incident log"><code>[20110.402871] nvme 0000:01:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x000e address=0x2000a3000 flags=0x0020]
+[20110.402913] nvme 0000:01:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x000e address=0x2000a3040 flags=0x0020]
+[20140.511020] nvme nvme0: I/O tag 77 (004d) opcode 0x2 (I/O Cmd) QID 5 timeout, aborting req_op:READ(0) size:16384
+[20140.511214] nvme nvme0: Abort status: 0x0
+[20170.622304] nvme nvme0: I/O tag 77 (004d) opcode 0x2 (I/O Cmd) QID 5 timeout, reset controller
+[20171.004112] nvme nvme0: 32/0/0 default/read/poll queues
+[20171.004530] I/O error, dev nvme0n1, sector 99112960 op 0x0:(READ) flags 0x80700 phys_seg 4 prio class 0</code></pre>
+  <h4>Step 1: order and classify</h4>
+  <p>Two IOMMU faults (platform layer, cause candidates), then a timeout 30.1 s later, an abort, a second timeout 30 s after that, a reset, and a consequence.</p>
+  <h4>Step 2: the 30-second shadow</h4>
+  <p>The first timeout at 20140.51 implies submission around 20110.51. The IOMMU faults at 20110.40 fall inside the window, about 0.1 s before. <span class="badge derived">Derived</span> Strong temporal correlation.</p>
+  <h4>Step 3: what the faults say</h4>
+  <p>The SSD tried a DMA (flags indicate the access type; decode with the AMD IOMMU specification) to IOVA 0x2_000A_3000 and 0x2_000A_3040, inside the data buffer region of the reference system (buffers start at 0x2_0000_0000). The command was a 16 KiB read, so the SSD was writing read data to host memory. The IOMMU refused because no valid mapping existed for that IOVA at that moment.</p>
+  <h4>Step 4: hypotheses</h4>
+  <ol>
+    <li>Host driver or upper layer unmapped the buffer early (a use-after-unmap bug), e.g. a previous command for the same buffer was completed/aborted and its mapping torn down while the device still had it.</li>
+    <li>The device used a stale or wrong PRP (a firmware bug: data for command A written with command B's addresses).</li>
+    <li>IOMMU mapping race in a passthrough or virtualization setup.</li>
+  </ol>
+  <h4>Step 5: evidence that discriminates</h4>
+  <p>Enable the NVMe tracepoints and capture the PRP1/PRP2 of each command (<code>nvme_setup_cmd</code> prints command dwords on many kernels; otherwise use bpftrace on the SQE). On the next occurrence, check whether the faulting IOVA belongs to the timed-out command's PRPs (hypothesis 1 or 3) or to a different, already-completed command (hypothesis 2). An analyzer capture would show the MWr TLP with the bad address and the SQE that supplied it.</p>
+  <h4>Conclusion</h4>
+  <p>The timeouts and reset are consequences; the first abnormal event is the IOMMU fault. Confidence that the fault is the trigger: high (timing, device, direction all match). Confidence about which side is wrong: low until the PRP correlation is done. A good bug report states exactly that.</p>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Starting from the bottom of the log</strong> (the I/O and filesystem errors) and opening the wrong bug.</li>
+    <li><strong>Ignoring the 30-second shadow</strong> of timeouts.</li>
+    <li><strong>Using <code>dmesg -T</code> across a suspend</strong> and misordering events against other logs.</li>
+    <li><strong>Filtering with <code>-l err</code></strong> and losing the info/warn-level AER and pciehp lines.</li>
+    <li><strong>Counting errors from the log</strong> instead of from <code>aer_dev_*</code> counters (rate limiting).</li>
+    <li><strong>Reading "Abort status: 0x0" as "the command was aborted successfully".</strong> It means the Abort command completed; check what happened next.</li>
+    <li><strong>Treating kernel hints</strong> ("faulty power saving mode?") as diagnoses.</li>
+    <li><strong>Attributing host-synthesized statuses to the device.</strong></li>
+    <li><strong>Clearing the ring buffer</strong> (<code>dmesg -C</code>) during an investigation.</li>
+    <li><strong>Disabling AER</strong> (<code>pci=noaer</code>) to "fix" log noise: it hides evidence and the underlying problem.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>A compact pattern library. Each row: symptom in the log, likely causes, the first and second checks, and the experiment that separates the causes.</p>
+  <table>
+    <caption>Kernel-log failure patterns</caption>
+    <thead><tr><th>Log symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th></tr></thead>
+    <tbody>
+      <tr><td>Steady correctable RxErr/BadTLP from the SSD</td><td>Marginal SI on downstream path, refclk, equalization</td><td><code>aer_dev_correctable</code> rate</td><td>Root port LnkSta2, current speed</td><td>Swap slot/drive; force lower speed in a lab and see if errors stop</td></tr>
+      <tr><td>CmpltTO from the SSD</td><td>Host memory latency, IOMMU block, short timeout range, RC issue</td><td>IOMMU faults at same time</td><td>DevCtl2 Completion Timeout range</td><td>Repeat with IOMMU passthrough in a lab; change timeout range (expert)</td></tr>
+      <tr><td>DPC + SDES, recovery successful</td><td>Link drop: device reset/crash, power, connector</td><td>Preceding correctable errors</td><td>Slot presence lines, SMART unsafe_shutdowns</td><td>Analyzer trigger on LTSSM exit from L0; power monitoring</td></tr>
+      <tr><td>CSTS=0xffffffff</td><td>Device unreachable</td><td>pciehp/DPC lines</td><td><code>lspci</code> of the device and root port</td><td>Reseat/power-cycle in a lab; check slot power</td></tr>
+      <tr><td>CSTS=0x3</td><td>Controller fatal (firmware)</td><td>Firmware revision, recent updates</td><td>Vendor telemetry log (caution)</td><td>Reproduce with the same workload; try previous firmware on a spare</td></tr>
+      <tr><td>Timeouts on one QID only</td><td>Stuck command, lost interrupt on that vector, CPU isolation</td><td><code>/proc/interrupts</code> for that queue's vector</td><td>Tracepoints for that QID</td><td>Move the workload's CPU; check MSI-X masking</td></tr>
+      <tr><td>Timeouts on all queues, CSTS normal</td><td>Firmware hang, APST/ASPM exit problem</td><td>Power state settings (APST, ASPM)</td><td>Timing relative to idle periods</td><td>Disable APST/ASPM in a lab (caution) and repeat</td></tr>
+      <tr><td>sct 0x2 / sc 0x81 errors</td><td>Media failure</td><td>smart-log media_errors</td><td>error-log LBAs</td><td>Read the LBA range again on a spare copy; replace drive</td></tr>
+      <tr><td>IOMMU faults from the SSD</td><td>Driver unmap race, device stale PRP, VM mapping</td><td>Fault address vs buffer regions</td><td>Tracepoint PRPs</td><td>Correlate faulting IOVA with command PRPs</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight" data-title="Separate cause, mechanism and consequence">
+    <p>Every incident log contains three kinds of lines: the cause (or the earliest symptom of it), the mechanism lines (recovery, resets, retries), and the consequence lines (I/O errors, filesystem complaints, application failures). Seniors annotate each line with one of these three words before they form a hypothesis.</p>
+  </aside>
+  <aside class="callout insight" data-title="Absence is data">
+    <p>No endpoint AER before a DPC event, no CQE before a timeout, no "Card not present" with a link down: what was <em>not</em> logged narrows the hypotheses as much as what was. Knowing which messages a healthy recovery prints (from a golden log) lets you see what is missing.</p>
+  </aside>
+  <aside class="callout insight" data-title="Know the platform's error policy">
+    <p>OS-native AER, firmware-first (GHES), DPC owned by the OS or by firmware (EDR), ASPM and APST policies, IOMMU mode: these change what appears in the log. The first thing a senior engineer records about an unfamiliar platform is its error-handling policy, because it defines what silence means.</p>
+  </aside>
+</section>
+
+<section id="lab">
+  <h2>Lab: building an incident timeline from kernel logs</h2>
+  <h4>Objective</h4>
+  <p>From a kernel log, produce an ordered, classified timeline, identify the first abnormal event, separate cause from consequence, and propose the next experiment, using your own system's logs, a synthetic incident, and a safe reset in an emulated environment.</p>
+  <h4>Skills</h4>
+  <p>dmesg/journalctl filtering and time handling; reading AER, DPC, pciehp, NVMe and IOMMU messages; correlation with tracepoints.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p>Steps 1–3: <span class="badge safe">Safe lab</span> (reading logs). Step 4 resets an emulated NVMe controller inside a QEMU guest: <span class="badge caution">Caution lab</span> procedure, zero risk to real hardware. Never run <code>nvme reset</code> against a real drive with mounted filesystems.</p></aside>
+  <h4>Hardware required</h4>
+  <p>Any Linux system; for step 4, a QEMU guest with an emulated NVMe controller (<a href="lab-environment.html">Lab Environment</a>).</p>
+  <h4>Software required</h4>
+  <p>systemd journal or dmesg, Python 3, <code>klog_triage.py</code>, nvme-cli and trace-cmd in the guest.</p>
+  <h4>Input</h4>
+  <p>Your system's kernel log; the synthetic incident in the worked example; the guest's log after step 4.</p>
+  <h4>Expected output</h4>
+  <p>Three timelines with every relevant line labelled cause / mechanism / consequence, the first abnormal event, and a one-paragraph conclusion with confidence.</p>
+  <h4>Background</h4>
+  <p>The patterns in this chapter; <a href="ch47.html">Chapter 47</a> on correlation.</p>
+  <h4>Step 1: your own baseline</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>journalctl -k -b 0 -o short-monotonic | grep -E 'pci .*01:00.0|nvme|bandwidth' &gt; golden.txt
+journalctl -k -b 0 -o short-monotonic | python3 klog_triage.py</code></pre>
+  <p>Record the enumeration, bandwidth and queue lines of a healthy boot. Note any correctable errors already present.</p>
+  <h4>Step 2: previous boots</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>journalctl --list-boots
+journalctl -k -b -1 -g 'nvme|AER|DPC|pciehp|DMAR|AMD-Vi' -o short-monotonic</code></pre>
+  <p>If this prints nothing for earlier boots, your journal is probably volatile: note it as a gap in your evidence chain.</p>
+  <h4>Step 3: the synthetic incident</h4>
+  <p>Save the worked example's log to a file, run <code>python3 klog_triage.py &lt; incident.txt</code>, and compare the script's view with your manual timeline.</p>
+  <h4>Step 4: a reset you caused (emulated controller)</h4>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code><span class="cm"># inside the QEMU guest, emulated NVMe only, nothing mounted from it</span>
+sudo trace-cmd record -e nvme -- sh -c 'sleep 1; nvme reset /dev/nvme0; sleep 2'
+sudo dmesg | tail -20
+trace-cmd report | grep -E 'qid=0' | head -40</code></pre>
+  <p>Observe which kernel lines a controller reset prints on your kernel, and the admin commands (Identify, Set Features Number of Queues, Create I/O CQ/SQ) the driver issues to bring the controller back, visible as qid=0 tracepoints.</p>
+  <h4>Observation</h4>
+  <p>For each timeline, mark the first abnormal event and the consequence lines. In step 4, note that no AER or link line appears: a controller reset is an NVMe-level event (CC.EN cleared and set), not a PCIe reset.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>In step 1, what link speed and width did the kernel report, and does it match <code>LnkSta</code>?</li>
+    <li>In step 3, why is the IOMMU fault, not the timeout, the first abnormal event?</li>
+    <li>In step 4, list the admin opcodes you saw after the reset and explain each.</li>
+    <li>What would be different in the log if the reset had been a PCIe Function Level Reset instead of an NVMe controller reset?</li>
+    <li>What evidence would you lose if the journal were volatile and the machine rebooted?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Extend <code>klog_triage.py</code> with a rule for your kernel's exact NVMe timeout string and a correlation that, for each timeout, prints matching tracepoint events (same QID and CID) from a <code>trace-cmd report</code> file.</p>
+  <details class="hint"><summary>Hints</summary><p>The CID in the timeout line is the hexadecimal value in parentheses; tracepoints print it in decimal as <code>cmdid=</code>. Convert before joining. Monotonic timestamps in both sources make the time window check straightforward.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>1: the bandwidth line names speed and width; it should equal <code>current_link_speed</code>/<code>width</code> unless the link retrained since boot. 2: by timing (inside the timeout's 30-second window, just after the submission) and by mechanism (a refused DMA explains a command that never completes), the fault precedes and explains the timeout; the timeout is the host noticing the absence. 3: typically Identify (06h, controller and namespaces), Set Features (09h, Number of Queues 07h and others such as Asynchronous Event Configuration), Create I/O Completion Queue (05h) and Create I/O Submission Queue (01h) for each queue pair, Asynchronous Event Request (0Ch); exact set and order depend on the kernel. 4: an FLR is a PCIe function reset: config space is reset and restored by the kernel, the PCI core may log the reset; the NVMe driver goes through a full re-probe-like path; AER is not necessarily involved either. 5: everything before the reboot, including the first abnormal event; only rasdaemon records, BMC logs or remote log collectors would remain.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>Whether the platform logs via native AER or GHES; whether DPC is present on the root port; the configured <code>io_timeout</code>; whether timestamps are monotonic; whether rate-limiting lines appear; and whether the golden log's queue count matches the post-reset count (a lower count after reset is a subtle sign of a degraded recovery).</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li><code>nvme reset</code> fails with "Resource busy" or similar: the device is in use or the kernel refuses; do not force it on a real drive.</li>
+    <li>No nvme events in trace-cmd: check that the <code>nvme</code> event group exists on your kernel.</li>
+    <li>The log contains GHES "Hardware Error" records instead of AER lines: the platform is firmware-first; decode the CPER records with the ACPI/UEFI definitions.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>In QEMU, hot-unplug the emulated NVMe device from the monitor (<code>device_del</code>) while a read loop runs in the guest, and compare the resulting log with Pattern 5. Emulated hot-unplug is a safe way to see removal and I/O-error consequences without touching hardware.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Decode <code>error status/mask=00000040/00002000</code> for a correctable error.</li>
+    <li>Decode <code>error status/mask=00100000/00000000</code> for an uncorrectable error. What would the TLP Header contain?</li>
+    <li>A timeout appears at 1234.5 s with io_timeout = 30. A pciehp Link Down appears at 1205.0 s. Is it a plausible cause? Why?</li>
+    <li>Which two values in a "controller is down" message distinguish "device unreachable" from "controller fatal"?</li>
+    <li>Write a <code>journalctl</code> command that shows only kernel messages from the previous boot between two wall-clock times, with monotonic timestamps.</li>
+    <li>List three reasons an error might never appear in the kernel log.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p>1: status bit 6 = Bad TLP; mask bit 13 = Advisory Non-Fatal masked. 2: bit 20 = Unsupported Request; the header log holds the header of the request that received UR (for example an MRd to an address no function claimed, or an MWr with a bad address), which you decode field by field. 3: plausible: the command was submitted around 1204.5 s, 0.5 s before the link went down, so it was in flight when the link dropped. 4: CSTS (0xFFFFFFFF vs 0x3 with CFS) and PCI_STATUS (0xFFFF vs a normal value). 5: <code>journalctl -k -b -1 --since "…" --until "…" -o short-monotonic</code>. 6: firmware-first handling not passed to the OS; error type masked; AER disabled (<code>pci=noaer</code>) or not supported; rate limiting; ring buffer overwritten; volatile journal lost on reboot; the device could not signal (link down) and the port had no reporting capability.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>Which timestamp is best for ordering kernel events within one boot?</p>
+      <ul class="options" data-answer="2"><li><code>dmesg -T</code> wall clock</li><li>Monotonic seconds since boot</li><li>The journal's receive time</li><li>The filesystem's mtime</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The monotonic clock is what the kernel stamps; wall-clock conversion can be wrong after suspend.</p></details>
+    </li>
+    <li>
+      <p>"pcieport 0000:00:01.1: AER: Correctable error message received from 0000:01:00.0" — which device detected the error?</p>
+      <ul class="options" data-answer="3"><li>The root port</li><li>The CPU</li><li>01:00.0, the SSD</li><li>The IOMMU</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The root port received the ERR_COR Message; the requester ID in the Message, 01:00.0, is the detecting function.</p></details>
+    </li>
+    <li>
+      <p>CSTS=0xffffffff, PCI_STATUS=0xffff most likely means:</p>
+      <ul class="options" data-answer="1"><li>The device is unreachable (link down, removed, powered off, in reset)</li><li>The controller set CFS</li><li>A shutdown completed</li><li>The admin queue is full</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Both a memory read and a config read returned all ones, the host-synthesized value for a failed read.</p></details>
+    </li>
+    <li>
+      <p>An NVMe timeout line appears at T. When was the command submitted, approximately, with default settings?</p>
+      <ul class="options" data-answer="4"><li>At T</li><li>T − 60 s</li><li>T − 1 s</li><li>T − 30 s</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>nvme_core.io_timeout defaults to 30 s for I/O; admin commands default to 60 s.</p></details>
+    </li>
+    <li>
+      <p>"nvme nvme0: Abort status: 0x0" followed by "timeout, reset controller" 30 s later means:</p>
+      <ul class="options" data-answer="2"><li>The command was aborted and then succeeded</li><li>The Abort command completed, but the original command still did not complete, so the driver escalated</li><li>The Abort failed</li><li>The controller reset itself</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Abort completion status 0 says the Abort command was processed; it does not guarantee the target command completed.</p></details>
+    </li>
+    <li>
+      <p>Which AER line shows that a link-level problem was detected on data flowing <em>to</em> the SSD?</p>
+      <details class="answer"><summary>Model answer</summary><p>A correctable or uncorrectable error from the SSD with "(Receiver ID)", e.g. RxErr or BadTLP reported by 01:00.0: the SSD was the receiver of the corrupted traffic.</p></details>
+    </li>
+    <li>
+      <p>An IOMMU fault line names the SSD and a DMA write. On the PCIe link, what did the SSD send?</p>
+      <ul class="options" data-answer="3"><li>A malformed TLP</li><li>An ERR_FATAL Message</li><li>A valid MWr TLP whose address the IOMMU refused to translate</li><li>Nothing</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The transaction was well-formed; the platform's address translation rejected it.</p></details>
+    </li>
+    <li>
+      <p>Why can the XFS and block I/O error lines be the most numerous yet least informative lines in an incident?</p>
+      <details class="answer"><summary>Model answer</summary><p>They are consequences: every in-flight or subsequent I/O that failed produces one, after the causal event. They identify impact, not cause.</p></details>
+    </li>
+    <li>
+      <p>Which source gives the true number of correctable errors since boot when the log shows "callbacks suppressed"?</p>
+      <ul class="options" data-answer="1"><li><code>aer_dev_correctable</code> in sysfs</li><li><code>dmesg | wc -l</code></li><li><code>nvme error-log</code></li><li><code>smart-log</code></li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The kernel counts every handled AER error in sysfs regardless of log rate limiting.</p></details>
+    </li>
+    <li>
+      <p>Describe the difference in the log between an NVMe controller reset and a DPC event.</p>
+      <details class="answer"><summary>Model answer</summary><p>A controller reset is NVMe-level (CC.EN toggled): NVMe driver lines (timeout/reset, queue recreation), no AER/DPC/pciehp lines. A DPC event is PCIe-level: pcieport DPC lines, AER details for the trigger, possible link down/up lines, the driver's error callbacks (frozen state, slot reset), then NVMe re-initialization.</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>(Beginner)</strong> How do you see kernel messages from before the last reboot?</p>
+      <details class="answer"><summary>Model answer</summary><p><code>journalctl -k -b -1</code>, if the journal is persistent; otherwise from a remote log collector, pstore, or a BMC log. dmesg only holds the current boot.</p></details></li>
+    <li><p><strong>(Beginner)</strong> What does "I/O error, dev nvme0n1, sector …" tell you?</p>
+      <details class="answer"><summary>Model answer</summary><p>That a block request to that namespace and sector failed. It is a consequence; find the NVMe or PCIe line that explains why.</p></details></li>
+    <li><p><strong>(Intermediate)</strong> Walk through the fields of an AER correctable error message.</p>
+      <details class="answer"><summary>Model answer</summary><p>Reporter (root port) and source BDF; severity; type (layer); which ID (Receiver/Requester/Completer) was logged; raw status and mask registers; decoded bits with "(First)" marking the first error pointer; for uncorrectable, the TLP header log.</p></details></li>
+    <li><p><strong>(Intermediate)</strong> A drive logs "controller is down; will reset: CSTS=0x3". What next?</p>
+      <details class="answer"><summary>Model answer</summary><p>CFS is set: the controller declared a fatal internal error while PCIe is fine. Capture firmware revision, SMART and error logs, vendor telemetry if possible (caution), the workload at the time, and check for known firmware issues; try to reproduce on a spare; test APST/ASPM hypotheses only as controlled experiments.</p></details></li>
+    <li><p><strong>(Advanced)</strong> How do you correlate a kernel NVMe timeout with an analyzer capture?</p>
+      <details class="answer"><summary>Model answer</summary><p>Take QID and CID from the log line; find the doorbell write and SQE fetch whose SQE has that CID on that queue in the analyzer, around T − io_timeout; check for data, CQE and MSI-X; align clocks using a marker (e.g. the Abort command, AER CfgWr, or a known admin command).</p></details></li>
+    <li><p><strong>(Advanced)</strong> Why might a platform show no AER lines at all even though the drive is clearly suffering link errors?</p>
+      <details class="answer"><summary>Model answer</summary><p>Firmware-first handling (errors go to firmware/BMC, maybe reported via GHES); AER disabled or not granted to the OS (_OSC); errors masked; the AER service not bound to the port; or errors only on a switch not covered by reporting.</p></details></li>
+    <li><p><strong>(Senior)</strong> A customer says "the filesystem corrupted itself". The log shows a DPC event 2 seconds before. How do you frame the investigation?</p>
+      <details class="answer"><summary>Model answer</summary><p>As a link-level containment event whose consequence was failed in-flight writes; the filesystem reacted correctly. Questions: why did the link drop (power, SI, firmware), was write data acknowledged before loss (volatile cache, flush semantics, power-loss protection), and did the recovery path behave correctly. Present a timeline with cause/mechanism/consequence and confidence per claim.</p></details></li>
+    <li><p><strong>(Senior)</strong> What do you change on a lab fleet so that the next incident leaves better evidence?</p>
+      <details class="answer"><summary>Model answer</summary><p>Persistent journals and remote logging; rasdaemon; golden boot logs per platform; continuous low-overhead counters (AER, SMART deltas); optional always-on BPF latency histograms; known error-handling policy per platform; and analyzer-ready slots for reproduction.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain why the teacher's "no answer" note in the diary was not the real problem.</li>
+    <li><strong>To a junior engineer:</strong> explain how to read an AER correctable error message and what to do about one.</li>
+    <li><strong>To a senior engineer:</strong> present the DPC incident timeline from the trace view in two minutes, with cause, mechanism, consequence and confidence.</li>
+  </ul>
+  <details class="answer"><summary>Model explanation for the junior engineer</summary><p>"The first line says the root port received a correctable error message from our SSD. The second gives severity and layer: Physical Layer, Receiver ID, so the SSD's receiver saw a bad symbol. The third is the raw status and mask, the fourth the decoded bit, RxErr. It was corrected, so no data was lost. One is not an incident; check the rate in aer_dev_correctable over time and under load, and compare with other slots. A rising rate or errors before a link drop make it an incident."</p></details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>dmesg and journalctl expose the kernel's testimony; monotonic timestamps order it; prefixes tell you which code and which device speak. AER lines report typed errors with the detecting function, the logged ID, status bits and header logs; DPC and pciehp lines report containment and link/presence changes; IOMMU lines report refused DMA with addresses; NVMe lines report timeouts, aborts, resets and CSTS values that distinguish unreachable from fatal controllers; block and filesystem lines report consequences. Build a timeline, look back across the timeout window, separate cause from mechanism from consequence, count with sysfs not with the log, and correlate with tracepoints and traces using QID/CID and time.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>retrieve kernel messages from this and previous boots with the right time base</li>
+      <li>name the code behind each message prefix</li>
+      <li>decode an AER message, including status/mask bits and the ID annotation</li>
+      <li>recognize timeout/abort/reset, DPC, link down/up, IOMMU fault and controller-fatal patterns</li>
+      <li>interpret CSTS and PCI_STATUS values in "controller is down" lines</li>
+      <li>find the first abnormal event and label consequences in a synthetic incident</li>
+      <li>join a kernel timeout line to tracepoints and to an analyzer trace by QID/CID and time</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Error Signaling and Logging; Advanced Error Reporting; Downstream Port Containment</cite>.</li>
+    <li><cite class="spec">NVM Express Base Specification 2.4 — Controller Status; Status Field and status code tables; Abort command</cite>.</li>
+    <li>Linux kernel documentation: the PCI Express AER driver guide (<code>Documentation/PCI/pcieaer-howto.rst</code>), PCI error recovery (<code>Documentation/PCI/pci-error-recovery.rst</code>), and the kernel parameters list (<code>Documentation/admin-guide/kernel-parameters.txt</code>) for <code>nvme_core.*</code>, <code>pcie_aspm</code>, <code>pci=</code>.</li>
+    <li>Manual pages: <code>dmesg(1)</code>, <code>journalctl(1)</code>, <code>journald.conf(5)</code>, <code>ras-mc-ctl(8)</code>.</li>
+    <li>Intel Virtualization Technology for Directed I/O and AMD I/O Virtualization Technology specifications, for IOMMU fault decoding.</li>
+  </ul>
+  <p>Next: <a href="labs-programming.html">Programming Labs</a> turns the reading skills of Chapters 69–71 into tools you build yourself. Set up your practice environment first with <a href="lab-environment.html">Lab Environment</a>.</p>
+</section>
