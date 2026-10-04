@@ -1,0 +1,627 @@
+<p class="lead">This module treats NVMe over TCP (NVMe/TCP) as a set of state machines on one byte stream. It covers how a receiver frames Protocol Data Units (PDUs) and when it must give up, how Ready to Transfer (R2T) pacing limits write throughput, why one TCP connection per queue creates head-of-line blocking, how digests split errors into "this command" and "this connection", and what changes once Transport Layer Security (TLS) hides every byte. The traces are new: interleaved reads, R2T starvation, a header digest failure with reconnect, and an encrypted capture you have to reason about without seeing a single PDU.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p><a href="ch66.html">Chapter 66</a> decoded every PDU type byte by byte, walked through reads, writes, digests and TLS 1.3, and built a stream parser. <a href="ch65.html">Chapter 65</a> placed NVMe/TCP inside NVMe over Fabrics (NVMe-oF): capsules, Connect, discovery and associations. This module assumes both. It adds the receiver's view (what a correct implementation must check, in what order), the performance view (what bounds a command's latency and a connection's throughput), and the operations view (how to debug when captures are incomplete or encrypted).</p>
+  <aside class="callout prereq"><p>Read <a href="ch66.html">NVMe/TCP</a> and <a href="ch65.html">NVMe over Fabrics</a> first. Also useful: <a href="ch33.html">I/O Commands</a> and <a href="ch38.html">Latency</a>. Related modules: <a href="dd49.html">NVMe Boot</a> (fabric boot and NBFT), <a href="performance.html">Performance Engineering</a>.</p></aside>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives by level</caption>
+    <thead><tr><th>Level</th><th>Objective</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Explain why a byte stream needs PDU framing, and name the three PDUs of a read and the four kinds in a large write.</td></tr>
+      <tr><td>Intermediate</td><td>Compute PLEN, PDO and padding for any PDU with digests and alignment, and check a stream for R2T/H2CData rule violations.</td></tr>
+      <tr><td>Advanced</td><td>Model write throughput as a function of MAXR2T, R2T length and round-trip time; quantify head-of-line blocking and TCP loss impact.</td></tr>
+      <tr><td>Senior</td><td>Choose connection counts, digest and TLS policy, and observability for a production NVMe/TCP deployment.</td></tr>
+      <tr><td>Trace analysis</td><td>Reassemble PDUs across segments, separate interleaved commands by CCCID, and find the first abnormal PDU or gap.</td></tr>
+      <tr><td>Debugging</td><td>Classify faults as network, transport framing, target resource, or NVMe command, using digests, TermReqs and timing.</td></tr>
+      <tr><td>Validation</td><td>Test negotiation corners (HPDA, CPDA, MAXR2T, MAXH2CDATA), digest errors, malformed PDUs, loss and reconnect.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>Imagine a long paper tape coming out of a ticker machine, with no gaps between messages. Every message starts with a small stamp: "message kind, how long the stamp is, where the words begin, total length." The reader cuts the tape after exactly that many letters, then reads the next stamp.</p>
+    <p>If one stamp gets smudged, the reader can no longer find where the next message starts — everything after is gibberish. So the reader stops the tape and asks for a fresh roll. But if only the words inside a message are smudged, the reader can still find the next stamp and just asks for that one message again.</p>
+    <p>When the writer wants to send a big parcel of words, the reader first says "I have space for this much, send it now." The writer waits for that note before sending. And because there is only one tape, a very long message holds up all the short ones behind it.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <table>
+    <caption>What the ticker tape represents, hides and gets wrong</caption>
+    <thead><tr><th>Story element</th><th>Represents</th><th>Hides</th><th>Misleads when</th></tr></thead>
+    <tbody>
+      <tr><td>One tape</td><td>One TCP connection (one per NVMe queue)</td><td>A host uses many connections (admin plus I/O queues)</td><td>You think head-of-line blocking affects every queue</td></tr>
+      <tr><td>Stamp</td><td>Common header + PDU-specific header</td><td>Lengths are fixed per type (HLEN), so readers can validate early</td><td>You imagine stamps vary freely</td></tr>
+      <tr><td>Smudged stamp → new roll</td><td>Header digest error → TermReq, close, reconnect</td><td>All commands on that connection must be recovered</td><td>You think only one command is lost</td></tr>
+      <tr><td>Smudged words → resend one</td><td>Data digest error → that command fails with a transport error status</td><td>The host's retry policy decides what happens next</td><td>You think the transport retransmits it automatically (TCP already did; the bytes arrived wrong)</td></tr>
+      <tr><td>"Send it now" note</td><td>R2T</td><td>Only writes need it; reads are pushed</td><td>You add a note for reads</td></tr>
+      <tr><td>Long message holds up short ones</td><td>Head-of-line blocking</td><td>Targets may interleave PDUs of different commands</td><td>You think a big command always blocks completely</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout breaks"><p>The tape is reliable and ordered because TCP makes it so; NVMe/TCP adds no retransmission of its own. The analogy hides that TCP loss recovery happens below the PDU layer and shows up only as delay.</p></aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Terms used in this module</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="pdu">PDU</span></td><td>One stamped message</td><td>Common header (8 bytes) + PDU-specific header + optional header digest, padding, data, data digest</td><td>PLEN gives total length on the stream</td><td>Not a TCP segment; PDUs and segments are independent</td></tr>
+      <tr><td><span class="g" data-term="maxr2t">MAXR2T</span></td><td>How many "send now" notes at once</td><td>ICReq field: maximum outstanding R2Ts per command the host supports, 0's based</td><td>Bounds write pipelining per command</td><td>Per command, not per connection</td></tr>
+      <tr><td>MAXH2CDATA</td><td>Largest parcel per message</td><td>ICResp field: maximum data bytes in one H2CData PDU</td><td>Host splits R2T ranges by it</td><td>Not the R2T length</td></tr>
+      <tr><td><span class="g" data-term="hpda">HPDA</span> / <span class="g" data-term="cpda">CPDA</span></td><td>Where words must start</td><td>Host / Controller PDU Data Alignment, 4-byte units, 0's based; the sender pads before data</td><td>Affects PDO</td><td>HPDA applies to data the controller sends; CPDA to data the host sends</td></tr>
+      <tr><td><span class="g" data-term="r2t">R2T</span></td><td>"Send this range now"</td><td>CCCID, TTAG, R2TO, R2TL</td><td>Answered by H2CData echoing TTAG</td><td>Not used for reads or in-capsule writes</td></tr>
+      <tr><td><span class="g" data-term="h2ctermreq">H2CTermReq</span></td><td>"Stop the tape"</td><td>Host-sent termination PDU carrying a Fatal Error Status (FES) and the offending header</td><td>Followed by connection close</td><td>Not an NVMe command status</td></tr>
+      <tr><td><span class="g" data-term="hol-blocking">Head-of-line blocking</span></td><td>Short messages stuck behind a long one</td><td>In-order delivery on one connection makes later bytes wait for earlier ones (transmission and loss recovery)</td><td>Mitigated by PDU interleaving and more connections</td><td>Not caused by NVMe ordering (NVMe commands are unordered)</td></tr>
+      <tr><td><span class="g" data-term="psk">PSK</span></td><td>Shared secret</td><td>Pre-shared key used by NVMe/TCP TLS 1.3 (configured, or generated after authentication)</td><td>Handled on Linux by tlshd and the kernel keyring</td><td>Not a certificate</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <figure>
+    <pre class="diagram">
+ HOST 192.0.2.10                                                  TARGET 192.0.2.20:4420
+ +---------------------------------+                              +-------------------------------------+
+ | blk-mq: per-CPU hw queues       |                              | nvmet-tcp: per-queue socket worker  |
+ | nvme-tcp: per-queue socket      |   one TCP connection / queue |  RX: frame PDUs, check digests      |
+ |  TX: CapsuleCmd, H2CData        |&lt;============================&gt;|  R2T allocator (buffer pool)        |
+ |  RX: frame PDUs, check digests, |  (optionally inside TLS 1.3) |  TX: C2HData (interleaved), R2T,    |
+ |      match CCCID, track R2Ts    |                              |      CapsuleResp                    |
+ | kTLS / tlshd (if TLS)           |                              | backing: Lab SSD 01:00.0 over PCIe  |
+ +---------------------------------+                              +-------------------------------------+</pre>
+    <figcaption>Per-queue state on both ends. The target-side PCIe view follows <a href="ch65.html#trace">Chapter 65</a>.</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture inventory</caption>
+    <thead><tr><th>Category</th><th>Items</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>Block requests; negotiated parameters (PFV, HPDA, CPDA, digests, MAXR2T, MAXH2CDATA, in-capsule size); TLS keys</td></tr>
+      <tr><td>Outputs</td><td>Completed requests; transport error statuses; TermReqs and reconnects; statistics</td></tr>
+      <tr><td>Actors</td><td>Host blk-mq and nvme-tcp; kernel TCP; kTLS/tlshd; NICs (with offloads); target nvmet-tcp; target backing device</td></tr>
+      <tr><td>State</td><td>Per connection: receive state (in header / in data / in digest), bytes remaining, current PDU; per command: CCCID, data received, R2Ts outstanding, TTAGs; per queue: SQ head (if flow control is on)</td></tr>
+      <tr><td>Memory</td><td>Host request buffers (data placed by offset), socket buffers, target R2T buffers</td></tr>
+      <tr><td>Registers</td><td>None on the wire; the fabric controller's properties are accessed with Property Get/Set capsules</td></tr>
+      <tr><td>Interfaces</td><td>TCP sockets; NVMe/TCP PDUs; capsules (SQE/CQE); TLS records</td></tr>
+      <tr><td>Dependencies</td><td>IP routing and MTU consistency; CPU for digests and TLS; target buffer pool; keep-alive timers</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The receiver state machine</h3>
+  <figure>
+    <pre class="diagram">
+   +--------------+  8 bytes   +---------------+ HLEN-8 (+4 if HDGSTF) +----------------+
+   | WAIT_CH      |-----------&gt;| WAIT_PSH      |----------------------&gt;| VALIDATE       |
+   +--------------+            +---------------+                       | type/HLEN/PDO/ |
+          ^                                                            | PLEN/HDGST     |
+          |                                                            +-------+--------+
+          |  PLEN consumed                       bad header / digest ---------&gt;| TermReq, close
+          |                                                                    v
+   +--------------+  data + DDGST   +---------------+  skip pad to PDO  +----------------+
+   | DISPATCH     |&lt;----------------| WAIT_DATA     |&lt;------------------| WAIT_PAD       |
+   | CQE/R2T/data |  DDGST bad: fail command, stay in sync                +----------------+
+   +--------------+</pre>
+    <figcaption>A receiver's state machine. Header problems are fatal because framing is lost; data digest problems are not.</figcaption>
+  </figure>
+  <table>
+    <caption>Length arithmetic for C2HData (HLEN 24)</caption>
+    <thead><tr><th>Configuration</th><th>PDO</th><th>PLEN for 32 KiB data</th></tr></thead>
+    <tbody>
+      <tr><td>No digests, HPDA 0</td><td>24</td><td>24 + 32,768 = 32,792</td></tr>
+      <tr><td>HDGST + DDGST, HPDA 0</td><td>28</td><td>28 + 32,768 + 4 = 32,800</td></tr>
+      <tr><td>HDGST + DDGST, HPDA 15 (64-byte alignment)</td><td>64 (36 bytes padding)</td><td>64 + 32,768 + 4 = 32,836</td></tr>
+    </tbody>
+  </table>
+  <p>Flag bits as defined in Linux <code>nvme-tcp.h</code>: 01h HDGSTF, 02h DDGSTF, 04h LAST_PDU, 08h SUCCESS. <span class="badge uncertain">Confirm in TCP Transport 1.3</span></p>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>A 1 MiB write on I/O queue 3, with no in-capsule data, MAXR2T = 0 (one R2T at a time), R2TL 128 KiB and MAXH2CDATA 128 KiB.</p>
+  <table>
+    <caption>Step by step</caption>
+    <thead><tr><th>#</th><th>Who acts</th><th>What changes</th><th>Where</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Host nvme-tcp</td><td>Allocates CID 0x0021; builds SQE Write, SGL Transport Data Block (5Ah), length 1 MiB</td><td>Host memory</td><td>CapsuleCmd PDU</td></tr>
+      <tr><td>2</td><td>Host TCP</td><td>Sends 76-byte PDU (72 + HDGST)</td><td>Network</td><td>Frame 142 bytes</td></tr>
+      <tr><td>3</td><td>Target</td><td>Parses capsule; allocates a 128 KiB buffer; issues R2T TTAG 1, R2TO 0</td><td>Target memory</td><td>R2T PDU; gap from step 2</td></tr>
+      <tr><td>4</td><td>Host</td><td>Sends H2CData [0, 128 KiB) with LAST_PDU</td><td>Network</td><td>H2CData PDU(s)</td></tr>
+      <tr><td>5</td><td>Target</td><td>Writes buffer to backing device or keeps it; issues next R2T</td><td>Target</td><td>Next R2T; gap</td></tr>
+      <tr><td>6</td><td>Both</td><td>Repeat for 8 ranges</td><td>Network</td><td>8 R2T / H2CData pairs</td></tr>
+      <tr><td>7</td><td>Target</td><td>Backing write completes; sends CapsuleResp CID 0x0021</td><td>Network</td><td>CapsuleResp</td></tr>
+      <tr><td>8</td><td>Host</td><td>Completes request; frees CID</td><td>Host</td><td>Block layer completion</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <ol class="seq" data-actors="Host|Network|Target|Lab SSD">
+      <li data-from="Host" data-to="Target">CapsuleCmd Write 1 MiB, CID 0x21</li>
+      <li data-note="Target">allocate 128 KiB</li>
+      <li data-from="Target" data-to="Host" class="dashed">R2T TTAG 1 [0, 128 KiB)</li>
+      <li data-from="Host" data-to="Target">H2CData TTAG 1, LAST_PDU</li>
+      <li data-from="Target" data-to="Host" class="dashed">R2T TTAG 2 [128, 256 KiB)</li>
+      <li data-from="Host" data-to="Target">H2CData TTAG 2 … (8 rounds)</li>
+      <li data-from="Target" data-to="Lab SSD">NVMe Write over PCIe</li>
+      <li data-from="Lab SSD" data-to="Target" class="dashed">CQE</li>
+      <li data-from="Target" data-to="Host" class="dashed">CapsuleResp CID 0x21</li>
+    </ol>
+    <figcaption>R2T-paced write with one outstanding R2T. Synthetic example for teaching.</figcaption>
+  </figure>
+
+  <h3>The central concept on the ladder: framing and pacing on one stream</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Messages on a tape are cut by their stamps; big parcels wait for a "send now" note; one long message delays the rest.</p></div>
+    <div class="rung" data-rung="B"><p>Each queue is a TCP stream of self-describing PDUs. Reads are pushed, writes are pulled by R2T. Header errors kill the stream; data errors kill one command.</p></div>
+    <div class="rung" data-rung="C"><p>Socket workers on both ends; CPU (or NIC offload) for CRC32C and TLS; target buffer pools for R2T; NIC segmentation and receive offloads.</p></div>
+    <div class="rung" data-rung="D"><p>TCP Transport 1.3 (PDUs, ICReq/ICResp, digests, R2T rules, TermReq, TLS use); Base 2.4 (capsules, transport error status, Connect); RFC 8446 (TLS 1.3); TCP RFCs.</p></div>
+    <div class="rung" data-rung="E"><p>ICReq/ICResp → Connect → Capsules. Read: CapsuleCmd → C2HData… → CapsuleResp (or SUCCESS). Write: CapsuleCmd → (R2T → H2CData…)… → CapsuleResp.</p></div>
+    <div class="rung" data-rung="F"><p>Wireshark NVMe/TCP dissector with reassembly: per-PDU type, CCCID, DATAO/DATAL, R2T fields; TCP retransmissions and window; with TLS, only record sizes and times.</p></div>
+    <div class="rung" data-rung="G"><p>Find the first PDU or gap that deviates; decide layer (TCP, framing, R2T pacing, target backing, NVMe status); then check whether other queues show it.</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for the header digest</h3>
+  <table>
+    <caption>Sixteen questions</caption>
+    <tbody>
+      <tr><td>1–3. What, why, problem</td><td>A CRC32C over a PDU's header (common + specific) that protects framing against corruption TCP's 16-bit checksum and offloads may miss.</td></tr>
+      <tr><td>4–5. Before, better</td><td>iSCSI also had optional header digests; without them, a corrupted length silently misframes the stream. With them, the receiver detects and terminates cleanly.</td></tr>
+      <tr><td>6–8. Creator, consumer, location</td><td>Sender computes, receiver checks; 4 bytes right after the header, not counted in HLEN.</td></tr>
+      <tr><td>9. Memory/registers</td><td>Socket buffers; NIC offload engines if CRC32C offload exists.</td></tr>
+      <tr><td>10–11. Before, after</td><td>Negotiated in ICReq/ICResp; checked on every PDU thereafter.</td></tr>
+      <tr><td>12. If wrong</td><td>TermReq with a header-digest FES, close; all commands on that queue are retried after reconnect.</td></tr>
+      <tr><td>13–14. Analyzer, Linux</td><td>Wireshark can validate digests when enabled; Linux logs a header digest error and reconnects the controller.</td></tr>
+      <tr><td>15. Validation</td><td>Inject corruption in each header field of each PDU type; verify TermReq, close, and recovery without data corruption.</td></tr>
+      <tr><td>16. Senior suspicion</td><td>A NIC or middlebox that corrupts at segment boundaries; memory errors on one host.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <p>Applicable: <cite class="spec">NVM Express TCP Transport Specification, Revision 1.3</cite>; <cite class="spec">NVM Express Base Specification, Revision 2.4</cite> (capsules, Connect, transport error status, authentication); <cite class="spec">RFC 8446 (TLS 1.3)</cite>; TCP specifications (RFC 9293 and loss-recovery RFCs).</p>
+  <table>
+    <caption>Behaviour by category</caption>
+    <thead><tr><th>Category</th><th>Examples</th></tr></thead>
+    <tbody>
+      <tr><td><span class="badge normative">Normative</span></td><td>PDU formats, HLEN per type, digest placement, R2T and H2CData rules, MAXR2T and MAXH2CDATA limits, TermReq on fatal errors, TLS 1.3 when TLS is used</td></tr>
+      <tr><td><span class="badge informative">Informative</span></td><td>Example flows, implementation notes</td></tr>
+      <tr><td><span class="badge optional">Optional</span></td><td>Digests; TLS; in-capsule data beyond the minimum; SUCCESS flag use; authentication; generated PSKs</td></tr>
+      <tr><td><span class="badge impl">Implementation-dependent</span></td><td>R2T length and timing, PDU sizes for C2HData, interleaving policy, connection counts, offloads, retry policy after transport errors</td></tr>
+      <tr><td><span class="badge version">Version-dependent</span></td><td>TLS details and secure channel concatenation (later revisions); kernel support for tlshd and generated PSKs</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout verified"><p>Consistent with <a href="ch66.html">Chapter 66</a>: PDU types 00h–07h and 09h; HLEN 128 (ICReq/ICResp), 24 (TermReq, CapsuleResp, data PDUs, R2T), 72 (CapsuleCmd); digests are CRC32C; ports 4420 and 8009; TLS 1.3 with PSKs. TLS record overhead from RFC 8446: 5-byte record header, 1-byte inner content type and a 16-byte tag for the AEAD ciphers used with TLS 1.3, at most 2<sup>14</sup> plaintext bytes per record.</p></aside>
+  <aside class="callout notsaid"><p>This module names FES values (Invalid PDU Header Field, PDU Sequence Error, Header Digest Error, Data Transfer Out of Range, Data Transfer Limit Exceeded, Unsupported Parameter) but does not give their numbers; read them from the TermReq figures. It does not state the exact conditions for using the SUCCESS flag (they involve SQ flow control). The specification does not say how large C2HData PDUs should be, how a target should schedule R2Ts across commands, or how many connections a host should open.</p></aside>
+  <aside class="callout warn"><p>Never assume: that PDU boundaries align with segments; that a CapsuleResp always follows C2HData; that MAXR2T > 0; that a capture with TLS can be decoded later; that TCP retransmission hides corruption (it hides loss, not corruption the checksum missed).</p></aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Participation and observability</caption>
+    <thead><tr><th>Hardware</th><th>Must / may</th><th>Observable?</th></tr></thead>
+    <tbody>
+      <tr><td>Host and target CPUs</td><td>Must (protocol, digests, TLS unless offloaded)</td><td>CPU profiles, softirq time</td></tr>
+      <tr><td>NICs with segmentation/receive offloads (TSO/GRO)</td><td>May</td><td>Capture on host shows large "super-segments"; wire capture shows real segments</td></tr>
+      <tr><td>NIC TLS or CRC offload</td><td>May</td><td>ethtool features and statistics</td></tr>
+      <tr><td>Switches</td><td>Must</td><td>Port counters, mirror captures</td></tr>
+      <tr><td>Target backing SSD</td><td>Must (some form)</td><td>Target-side PCIe trace, iostat</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw"><p>Where you capture changes what you see. A host-side tcpdump sees segments before TSO splits them (one 64 KiB "frame") and after GRO merges them. A switch mirror sees the wire. When a capture shows impossible frame sizes, it was taken above the offload.</p></aside>
+  <p>Internal and unobservable: target buffer pool occupancy (only inferred from R2T gaps), NIC queue selection, and digest computation location unless the driver reports it.</p>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>Receiver checks in order</caption>
+    <thead><tr><th>Check</th><th>Failure</th><th>Outcome</th></tr></thead>
+    <tbody>
+      <tr><td>PDU type known and legal for direction/state</td><td>Unknown type, ICReq after initialisation</td><td>Fatal (PDU sequence or invalid header field)</td></tr>
+      <tr><td>HLEN equals the type's fixed value</td><td>Mismatch</td><td>Fatal</td></tr>
+      <tr><td>Header digest (if negotiated)</td><td>Mismatch</td><td>Fatal</td></tr>
+      <tr><td>PDO and PLEN consistent with flags, alignment, data length</td><td>Inconsistent</td><td>Fatal</td></tr>
+      <tr><td>CCCID refers to an outstanding command; TTAG to an open R2T</td><td>Unknown</td><td>Fatal</td></tr>
+      <tr><td>Data range within command length and R2T range; ≤ MAXH2CDATA</td><td>Out of range / limit</td><td>Fatal</td></tr>
+      <tr><td>Data digest</td><td>Mismatch</td><td>Command fails with a transport error status; connection survives</td></tr>
+      <tr><td>NVMe status in CQE</td><td>Error status</td><td>Normal NVMe error handling</td></tr>
+    </tbody>
+  </table>
+  <p>Ordering: within a connection, PDUs arrive in send order. Across commands, the target may interleave C2HData PDUs of different CCCIDs; within one command, DATAO increases. Completion: CapsuleResp, or the last C2HData with SUCCESS where permitted. Recovery after a fatal error: close, reconnect the queue (ICReq, Connect with the same QID and CNTLID), and resubmit commands that did not complete.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic examples for teaching. Host 192.0.2.10, target 192.0.2.20:4420, I/O queue 3, header and data digests on, HPDA 0, MTU 9000. Rows show reassembled PDUs (Wireshark "NVMe/TCP" rows); frame lengths for single-segment PDUs are PDU + 66.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace A — normal: two 64 KiB reads with interleaved C2HData">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Tgt</td><td>0.0</td><td>CapsuleCmd (frame 142)</td><td>FLAGS 01h HLEN 72 PDO 0 PLEN 76; CID 0x0011 Read SLBA 0x1000 NLB 127; SGL 5Ah len 65536</td><td>Read A</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Tgt</td><td>1.2</td><td>CapsuleCmd (frame 142)</td><td>CID 0x0012 Read SLBA 0x9000 NLB 127</td><td>Read B</td></tr>
+        <tr class="dir-up"><td>3</td><td>Tgt→Host</td><td>88.4</td><td>C2HData</td><td>FLAGS 03h PDO 28 PLEN 32800; CCCID 0x0011 DATAO 0 DATAL 32768</td><td>A, first half</td></tr>
+        <tr class="dir-up"><td>4</td><td>Tgt→Host</td><td>99.1</td><td>C2HData</td><td>FLAGS 03h; CCCID 0x0012 DATAO 0 DATAL 32768</td><td>B, first half (interleaved)</td></tr>
+        <tr class="dir-up"><td>5</td><td>Tgt→Host</td><td>109.6</td><td>C2HData</td><td>FLAGS 07h (LAST_PDU); CCCID 0x0011 DATAO 32768 DATAL 32768</td><td>A complete</td></tr>
+        <tr class="dir-up"><td>6</td><td>Tgt→Host</td><td>110.0</td><td>CapsuleResp (frame 94)</td><td>FLAGS 01h PLEN 28; CID 0x0011 Status 0</td><td>A done: 110 µs</td></tr>
+        <tr class="dir-up"><td>7</td><td>Tgt→Host</td><td>120.5</td><td>C2HData</td><td>FLAGS 07h; CCCID 0x0012 DATAO 32768 DATAL 32768</td><td>B complete</td></tr>
+        <tr class="dir-up"><td>8</td><td>Tgt→Host</td><td>120.9</td><td>CapsuleResp</td><td>CID 0x0012 Status 0</td><td>B done: 120 µs</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Each C2HData PDU is 32,800 bytes: 24 header + 4 HDGST + 32,768 data + 4 DDGST, spanning four 8,948-byte segments at MTU 9000 (header 66 bytes per frame). At 25 Gb/s a 32 KiB PDU takes ≈ 10.5 µs to serialise, matching the spacing of rows 3–5 and 7. The target interleaved the two commands, so neither waited for the other's full 64 KiB. CapsuleResp carries FLAGS 01h only: no data, so no data digest. The SUCCESS flag was not used here. Time from capsule to first data (88 µs) is target-side: backing read on the Lab SSD.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace B — slow: 1 MiB write starved of R2Ts">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Tgt</td><td>0</td><td>CapsuleCmd</td><td>CID 0x0021 Write NLB 2047 (1 MiB); SGL 5Ah</td><td>No in-capsule data</td></tr>
+        <tr class="dir-up"><td>2</td><td>Tgt→Host</td><td>48</td><td>R2T</td><td>PLEN 28; CCCID 0x0021 TTAG 1 R2TO 0 R2TL 131072</td><td>First range</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Tgt</td><td>49 – 91</td><td>H2CData</td><td>FLAGS 07h; TTAG 1 DATAO 0 DATAL 131072 PLEN 131104</td><td>Range 1 sent</td></tr>
+        <tr class="dir-up"><td>4</td><td>Tgt→Host</td><td>142</td><td>R2T</td><td>TTAG 2 R2TO 131072</td><td>Range 2</td></tr>
+        <tr class="note"><td colspan="6">Ranges 2–4 repeat at ≈ 95 µs intervals.</td></tr>
+        <tr class="dir-up"><td>5</td><td>Tgt→Host</td><td>427</td><td>R2T</td><td>TTAG 5 R2TO 524288</td><td>Range 5</td></tr>
+        <tr class="abnormal"><td>6</td><td>Tgt→Host</td><td>2,611</td><td>R2T</td><td>TTAG 6 R2TO 655360</td><td><strong>First abnormal event:</strong> 2.1 ms gap before range 6</td></tr>
+        <tr class="note"><td colspan="6">Ranges 6–8 at ≈ 95 µs again.</td></tr>
+        <tr class="dir-up"><td>7</td><td>Tgt→Host</td><td>3,080</td><td>CapsuleResp</td><td>CID 0x0021 Status 0</td><td>Done after 3.08 ms (≈ 1.0 ms expected)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The host replied instantly to every R2T (H2CData follows within 1 µs), and TCP shows no retransmissions, so the delay is the target holding back R2T 6. With one outstanding R2T per command, every round costs a round trip plus target buffer allocation; the advanced lab's model gives ≈ 1.0 ms for this write. The 2.1 ms gap is buffer-pool pressure on the target: other connections' writes hold the pool, or the backing device is slow to drain it. Confirm with target-side statistics or tracing at the gap time. Remedies: larger target pool, more in-flight R2Ts per command (if the host's MAXR2T allows), or in-capsule data for small writes. Linux hosts have historically advertised MAXR2T 0 in ICReq; check your kernel.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace C — failed: header digest error, termination and reconnect">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ms)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Tgt</td><td>0.000</td><td>CapsuleCmd</td><td>CIDs 0x0030–0x0037: eight 16 KiB reads</td><td>Queue 3 busy</td></tr>
+        <tr class="dir-up"><td>2</td><td>Tgt→Host</td><td>0.081</td><td>C2HData</td><td>CCCID 0x0030 FLAGS 07h, PLEN 16416</td><td>OK</td></tr>
+        <tr class="abnormal"><td>3</td><td>Tgt→Host</td><td>0.087</td><td>C2HData</td><td>CCCID 0x0031; HDGST in frame ≠ CRC32C of header bytes (Wireshark: "bad digest")</td><td><strong>First abnormal event:</strong> corrupted PDU header</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Tgt</td><td>0.088</td><td>H2CTermReq</td><td>PLEN 24 + copy of the offending header; FES: Header Digest Error</td><td>Host terminates the connection</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Tgt</td><td>0.089</td><td>TCP FIN</td><td></td><td>Close</td></tr>
+        <tr class="note"><td colspan="6">dmesg: nvme-tcp header digest error; controller reset/reconnect scheduled. Six commands (0x0032–0x0037) were also outstanding.</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Tgt</td><td>2.410</td><td>TCP SYN → ICReq (frame 194)</td><td>HPDA 0, digests requested, MAXR2T 0</td><td>New connection for queue 3 (after the controller-level reconnect)</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Tgt</td><td>2.520</td><td>CapsuleCmd (frame 1170)</td><td>Fabrics Connect QID 3, CNTLID 1; PLEN 1104</td><td>Re-associate queue</td></tr>
+        <tr class="dir-down"><td>8</td><td>Host→Tgt</td><td>2.640</td><td>CapsuleCmd</td><td>CIDs re-issued for the seven failed reads</td><td>Retry by block layer</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The host cannot trust anything after row 3: PLEN might be wrong, so the next PDU's start is unknown. Terminating is the only safe action. Every command on that queue — including those whose data was fine — fails at the transport layer and is retried, which is why one flipped bit costs about 2.6 ms and seven retries. The Connect PDU is 1104 bytes rather than Chapter 65's 1096 because this connection negotiated both digests: 4 bytes of header digest after the 72-byte header and 4 bytes of data digest after the 1024 bytes of in-capsule data. Questions to answer next: is corruption repeating (count per host, NIC, switch port); does it appear only on the receive side of one host (NIC/memory) or on traffic through one switch? Without digests this corruption would have misframed the stream or, worse for data digests, delivered bad data silently.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace D — ambiguous: a latency spike inside TLS">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Tgt</td><td>0</td><td>TLS Application Data</td><td>record length 98</td><td>Likely one CapsuleCmd (76 + 22)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Tgt→Host</td><td>92</td><td>TLS Application Data ×9</td><td>8 records of 16,406 + 1 record of 34</td><td>Likely 128 KiB of C2HData PDUs</td></tr>
+        <tr class="dir-up"><td>3</td><td>Tgt→Host</td><td>146</td><td>TLS Application Data</td><td>record length 50</td><td>Likely a CapsuleResp (28 + 22)</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Tgt</td><td>310</td><td>TLS Application Data</td><td>record length 98</td><td>Next command</td></tr>
+        <tr class="abnormal"><td>5</td><td>Tgt→Host</td><td>8,740</td><td>TLS Application Data ×9</td><td>same sizes as row 2</td><td><strong>First abnormal event:</strong> response starts 8.4 ms after the command</td></tr>
+        <tr class="dir-up"><td>6</td><td>Tgt→Host</td><td>8,795</td><td>TLS Application Data</td><td>record length 50</td><td>Completion</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Why it is ambiguous.</strong> The PDUs are invisible. Record sizes allow inference: each record adds 22 bytes (5 header + 1 content type + 16 tag), so a 50-byte record holds 28 bytes — a CapsuleResp with header digest; 98 − 22 = 76 bytes is a CapsuleCmd with header digest; 16,406 − 22 = 16,384 bytes is a full record of C2HData bytes. These are inferences: records and PDUs are independent, just as segments and PDUs are, and one record could hold parts of two PDUs. The 8.4 ms delay has at least three explanations: (a) the target's backing read was slow; (b) the target's TLS send path (kTLS, or a stalled offload) delayed the data; (c) the host's capture point is above kTLS and the delay is in the host's receive path. The capture cannot tell them apart. Resolve with target-side NVMe tracing (backing I/O latency at the same time), TLS key logging in the lab to decrypt, or host nvme-tcp tracepoints. Lesson for production: plan observability before enabling TLS — per-command latency on both ends, exported as metrics.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Read-only commands on a host with NVMe/TCP controllers. <span class="badge version">Version-dependent</span> sysfs attributes, tracepoints and tools vary by kernel.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo nvme list-subsys                               <span class="cm"># transport, traddr, trsvcid, state per path</span>
+cat /sys/class/nvme/nvme1/transport /sys/class/nvme/nvme1/address
+cat /sys/class/nvme/nvme1/queue_count               <span class="cm"># admin + I/O queues = TCP connections</span>
+ss -tni '( dport = :4420 )' | head -20              <span class="cm"># per-connection rtt, cwnd, retrans, bytes</span>
+nstat -az | grep -i -E 'TcpRetransSegs|TCPLossProbes'
+journalctl -k -b | grep -i nvme | grep -i -E 'digest|reconnect|termreq|error' | tail
+ls /sys/kernel/tracing/events/ | grep -i nvme        <span class="cm"># available tracepoints (nvme, nvme_tcp if present)</span>
+ethtool -k eth0 | grep -i -E 'tcp-segmentation|generic-receive|tls'
+sudo tcpdump -i eth0 -s 256 -c 2000 -w /tmp/nvme.pcap port 4420   <span class="cm"># headers only; lab use</span></code></pre>
+  <table>
+    <caption>What each output proves and cannot prove</caption>
+    <thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>queue_count</code> 9</td><td>Admin + 8 I/O connections</td><td>How load spreads across them</td></tr>
+      <tr><td><code>ss</code> retrans counts on one connection</td><td>Loss or reordering on that flow</td><td>Whether it hurt NVMe latency (correlate with time)</td></tr>
+      <tr><td>Journal "header digest error"</td><td>Corruption detected on receive</td><td>Where it happened (NIC, switch, memory, peer)</td></tr>
+      <tr><td>TSO/GRO enabled</td><td>Host captures show merged frames</td><td>Wire segmentation</td></tr>
+      <tr><td>Snap-length 256 capture</td><td>PDU headers of the first PDU in each frame</td><td>Headers of PDUs starting mid-frame; data digests</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout warn"><p>Full-payload captures contain customer data. Capture headers only (small snap length) unless you are in a lab, and never export TLS session keys from production systems.</p></aside>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Labs are simulation and paper analysis. Live captures on lab hosts are optional and read-only.</p></aside>
+
+  <h3>Beginner lab — length arithmetic</h3>
+  <p><strong>Objective:</strong> compute PDO and PLEN. <strong>Prerequisites:</strong> the length table. <strong>Setup:</strong> paper. <strong>Procedure:</strong> compute PDO and PLEN for (i) CapsuleCmd with 4 KiB in-capsule data, both digests, CPDA 0; (ii) C2HData 4 KiB, both digests, HPDA 7 (32-byte alignment); (iii) R2T with header digest. <strong>Questions:</strong> which PDUs never carry a data digest? Why does HLEN not include digests?</p>
+  <details class="solution"><summary>Solution</summary><p>(i) PDO 76, PLEN 76 + 4096 + 4 = 4176. (ii) header + HDGST = 28; next 32-byte boundary 32 → PDO 32, PLEN 32 + 4096 + 4 = 4132. (iii) PLEN 28, PDO 0. CapsuleResp, R2T, ICReq/ICResp and TermReq carry no data digest. HLEN is fixed per type so a receiver can validate it before knowing negotiated options.</p></details>
+  <p><strong>Extension:</strong> compute the frames for (ii) at MTU 1500.</p>
+
+  <h3>Intermediate lab — a PDU stream checker</h3>
+  <p><strong>Objective:</strong> implement the receiver checks for writes. <strong>Prerequisites:</strong> <a href="ch66.html#code">Chapter 66 stream parser</a>. <strong>Setup:</strong> save as <code>pdu_check.py</code>; run it. It walks a merged view of both directions of one connection.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="pdu_check.py"><code>#!/usr/bin/env python3
+"""pdu_check.py - frame an NVMe/TCP byte stream into PDUs and check the
+write data rules (R2T -&gt; H2CData) for one connection, host-side view.
+
+Common header (8 bytes): type, flags, HLEN, PDO, PLEN (le32).
+Flag bits as in Linux nvme-tcp.h: 01h HDGSTF, 02h DDGSTF, 04h LAST_PDU,
+08h SUCCESS. PDU-specific fields from the TCP Transport chapter.
+Digests are CRC32C. Teaching tool: confirm every rule in TCP Transport 1.3.
+"""
+import struct
+
+HLEN = {0: 128, 1: 128, 2: 24, 3: 24, 4: 72, 5: 24, 6: 24, 7: 24, 9: 24}
+NAME = {0: "ICReq", 1: "ICResp", 2: "H2CTermReq", 3: "C2HTermReq", 4: "CapsuleCmd",
+        5: "CapsuleResp", 6: "H2CData", 7: "C2HData", 9: "R2T"}
+
+def crc32c(data, crc=0xFFFFFFFF):
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc &gt;&gt; 1) ^ (0x82F63B78 if crc &amp; 1 else 0)
+    return crc ^ 0xFFFFFFFF
+
+def pdu(ptype, psh=b"", data=b"", flags=0, hdgst=True):
+    hlen = HLEN[ptype]
+    flags |= 0x01 if hdgst else 0
+    pdo = (hlen + (4 if hdgst else 0)) if data else 0
+    plen = hlen + (4 if hdgst else 0) + len(data)
+    ch = struct.pack("&lt;BBBBI", ptype, flags, hlen, pdo, plen)
+    hdr = ch + psh.ljust(hlen - 8, b"\0")
+    return hdr + (struct.pack("&lt;I", crc32c(hdr)) if hdgst else b"") + data
+
+def r2t(cccid, ttag, off, ln):
+    return pdu(9, struct.pack("&lt;HHII", cccid, ttag, off, ln))
+
+def h2c(cccid, ttag, off, data, last):
+    return pdu(6, struct.pack("&lt;HHII", cccid, ttag, off, len(data)), data, 0x04 if last else 0)
+
+def check(stream, write_len, maxr2t=0, maxh2cdata=65536):
+    """Walk a mixed stream; return list of findings (first is first abnormal)."""
+    out, pos, open_r2t = [], 0, {}
+    while pos + 8 &lt;= len(stream):
+        t, flags, hlen, pdo, plen = struct.unpack_from("&lt;BBBBI", stream, pos)
+        name = NAME.get(t, "type %02Xh" % t)
+        if t not in HLEN or hlen != HLEN[t]:
+            return out + ["@%d %s: invalid header field (HLEN %d) -&gt; TermReq" % (pos, name, hlen)]
+        if flags &amp; 1:
+            want = struct.unpack_from("&lt;I", stream, pos + hlen)[0]
+            if crc32c(stream[pos:pos + hlen]) != want:
+                return out + ["@%d %s: header digest error -&gt; H2CTermReq, close" % (pos, name)]
+        cccid, ttag, off, ln = struct.unpack_from("&lt;HHII", stream, pos + 8)
+        if t == 9:
+            if off + ln &gt; write_len:
+                return out + ["@%d R2T beyond command length -&gt; fatal" % pos]
+            open_r2t[ttag] = [off, off + ln]
+            if len(open_r2t) &gt; maxr2t + 1:
+                return out + ["@%d R2T: %d outstanding &gt; MAXR2T+1 -&gt; fatal" % (pos, len(open_r2t))]
+            out.append("@%d R2T ttag %d [%d, %d)" % (pos, ttag, off, off + ln))
+        elif t == 6:
+            if ttag not in open_r2t:
+                return out + ["@%d H2CData for unknown TTAG %d -&gt; fatal" % (pos, ttag)]
+            exp, end = open_r2t[ttag]
+            if off != exp or off + ln &gt; end or ln &gt; maxh2cdata:
+                return out + ["@%d H2CData [%d, %d) outside expected [%d, %d) or &gt; MAXH2CDATA"
+                              % (pos, off, off + ln, exp, end)]
+            open_r2t[ttag][0] = off + ln
+            if flags &amp; 0x04:
+                status = "complete" if off + ln == end else "LAST_PDU early!"
+                out.append("@%d H2CData ttag %d LAST_PDU, R2T %s" % (pos, ttag, status))
+                del open_r2t[ttag]
+        pos += plen
+    return out + ["end of stream, %d R2T(s) still open" % len(open_r2t)]
+
+if __name__ == "__main__":
+    D = bytes(range(256)) * 512                       # 128 KiB of write data
+    good = (r2t(0x21, 1, 0, 65536) + h2c(0x21, 1, 0, D[:32768], False)
+            + h2c(0x21, 1, 32768, D[32768:65536], True)
+            + r2t(0x21, 2, 65536, 65536) + h2c(0x21, 2, 65536, D[65536:], True))
+    print("good stream:"); [print("  ", s) for s in check(good, len(D))]
+    bad = bytearray(good)
+    bad[len(r2t(0x21, 1, 0, 65536)) + 13] ^= 0x10     # flip a bit in DATAO of PDU 2
+    print("corrupted header:"); [print("  ", s) for s in check(bytes(bad), len(D))]
+    eager = r2t(0x21, 1, 0, 65536) + r2t(0x21, 2, 65536, 65536)
+    print("two R2Ts, MAXR2T=0:"); [print("  ", s) for s in check(eager, len(D))]</code></pre>
+  <p>Expected output (deterministic):</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>good stream:
+   @0 R2T ttag 1 [0, 65536)
+   @32824 H2CData ttag 1 LAST_PDU, R2T complete
+   @65620 R2T ttag 2 [65536, 131072)
+   @65648 H2CData ttag 2 LAST_PDU, R2T complete
+   end of stream, 0 R2T(s) still open
+corrupted header:
+   @0 R2T ttag 1 [0, 65536)
+   @28 H2CData: header digest error -&gt; H2CTermReq, close
+two R2Ts, MAXR2T=0:
+   @0 R2T ttag 1 [0, 65536)
+   @28 R2T: 2 outstanding &gt; MAXR2T+1 -&gt; fatal</code></pre>
+  <p><strong>Procedure:</strong> (1) set LAST_PDU on the first H2CData and observe; (2) add data digests to <code>pdu()</code> and a check; (3) add a C2HData path that tracks DATAO per CCCID. <strong>Questions:</strong> why is an early LAST_PDU an error? Which errors are fatal and which per-command?</p>
+  <details class="solution"><summary>Solution</summary><p>(1) The checker reports "LAST_PDU early!": the R2T range is not covered, so the controller cannot complete the transfer — a fatal sequence error in a real target. (2) DDGST covers data only; on mismatch, report a per-command failure and continue framing. (3) Keep a dictionary CCCID → next expected DATAO; reject gaps, overlaps and data beyond the command length. Fatal: anything that breaks framing or references unknown state; per-command: data digest.</p></details>
+  <p><strong>Extension:</strong> feed it a pcap reassembled with tshark's "follow TCP stream" raw output.</p>
+
+  <h3>Advanced lab — what bounds latency and throughput</h3>
+  <p><strong>Objective:</strong> quantify R2T pacing, head-of-line blocking and TLS overhead. <strong>Prerequisites:</strong> <a href="ch38.html">Latency</a>. <strong>Setup:</strong> save as <code>tcp_model.py</code>; run it.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="tcp_model.py"><code>#!/usr/bin/env python3
+"""tcp_model.py - first-order NVMe/TCP timing model (teaching numbers).
+
+1. Large write: time vs MAXR2T for R2T-paced data.
+2. Head-of-line blocking: a 4 KiB read queued behind a 1 MiB read on the
+   same connection, for different C2HData PDU sizes, plus one TCP loss.
+3. TLS 1.3 record overhead (RFC 8446: 5-byte header, 16-byte AEAD tag,
+   1-byte inner content type, at most 16 KiB plaintext per record).
+"""
+LINK_GBPS = 25.0
+RTT_US = 60.0            # host &lt;-&gt; target round trip incl. stack processing
+R2T_PREP_US = 20.0       # target time to allocate a buffer and send an R2T
+BYTES_PER_US = LINK_GBPS * 1000 / 8   # 3125 bytes per microsecond
+
+def write_time(total, r2tl, maxr2t):
+    """CapsuleCmd, then R2T rounds; up to maxr2t+1 R2Ts outstanding."""
+    n = -(-total // r2tl)
+    window = maxr2t + 1
+    rounds = -(-n // window)
+    # each round: R2T(s) reach host, data flows; pipelining hides RTT only inside a round
+    return RTT_US / 2 + rounds * (R2T_PREP_US + RTT_US) + total / BYTES_PER_US
+
+def hol_wait(big, pdu, loss=False, rto_us=0.0):
+    """Extra wait of a small read whose data the target interleaves at PDU granularity."""
+    wait = min(big, pdu) / BYTES_PER_US          # finish the PDU in flight
+    if loss:
+        wait += rto_us                           # TCP delivers in order: all streams wait
+    return wait
+
+if __name__ == "__main__":
+    print("1 MiB write, R2TL 128 KiB, %.0f Gb/s, RTT %.0f us" % (LINK_GBPS, RTT_US))
+    for m in (0, 1, 3, 7):
+        t = write_time(1 &lt;&lt; 20, 128 &lt;&lt; 10, m)
+        print("  MAXR2T %d (%d outstanding): %6.1f us  -&gt; %5.2f GB/s per command"
+              % (m, m + 1, t, (1 &lt;&lt; 20) / t / 1000))
+    print("4 KiB read behind a 1 MiB read on the same connection")
+    for p in (8 &lt;&lt; 10, 32 &lt;&lt; 10, 128 &lt;&lt; 10, 1 &lt;&lt; 20):
+        print("  C2HData PDU %7d B: extra wait %6.1f us" % (p, hol_wait(1 &lt;&lt; 20, p)))
+    print("  ... plus one lost segment, fast retransmit after ~3 RTT: %6.1f us"
+          % hol_wait(1 &lt;&lt; 20, 32 &lt;&lt; 10, True, 3 * RTT_US))
+    print("  ... plus one lost tail segment, RTO 200 ms:            %8.1f us"
+          % hol_wait(1 &lt;&lt; 20, 32 &lt;&lt; 10, True, 200_000))
+    rec = 16384
+    over = 5 + 16 + 1
+    print("TLS 1.3: %d B overhead per %d B record = %.3f%%; 1 MiB = %d records"
+          % (over, rec, 100 * over / rec, (1 &lt;&lt; 20) // rec))</code></pre>
+  <p>Expected output (deterministic):</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>1 MiB write, R2TL 128 KiB, 25 Gb/s, RTT 60 us
+  MAXR2T 0 (1 outstanding): 1005.5 us  -&gt;  1.04 GB/s per command
+  MAXR2T 1 (2 outstanding):  685.5 us  -&gt;  1.53 GB/s per command
+  MAXR2T 3 (4 outstanding):  525.5 us  -&gt;  2.00 GB/s per command
+  MAXR2T 7 (8 outstanding):  445.5 us  -&gt;  2.35 GB/s per command
+4 KiB read behind a 1 MiB read on the same connection
+  C2HData PDU    8192 B: extra wait    2.6 us
+  C2HData PDU   32768 B: extra wait   10.5 us
+  C2HData PDU  131072 B: extra wait   41.9 us
+  C2HData PDU 1048576 B: extra wait  335.5 us
+  ... plus one lost segment, fast retransmit after ~3 RTT:  190.5 us
+  ... plus one lost tail segment, RTO 200 ms:            200010.5 us
+TLS 1.3: 22 B overhead per 16384 B record = 0.134%; 1 MiB = 64 records</code></pre>
+  <p><strong>Procedure:</strong> (1) change RTT to 500 µs (cross-site) and compare MAXR2T values; (2) find R2TL that gives 2 GB/s with MAXR2T 0; (3) explain why throughput per <em>connection</em> can exceed per-command throughput. <strong>Questions:</strong> what does the tail-loss line mean for p99.99 latency? Is TLS's byte overhead the real cost?</p>
+  <details class="solution"><summary>Solution</summary><p>(1) With long RTT, MAXR2T 0 collapses (≈ 8 RTTs per 1 MiB); pipelining matters more. (2) With one R2T for the whole MiB (R2TL 1 MiB) the model gives 30 + (20 + 60) + 335.5 ≈ 446 µs, about 2.35 GB/s — at the cost of 1 MiB target buffer per write. (3) Many commands run concurrently on one connection, each with its own R2Ts, so the link fills even when each command is paced. A single tail loss stalls every command on that connection for an RTO — the p99.99 driver in many deployments; tail loss probes and more connections reduce the blast radius. TLS byte overhead is 0.13%; its real cost is CPU per record unless offloaded.</p></details>
+  <p><strong>Extension:</strong> add data digest CPU cost (bytes / CRC throughput per core) and find where CPU, not the link, becomes the limit.</p>
+
+  <h3>Senior forensic lab — periodic reconnects on 3% of hosts</h3>
+  <p><strong>Objective:</strong> localise corruption from digest evidence. <strong>Setup (synthetic evidence):</strong> 3% of hosts log header digest errors and reconnects every 2–6 hours; data digest errors are never logged; all affected hosts use NIC firmware F2 with TSO enabled; no affected host with TSO disabled; target-side captures (wire mirror) of the bad PDUs show the corrupted header bytes always start exactly at a TCP segment boundary; switch error counters are clean.</p>
+  <p><strong>Procedure:</strong> list hypotheses (switch, cable, host memory, NIC offload, target bug); test each against the evidence; choose a decisive experiment.</p>
+  <details class="solution"><summary>Solution</summary><p>Clean switch counters and correlation with NIC firmware and TSO point at the sending NIC's segmentation offload. Corruption only at segment boundaries fits a segmentation bug. If ordinary data bytes at boundaries were hit, data digest errors would appear; none do, so the corruption is specific to PDU headers that happen to start at a segment boundary. That is consistent with a NIC that inspects or rewrites bytes it believes are a header at the start of each segment (for example, an offload that partly parses upper-layer protocols). Decisive experiment: on one affected host, toggle TSO off, then F2 → F1, each for 48 h, with digest error counts. Fix: firmware update or disable the offload; keep digests on — they turned silent corruption into a recoverable event. Confidence: medium-high before the experiment.</p></details>
+  <p><strong>Extension:</strong> estimate how many commands per day were retried because of these reconnects.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <table>
+    <caption>Five NVMe/TCP failure patterns</caption>
+    <thead><tr><th>Field</th><th>1. Large I/O hangs, small works</th><th>2. Write latency high, reads fine</th><th>3. Periodic reconnects</th><th>4. p99.99 latency spikes of ≈ 200 ms</th><th>5. Connect fails after enabling TLS</th></tr></thead>
+    <tbody>
+      <tr><td>Symptom</td><td>4 KiB OK, 128 KiB times out</td><td>Writes 3× expected</td><td>Digest errors, TermReq</td><td>Rare huge outliers on all queues of one connection</td><td>No NVMe traffic at all</td></tr>
+      <tr><td>Possible causes</td><td>MTU mismatch, PMTUD blocked</td><td>R2T starvation; MAXR2T 0 with long RTT; small R2TL</td><td>NIC offload, memory, cabling</td><td>Tail loss and RTO</td><td>PSK mismatch, identity mismatch, tlshd not running</td></tr>
+      <tr><td>Evidence</td><td>Retransmits of large segments</td><td>CapsuleCmd→R2T gaps</td><td>Journal; target capture</td><td><code>ss</code> RTO counters; capture</td><td>TLS alert in capture; tlshd log</td></tr>
+      <tr><td>First check</td><td>Path MTU end to end</td><td>Gap before first R2T vs between R2Ts</td><td>Header vs data digest counts</td><td>Retransmission at spike time</td><td>Is tlshd running and keyring populated?</td></tr>
+      <tr><td>Second check</td><td>ICMP filtering</td><td>Target buffer pool stats</td><td>Correlate by NIC firmware/offload</td><td>Loss location (switch counters)</td><td>PSK identity names correct NQNs</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Ping with DF at full size</td><td>Enlarge pool or in-capsule size</td><td>Toggle offloads</td><td>Enable tail loss probe; add connections</td><td>Connect without TLS on lab target</td></tr>
+      <tr><td>Likely conclusion</td><td>Network config</td><td>Target resource / tuning</td><td>Hardware/firmware</td><td>Network loss + single connection</td><td>Key provisioning</td></tr>
+      <tr><td>Confidence</td><td>High</td><td>High with target stats</td><td>Medium-high</td><td>High</td><td>High</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>Why does NVMe/TCP need PDUs?</p><details class="answer"><summary>Model answer</summary><p>TCP is a byte stream without message boundaries; PDUs carry their own lengths.</p></details></li>
+    <li><p>Which PDUs make a read?</p><details class="answer"><summary>Model answer</summary><p>CapsuleCmd, one or more C2HData, CapsuleResp (unless SUCCESS is used).</p></details></li>
+    <li><p>What is R2T for?</p><details class="answer"><summary>Model answer</summary><p>The controller requests write data when it has buffer space.</p></details></li>
+    <li><p>What ports are used?</p><details class="answer"><summary>Model answer</summary><p>4420 for I/O controllers, 8009 for discovery (both registered; targets may choose others).</p></details></li>
+    <li><p>What does a data digest protect?</p><details class="answer"><summary>Model answer</summary><p>The PDU's data bytes, with CRC32C.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>Why is a header digest error fatal but a data digest error not?</p><details class="answer"><summary>Model answer</summary><p>A bad header means framing is lost; a bad data digest leaves framing intact.</p></details></li>
+    <li><p>Compute PLEN of a 32 KiB C2HData with both digests, HPDA 0.</p><details class="answer"><summary>Model answer</summary><p>28 + 32,768 + 4 = 32,800.</p></details></li>
+    <li><p>What does MAXR2T 0 mean?</p><details class="answer"><summary>Model answer</summary><p>One outstanding R2T per command.</p></details></li>
+    <li><p>Why can a host capture show 64 KiB frames?</p><details class="answer"><summary>Model answer</summary><p>Captured above TSO/GRO.</p></details></li>
+    <li><p>What happens to other commands after a TermReq?</p><details class="answer"><summary>Model answer</summary><p>They fail at transport level and are retried after reconnect.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>Model write time per command.</p><details class="answer"><summary>Model answer</summary><p>Capsule half-RTT + rounds × (R2T preparation + RTT) + bytes/bandwidth, with rounds = ceil(ranges / (MAXR2T+1)).</p></details></li>
+    <li><p>How does a target reduce head-of-line blocking?</p><details class="answer"><summary>Model answer</summary><p>Interleave C2HData of different commands at moderate PDU sizes; hosts use more connections.</p></details></li>
+    <li><p>How do you debug inside TLS?</p><details class="answer"><summary>Model answer</summary><p>Record sizes and timing, endpoint tracing and metrics, lab key logging.</p></details></li>
+    <li><p>Validate digest handling.</p><details class="answer"><summary>Model answer</summary><p>Inject corruption in each field and data region; verify fatal vs per-command outcomes and clean recovery.</p></details></li>
+    <li><p>When is in-capsule data better?</p><details class="answer"><summary>Model answer</summary><p>Small writes: saves an R2T round trip, costs target buffer per capsule.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>Digests on or off in production?</p><details class="answer"><summary>Model answer</summary><p>On, unless TLS already provides integrity and CPU cost is proven prohibitive; measure.</p></details></li>
+    <li><p>How many connections per host?</p><details class="answer"><summary>Model answer</summary><p>Enough to spread CPU and limit loss blast radius; bounded by target resources.</p></details></li>
+    <li><p>Plan TLS rollout.</p><details class="answer"><summary>Model answer</summary><p>Key provisioning, tlshd health, offload capacity, observability first, staged rollout with rollback.</p></details></li>
+    <li><p>Cross-site NVMe/TCP: risks?</p><details class="answer"><summary>Model answer</summary><p>RTT amplifies R2T pacing and loss recovery; tune MAXR2T, R2TL, in-capsule size and timeouts.</p></details></li>
+    <li><p>How do you report a "network is slow" complaint?</p><details class="answer"><summary>Model answer</summary><p>Split latency into host, network (RTT/retransmits), target transport (R2T gaps) and backing device, with evidence for each.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>HLEN of an R2T PDU is:</p>
+      <ul class="options" data-answer="2"><li>8</li><li>24</li><li>72</li><li>128</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Data PDUs and R2T use 24.</p></details></li>
+    <li><p>FLAGS 07h on C2HData means:</p>
+      <ul class="options" data-answer="3"><li>Header digest only</li><li>SUCCESS</li><li>Both digests and LAST_PDU</li><li>Error</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>01h + 02h + 04h.</p></details></li>
+    <li><p>A data digest mismatch leads to:</p>
+      <ul class="options" data-answer="1"><li>That command failing with a transport error status</li><li>TermReq and close</li><li>TCP retransmission</li><li>Nothing</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Framing is intact.</p></details></li>
+    <li><p>Which shows target buffer pressure?</p>
+      <ul class="options" data-answer="4"><li>Retransmissions</li><li>Bad digests</li><li>Large frames</li><li>Long CapsuleCmd→R2T or R2T→R2T gaps</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The target delays R2Ts until it has space.</p></details></li>
+    <li><p>TLS 1.3 adds per record:</p>
+      <ul class="options" data-answer="2"><li>5 bytes</li><li>22 bytes</li><li>64 bytes</li><li>16 bytes</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>5 header + 1 content type + 16 tag.</p></details></li>
+    <li><p>A single lost tail segment affects:</p>
+      <ul class="options" data-answer="3"><li>One command</li><li>All connections of the host</li><li>All commands on that connection</li><li>Only writes</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>In-order delivery per connection.</p></details></li>
+    <li><p>Why did Trace C retry seven reads, not one?</p><details class="answer"><summary>Model answer</summary><p>The connection terminated; all outstanding commands on it failed.</p></details></li>
+    <li><p>In Trace D, what does a 50-byte TLS record most likely contain?</p><details class="answer"><summary>Model answer</summary><p>A 28-byte CapsuleResp with header digest (50 − 22).</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <details class="answer"><summary>To a child — model</summary><p>"Messages on one long tape, each with a stamp saying how long it is. A smudged stamp means start a new tape; smudged words mean ask for that message again. Big parcels wait for a 'send now' note, and long messages slow down the short ones behind them."</p></details>
+  <details class="answer"><summary>To a junior engineer — model</summary><p>"Each queue is a TCP connection carrying PDUs: 8-byte common header, fixed HLEN, optional digests and padding. Reads come back as C2HData plus CapsuleResp; writes use R2T and H2CData unless small enough for in-capsule. Header digest errors kill the connection; data digest errors fail one command."</p></details>
+  <details class="answer"><summary>To a senior engineer — model</summary><p>"NVMe/TCP latency is host stack + RTT × R2T rounds + target buffering + backing device, and the tail is TCP loss on a shared connection. Tune MAXR2T, R2TL, in-capsule size and connection count; keep digests on; plan observability before TLS, because captures stop working."</p></details>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain framing, R2T pacing, digests and head-of-line blocking</li>
+      <li>diagram the receiver state machine and an R2T-paced write</li>
+      <li>identify interleaving, R2T gaps, TermReqs and TLS record patterns in captures</li>
+      <li>debug the five patterns and the encrypted-capture ambiguity</li>
+      <li>distinguish NVMe/TCP framing from capsules (<a href="ch65.html">NVMe over Fabrics</a>), from boot-time connections (<a href="dd49.html">NVMe Boot</a>), and from PCIe data movement (<a href="ch33.html">I/O Commands</a>)</li>
+      <li>cite TCP Transport 1.3, Base 2.4 and RFC 8446 for what each defines</li>
+    </ul>
+  </aside>
+  <p><strong>Next:</strong> return to <a href="ch66.html">NVMe/TCP</a> or continue with <a href="dd51.html">the next module</a>.</p>
+</section>

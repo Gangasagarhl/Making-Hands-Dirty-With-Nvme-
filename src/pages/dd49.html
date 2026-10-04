@@ -1,0 +1,595 @@
+<p class="lead">This module follows the drive through the minutes when no operating system exists. It covers the firmware driver's timing contract with the controller, Boot Partition reads at Transaction Layer Packet (TLP) level, the internal structure of the NVMe Boot Firmware Table (NBFT), the firmware-to-OS handoff for NVMe over TCP (NVMe/TCP) boot, and the failures that only show up at the seams: a timeout chosen too short, an identity that changes between firmware and OS, and Direct Memory Access (DMA) that outlives the code that started it.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p><a href="ch64.html">Chapter 64</a> walked through the pre-OS journey: Unified Extensible Firmware Interface (UEFI) enumeration, option ROMs, a local boot from a namespace with firmware queues at 0x7F00_0000, Boot Partitions, and NVMe over Fabrics (NVMe-oF) boot with the NBFT. This module assumes all of that. It works on three seams the chapter only named. The first is the <em>timing seam</em>: the Capability Timeout (CAP.TO) and how firmware should honour it. The second is the <em>data seam</em>: how the NBFT carries host identity, interfaces and namespaces across the handoff, byte by byte. The third is the <em>ownership seam</em>: who owns the controller, the queues and the network sessions at each moment between power-on and the root file system mounting.</p>
+  <aside class="callout prereq"><p>Read <a href="ch64.html">NVMe Boot</a> first. You also need <a href="ch27.html">Controller Initialization</a> (CC/CSTS sequence), <a href="ch65.html">NVMe over Fabrics</a> (Connect, NQNs, discovery), <a href="ch66.html">NVMe/TCP</a> (Protocol Data Units (PDUs)), and <a href="ch49.html">PCIe Reset</a>. Related modules: <a href="dd41.html">Reset</a>, <a href="dd50.html">NVMe/TCP</a>.</p></aside>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives by level</caption>
+    <thead><tr><th>Level</th><th>Objective</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Name the three places boot code can come from (a namespace, a Boot Partition, a remote namespace) and the handoff artefact for each.</td></tr>
+      <tr><td>Intermediate</td><td>Read a Boot Partition transfer at TLP level and decode the parts of an NBFT: header, descriptors, heap objects and checksum.</td></tr>
+      <tr><td>Advanced</td><td>Derive firmware timeouts from CAP.TO (and, in newer revisions, from the ready timeouts), and design discovery and retry policy for fabric boot.</td></tr>
+      <tr><td>Senior</td><td>Own the boot chain: identity consistency (host NQN and host ID), quiescing the controller at handoff, A/B recovery, and boot SLAs across a fleet.</td></tr>
+      <tr><td>Trace analysis</td><td>Follow boot across PCIe captures (firmware MMIO and DMA below 4 GiB) and network captures (discovery, Connect, data), and find the handoff point.</td></tr>
+      <tr><td>Debugging</td><td>Separate "device not ready", "firmware gave up", "identity mismatch", "NBFT not consumed" and "leftover DMA".</td></tr>
+      <tr><td>Validation</td><td>Test boot under slow-ready conditions, unreachable discovery, corrupted tables, A/B partition failure and repeated warm reboots.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>A big ship arrives at a harbour at night. The captain does not know the harbour, so a small boat brings out a pilot. The pilot steers the ship through the narrow entrance and ties it to the dock. Then the pilot climbs down, and the captain takes over for the rest of the journey.</p>
+    <p>Before leaving, the pilot writes a card: "Your ship's name, which dock, which rope is tied to which post, and the harbour master's radio channel." The captain must use the card. If the captain forgets it and calls the harbour master using a different ship's name, the harbour master says "I don't know you" and the ship cannot unload.</p>
+    <p>Two more rules. The pilot must wait as long as the harbour's rule book says before deciding the dock is closed, not give up after one minute. And the pilot must untie every rope it was holding before leaving. A rope still pulling on the ship after the captain takes over causes accidents nobody can explain.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <table>
+    <caption>What the harbour pilot represents, hides and gets wrong</caption>
+    <thead><tr><th>Story element</th><th>Represents</th><th>Hides</th><th>Misleads when</th></tr></thead>
+    <tbody>
+      <tr><td>Pilot</td><td>Platform firmware with its NVMe and NVMe/TCP drivers</td><td>Several firmware components (UEFI core, NIC driver, TCP/IP stack, NVMe-oF driver, option ROMs)</td><td>You expect one owner of all state</td></tr>
+      <tr><td>Captain</td><td>OS loader and OS (initramfs, kernel driver)</td><td>The loader is in between, and also uses the firmware drivers</td><td>You think handoff happens at one instant (it happens at ExitBootServices and again in initramfs)</td></tr>
+      <tr><td>Card</td><td>NBFT (an Advanced Configuration and Power Interface (ACPI) table)</td><td>Only fabric boot uses it; local boot passes a device path in boot variables</td><td>You look for an NBFT after a local boot</td></tr>
+      <tr><td>Ship's name</td><td>Host NQN and host ID</td><td>The subsystem's allow list checks them</td><td>You think the network address is the identity</td></tr>
+      <tr><td>Waiting by the rule book</td><td>Honouring CAP.TO</td><td>The device may legitimately take seconds after an unsafe shutdown</td><td>You treat slow ready as a fault</td></tr>
+      <tr><td>Untying ropes</td><td>Quiescing: disabling the controller and bus mastering, closing TCP sessions</td><td>The OS also resets defensively</td><td>You assume the OS reset solves every leftover</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout breaks"><p>A pilot physically leaves the ship. Firmware code may remain resident: UEFI runtime services, System Management Mode, and ACPI tables persist after handoff. "Firmware is gone" is true for boot-services drivers, not for everything firmware wrote.</p></aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Terms used in this module</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="nbft">NBFT</span></td><td>The pilot's card</td><td>NVMe Boot Firmware Table: ACPI table with signature "NBFT", describing host, interfaces, subsystem namespaces, discovery and security for fabric boot</td><td>Written by firmware; read by OS tooling in initramfs</td><td>Not used for local PCIe boot</td></tr>
+      <tr><td><span class="g" data-term="heap-object">Heap object</span></td><td>"See page N, M letters long"</td><td>An (offset, length) pair pointing into the NBFT heap; offset counted from byte 0 of the table (libnvme: 32-bit offset, 16-bit length)</td><td>Carries variable-length strings such as NQNs and addresses</td><td>The offset is not relative to the heap start</td></tr>
+      <tr><td><span class="g" data-term="hfi">HFI</span></td><td>Which network card</td><td>Host Fabric Interface descriptor and its transport information (PCI address, MAC, VLAN, IP, gateway, DHCP data)</td><td>Referenced by SSNS descriptors by index</td><td>Not the same as the OS interface name</td></tr>
+      <tr><td><span class="g" data-term="ssns">SSNS</span></td><td>Which dock</td><td>Subsystem Namespace descriptor: transport type, address and service ID, subsystem NQN, namespace ID, flags, primary HFI and discovery index</td><td>One per boot-relevant namespace path</td><td>Can describe a non-bootable (secondary) namespace too</td></tr>
+      <tr><td><span class="g" data-term="boot-partition">Boot Partition</span></td><td>A small shelf at the front of the shop</td><td>Two optional areas read through BPINFO/BPRSEL/BPMBL registers before full controller initialisation</td><td>Data delivered by device MWr to the BPMBL address</td><td>Not a namespace partition (GPT)</td></tr>
+      <tr><td><span class="g" data-term="cap-to">CAP.TO</span></td><td>The rule book's waiting time</td><td>Worst-case time for CSTS.RDY to change after CC.EN changes, in 500 ms units</td><td>Firmware and OS timeouts must be at least this</td><td>A limit, not an expected time</td></tr>
+      <tr><td><span class="g" data-term="crto">CRTO</span></td><td>A newer, split rule book</td><td>Controller Ready Timeouts register (newer Base revisions), distinguishing ready time with and without media</td><td>Used with a CAP capability flag</td><td>Version-dependent; may be absent</td></tr>
+      <tr><td>ExitBootServices</td><td>The pilot climbs down</td><td>UEFI call after which boot-services drivers (including the NVMe driver) stop running</td><td>OS loader calls it; firmware drivers should quiesce devices</td><td>Not a device reset by itself</td></tr>
+      <tr><td><span class="g" data-term="host-nqn">Host NQN</span> / host ID</td><td>Ship's name</td><td>Host identity presented in Fabrics Connect</td><td>Carried in the NBFT host descriptor</td><td>Generated fresh by careless OS images</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <figure>
+    <pre class="diagram">
+ POWER-ON                    PRE-OS (boot services)                        HANDOFF                 OS
+ +--------+   +-----------------------------------------------+   +-----------------+   +---------------------+
+ | reset, |   | PCIe enumeration -&gt; NVMe UEFI driver (local)   |   | OS loader       |   | kernel nvme driver  |
+ | memory |--&gt;|   queues 0x7F00_0000, polling, no MSI-X        |--&gt;| ExitBootServices|--&gt;|  resets controller  |
+ | init   |   | Boot Partition read (optional) BPMBL 0x7F10_0000|  | NBFT stays in   |   | initramfs: read NBFT|
+ +--------+   | NIC driver + TCP/IP + NVMe/TCP initiator        |   | ACPI memory     |   |  connect again with |
+              |   discovery 192.0.2.20:8009, I/O 4420           |   +-----------------+   |  same host NQN/ID   |
+              | publish NBFT (host, HFI, SSNS, discovery)       |                         | mount root          |
+              +-----------------------------------------------+                          +---------------------+</pre>
+    <figcaption>Ownership across boot. Addresses below 4 GiB are typical for firmware allocations; values are from the course's synthetic lab system.</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture inventory</caption>
+    <thead><tr><th>Category</th><th>Items</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>Boot variables (BootOrder, device paths); firmware setup for NVMe-oF (host NQN, addresses, discovery); DHCP responses; CAP and Boot Partition registers</td></tr>
+      <tr><td>Outputs</td><td>Loaded OS loader; NBFT in ACPI memory; boot-time logs; controller state left behind</td></tr>
+      <tr><td>Actors</td><td>UEFI core, NVMe driver, NIC driver, NVMe/TCP initiator, OS loader, initramfs tools (nvme-cli, NetworkManager or equivalent), kernel driver, target subsystem</td></tr>
+      <tr><td>State</td><td>CC/CSTS; firmware queues; Boot Partition read status; TCP sessions and fabric controller IDs; NBFT contents</td></tr>
+      <tr><td>Memory</td><td>Firmware queues 0x7F00_0000 / 0x7F00_1000; Boot Partition buffer 0x7F10_0000; NBFT region; loader image</td></tr>
+      <tr><td>Registers</td><td>CAP (TO), CC, CSTS, AQA/ASQ/ACQ, BPINFO/BPRSEL/BPMBL (commonly given as 40h/44h/48h; confirm), CRTO (newer revisions)</td></tr>
+      <tr><td>Interfaces</td><td>UEFI NVM Express Pass Thru and device paths; ACPI tables; Fabrics Connect; NVMe/TCP PDUs</td></tr>
+      <tr><td>Dependencies</td><td>Enumeration and BAR assignment; network link, DHCP and routing; target allow lists; initramfs containing NBFT-aware tools</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The NBFT, structurally</h3>
+  <table>
+    <caption>NBFT parts as encoded in libnvme 1.16.2 (confirm in NVMe Boot 1.4)</caption>
+    <thead><tr><th>Part</th><th>Contents</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>Header</td><td>ACPI standard header (signature "NBFT", length, major revision, checksum, OEM ID, OEM table ID, OEM revision, creator ID, creator revision), then heap offset and length, a driver device-path signature heap object, minor revision</td><td>Whole table must sum to 0; OS rejects a bad checksum</td></tr>
+      <tr><td>Control descriptor</td><td>Locations and counts of the other descriptor tables</td><td>Parsers start here</td></tr>
+      <tr><td>Host descriptor</td><td>Host ID (16 bytes), host NQN (heap object); flags: valid, host ID configured, host NQN configured, primary administrative host flag field</td><td>Identity the OS must reuse</td></tr>
+      <tr><td>HFI descriptors + transport info</td><td>Transport type (TCP = 3 in libnvme); PCI segment/bus/device/function; MAC; VLAN; IP origin; address, prefix, gateway; route metric; DNS; DHCP server; host name; flags (valid, global route, DHCP override)</td><td>OS must bring up the same interface the same way</td></tr>
+      <tr><td>SSNS descriptors</td><td>Index, flags, transport type and flags (header/data digest), discovery index, address and service ID (heap objects), port ID, NSID, namespace identifier type/value, security index, primary and secondary HFIs, subsystem NQN, extended info</td><td>Each path to a boot or data namespace</td></tr>
+      <tr><td>Security, discovery descriptors</td><td>Security profile references; discovery controller address and NQN</td><td>TLS/authentication and rediscovery</td></tr>
+      <tr><td>Heap</td><td>Strings and variable data</td><td>Everything heap objects point to</td></tr>
+    </tbody>
+  </table>
+  <p>SSNS flags of note (libnvme): valid; non-bootable entry; use security; DHCP root-path override; extended info in use; separate discovery controller; discovered namespace; and a two-bit field for namespace availability (available / unavailable). <span class="badge uncertain">Confirm bit positions in NVMe Boot 1.4</span></p>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>A fabric boot from target 192.0.2.20, then handoff to Linux.</p>
+  <table>
+    <caption>Step by step</caption>
+    <thead><tr><th>#</th><th>Who acts</th><th>What changes</th><th>Where</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>UEFI NIC driver</td><td>Link up; DHCP or static address 192.0.2.10/24</td><td>NIC, firmware IP stack</td><td>DHCP frames; firmware log</td></tr>
+      <tr><td>2</td><td>NVMe/TCP initiator</td><td>Connects to discovery controller 192.0.2.20:8009; reads the discovery log</td><td>Network</td><td>ICReq/ICResp, Connect, Get Log Page capsules</td></tr>
+      <tr><td>3</td><td>Initiator</td><td>Connects admin queue to subsystem nqn.2026-10.org.example:lab-ssd at port 4420 with configured host NQN/ID; creates one I/O queue</td><td>Network; target creates a controller</td><td>Connect capsules; CNTLID in responses</td></tr>
+      <tr><td>4</td><td>UEFI block layer</td><td>Reads GPT, ESP and loader via Read capsules</td><td>Network → firmware memory</td><td>C2HData PDUs</td></tr>
+      <tr><td>5</td><td>Firmware</td><td>Builds NBFT, computes checksum, installs it as an ACPI table</td><td>Firmware memory</td><td>Table visible to OS</td></tr>
+      <tr><td>6</td><td>OS loader</td><td>Loads kernel and initramfs over the same path; calls ExitBootServices</td><td>Firmware → OS</td><td>Last firmware-originated frames; TCP sessions abandoned</td></tr>
+      <tr><td>7</td><td>Kernel</td><td>Starts network-unaware; the firmware sessions are dead</td><td>Host</td><td>Target logs keep-alive expiry later</td></tr>
+      <tr><td>8</td><td>initramfs</td><td>Reads NBFT, configures the HFI, connects with the same host NQN/ID</td><td>Host and network</td><td>New TCP SYN to 4420; Connect with identical host NQN</td></tr>
+      <tr><td>9</td><td>Kernel</td><td>Namespace appears as /dev/nvme0n1; root mounts</td><td>Host</td><td>dmesg; mount</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <ol class="seq" data-actors="Firmware|Discovery 8009|Subsystem 4420|initramfs">
+      <li data-from="Firmware" data-to="Discovery 8009">ICReq, Connect, Get Log Page</li>
+      <li data-from="Discovery 8009" data-to="Firmware" class="dashed">log: lab-ssd at 192.0.2.20:4420</li>
+      <li data-from="Firmware" data-to="Subsystem 4420">ICReq, Connect (host NQN H)</li>
+      <li data-from="Subsystem 4420" data-to="Firmware" class="dashed">CNTLID 1</li>
+      <li data-from="Firmware" data-to="Subsystem 4420">Read GPT, ESP, loader</li>
+      <li data-note="Firmware">publish NBFT; ExitBootServices</li>
+      <li data-from="initramfs" data-to="Subsystem 4420">ICReq, Connect (host NQN H, from NBFT)</li>
+      <li data-from="Subsystem 4420" data-to="initramfs" class="dashed">CNTLID 2</li>
+      <li data-note="Subsystem 4420">old controller 1 expires via keep-alive timeout</li>
+    </ol>
+    <figcaption>Fabric boot and OS reconnection. Synthetic example for teaching.</figcaption>
+  </figure>
+
+  <h3>The central concept on the ladder: a handoff of ownership</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>A pilot brings the ship in, writes a card, unties the ropes and leaves; the captain uses the card to carry on.</p></div>
+    <div class="rung" data-rung="B"><p>Firmware brings up the storage path, reads the loader, records how it did so, and must leave the device quiet; the OS reconstructs the path from that record.</p></div>
+    <div class="rung" data-rung="C"><p>UEFI drivers with polling queues in low memory; a NIC and TCP/IP stack in firmware; an ACPI table in reserved memory; an OS driver that resets the controller.</p></div>
+    <div class="rung" data-rung="D"><p>Base 2.4 (initialisation, CAP.TO, Boot Partitions), NVMe Boot 1.4 (pre-OS NVMe-oF, NBFT), UEFI (driver model, ExitBootServices, Pass Thru), ACPI (table header and checksum).</p></div>
+    <div class="rung" data-rung="E"><p>Local: CC.EN → CSTS.RDY within CAP.TO → admin commands → reads. Fabric: discovery → Connect → reads → NBFT → disconnect by abandonment → OS Connect.</p></div>
+    <div class="rung" data-rung="F"><p>PCIe: MWr32/MRd32 to BAR0 0xFE60_xxxx and DMA to 0x7F00_xxxx, then the OS reset. Network: two Connects with the same host NQN, minutes apart.</p></div>
+    <div class="rung" data-rung="G"><p>Ask who owned the device at the failing moment, which identity it used, and what timing contract it honoured.</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for the NBFT</h3>
+  <table>
+    <caption>Sixteen questions</caption>
+    <tbody>
+      <tr><td>1–3. What, why, problem</td><td>An ACPI table recording how firmware reached the boot namespace, so the OS can reach it again without its own configuration.</td></tr>
+      <tr><td>4–5. Before, better</td><td>iSCSI used the iBFT; ad-hoc kernel parameters. NBFT carries NVMe-oF identity (NQNs, host ID), multiple paths, discovery and security.</td></tr>
+      <tr><td>6–8. Creator, consumer, location</td><td>Firmware creates; OS tools in initramfs consume; ACPI-reserved memory, exposed by Linux under /sys/firmware/acpi/tables/.</td></tr>
+      <tr><td>9. Memory/registers</td><td>Memory only; no device registers.</td></tr>
+      <tr><td>10–11. Before, after</td><td>Successful fabric connection and loader read; afterwards OS reconnection.</td></tr>
+      <tr><td>12. If wrong</td><td>Checksum failure (table ignored), wrong host NQN (Connect Invalid Host), wrong HFI (no route), missing table (no root).</td></tr>
+      <tr><td>13–14. Analyzer, Linux</td><td>Not on a wire; in Linux, the table file and <code>nvme nbft show</code> (version-dependent).</td></tr>
+      <tr><td>15. Validation</td><td>Parse every generated table with two independent parsers; corrupt fields; multipath and VLAN cases; DHCP versus static.</td></tr>
+      <tr><td>16. Senior suspicion</td><td>initramfs built without NBFT support, or a host NQN regenerated at image build time.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <p>Applicable: <cite class="spec">NVM Express Boot Specification, Revision 1.4</cite>; <cite class="spec">NVM Express Base Specification, Revision 2.4</cite> (controller initialisation, Capabilities, Boot Partitions, Fabrics Connect); <cite class="spec">NVM Express TCP Transport Specification, Revision 1.3</cite>; <cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4</cite>; UEFI Specification (driver model, NVM Express Pass Thru Protocol, device paths); ACPI Specification (system description table header).</p>
+  <table>
+    <caption>Behaviour by category</caption>
+    <thead><tr><th>Category</th><th>Examples</th></tr></thead>
+    <tbody>
+      <tr><td><span class="badge normative">Normative</span></td><td>CAP.TO meaning; CC/CSTS handshake; Boot Partition register semantics; NBFT structure and checksum; Connect parameters and statuses; ACPI header</td></tr>
+      <tr><td><span class="badge informative">Informative</span></td><td>Example boot flows and diagrams in NVMe Boot</td></tr>
+      <tr><td><span class="badge optional">Optional</span></td><td>Boot Partitions; Boot Partition write protection; discovery during boot; security descriptors; multipath entries</td></tr>
+      <tr><td><span class="badge impl">Implementation-dependent</span></td><td>Firmware timeouts, retry counts, polling intervals, how firmware setup stores fabric configuration, whether firmware quiesces the controller, how the OS image consumes NBFT</td></tr>
+      <tr><td><span class="badge version">Version-dependent</span></td><td>CRTO and ready-with-media semantics (newer Base revisions); NBFT minor revisions and descriptors (for example the SSNS extended info descriptor); tool support (<code>nvme nbft</code>)</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout verified"><p>From libnvme 1.16.2 <code>nbft.h</code>: signature 4E424654h ("NBFT"); the entire table including the checksum field shall sum to 0; descriptor type values 0 Header, 1 Control, 2 Host, 3 HFI, 4 SSNS, 5 Security, 6 Discovery, 7 HFI Transport Info, 9 SSNS Extended Info; heap objects as 32-bit offset from table start plus 16-bit length; TCP transport type 3. The ACPI header layout (36 bytes, checksum at byte 9) is ACPI-standard. The example system's CAP = 0x0040_0830_1401_0FFF has TO = 14h = 20 × 500 ms = 10 s (Chapter 64's firmware trace used an illustrative 30 s).</p></aside>
+  <aside class="callout notsaid"><p>The specifications do not say how long a firmware driver should keep retrying a discovery controller, how firmware should order multiple boot paths, or that the OS must reconnect within a time limit (the target's keep-alive and controller-loss timers decide what survives). The Base specification does not require firmware to disable the controller before handoff; good firmware does, and good OS drivers reset regardless. This module does not give Boot Partition register bit positions.</p></aside>
+  <aside class="callout warn"><p>Never assume: that a slow CSTS.RDY is a fault; that firmware cleaned up; that the OS will find the same interface name; that the host NQN in the OS image equals the one in firmware setup; that a corrupted NBFT is reported loudly.</p></aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Participation and observability</caption>
+    <thead><tr><th>Hardware</th><th>Must / may</th><th>Observable?</th></tr></thead>
+    <tbody>
+      <tr><td>Root complex, memory controller, IOMMU (usually off in pre-OS)</td><td>Must (IOMMU may)</td><td>PCIe analyzer shows physical addresses</td></tr>
+      <tr><td>SSD controller (local boot)</td><td>Must</td><td>MMIO and DMA TLPs</td></tr>
+      <tr><td>Boot Partition storage in the SSD</td><td>May</td><td>Only through BPINFO status and delivered data</td></tr>
+      <tr><td>NIC with UEFI driver (fabric boot)</td><td>Must for fabric boot</td><td>Network capture; NIC DMA on PCIe</td></tr>
+      <tr><td>Target system and its SSDs</td><td>Must for fabric boot</td><td>Target logs and captures</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw"><p>Firmware runs before the IOMMU is enabled, so device DMA reaches physical memory directly. If a controller is still enabled when the OS starts, a late completion or Boot Partition MWr can land in memory the OS has already reused. The OS enables the IOMMU and resets the controller early, but there is a window between ExitBootServices and the driver's reset.</p></aside>
+  <p>Internal and unobservable: why the controller is slow to become ready (media recovery after power loss, metadata replay), and how firmware schedules its NIC polling against NVMe polling.</p>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>Boot-time protocol exchanges</caption>
+    <thead><tr><th>Path</th><th>Exchange</th><th>Completion signal</th><th>Failure signal</th></tr></thead>
+    <tbody>
+      <tr><td>Local controller enable</td><td>MWr CC.EN = 1, MRd CSTS polls</td><td>CSTS.RDY = 1 within CAP.TO</td><td>CSTS.CFS = 1, or timeout</td></tr>
+      <tr><td>Boot Partition read</td><td>MRd BPINFO; MWr BPMBL; MWr BPRSEL (ID, offset, size)</td><td>BPINFO read status "completed"; data by device MWr</td><td>Read status "error"</td></tr>
+      <tr><td>Firmware admin/I/O</td><td>Polled queues; SQ tail doorbell writes</td><td>CQE phase flip in firmware memory</td><td>Error status; firmware timeout</td></tr>
+      <tr><td>Fabric discovery</td><td>TCP to 8009; Connect to the discovery NQN; Get Log Page</td><td>Log entries</td><td>No SYN-ACK; Connect status</td></tr>
+      <tr><td>Fabric I/O</td><td>Connect admin/I/O; Read capsules</td><td>CapsuleResp</td><td>Connect Invalid Host (SCT 1h, SC 84h in libnvme and Linux; confirm), timeouts</td></tr>
+      <tr><td>Handoff</td><td>NBFT publication; no wire protocol</td><td>OS Connect succeeds</td><td>OS cannot find or parse NBFT</td></tr>
+    </tbody>
+  </table>
+  <p>The firmware's TCP sessions are not closed gracefully at ExitBootServices on many platforms; the target finds out through its keep-alive timer, so the subsystem briefly sees two controllers for the same host. <span class="badge impl">Implementation-dependent</span></p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic examples for teaching. PCIe traces use the lab system (SSD 01:00.0, RID 0x0100, BAR0 0xFE60_0000). Firmware buffers are below 4 GiB, so register accesses and firmware DMA use 32-bit TLPs (MRd32/MWr32). Network traces use host 192.0.2.10 and target 192.0.2.20; frame length = PDU + 66.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace A — normal: 128 KiB Boot Partition read before full initialisation">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MRd32</td><td>Req=RC Addr=0xFE60_0040 Len=1DW</td><td>Read BPINFO</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.9</td><td>CplD</td><td>Data: size 1 × 128 KiB, read status 0 (none), active ID 0</td><td>One 128 KiB partition per ID; partition 0 active</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.5</td><td>MWr32</td><td>Addr=0xFE60_0048 Data=0x7F10_0000 (low dword; high dword 0)</td><td>BPMBL: destination buffer in firmware memory</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>2.0</td><td>MWr32</td><td>Addr=0xFE60_0044 Data: ID 0, offset 0, size 32 × 4 KiB</td><td>BPRSEL: start reading 128 KiB</td></tr>
+        <tr class="dir-up"><td>5–516</td><td>Dev→Host</td><td>140 – 1,920</td><td>MWr32 ×512</td><td>Req=0x0100 Addr=0x7F10_0000 … 0x7F11_FF00 Len=64DW each</td><td>Boot data in 256-byte (MPS) writes</td></tr>
+        <tr class="dir-down"><td>517</td><td>Host→Dev</td><td>2,100</td><td>MRd32</td><td>Addr=0xFE60_0040</td><td>Poll BPINFO</td></tr>
+        <tr class="dir-up"><td>518</td><td>Dev→Host</td><td>2,101</td><td>CplD</td><td>read status 2 (completed)</td><td>Done</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> No queues, no doorbells, no commands: the only host traffic is three register accesses and polls. The device masters 512 MWr32 TLPs (128 KiB / 256 B), contiguous and in address order — Posted writes, so they cannot pass each other, and the completion status read in row 518 is ordered behind them (a read completion cannot pass posted writes in the same direction). That ordering is what lets firmware trust the buffer once status reads "completed". The status encodings shown follow Chapter 64's description; confirm field positions and the CC.EN precondition in Base 2.4. Throughput ≈ 128 KiB in 1.8 ms ≈ 73 MB/s — slow by I/O standards, irrelevant for boot.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace B — slow: discovery controller unreachable, fallback to the configured subsystem">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (s)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Tgt</td><td>2.104</td><td>TCP</td><td>192.0.2.10 → 192.0.2.20:8009 SYN</td><td>Firmware discovery attempt 1</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Tgt</td><td>3.104</td><td>TCP</td><td>SYN (retransmission)</td><td>No answer</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Tgt</td><td>5.104</td><td>TCP</td><td>SYN (retransmission)</td><td>No answer</td></tr>
+        <tr class="note"><td colspan="6">Firmware gives each discovery attempt 5 s, three attempts: 15 s spent. Discovery service on 8009 was stopped during target maintenance.</td></tr>
+        <tr class="abnormal"><td>4</td><td>Host→Tgt</td><td>17.110</td><td>TCP</td><td>192.0.2.10 → 192.0.2.20:4420 SYN</td><td><strong>First event outside the normal profile:</strong> firmware falls back to the SSNS address from setup, 15 s late</td></tr>
+        <tr class="dir-up"><td>5</td><td>Tgt→Host</td><td>17.110 2</td><td>TCP</td><td>SYN-ACK</td><td>Subsystem port is up</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Tgt</td><td>17.110 5</td><td>NVMe/TCP 194</td><td>ICReq (PDU 128)</td><td>Connection initialisation</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Tgt</td><td>17.111 0</td><td>NVMe/TCP 1162</td><td>CapsuleCmd Fabrics Connect QID 0, 1024 B in-capsule data</td><td>Admin Connect</td></tr>
+        <tr class="dir-up"><td>8</td><td>Tgt→Host</td><td>17.111 1</td><td>NVMe/TCP 90</td><td>CapsuleResp CNTLID 1, Success</td><td>Boot continues normally</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Boot succeeds, 15 s slower than usual (the advanced lab's model predicts p50 ≈ 19 s against ≈ 4 s). The SYN retransmissions at 1 s and 2 s intervals are the firmware TCP stack's own back-off, not the network. The slow boot is a policy choice: three tries of 5 s each. For a fleet boot SLA, one short discovery try followed by fallback is better, provided the fallback is correct. The NBFT published after this boot should flag that the namespace was not discovered (or omit the discovery reference), so the OS does not wait on 8009 again; check how your firmware sets the "discovered namespace" flag.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace C — failed: the OS reconnects with a different host NQN">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (s)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Tgt</td><td>3.912</td><td>NVMe/TCP 1162</td><td>Connect QID 0, HOSTNQN …uuid:5e1f0000-…-000000000010</td><td>Firmware Connect (from setup)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Tgt→Host</td><td>3.912 1</td><td>NVMe/TCP 90</td><td>CapsuleResp CNTLID 1, Success</td><td>Firmware boot reads loader, kernel, initramfs</td></tr>
+        <tr class="note"><td colspan="6">≈ 9.4 s: ExitBootServices; firmware sessions abandoned.</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Tgt</td><td>14.207</td><td>NVMe/TCP 194</td><td>ICReq</td><td>initramfs connection</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Tgt</td><td>14.208</td><td>NVMe/TCP 1162</td><td>Connect QID 0, HOSTNQN …uuid:9c41a2d3-…-7a10e2b4f001</td><td>Different host NQN</td></tr>
+        <tr class="abnormal"><td>5</td><td>Tgt→Host</td><td>14.208 1</td><td>NVMe/TCP 90</td><td>CapsuleResp Status SCT 1h SC 84h (Connect Invalid Host), DNR=1</td><td><strong>First abnormal event</strong></td></tr>
+        <tr class="note"><td colspan="6">Console: "Gave up waiting for root file system device". Target: controller 1 removed at ≈ 24 s (keep-alive expiry).</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The network, target and subsystem all work — the firmware connected 10 s earlier. The OS presented a different identity, which the subsystem's allow list refused. The usual cause is an initramfs that does not consume the NBFT and falls back to <code>/etc/nvme/hostnqn</code>, generated when the OS image was built (so every server from that image shares it — a second problem). Evidence: decode the NBFT host descriptor on a rescue boot and compare with the OS file. Fix: make initramfs NBFT-aware or provision the OS host NQN from the NBFT; regression test: boot two servers from one image and confirm each presents its NBFT identity.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace D — ambiguous: a write that lands after handoff">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ms, from ExitBootServices)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>−0.4</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x00000004</td><td>Firmware admin SQ tail = 4: one last command (Get Features, for its own bookkeeping)</td></tr>
+        <tr class="note"><td colspan="6">0.0: ExitBootServices. The firmware driver did not wait for the completion and did not clear CC.EN.</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.6</td><td>MRd32</td><td>Req=0x0100 Addr=0x7F00_00C0 Len=16DW</td><td>Device fetches SQE slot 3</td></tr>
+        <tr class="abnormal"><td>3</td><td>Dev→Host</td><td>212.0</td><td>MWr32</td><td>Req=0x0100 Addr=0x7F00_1030 Len=4DW</td><td><strong>First abnormal event:</strong> CQE written to firmware CQ slot 3 — 212 ms after handoff</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>1,840</td><td>MWr32</td><td>Addr=0xFE60_0014 Data=0x0046_0060</td><td>Linux driver: CC.EN = 0 (reset)</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>1,840 – 2,310</td><td>MRd32 ×n</td><td>Addr=0xFE60_001C</td><td>Poll CSTS until RDY = 0 (470 ms)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Why it is ambiguous.</strong> A kernel crash at 0.4 s reports corrupted memory near physical 0x7F00_1030. Row 3 is a plausible culprit: a 16-byte write into memory the OS had already reclaimed. But the trace alone cannot show (a) whether the OS had reused that page by 212 ms (it depends on the memory map handed off and the allocator); (b) whether the 212 ms latency is normal for that command after an unsafe shutdown or a device problem; (c) whether other corruption sources exist. Distinguishing experiments: mark 0x7F00_0000–0x7F00_1FFF reserved in the OS (via a kernel parameter) and repeat; or patch the firmware driver to wait for outstanding completions and clear CC.EN before handoff. If corruption disappears in both, the late DMA is confirmed. The defensive fixes belong on both sides: firmware quiesces; the OS enables the IOMMU and resets the controller as early as possible.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>All commands are read-only. <span class="badge version">Version-dependent</span> the NBFT subcommand and paths depend on nvme-cli/libnvme and kernel versions.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Is there an NBFT? (fabric boot only)</span>
+ls -l /sys/firmware/acpi/tables/ | grep -i nbft
+sudo xxd /sys/firmware/acpi/tables/NBFT | head -4      <span class="cm"># header: "NBFT", length, revision, checksum</span>
+sudo nvme nbft show                                    <span class="cm"># decoded host, HFI, SSNS, discovery (newer nvme-cli)</span>
+<span class="cm"># Identity used by the OS versus firmware</span>
+cat /etc/nvme/hostnqn /etc/nvme/hostid 2&gt;/dev/null
+sudo nvme list-subsys                                  <span class="cm"># transport, address, state per controller</span>
+<span class="cm"># Boot path and timing</span>
+efibootmgr -v                                          <span class="cm"># boot entries and device paths</span>
+systemd-analyze                                        <span class="cm"># firmware and loader time, if reported</span>
+journalctl -b -k | grep -i -E 'nvme|nbft' | head -40
+<span class="cm"># Local controller: timeout capability and Boot Partition support</span>
+sudo nvme show-regs /dev/nvme0 -H | grep -i -E 'timeout|boot partition'</code></pre>
+  <table>
+    <caption>What each output proves and cannot prove</caption>
+    <thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>NBFT file exists</td><td>Firmware published a table</td><td>That its checksum is valid or that initramfs read it</td></tr>
+      <tr><td><code>nvme nbft show</code> host NQN equals <code>/etc/nvme/hostnqn</code></td><td>Identity consistent now</td><td>That initramfs used it at boot (check journal)</td></tr>
+      <tr><td><code>systemd-analyze</code> firmware time 25 s</td><td>Boot spent long in firmware</td><td>Which step; you need firmware logs or a capture</td></tr>
+      <tr><td><code>show-regs</code> timeout field</td><td>The device's CAP.TO promise</td><td>What timeout firmware actually used</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Labs are simulation and analysis. Booting real systems over the network or reading Boot Partitions on test hardware is <span class="badge expert">Expert lab</span> work on lab machines only; never write Boot Partitions on drives you depend on.</p></aside>
+
+  <h3>Beginner lab — map the seams</h3>
+  <p><strong>Objective:</strong> list ownership and identity at each boot stage. <strong>Prerequisites:</strong> mechanism table. <strong>Setup:</strong> paper. <strong>Procedure:</strong> for local boot and fabric boot, fill a table with columns: stage, owner of the controller (or session), queues or connection used, identity presented, artefact handed on. <strong>Observations:</strong> note where two owners overlap. <strong>Questions:</strong> at which stage can a late DMA occur? At which stage does the host NQN matter twice?</p>
+  <details class="solution"><summary>Solution</summary><p>Local: firmware (queues at 0x7F00_xxxx) → loader (same driver) → gap after ExitBootServices (no owner, device maybe still enabled) → OS driver after reset. Fabric: firmware sessions (host NQN from setup) → loader → gap (target still has controller 1 until keep-alive expiry) → initramfs (host NQN from NBFT). Late DMA belongs to the local gap; the host NQN matters at the firmware Connect and the OS Connect.</p></details>
+  <p><strong>Extension:</strong> add a Boot Partition stage before full initialisation.</p>
+
+  <h3>Intermediate lab — build and break an NBFT model</h3>
+  <p><strong>Objective:</strong> understand header, heap objects and checksum. <strong>Prerequisites:</strong> architecture section. <strong>Setup:</strong> save as <code>nbft_toy.py</code>; run it. Descriptor bodies are a teaching format, not the real layout.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="nbft_toy.py"><code>#!/usr/bin/env python3
+"""nbft_toy.py - build and check a TEACHING model of an NBFT.
+
+Real parts: the 36-byte ACPI table header (signature, length, revision,
+checksum, OEM fields, creator fields) and the rule that all bytes of the
+table sum to 0 modulo 256. Header extension (heap offset/length) and the
+6-byte heap object (le32 offset, le16 length) follow libnvme's nbft.h.
+Toy parts: the descriptor bodies below are a simplified record format,
+NOT the NVMe Boot 1.4 byte layout. Read the specification for that.
+"""
+import struct
+
+HOSTNQN = b"nqn.2014-08.org.nvmexpress:uuid:5e1f0000-0000-4000-8000-000000000010"
+SUBNQN = b"nqn.2026-10.org.example:lab-ssd"
+
+def heap_obj(off, ln):
+    return struct.pack("&lt;IH", off, ln)
+
+def build(trsvcid=b"4420", traddr=b"192.0.2.20", nsid=1, corrupt=False):
+    heap = bytearray()
+    def put(b):
+        off = len(heap)
+        heap.extend(b + b"\0")          # NUL-terminate for readability
+        return off, len(b)
+    s_nqn, s_traddr, s_svc, h_nqn = put(SUBNQN), put(traddr), put(trsvcid), put(HOSTNQN)
+    # toy descriptors: (type, index, flags, fields...)
+    host = struct.pack("&lt;BBH", 2, 0, 0x0007) + b"\x5e\x1f" + b"\0" * 14
+    hfi = struct.pack("&lt;BBHB4sB4s", 3, 1, 0x0001, 3, bytes([192, 0, 2, 10]), 24,
+                      bytes([192, 0, 2, 1]))
+    ssns = struct.pack("&lt;BBHBI", 4, 1, 0x0001 | 0x0080, 3, nsid)
+    hdr_len = 36 + 4 + 4 + 6 + 1 + 3          # ACPI hdr + heap off/len + sig obj + minor + pad
+    body = host + hfi + ssns
+    heap_off = hdr_len + len(body) + 4 * 6     # four heap objects follow the body
+    # heap objects hold offsets from byte 0 of the table, not from the heap
+    refs = [heap_obj(heap_off + o, l) for o, l in (h_nqn, s_nqn, s_traddr, s_svc)]
+    body += b"".join(refs)
+    total = hdr_len + len(body) + len(heap)
+    acpi = struct.pack("&lt;4sIBB6s8sI4sI", b"NBFT", total, 1, 0, b"LABOEM",
+                       b"LABNBFT ", 1, b"LABF", 1)
+    ext = struct.pack("&lt;II", heap_off, len(heap)) + heap_obj(0, 0) + b"\x00" + b"\0" * 3
+    t = bytearray(acpi + ext + body + heap)
+    t[9] = (-sum(t)) &amp; 0xFF                    # checksum at byte offset 9
+    if corrupt:
+        t[heap_off + 5] ^= 0x01                 # flip one bit in the subsystem NQN
+    return bytes(t)
+
+def check(t):
+    sig, length, rev, csum = struct.unpack_from("&lt;4sIBB", t, 0)
+    problems = []
+    if sig != b"NBFT": problems.append("bad signature")
+    if length != len(t): problems.append("length %d != %d" % (length, len(t)))
+    if sum(t) &amp; 0xFF: problems.append("checksum: table sums to %02Xh, not 00h" % (sum(t) &amp; 0xFF))
+    heap_off, heap_len = struct.unpack_from("&lt;II", t, 36)
+    if heap_off + heap_len &gt; length: problems.append("heap outside table")
+    return problems, heap_off, heap_len
+
+def strings(t):
+    _, heap_off, _ = check(t)
+    out = []
+    p = heap_off - 4 * 6
+    for name in ("host NQN", "subsystem NQN", "traddr", "trsvcid"):
+        off, ln = struct.unpack_from("&lt;IH", t, p); p += 6
+        out.append("%-13s @%3d len %2d: %s" % (name, off, ln, t[off:off + ln].decode(errors="replace")))
+    return out
+
+if __name__ == "__main__":
+    for label, kw in (("good", {}), ("corrupted", {"corrupt": True})):
+        t = build(**kw)
+        problems, ho, hl = check(t)
+        print("%-9s table %d bytes, heap at %d (%d bytes): %s" %
+              (label, len(t), ho, hl, "; ".join(problems) or "OK"))
+    for line in strings(build()):
+        print("   ", line)</code></pre>
+  <p>Expected output (deterministic):</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>good      table 238 bytes, heap at 121 (117 bytes): OK
+corrupted table 238 bytes, heap at 121 (117 bytes): checksum: table sums to 01h, not 00h
+    host NQN      @169 len 68: nqn.2014-08.org.nvmexpress:uuid:5e1f0000-0000-4000-8000-000000000010
+    subsystem NQN @121 len 31: nqn.2026-10.org.example:lab-ssd
+    traddr        @153 len 10: 192.0.2.20
+    trsvcid       @164 len  4: 4420</code></pre>
+  <p><strong>Procedure:</strong> (1) change the target port to 4421 and confirm the checksum is recomputed; (2) flip two bits that cancel in the byte sum (add 1 to one byte, subtract 1 from another) and run <code>check()</code>; (3) make a heap object point beyond the table. <strong>Questions:</strong> what does a byte-sum checksum fail to catch? Why must parsers bound-check heap objects? <strong>Expected reasoning:</strong> the checksum detects accidental single changes, not compensating ones; heap offsets come from firmware and must be distrusted.</p>
+  <details class="solution"><summary>Solution</summary><p>(2) passes the checksum: an 8-bit sum misses compensating errors and any reordering of bytes. (3) a parser that trusts the offset reads outside the table — at best garbage, at worst a crash in early boot. Real parsers (libnvme) check offsets against the table length. A senior lesson: the ACPI checksum is integrity against accidents, not validation; parse defensively.</p></details>
+  <p><strong>Extension:</strong> add a second SSNS for a secondary path through another HFI and print both.</p>
+
+  <h3>Advanced lab — timeout and retry policy by simulation</h3>
+  <p><strong>Objective:</strong> quantify firmware timeout and discovery retry choices. <strong>Prerequisites:</strong> <a href="ch27.html">Controller Initialization</a>. <strong>Setup:</strong> save as <code>boot_budget.py</code>; run it.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="boot_budget.py"><code>#!/usr/bin/env python3
+"""boot_budget.py - Monte Carlo model of two pre-OS timing contracts.
+
+1. Local boot: firmware waits for CSTS.RDY with its own timeout. CAP.TO is
+   the device's promise (here 10 s). Ready-time distribution is invented
+   for teaching: most boots are fast, boots after an unsafe shutdown are slow.
+2. Fabric boot: discovery controller retries before falling back to the
+   subsystem address stored in firmware settings.
+All numbers are synthetic; the shape of the result is the lesson.
+"""
+import random
+
+CAP_TO_S = 10.0
+N = 200_000
+
+def ready_time(rng):
+    if rng.random() &lt; 0.97:                       # clean shutdown last time
+        return rng.uniform(0.3, 0.7)
+    t = rng.lognormvariate(1.0, 0.6)              # recovery after power loss
+    return min(t, CAP_TO_S * 0.98)                # device honours its CAP.TO
+
+def local(timeout_s, rng):
+    fails = sum(ready_time(rng) &gt; timeout_s for _ in range(N))
+    return fails / N
+
+def fabric(discovery_up, tries, per_try_s, rng):
+    t = rng.uniform(1.5, 3.0)                     # link up + DHCP
+    if discovery_up:
+        t += rng.uniform(0.05, 0.2)               # discovery connect + log page
+    else:
+        t += tries * per_try_s                    # every try times out
+    t += rng.uniform(0.1, 0.4)                    # connect admin/I/O, Identify
+    t += rng.uniform(0.8, 2.0)                    # read GPT, ESP, loader over TCP
+    return t
+
+if __name__ == "__main__":
+    rng = random.Random(64)
+    print("Local boot, CAP.TO = %.0f s, %d simulated boots" % (CAP_TO_S, N))
+    for timeout in (2.0, 5.0, 10.0, 15.0):
+        print("  firmware timeout %4.1f s -&gt; 'no bootable device' rate %.4f%%"
+              % (timeout, 100 * local(timeout, rng)))
+    print("Fabric boot, p50 / p99 time to loader (s)")
+    for label, up, tries, per in (("discovery up", True, 0, 0),
+                                  ("down, 3 x 5 s", False, 3, 5.0),
+                                  ("down, 1 x 2 s", False, 1, 2.0)):
+        ts = sorted(fabric(up, tries, per, rng) for _ in range(20_000))
+        print("  %-14s %5.1f / %5.1f" % (label, ts[len(ts) // 2], ts[int(len(ts) * 0.99)]))</code></pre>
+  <p>Expected output (deterministic with seed 64):</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>Local boot, CAP.TO = 10 s, 200000 simulated boots
+  firmware timeout  2.0 s -&gt; 'no bootable device' rate 2.1235%
+  firmware timeout  5.0 s -&gt; 'no bootable device' rate 0.4835%
+  firmware timeout 10.0 s -&gt; 'no bootable device' rate 0.0000%
+  firmware timeout 15.0 s -&gt; 'no bootable device' rate 0.0000%
+Fabric boot, p50 / p99 time to loader (s)
+  discovery up     4.0 /   5.2
+  down, 3 x 5 s   18.9 /  20.1
+  down, 1 x 2 s    5.9 /   7.1</code></pre>
+  <p><strong>Procedure:</strong> (1) set the unsafe-shutdown share to 10% and rerun; (2) remove the <code>min()</code> cap so the device sometimes exceeds CAP.TO, and see which timeout catches it; (3) find the shortest discovery policy that keeps p99 under 8 s with discovery down. <strong>Questions:</strong> who is at fault in each failure case? What should firmware log when it gives up?</p>
+  <details class="solution"><summary>Solution</summary><p>With timeout below CAP.TO, failures are the firmware's fault: the device kept its promise. Removing the cap creates device faults that even a CAP.TO-length wait cannot fix; firmware should then log "CSTS.RDY not set within CAP.TO (10 s)" with CSTS (including CFS) so the failure is attributable. One 2 s discovery try keeps p99 near 7 s. A fleet with 2% "no bootable device" after power events is the classic signature of a firmware timeout shorter than CAP.TO.</p></details>
+  <p><strong>Extension:</strong> model CRTO: a smaller ready-without-media time and a larger ready-with-media time, and decide which one gates the firmware's first admin command.</p>
+
+  <h3>Senior forensic lab — the reboot that loses one server in 300</h3>
+  <p><strong>Objective:</strong> reason from fleet evidence across firmware, OS and target. <strong>Prerequisites:</strong> all traces. <strong>Setup (synthetic evidence):</strong> 6,000 diskless servers boot over NVMe/TCP; after a scheduled reboot wave, 21 hang at "waiting for root device". All 21 booted firmware successfully. Target logs show their OS Connects succeeded, then I/O queue Connects failed with Connect Invalid Parameters. Each of the 21 reconnected within 3 s of the firmware's Connect. Controller limit per host on the target: 2.</p>
+  <details class="solution"><summary>Solution</summary><p>Identity is fine (admin Connect succeeded). The firmware's abandoned controller still counts until keep-alive expiry, so a fast OS reconnect creates a second controller for the same host; I/O queue Connects then hit the target's resource limit (shown as Invalid Parameters on this target — check what your target returns). Servers that reconnect after the old controller expired are unaffected, which explains the small fraction. Decisive experiment: delay initramfs connection by keep-alive time + 1 s on a test group, or raise the per-host limit; capture target logs. Fixes: firmware sends a disconnect (or a short keep-alive timeout in its Connect) before handoff; target limits account for boot overlap. Confidence before experiment: medium-high.</p></details>
+  <p><strong>Extension:</strong> write the post-incident report section "why this did not appear in lab testing".</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <table>
+    <caption>Five boot failure patterns</caption>
+    <thead><tr><th>Field</th><th>1. "No bootable device" after power loss</th><th>2. Root not found after fabric boot</th><th>3. Slow fabric boot</th><th>4. Memory corruption early in OS boot</th><th>5. Boot Partition data wrong</th></tr></thead>
+    <tbody>
+      <tr><td>Symptom</td><td>Intermittent, after outages</td><td>Kernel waits for root</td><td>15–20 s extra</td><td>Random early crashes on some models</td><td>First stage fails checks</td></tr>
+      <tr><td>Possible causes</td><td>Firmware timeout &lt; CAP.TO; device fault</td><td>Host NQN mismatch; NBFT not consumed; HFI misconfigured</td><td>Discovery retries; DHCP delays</td><td>Late DMA after handoff</td><td>Read of inactive partition; offset/size error; partial update</td></tr>
+      <tr><td>Evidence</td><td>CSTS at failure; firmware log</td><td>Connect status; NBFT; journal</td><td>Capture timing</td><td>PCIe capture across handoff</td><td>BPINFO active ID; BPRSEL value</td></tr>
+      <tr><td>First check</td><td>Firmware timeout value vs CAP.TO</td><td>Connect status code</td><td>Which step consumes the time</td><td>Is CC.EN still 1 at handoff?</td><td>Which ID was read?</td></tr>
+      <tr><td>Second check</td><td>CSTS.CFS</td><td>NBFT host NQN vs OS file</td><td>Discovery service status</td><td>Device DMA after ExitBootServices</td><td>Update log for the A/B switch</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Extend firmware timeout to CAP.TO</td><td>Boot with NBFT-aware initramfs</td><td>One short discovery try</td><td>Reserve firmware memory in OS</td><td>Read both partitions and compare digests</td></tr>
+      <tr><td>Likely conclusion</td><td>Firmware bug</td><td>Image/provisioning bug</td><td>Policy</td><td>Firmware cleanup bug</td><td>Update process bug</td></tr>
+      <tr><td>Confidence</td><td>High</td><td>High</td><td>High</td><td>Medium until both experiments</td><td>Medium-high</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>What does firmware need to boot from a local NVMe SSD?</p><details class="answer"><summary>Model answer</summary><p>Enumeration, an NVMe driver, controller enable, Identify, an I/O queue, and reads of GPT, ESP and the loader.</p></details></li>
+    <li><p>What is the NBFT for?</p><details class="answer"><summary>Model answer</summary><p>Telling the OS how firmware reached the fabric boot namespace so it can reconnect the same way.</p></details></li>
+    <li><p>Why does the OS reset the controller?</p><details class="answer"><summary>Model answer</summary><p>To start from a known state, regardless of what firmware left.</p></details></li>
+    <li><p>What is a Boot Partition?</p><details class="answer"><summary>Model answer</summary><p>A small optional storage area read through registers before full initialisation, with two IDs for A/B updates.</p></details></li>
+    <li><p>What does CAP.TO mean?</p><details class="answer"><summary>Model answer</summary><p>Worst-case time for CSTS.RDY to follow CC.EN, in 500 ms units.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>Why are firmware TLPs 32-bit?</p><details class="answer"><summary>Model answer</summary><p>Firmware typically allocates buffers below 4 GiB (0x7F00_0000 here), and MMIO BAR0 is below 4 GiB.</p></details></li>
+    <li><p>How does firmware know a Boot Partition read finished?</p><details class="answer"><summary>Model answer</summary><p>BPINFO read status shows completed; ordering ensures earlier posted data writes are visible first.</p></details></li>
+    <li><p>What is a heap object?</p><details class="answer"><summary>Model answer</summary><p>An offset-from-table-start and length pair locating variable data in the NBFT heap.</p></details></li>
+    <li><p>Connect Invalid Host after fabric boot: first suspect?</p><details class="answer"><summary>Model answer</summary><p>OS host NQN differs from the firmware's; initramfs did not use the NBFT.</p></details></li>
+    <li><p>Why do two controllers exist briefly for one host?</p><details class="answer"><summary>Model answer</summary><p>Firmware sessions are abandoned; the target removes them only at keep-alive expiry.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>How should firmware pick its ready timeout?</p><details class="answer"><summary>Model answer</summary><p>At least CAP.TO (or the applicable CRTO value), logging CSTS on failure; never a fixed short value.</p></details></li>
+    <li><p>What must firmware do at ExitBootServices?</p><details class="answer"><summary>Model answer</summary><p>Wait for or abort outstanding commands, disable the controller (and ideally bus mastering), and disconnect fabric sessions where practical.</p></details></li>
+    <li><p>How would you validate NBFT generation?</p><details class="answer"><summary>Model answer</summary><p>Parse with independent parsers, compare to setup, cover static/DHCP, VLAN, multipath, security, and corrupt-table handling in the OS.</p></details></li>
+    <li><p>What does A/B mean for Boot Partitions?</p><details class="answer"><summary>Model answer</summary><p>Write the inactive partition, verify it, then switch the active ID; a failed write never removes the working copy.</p></details></li>
+    <li><p>Why is discovery retry policy an SLA decision?</p><details class="answer"><summary>Model answer</summary><p>Retries trade boot time against resilience; at fleet scale each second multiplies across reboots.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>Design identity management for diskless servers.</p><details class="answer"><summary>Model answer</summary><p>Per-server host NQN/ID provisioned in firmware, published in NBFT, consumed by initramfs, never baked into images; allow lists managed centrally.</p></details></li>
+    <li><p>2% boot failures after a data-centre power event. Approach?</p><details class="answer"><summary>Model answer</summary><p>Check firmware ready timeout versus CAP.TO; group by firmware version and drive model; capture CSTS; lab-reproduce with power cuts.</p></details></li>
+    <li><p>Who owns the handoff gap?</p><details class="answer"><summary>Model answer</summary><p>Both: firmware quiesces, OS resets early with IOMMU on; tests must cover the gap explicitly.</p></details></li>
+    <li><p>When would you use Boot Partitions in a product?</p><details class="answer"><summary>Model answer</summary><p>Embedded or appliance designs needing a first stage before a full driver; not on general servers using UEFI and an ESP.</p></details></li>
+    <li><p>How do you keep boot behaviour stable across firmware updates?</p><details class="answer"><summary>Model answer</summary><p>Boot regression suite with timing budgets, NBFT diffs, identity checks, and slow-ready injection on each release.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>CAP.TO = 14h. The minimum safe firmware ready timeout is:</p>
+      <ul class="options" data-answer="3"><li>2 s</li><li>5 s</li><li>10 s</li><li>20 s</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>20 × 500 ms = 10 s.</p></details></li>
+    <li><p>Firmware queue at 0x7F00_0000 is fetched with:</p>
+      <ul class="options" data-answer="2"><li>MRd64</li><li>MRd32</li><li>CfgRd0</li><li>MsgD</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Address below 4 GiB uses the 3-DW header form.</p></details></li>
+    <li><p>An NBFT heap object offset is measured from:</p>
+      <ul class="options" data-answer="1"><li>The start of the table</li><li>The start of the heap</li><li>The descriptor</li><li>The end of the header</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Per libnvme's description of the heap object.</p></details></li>
+    <li><p>A 128 KiB Boot Partition read at MPS 256 produces how many device writes at minimum?</p>
+      <ul class="options" data-answer="4"><li>32</li><li>128</li><li>256</li><li>512</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>131,072 / 256 = 512.</p></details></li>
+    <li><p>Connect Invalid Host is:</p>
+      <ul class="options" data-answer="2"><li>SCT 0h SC 84h</li><li>SCT 1h SC 84h</li><li>SCT 1h SC 82h</li><li>A TCP reset</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Command-specific status 84h (82h is Invalid Parameters), per libnvme and Linux; confirm in Base 2.4.</p></details></li>
+    <li><p>Which artefact passes a local boot path to the OS?</p>
+      <ul class="options" data-answer="3"><li>NBFT</li><li>BPINFO</li><li>UEFI boot variables and device paths</li><li>CAP</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>NBFT is for fabric boot.</p></details></li>
+    <li><p>Why does an 8-bit byte-sum checksum not prove an NBFT is correct?</p><details class="answer"><summary>Model answer</summary><p>Compensating changes and wrong-but-consistent content pass; it detects accidents only.</p></details></li>
+    <li><p>Why might a late DMA corrupt OS memory only on some boots?</p><details class="answer"><summary>Model answer</summary><p>It depends on whether the page was already reused and on command latency, both variable.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <details class="answer"><summary>To a child — model</summary><p>"A pilot steers a ship into harbour, writes a card saying the ship's name and dock, lets go of every rope, and leaves. The captain uses the same name from the card. If the captain uses a different name, the harbour won't let the ship unload."</p></details>
+  <details class="answer"><summary>To a junior engineer — model</summary><p>"Firmware brings the controller up, waiting at least CAP.TO, reads the loader, and for fabric boot writes an NBFT with host identity, interfaces and namespaces. The OS resets the controller or reconnects using the NBFT. Most boot bugs are short timeouts, identity mismatches, or firmware leaving the device running."</p></details>
+  <details class="answer"><summary>To a senior engineer — model</summary><p>"Boot is a chain of ownership transfers with gaps. Contracts at each seam: timing (CAP.TO/CRTO), identity (host NQN/ID via NBFT), and quiescence (no DMA or live sessions across handoff). Instrument each seam, test with slow-ready and unreachable-discovery injection, and treat images that carry identity as defects."</p></details>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain the three boot sources, the timing contract and the NBFT structure</li>
+      <li>diagram fabric boot and handoff, including the two Connects and keep-alive expiry</li>
+      <li>identify Boot Partition transfers, late DMA and identity changes in traces</li>
+      <li>debug the five boot patterns and the handoff ambiguity</li>
+      <li>distinguish NBFT from boot variables, Boot Partitions from namespace partitions, and boot-time reconnection from runtime fabric recovery (<a href="ch65.html">NVMe over Fabrics</a>, <a href="dd50.html">NVMe/TCP</a>, <a href="dd41.html">Reset</a>)</li>
+      <li>cite NVMe Boot 1.4, Base 2.4, TCP Transport 1.3, UEFI and ACPI for what each defines</li>
+    </ul>
+  </aside>
+  <p><strong>Next:</strong> <a href="dd50.html">NVMe/TCP</a> — what the OS actually sends once it reconnects.</p>
+</section>
