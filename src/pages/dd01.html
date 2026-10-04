@@ -1,0 +1,687 @@
+<p class="lead">Chapter 1 introduced the workers: CPU, memory, devices, buses, interrupts and Direct Memory Access (DMA). This module looks at the contract between them that every NVM Express (NVMe) command depends on: memory types, caches and coherence, store ordering and barriers, the true cost of a memory-mapped register read, the path an interrupt takes back to a CPU core, and Non-Uniform Memory Access (NUMA) locality. These are the places where "the SSD is slow" or "the SSD did the wrong thing" turns out to be a CPU-side problem.</p>
+
+<section id="orientation">
+<h2>Orientation</h2>
+<p>A single 4 KiB NVMe Read involves the CPU writing a 64-byte command into ordinary cached memory, writing one 32-bit value into a device register across the Peripheral Component Interconnect Express (PCIe) link, the device reading that cached memory without the CPU's help, the device writing data and a completion back into memory, and a message-signalled interrupt landing on some core. Each step relies on a rule of the CPU and memory system: which writes become visible first, whether the device sees what is in the cache, how expensive it is to read a device register, and which core is woken. Chapter 1 showed <em>that</em> these steps happen. This module shows <em>which guarantees make them correct</em>, what breaks when a guarantee is missing, and how that looks in a trace.</p>
+<aside class="callout prereq">
+<p>Read <a href="ch01.html">Chapter 1 — How Computers Move Data</a> first (address spaces, virtual and physical memory, I/O, drivers, interrupts, DMA). This module also assumes the BAR picture from <a href="ch19.html">Chapter 19</a> and the DMA overview in <a href="ch20.html">Chapter 20</a>. The doorbell and completion mechanics appear in <a href="ch28.html">Chapter 28</a> and the interrupt path in <a href="ch43.html">Chapter 43</a>; you do not need them in detail yet.</p>
+</aside>
+<p>Where this goes next: <a href="dd02.html">Module 02 — DMA and Address Translation</a> follows the device's addresses through the I/O memory-management unit; <a href="dd06.html">Module 06 — BAR and MMIO</a> looks at register windows from the device side; <a href="dd27.html">Module 27 — Doorbells</a> and <a href="dd19.html">Module 19 — MSI and MSI-X</a> use the ordering and interrupt rules taught here.</p>
+</section>
+
+<section id="objectives">
+<h2>Required learning objectives</h2>
+<table>
+<caption>What you should be able to do at each level after this module</caption>
+<thead><tr><th>Level</th><th>Objective</th></tr></thead>
+<tbody>
+<tr><td>Beginner</td><td>Explain why the CPU puts commands in memory and only writes a small value to the device, and name the three places data can be: CPU register, cache/DRAM, device.</td></tr>
+<tr><td>Intermediate</td><td>Distinguish write-back, uncached and write-combining memory types; explain why device registers are mapped uncached; explain cache-coherent DMA and what "snooping" means.</td></tr>
+<tr><td>Advanced</td><td>Explain store ordering between normal memory and memory-mapped I/O (MMIO), the role of barriers such as the ones inside Linux <code>writel()</code>, and why a posted MMIO write can be "flushed" by a read.</td></tr>
+<tr><td>Senior</td><td>Reason about NUMA placement of queues, buffers and interrupt vectors; predict the throughput cost of MMIO reads in a hot path; judge whether a platform-specific behavior (coherence, ordering) is guaranteed by architecture, by PCIe, or only by one implementation.</td></tr>
+<tr><td>Trace analysis</td><td>Recognize in a PCIe trace the signature of a CPU-side problem: MMIO reads (Root Complex-originated MRd to a BAR) in the hot path, doorbells that precede stale queue contents, interrupts written but serviced late.</td></tr>
+<tr><td>Debugging</td><td>Separate "the device was slow" from "the CPU, cache or interrupt routing was slow" using timestamps on both sides of the link.</td></tr>
+<tr><td>Validation</td><td>Design tests that vary memory placement (local vs remote NUMA node), interrupt affinity and CPU architecture (strongly vs weakly ordered) to expose ordering and locality bugs.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="kid">
+<h2>Kid story</h2>
+<aside class="callout kid">
+<p>Imagine a busy restaurant kitchen. The head chef (the CPU) works at a counter with a tiny cutting board right in front of her (registers), a small shelf next to her hands (cache), and a big walk-in fridge down the corridor (memory). Outside the kitchen is a delivery company (the device) with its own van and its own key to the fridge.</p>
+<p>When the chef wants a delivery, she does not drive the van. She writes an order slip and pins it on the board <em>inside the fridge</em>. Then she rings a small bell on the delivery company's wall (the doorbell). The driver walks into the fridge, reads the slip, loads the van, later brings the goods back to the fridge, puts a "done" note on the fridge board, and presses a buzzer in the kitchen.</p>
+<p>Three things can go wrong. If the chef rings the bell <em>before</em> she has finished writing the slip, the driver reads half a slip. If the slip is still on the chef's shelf and not yet in the fridge, the driver must be able to see the shelf too — in this kitchen there is a rule that the driver always checks the chef's shelf. And if the buzzer rings in the wrong kitchen (there are two kitchens in this building), someone has to run across the building to tell the chef.</p>
+</aside>
+</section>
+
+<section id="boundary">
+<h2>Analogy boundary</h2>
+<aside class="callout breaks">
+<p><strong>What the analogy represents.</strong> The slip on the fridge board is the Submission Queue Entry (SQE) in host memory. The bell is the MMIO doorbell write. The driver's own key is bus-mastering DMA. "The driver checks the chef's shelf" is cache-coherent (snooped) DMA. The two kitchens are two NUMA nodes, and the buzzer is a Message Signalled Interrupt (MSI-X) message.</p>
+<p><strong>What it hides.</strong> (1) The chef does not write slowly in one place: modern CPUs keep stores in a <em>store buffer</em> and may make them visible in a different order than the program wrote them, depending on architecture and memory type. (2) Ringing the bell is not instantaneous: a doorbell is a posted write that may sit in buffers; the chef walks away immediately and never learns when it arrived. (3) Asking the delivery company a question (an MMIO read) is extremely expensive: the chef stands at the wall waiting for the answer and cooks nothing meanwhile. (4) The fridge is not one fridge: with an I/O memory-management unit (IOMMU) the driver's map of the fridge is a different map from the chef's (see <a href="dd02.html">Module 02</a>).</p>
+<p><strong>Where it misleads.</strong> The story suggests that the order of events is natural. It is not: correct order is <em>enforced</em> by barriers, by the uncached memory type of the doorbell, and by PCIe ordering rules. It also suggests the "shelf check" is universal; on some platforms DMA is not coherent with CPU caches and software must clean or invalidate cache lines explicitly. Finally, the buzzer is not a wire: an MSI-X interrupt is itself a memory write, which is why it is ordered behind the data it announces.</p>
+</aside>
+</section>
+
+<section id="vocabulary">
+<h2>Vocabulary</h2>
+<table>
+<caption>Terms used in this module</caption>
+<thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship to adjacent terms</th><th>Common confusion</th></tr></thead>
+<tbody>
+<tr><td><span class="g" data-term="cache-line">Cache line</span></td><td>The smallest chunk the CPU's shelf holds.</td><td>The unit of caching and coherence, 64 bytes on mainstream x86-64 and many Arm cores <span class="badge impl">Implementation-dependent</span>.</td><td>One NVMe SQE (64 bytes) fits one 64-byte line when aligned; a 16-byte Completion Queue Entry (CQE) shares a line with three others.</td><td>Thinking the PCIe Cache Line Size register (offset 0Ch) affects PCIe transfers; it has no effect on PCIe.</td></tr>
+<tr><td><span class="g" data-term="cache-coherence">Cache coherence</span></td><td>Everyone sees the same value for the same address.</td><td>A hardware protocol keeping caches consistent; for I/O, the Root Complex snoops CPU caches on DMA so device reads see dirty lines and device writes invalidate stale ones.</td><td>Coherent DMA removes the need for explicit cache maintenance; the No Snoop attribute in a TLP may ask the platform to skip snooping.</td><td>"DMA bypasses the cache so the CPU must flush" — true only on non-coherent platforms.</td></tr>
+<tr><td><span class="g" data-term="memory-type">Memory type</span></td><td>The rules the CPU uses for an address range.</td><td>Attributes such as write-back (WB), uncached (UC) and write-combining (WC), set via page attributes (on x86, the Page Attribute Table and Memory Type Range Registers).</td><td>DRAM is normally WB; device registers UC; prefetchable BARs may be WC.</td><td>Believing "prefetchable" in a BAR means the OS must map it WC; it only means it is <em>safe</em> to.</td></tr>
+<tr><td><span class="g" data-term="mmio">MMIO</span></td><td>Talking to a device by writing to an address.</td><td>Memory-mapped I/O: loads and stores to physical addresses claimed by a device's Base Address Register (BAR) become PCIe Memory Read/Write requests.</td><td>An MMIO store becomes a posted MWr; an MMIO load becomes a non-posted MRd that the CPU waits for.</td><td>Treating an MMIO read as cheap because it is "just a load".</td></tr>
+<tr><td><span class="g" data-term="store-buffer">Store buffer</span></td><td>The chef's outbox.</td><td>A per-core queue where retired stores wait before becoming globally visible; allows the core to continue executing.</td><td>Source of reordering visible to other agents; drained by fences and some serializing instructions.</td><td>Assuming a store is visible to the device the moment the instruction executes.</td></tr>
+<tr><td><span class="g" data-term="memory-barrier">Memory barrier</span></td><td>"Finish what came before first."</td><td>An instruction or compiler primitive constraining the order in which memory operations become visible (x86 <code>sfence</code>/<code>mfence</code>, Arm <code>dmb</code>/<code>dsb</code>; Linux <code>wmb()</code>, <code>dma_wmb()</code>).</td><td>Linux <code>writel()</code> includes the ordering needed between prior normal-memory writes and the MMIO write; <code>writel_relaxed()</code> does not.</td><td>Believing x86 needs no barriers anywhere; it needs fewer, and the compiler can still reorder.</td></tr>
+<tr><td><span class="g" data-term="posted">Posted write</span></td><td>Send and forget.</td><td>A PCIe Memory Write needs no completion; the CPU continues as soon as it leaves the core.</td><td>A later MMIO read to the same device cannot pass it (PCIe ordering), which is why reads "flush" writes.</td><td>Thinking the CPU knows when a doorbell has arrived.</td></tr>
+<tr><td><span class="g" data-term="numa">NUMA</span></td><td>Two kitchens, one building.</td><td>Non-Uniform Memory Access: memory and PCIe Root Ports are attached to particular sockets/dies; access from another node crosses an inter-socket link with extra latency.</td><td>A PCIe device has a home node (<code>numa_node</code> in sysfs); queues, buffers and interrupt vectors should usually be local.</td><td>Expecting identical latency from every core.</td></tr>
+<tr><td><span class="g" data-term="msi-x">MSI-X</span></td><td>The buzzer.</td><td>Message Signalled Interrupts, extended: the device performs a Memory Write of a data value to an address from its MSI-X table; the platform turns it into a CPU interrupt.</td><td>On x86 the address lies in the 0xFEE0_0000 window that targets local Advanced Programmable Interrupt Controllers (APICs).</td><td>Thinking an interrupt is a separate wire on PCIe; it is a TLP and obeys write ordering.</td></tr>
+<tr><td><span class="g" data-term="irq-affinity">Interrupt affinity</span></td><td>Which chef hears the buzzer.</td><td>The set of CPUs an interrupt vector is steered to, programmed via the MSI-X address/data (and interrupt remapping when enabled).</td><td>Linux NVMe uses managed affinity: one completion queue vector per CPU set.</td><td>Assuming moving an IRQ is always possible; managed IRQs cannot be re-steered from user space.</td></tr>
+<tr><td><span class="g" data-term="iommu">IOMMU</span></td><td>The driver's own map of the fridge.</td><td>I/O memory-management unit: translates device addresses (IOVAs) to physical addresses and enforces permissions.</td><td>Treated in depth in <a href="dd02.html">Module 02</a>.</td><td>Thinking the device uses the CPU's virtual addresses.</td></tr>
+<tr><td><span class="g" data-term="root-complex">Root Complex</span></td><td>The kitchen door to the outside world.</td><td>The host-side PCIe component that turns CPU memory accesses into TLPs and device TLPs into memory/interrupt traffic.</td><td>Contains Root Ports; often contains or fronts the IOMMU and interrupt translation.</td><td>Seeing it as one chip; on modern CPUs it is distributed logic inside the processor.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="architecture">
+<h2>Architecture</h2>
+<p>The diagram shows the reference machine from <a href="ch01.html">Chapter 1</a>, extended with the pieces this module cares about: store buffers, the cache hierarchy and its coherence fabric, the memory-type attributes on each address range, a second socket (NUMA node 1), and the interrupt delivery path.</p>
+<figure>
+<pre class="diagram">
+  NUMA node 0 (socket 0)                                   NUMA node 1 (socket 1)
+ ┌───────────────────────────────────────────────┐        ┌──────────────────────────┐
+ │ core 0           core 1           core N      │        │ cores 32..63             │
+ │ ┌──────────┐   ┌──────────┐                   │        │ caches                   │
+ │ │regs      │   │regs      │                   │        │ memory controller        │
+ │ │store buf │   │store buf │                   │        │ DRAM (node 1)            │
+ │ │L1/L2     │   │L1/L2     │                   │◀──────▶│ Root Ports (other slots) │
+ │ └────┬─────┘   └────┬─────┘  local APICs      │ inter- └──────────────────────────┘
+ │      └──── shared cache / coherence fabric ───┤ socket
+ │               │                 │             │ link
+ │       memory controller   Root Complex + IOMMU│
+ │               │              Root Port 00:01.1│
+ └───────────────┼─────────────────┼─────────────┘
+          DRAM node 0 (WB)         │ PCIe Gen4 x4
+     SQ1 0x1_2340_0000 (IOVA)      │
+     CQ1 0x1_2341_0000 (IOVA)  ┌───┴────────────────────────┐
+     data 0x2_0000_0000 (IOVA) │ Lab SSD 01:00.0            │
+                               │ BAR0 0xFE60_0000 (UC)      │
+                               │  registers, doorbells 1000h│
+                               │  MSI-X table 2000h         │
+                               └────────────────────────────┘
+</pre>
+<figcaption>Synthetic example for teaching: the reference machine with a second NUMA node. The Lab SSD hangs off node 0.</figcaption>
+</figure>
+<table>
+<caption>Architecture summary for one NVMe I/O, seen from the CPU/memory side</caption>
+<thead><tr><th>Aspect</th><th>What it is here</th></tr></thead>
+<tbody>
+<tr><td>Inputs</td><td>An application request (read 4 KiB at an offset); a buffer in user or kernel memory; the driver's queue state.</td></tr>
+<tr><td>Outputs</td><td>Data in a host buffer; a CQE in the Completion Queue; an interrupt on a chosen core; updated head/tail state.</td></tr>
+<tr><td>Actors</td><td>CPU core (driver code), store buffer, caches and coherence fabric, memory controller, Root Complex, IOMMU, interrupt controller (local APIC or equivalent), the NVMe controller's DMA engine.</td></tr>
+<tr><td>State</td><td>Driver's SQ tail and CQ head; controller's SQ head and CQ tail; Phase Tag; cache-line states (modified/shared/invalid); store-buffer contents; IOMMU mappings.</td></tr>
+<tr><td>Memory</td><td>SQ, CQ and data buffers in write-back DRAM, ideally on the device's NUMA node; MSI-X table in device memory (BAR0 + 2000h).</td></tr>
+<tr><td>Registers</td><td>CPU general-purpose registers holding the doorbell value; page-attribute state for BAR mappings; NVMe doorbells (SQ1TDBL at BAR0 + 1008h, CQ1HDBL at BAR0 + 100Ch); PCI Command register Bus Master Enable.</td></tr>
+<tr><td>Interfaces</td><td>Core-to-fabric (loads/stores, fences); fabric-to-Root Complex; PCIe link (TLPs); interrupt message to core.</td></tr>
+<tr><td>Dependencies</td><td>Correct memory type for each mapping; barrier between SQE stores and doorbell store; coherent DMA (or explicit cache maintenance); IOMMU mapping; interrupt routing (and remapping) set up; Bus Master Enable set.</td></tr>
+</tbody>
+</table>
+<h3>Memory types that matter to a storage engineer</h3>
+<table>
+<caption>Memory types, x86 terminology (other architectures have equivalents with different names)</caption>
+<thead><tr><th>Type</th><th>Cached?</th><th>Ordering of stores</th><th>Reads may be speculative?</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td>Write-back (WB)</td><td>Yes</td><td>Program order to other agents on x86 (Total Store Order); weaker on Arm/POWER</td><td>Yes</td><td>DRAM: queues, buffers</td></tr>
+<tr><td>Uncached (UC)</td><td>No</td><td>Strongly ordered, not combined</td><td>No</td><td>Device registers with side effects: NVMe doorbells, CC, CSTS</td></tr>
+<tr><td>Write-combining (WC)</td><td>No</td><td>Writes may be merged and reordered until a fence</td><td>Yes (reads are speculative-safe only for prefetchable memory)</td><td>Frame buffers, Controller Memory Buffer data regions; <em>never</em> doorbells</td></tr>
+</tbody>
+</table>
+<aside class="callout impl">
+<p>The exact memory-type mechanisms (x86 Page Attribute Table, Memory Type Range Registers; Arm Device-nGnRE versus Normal memory attributes) are architecture specifications, not PCIe or NVMe ones. The table describes typical Linux behavior on x86-64: <code>ioremap()</code> gives UC, <code>ioremap_wc()</code> gives WC. Confirm the rules for your architecture in its architecture reference manual.</p>
+</aside>
+</section>
+
+<section id="mechanism">
+<h2>Mechanism</h2>
+<p>This is the life of one 4 KiB Read on the reference machine, told from the point of view of the CPU and memory system. The submitting core is core 3 on NUMA node 0; the queue pair is I/O queue 1; the command goes into SQ1 slot 5.</p>
+<ol>
+<li><strong>Driver builds the SQE.</strong> <em>Who:</em> core 3 executing driver code. <em>What changes:</em> 64 bytes of SQ1 slot 5 (IOVA 0x1_2340_0140). <em>Where:</em> first in core 3's store buffer, then in its L1 cache line, marked modified. DRAM may still hold old bytes. <em>Evidence:</em> none outside the core; a debugger or a memory dump after the fact.</li>
+<li><strong>Ordering point.</strong> <em>Who:</em> the barrier inside <code>writel()</code> (on x86 the UC store itself is ordered behind earlier WB stores; on Arm an explicit barrier is emitted). <em>What changes:</em> all earlier stores, including the SQE, must become visible to other agents before the doorbell store does. <em>Where:</em> store buffer drain order. <em>Evidence:</em> only indirect — the device later reads the correct SQE.</li>
+<li><strong>Doorbell store.</strong> <em>Who:</em> core 3. <em>What changes:</em> a 32-bit UC store of value 6 to 0xFE60_1008. <em>Where:</em> leaves the core, travels the fabric to the Root Complex, becomes a posted MWr on the link. <em>Evidence:</em> a Host→Dev MWr32 to BAR0 + 1008h in the analyzer. The core has already moved on.</li>
+<li><strong>Command fetch.</strong> <em>Who:</em> the NVMe controller as bus master. <em>What changes:</em> nothing in memory; the controller obtains a copy of the SQE. <em>Where:</em> its MRd reaches the Root Complex, is translated by the IOMMU, and is serviced <em>coherently</em>: the fabric snoops core 3's cache, which holds the modified line, and returns the up-to-date bytes. <em>Evidence:</em> Dev→Host MRd of 64 bytes and a CplD answering it.</li>
+<li><strong>Data written to memory.</strong> <em>Who:</em> controller DMA engine. <em>What changes:</em> the 4 KiB buffer. <em>Where:</em> DRAM on node 0; any cached copies of those lines in any core are invalidated by the coherent write. <em>Evidence:</em> sixteen 256-byte MWr TLPs (Max Payload Size 256 B).</li>
+<li><strong>CQE written.</strong> <em>Who:</em> controller. <em>What changes:</em> 16 bytes of CQ1 slot 5, with the Phase Tag flipped to the current phase. <em>Where:</em> DRAM; invalidates the CPU's cached copy of that line. <em>Evidence:</em> one 16-byte MWr after the data. PCIe ordering keeps it behind the data writes (unless Relaxed Ordering allows otherwise — see <a href="ch14.html">Chapter 14</a>).</li>
+<li><strong>Interrupt message.</strong> <em>Who:</em> controller. <em>What changes:</em> the target core's interrupt controller latches a vector. <em>Where:</em> MWr to the 0xFEE0_xxxx window; the Root Complex (with interrupt remapping, if enabled) converts it into an interrupt for the core named in the vector's affinity. <em>Evidence:</em> Dev→Host MWr32 to 0xFEE0_0000 range; on the CPU side, a counter increment in <code>/proc/interrupts</code>.</li>
+<li><strong>Completion processing.</strong> <em>Who:</em> the core that took the interrupt (core 3 if affinity matches the submitter). <em>What changes:</em> driver reads the CQE (a cache miss, because the line was invalidated by the device's write), checks the Phase Tag, matches the Command Identifier (CID), completes the request. <em>Where:</em> core's cache. <em>Evidence:</em> tracepoints such as <code>nvme_complete_rq</code>; no PCIe traffic.</li>
+<li><strong>CQ head doorbell.</strong> <em>Who:</em> the completing core. <em>What changes:</em> controller learns that slot 5 may be reused. <em>Where:</em> MWr to BAR0 + 100Ch. <em>Evidence:</em> Host→Dev MWr32.</li>
+</ol>
+<figure>
+<ol class="seq" data-actors="Core 3|Cache / fabric|Root Complex + IOMMU|Lab SSD">
+<li data-from="Core 3" data-to="Cache / fabric">store SQE (64 B, WB)</li>
+<li data-note="Core 3">barrier: SQE before doorbell</li>
+<li data-from="Core 3" data-to="Root Complex + IOMMU" data-t="0 ns">UC store 0xFE60_1008 = 6</li>
+<li data-from="Root Complex + IOMMU" data-to="Lab SSD">MWr: SQ1 tail doorbell</li>
+<li data-from="Lab SSD" data-to="Root Complex + IOMMU" data-t="790 ns">MRd 64 B @ IOVA 0x1_2340_0140</li>
+<li data-from="Root Complex + IOMMU" data-to="Cache / fabric">translate, snoop core 3 line</li>
+<li data-from="Cache / fabric" data-to="Root Complex + IOMMU" class="dashed">dirty line supplied</li>
+<li data-from="Root Complex + IOMMU" data-to="Lab SSD" class="dashed">CplD 64 B</li>
+<li data-from="Lab SSD" data-to="Root Complex + IOMMU" data-t="62 µs">MWr ×16 data, MWr CQE</li>
+<li data-from="Root Complex + IOMMU" data-to="Cache / fabric">write DRAM, invalidate lines</li>
+<li data-from="Lab SSD" data-to="Root Complex + IOMMU" data-t="63.5 µs">MWr 0xFEE0_0000 (MSI-X)</li>
+<li data-from="Root Complex + IOMMU" data-to="Core 3">interrupt vector</li>
+<li data-from="Core 3" data-to="Lab SSD" data-t="66 µs">MWr: CQ1 head doorbell</li>
+</ol>
+<figcaption>Synthetic sequence: the CPU-and-memory view of one Read. Times illustrative, not measured.</figcaption>
+</figure>
+
+<h3>The ladder for "the CPU–device memory contract"</h3>
+<div class="ladder">
+<div class="rung" data-rung="A"><p>The chef must pin the whole slip in the fridge before ringing the bell, and the delivery driver must be allowed to read slips still on the chef's shelf.</p></div>
+<div class="rung" data-rung="B"><p>Commands and data live in normal memory. The CPU tells the device about new work with one register write. Both sides must agree on what is visible and in what order.</p></div>
+<div class="rung" data-rung="C"><p>Stores pass through store buffers and caches. Device registers are mapped uncached. DMA from the device is snooped against CPU caches. Interrupts are memory writes into an interrupt-controller window.</p></div>
+<div class="rung" data-rung="D"><p>PCIe defines ordering among TLPs (posted writes are not passed by later reads or writes in the same direction, with exceptions such as Relaxed Ordering). NVMe defines that the host updates the SQ tail doorbell after placing entries. CPU architecture manuals define store ordering and memory types. No single document defines the whole contract.</p></div>
+<div class="rung" data-rung="E"><p>On the link: posted MWr (doorbell), non-posted MRd (fetch) with CplD, posted MWr (data, CQE, MSI-X). The CPU's barrier is invisible on the link; only its consequence is.</p></div>
+<div class="rung" data-rung="F"><p>The analyzer shows the doorbell, the fetch and the bytes returned. If the bytes are stale, the trace alone cannot say whether the CPU stored late or the device fetched early; you need a host-side record of what the driver wrote.</p></div>
+<div class="rung" data-rung="G"><p>A wrong-command or stale-data symptom that appears only on one CPU architecture, only under load, or only with a specific compiler build is a strong hint of a missing barrier or a wrong memory type, not of a device bug.</p></div>
+</div>
+
+<h3>The sixteen questions, for "the doorbell write"</h3>
+<table>
+<caption>Master-prompt §4 for the central event of this module</caption>
+<thead><tr><th>#</th><th>Question</th><th>Answer</th></tr></thead>
+<tbody>
+<tr><td>1–3</td><td>What, why, which problem?</td><td>A 32-bit uncached store that becomes a posted MWr carrying the new SQ tail; it tells the controller about new work cheaply, without polling and without a CPU wait.</td></tr>
+<tr><td>4–5</td><td>Before, and why better?</td><td>ATA taskfile registers and AHCI's command-issue register needed several register accesses per command; NVMe writes the bulky command at cache speed and sends only 4 bytes across the link.</td></tr>
+<tr><td>6–8</td><td>Creator, consumer, location</td><td>Host driver on the submitting core; controller's arbitration logic; BAR0 + 1000h + (2y × (4 &lt;&lt; CAP.DSTRD)) — BAR0 + 1008h for SQ1.</td></tr>
+<tr><td>9</td><td>Memory/registers</td><td>SQ in WB DRAM, UC mapping of BAR0, store buffer, doorbell register.</td></tr>
+<tr><td>10–11</td><td>Before / after</td><td>SQE stores then a write barrier; afterwards the controller fetches from its head to the new tail.</td></tr>
+<tr><td>12</td><td>If wrong?</td><td>Too early: stale SQE. Wrong value: garbage fetched or an invalid-doorbell error. WC mapping: delayed or merged write.</td></tr>
+<tr><td>13–14</td><td>Analyzer / Linux</td><td>Host→Dev MWr32 to BAR0 + 1008h from the Root Complex; Linux shows only tracepoints (<code>nvme_setup_cmd</code>) and the BAR in <code>/proc/iomem</code>.</td></tr>
+<tr><td>15</td><td>Validation tests</td><td>Barrier on weakly ordered CPUs, tail wrap, out-of-range tail values, back-to-back doorbells, doorbells during link power transitions.</td></tr>
+<tr><td>16</td><td>Senior suspects</td><td>Relaxed accessor, wrong memory type, remote-node submission, batching that delays the doorbell.</td></tr>
+</tbody>
+</table>
+
+<h3>Why an MMIO read is so expensive</h3>
+<p>An MMIO store is posted: the core hands it to the fabric and continues. An MMIO load to UC memory is non-posted and cannot be speculated: the core must wait until the Root Complex sends an MRd, the device answers with a CplD, and the data returns through the fabric. On the reference machine that round trip is of the order of a microsecond (<span class="badge impl">Implementation-dependent</span>). During it, that instruction cannot retire, and on many cores later loads stall behind it.</p>
+<div class="formula">
+<div class="eq"><var>R</var><sub>max</sub> = 1 / (<var>t</var><sub>cpu</sub> + <var>n</var><sub>rd</sub> × <var>t</var><sub>mmio</sub>)</div>
+<dl class="vars">
+<dt>R<sub>max</sub></dt><dd>upper bound on I/Os per second that one core can submit and complete</dd>
+<dt>t<sub>cpu</sub></dt><dd>CPU time per I/O spent in software, excluding MMIO reads, in seconds</dd>
+<dt>n<sub>rd</sub></dt><dd>number of MMIO reads per I/O in the hot path</dd>
+<dt>t<sub>mmio</sub></dt><dd>round-trip time of one MMIO read, in seconds</dd>
+</dl>
+</div>
+<p>Worked example (synthetic numbers): with <var>t</var><sub>cpu</sub> = 1.5 µs and no MMIO reads, one core reaches about 667,000 I/Os per second. Add one MMIO read of 1 µs per I/O and the bound falls to 400,000. This is why the NVMe design has the controller <em>write</em> completions into host memory (the Phase Tag tells the CPU a new entry has arrived) instead of the CPU reading a status register.</p>
+
+<h3>Why a read "flushes" posted writes</h3>
+<p>PCIe ordering does not allow a read request to pass a posted write travelling in the same direction. So if a driver writes a register and then reads any register of the same device, the read's completion proves the earlier write reached the device. Drivers use this deliberately (for example after a reset write) and it is the only way the CPU can know a posted write has landed. The cost is the MMIO read above. The rule and its exceptions are in <a href="ch14.html">Chapter 14</a> and <a href="dd14.html">Module 14</a>.</p>
+<aside class="callout warn">
+<p>The flush works only along one path. A read to device A does not prove that a write to device B has arrived; and a write that a CPU fabric holds in a write-combining buffer may not have left the core at all until a fence.</p>
+</aside>
+
+<h3>NUMA: the second kitchen</h3>
+<p>On a two-socket machine the Lab SSD's Root Port belongs to socket 0. If the submitting thread runs on socket 1, its SQE stores land in socket 1's cache; the device's fetch must snoop across the inter-socket link; if the buffer was allocated on node 1, every data TLP crosses it too; and if the completion vector targets a socket 1 core, the interrupt crosses back. Each crossing adds latency (tens to a few hundred nanoseconds per access, <span class="badge impl">Implementation-dependent</span>) and consumes inter-socket bandwidth. Linux NVMe allocates per-CPU queues and spreads interrupt vectors across CPUs; but buffer placement is under application control.</p>
+</section>
+
+<section id="spec">
+<h2>Specification discipline</h2>
+<p>No single specification owns this module. Be precise about which document makes each claim.</p>
+<table>
+<caption>Who defines what</caption>
+<thead><tr><th>Topic</th><th>Authoritative source</th><th>Character</th></tr></thead>
+<tbody>
+<tr><td>Ordering of TLPs on the link (posted vs non-posted, Relaxed Ordering, ID-Based Ordering)</td><td><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Transaction Ordering</cite></td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>No Snoop attribute meaning</td><td><cite class="spec">PCI Express Base Specification — Transaction Attributes</cite></td><td><span class="badge normative">Normative</span> for the attribute; what the platform does with it is <span class="badge impl">Implementation-dependent</span></td></tr>
+<tr><td>Host updates the SQ tail doorbell after placing entries; controller writes CQE with Phase Tag</td><td><cite class="spec">NVM Express Base Specification, Revision 2.4 — Queue Mechanics</cite> and the NVMe over PCIe Transport Specification, Revision 1.4</td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Doorbell register offsets and stride</td><td><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4 — controller registers / doorbells</cite> (historically in the Base specification)</td><td><span class="badge normative">Normative</span>; location of the text is <span class="badge version">Version-dependent</span></td></tr>
+<tr><td>Store ordering, memory types, fences</td><td>CPU architecture manuals (e.g. Intel 64 and IA-32 Architectures Software Developer's Manual; Arm Architecture Reference Manual)</td><td>Normative for that architecture only</td></tr>
+<tr><td>Cache coherence of DMA</td><td>Platform/chipset documentation</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+<tr><td>Linux accessor semantics (<code>writel</code>, <code>writel_relaxed</code>, <code>dma_wmb</code>)</td><td>Linux kernel documentation: <code>Documentation/memory-barriers.txt</code>, <code>Documentation/driver-api/device-io.rst</code></td><td>Kernel contract, informative with respect to hardware</td></tr>
+<tr><td>MSI-X message format and table</td><td><cite class="spec">PCI Express Base Specification — MSI-X Capability</cite>; address/data interpretation in the CPU vendor's interrupt documentation</td><td>Normative structure; meaning of address/data <span class="badge impl">Implementation-dependent</span></td></tr>
+</tbody>
+</table>
+<aside class="callout verified">
+<p>Well established: PCIe Memory Writes are posted; Memory Reads are non-posted and answered by completions; a read must not pass an earlier posted write in the same direction under default ordering; NVMe SQEs are 64 bytes and CQEs 16 bytes; doorbells start at BAR0 + 1000h.</p>
+</aside>
+<aside class="callout derived">
+<p>Derived: because an MSI-X message is a posted write from the device and data/CQE writes are also posted writes from the device, default PCIe ordering delivers the interrupt after the data it announces. With Relaxed Ordering set on data writes, this reasoning needs the specification's exact Relaxed Ordering rules — the MSI-X write itself must not be relaxed for the guarantee to hold. Confirm in the Transaction Ordering section of your revision.</p>
+</aside>
+<aside class="callout impl">
+<p>Implementation-dependent: MMIO round-trip time; whether the platform honors No Snoop; NUMA distances; whether interrupt remapping is enabled; how many MSI-X vectors the driver allocates; write-combining buffer sizes and flush triggers.</p>
+</aside>
+<aside class="callout version">
+<p>Version-dependent: the NVMe documents moved PCIe-specific register material into the NVMe over PCIe Transport Specification during the 2.x restructuring; older (1.x) Base specifications contain it directly. Linux accessor semantics have also been clarified over kernel releases — read the documentation for the kernel you run.</p>
+</aside>
+<aside class="callout notsaid">
+<p>What the specifications do not say: NVMe does not say which barrier instruction to use; PCIe does not say how CPU stores become TLPs or how long a store takes to leave the core; neither says that DMA is cache-coherent. Do not cite NVMe or PCIe for a CPU memory-ordering guarantee.</p>
+</aside>
+<aside class="callout warn">
+<p>Never assume: that a program-order store is a visibility-order store on every architecture; that x86 behavior holds on Arm servers; that an MMIO write has arrived because the instruction completed; that the interrupt lands on the submitting core.</p>
+</aside>
+</section>
+
+<section id="hardware">
+<h2>Hardware view</h2>
+<table>
+<caption>Who participates</caption>
+<thead><tr><th>Category</th><th>Hardware</th></tr></thead>
+<tbody>
+<tr><td>Must participate</td><td>CPU core and its store path; memory controller and DRAM; Root Complex and Root Port; PCIe link; NVMe controller (doorbell logic, DMA engine, MSI-X logic); interrupt controller of the target core.</td></tr>
+<tr><td>May participate</td><td>IOMMU (translation and interrupt remapping); inter-socket link (if anything is remote); PCIe switches; retimers; last-level cache features that let device writes allocate directly into cache (vendor-specific "direct cache access" technologies, <span class="badge impl">Implementation-dependent</span>).</td></tr>
+<tr><td>Observable</td><td>TLPs on the link (analyzer); interrupt counts and CPU placement (<code>/proc/interrupts</code>); NUMA node of the device (sysfs); BAR mappings and memory types (<code>/proc/iomem</code>, x86 PAT debug files); performance counters (cache misses, remote accesses) via <code>perf</code>.</td></tr>
+<tr><td>Internal, generally unobservable</td><td>Store-buffer contents and drain order; cache-line states at any instant; snoop traffic in the fabric; write-combining buffer occupancy; the time between the core issuing an MMIO store and the TLP leaving the Root Port.</td></tr>
+</tbody>
+</table>
+<aside class="callout hw">
+<p>The gap between "observable" and "unobservable" is the heart of this module's debugging difficulty: the decisive events (a store not yet visible, a WC buffer not yet flushed) happen inside the CPU package, where neither a PCIe analyzer nor Linux can see them. You infer them from timestamps and content on both sides.</p>
+</aside>
+</section>
+
+<section id="protocol">
+<h2>Protocol view</h2>
+<table>
+<caption>The transactions in the CPU–device contract</caption>
+<thead><tr><th>Transaction</th><th>Direction</th><th>Posted?</th><th>Request/response</th><th>Ordering note</th><th>Errors</th></tr></thead>
+<tbody>
+<tr><td>Doorbell MWr</td><td>Host→Dev</td><td>Posted</td><td>No response</td><td>Behind earlier host→device writes</td><td>Lost write is invisible to the CPU; device may log an invalid doorbell write</td></tr>
+<tr><td>Register read (CSTS, CAP)</td><td>Host→Dev MRd, Dev→Host CplD</td><td>Non-posted</td><td>Completion with data</td><td>Cannot pass earlier posted writes</td><td>UR/CA or Completion Timeout → all-ones to the CPU (platform-dependent)</td></tr>
+<tr><td>SQE fetch</td><td>Dev→Host MRd, Host→Dev CplD</td><td>Non-posted</td><td>One or more completions</td><td>Read Completion Boundary (64 B here) may split it</td><td>UR/CA from Root Complex (e.g., IOMMU block); Completion Timeout in device</td></tr>
+<tr><td>Data / CQE write</td><td>Dev→Host MWr</td><td>Posted</td><td>None</td><td>CQE after data by default ordering</td><td>Blocked writes are discarded by the platform and logged</td></tr>
+<tr><td>MSI-X</td><td>Dev→Host MWr to interrupt window</td><td>Posted</td><td>None</td><td>After CQE by default ordering</td><td>Masked vector → Pending Bit Array set instead of message</td></tr>
+</tbody>
+</table>
+<aside class="callout proto">
+<p>The completion of a doorbell write is not a TLP — it is the controller's later behavior (fetching). The completion of an NVMe command is not a PCIe completion — it is a posted write of a CQE. Keep PCIe completions and NVMe completions separate in your head; <a href="command-vs-packet.html">Command vs Packet vs Completion</a> drills this.</p>
+</aside>
+</section>
+
+<section id="trace">
+<h2>Trace view</h2>
+<p>All four traces are <strong>synthetic examples for teaching</strong> on the reference machine. Requester ID RC denotes the Root Complex; 0x0100 is the Lab SSD. Host-side annotations (core numbers, function names) come from a hypothetical synchronized software log, which a real analyzer would not show.</p>
+
+<h3>Trace 1 — normal: submit and complete with batching</h3>
+<div class="trace" data-kind="synthetic" data-title="Normal: two SQEs, one doorbell, coherent fetch">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Host log: core 3 writes SQEs into SQ1 slots 5 and 6 (CIDs 0x0042, 0x0043), then <code>writel(7, SQ1TDBL)</code>.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Len=1 Req=RC Data=0x00000007</td><td>Tail 5 → 7: two new commands, one doorbell</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>780</td><td>MRd64</td><td>Addr=0x1_2340_0140 Len=32 Req=0x0100 Tag=0x14</td><td>Fetch 128 bytes: both SQEs in one request</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,290</td><td>CplD</td><td>Tag=0x14 Len=16 ByteCount=128 Status=SC</td><td>First 64 B (RCB split)</td></tr>
+<tr class="dir-down"><td>4</td><td>Host→Dev</td><td>1,320</td><td>CplD</td><td>Tag=0x14 Len=16 ByteCount=64 Status=SC</td><td>Second 64 B; contents match host log</td></tr>
+<tr class="note"><td colspan="6">≈ 60 µs: media access, no link traffic for these commands.</td></tr>
+<tr class="dir-up"><td>5–36</td><td>Dev→Host</td><td>61,800–64,900</td><td>MWr64</td><td>Len=64 each, 0x2_0000_0000… and 0x2_0000_1000…</td><td>2 × 4 KiB of data</td></tr>
+<tr class="dir-up"><td>37</td><td>Dev→Host</td><td>65,100</td><td>MWr64</td><td>Addr=0x1_2341_0050 Len=8</td><td>Two CQEs (slots 5, 6) in one 32-byte write</td></tr>
+<tr class="dir-up"><td>38</td><td>Dev→Host</td><td>65,200</td><td>MWr32</td><td>Addr=0xFEE0_0000 Data=vector 3</td><td>One MSI-X for both completions</td></tr>
+<tr class="dir-down"><td>39</td><td>Host→Dev</td><td>67,400</td><td>MWr32</td><td>Addr=0xFE60_100C Data=0x00000007</td><td>CQ1 head 5 → 7</td></tr>
+</tbody>
+</table>
+<p>Analysis: no MMIO reads anywhere; the CPU never waited on the device. Batching two commands behind one doorbell halved the host→device writes and let the controller fetch both SQEs in one 128-byte read. The coherent fetch returned the values the host log says were written, so the barrier did its job. Whether a controller fetches several SQEs per read is <span class="badge impl">Implementation-dependent</span>.</p>
+</div>
+
+<h3>Trace 2 — slow: an MMIO read in the hot path</h3>
+<div class="trace" data-kind="synthetic" data-title="Slow: debug build reads CSTS after every doorbell">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000006</td><td>Doorbell</td></tr>
+<tr class="abnormal"><td>2</td><td>Host→Dev</td><td>40</td><td>MRd32</td><td>Addr=0xFE60_001C Len=1 Req=RC Tag=0x03</td><td>First abnormal event: CPU reads CSTS (offset 1Ch) in the submission path</td></tr>
+<tr class="dir-up"><td>3</td><td>Dev→Host</td><td>820</td><td>MRd64</td><td>Addr=0x1_2340_0140 Len=16 Tag=0x15</td><td>SQE fetch proceeds normally</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,150</td><td>CplD</td><td>CplID=0x0100 Tag=0x03 Data=0x00000001</td><td>CSTS.RDY = 1; core 3 stalled ≈ 1.1 µs waiting for this</td></tr>
+<tr class="note"><td colspan="6">The same pattern repeats for every command. Host-side: <code>perf</code> shows the submit function dominating CPU time; IOPS per core plateau at ≈ 380 k although the device is idle 40% of the time.</td></tr>
+</tbody>
+</table>
+<p>Analysis: nothing is broken; nothing reports an error. The signature is a Root Complex-originated MRd to BAR0 for every I/O. Applying the formula from the Mechanism section with <var>t</var><sub>cpu</sub> ≈ 1.5 µs and <var>t</var><sub>mmio</sub> ≈ 1.1 µs predicts ≈ 385 k I/Os per second per core, matching the plateau. The fix is to remove the read (health checks belong in a timer, not the I/O path). The tell-tale for a senior engineer: Host→Dev MRd TLPs during steady-state I/O. A healthy NVMe hot path has none.</p>
+</div>
+
+<h3>Trace 3 — failed: doorbell overtakes the SQE (weakly ordered CPU)</h3>
+<div class="trace" data-kind="synthetic" data-title="Failed: Arm server, driver patch replaced writel() with writel_relaxed()">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Host log: core 12 writes SQ1 slot 9 with CID 0x0101 (Read, LBA 0x4000), then rings tail = 10. Slot 9 previously held CID 0x00E1 (Write, LBA 0x9000) from the previous lap of the ring.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000000A</td><td>Tail 9 → 10</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>610</td><td>MRd64</td><td>Addr=0x1_2340_0240 Len=16 Tag=0x22</td><td>Fetch slot 9</td></tr>
+<tr class="abnormal"><td>3</td><td>Host→Dev</td><td>1,050</td><td>CplD</td><td>Tag=0x22 Len=16 Status=SC Data: CDW0=0x00E1_0001 …</td><td>First abnormal event: returned SQE is the <em>old</em> Write (opcode 01h, CID 0x00E1), not the new Read</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,400</td><td>MRd64</td><td>Addr=0x2_0004_0000 Len=128</td><td>Controller fetches write data from the old buffer address</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>95,000</td><td>MWr64</td><td>Addr=0x1_2341_0090 Len=4</td><td>CQE: CID 0x00E1, success</td></tr>
+<tr class="note"><td colspan="6">Kernel log (illustrative): <code>nvme nvme0: invalid id 225 completed on queue 1</code>. Command 0x0101 later times out. LBA 0x9000 has been silently overwritten with whatever was in the stale buffer.</td></tr>
+</tbody>
+</table>
+<p>Analysis: the PCIe exchange is protocol-correct. The fetch returned the bytes that were visible in coherent memory at that moment — the previous lap's command. The controller executed exactly what it read. The first abnormal event is the <em>content</em> of row 3 compared with the host log. Hypotheses: (a) the doorbell store became visible before the SQE stores (missing barrier — consistent with the patch and with an Arm platform); (b) the controller fetched from a cached copy of an older read (device-side prefetch bug); (c) the driver wrote the SQE to the wrong slot. Disambiguation: (c) is refuted by dumping SQ1 after the event — slot 9 does contain CID 0x0101; (b) is tested by inserting a delay before the doorbell — the bug disappears, which a device-cache bug would not do; restoring <code>writel()</code> eliminates it. Conclusion: missing write barrier, high confidence. This is a data-corruption bug, which is why accessor choices are reviewed so carefully.</p>
+</div>
+
+<h3>Trace 4 — ambiguous: interrupt written, handled late</h3>
+<div class="trace" data-kind="synthetic" data-title="Ambiguous: 40 µs between MSI-X and completion processing">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-up"><td>1</td><td>Dev→Host</td><td>63.4</td><td>MWr64</td><td>Addr=0x1_2341_0050 Len=4</td><td>CQE for CID 0x0042</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>63.5</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=vector 7</td><td>MSI-X; address encodes a different target than the submitting core</td></tr>
+<tr class="abnormal"><td>3</td><td>Host→Dev</td><td>104.0</td><td>MWr32</td><td>Addr=0xFE60_100C Data=0x00000006</td><td>CQ head doorbell 40 µs after the interrupt (normal ≈ 2–3 µs)</td></tr>
+<tr class="note"><td colspan="6">Host log: completion handled on core 40 (NUMA node 1); submission was on core 3 (node 0).</td></tr>
+</tbody>
+</table>
+<p>Analysis: the device did its part promptly; everything slow happened inside the host, where the analyzer is blind. Candidates: the target core was in a deep idle state and took long to wake; the interrupt was steered to a remote node (consistent with the host log) and the core was busy with higher-priority work; interrupt coalescing was configured (but then the MSI-X itself would be delayed — row 2 is prompt, which argues against device-side coalescing); interrupt remapping or virtualization added latency. The trace alone cannot decide. Next evidence: <code>/proc/interrupts</code> per-CPU counts for the queue's vector, the effective affinity list, CPU idle-state residency, and a run with idle states limited. Confidence in any single cause from this trace alone: low.</p>
+</div>
+</section>
+
+<section id="linux">
+<h2>Linux view</h2>
+<p>All commands below are read-only inspection (<span class="badge safe">Safe lab</span>). Some need root only to reveal real addresses. Output formats vary by kernel version and platform; this page shows no output that should be taken as authoritative.</p>
+<pre class="code" data-kind="read-only" data-lang="sh" data-title="CPU, memory and I/O inspection"><code><span class="cm"># CPU topology, caches, NUMA nodes</span>
+lscpu
+lscpu --caches
+cat /sys/devices/system/node/node*/cpulist
+
+<span class="cm"># Which NUMA node and CPUs are local to the SSD</span>
+cat /sys/bus/pci/devices/0000:01:00.0/numa_node
+cat /sys/bus/pci/devices/0000:01:00.0/local_cpulist
+
+<span class="cm"># Physical address map: RAM ranges, BARs (addresses shown as 0 without root)</span>
+sudo grep -i -A2 "01:00.0" /proc/iomem
+
+<span class="cm"># Memory types of mappings (x86; needs debugfs and root)</span>
+sudo grep -i "fe600000" /sys/kernel/debug/x86/pat_memtype_list
+
+<span class="cm"># Interrupts: one line per NVMe vector, one column per CPU</span>
+grep nvme /proc/interrupts
+<span class="cm"># Effective affinity of one vector (replace N with the IRQ number)</span>
+cat /proc/irq/N/effective_affinity_list
+
+<span class="cm"># Queue-to-CPU mapping chosen by blk-mq</span>
+grep -H . /sys/block/nvme0n1/mq/*/cpu_list
+
+<span class="cm"># Is the IOMMU translating for this device?</span>
+ls /sys/bus/pci/devices/0000:01:00.0/iommu_group/devices/</code></pre>
+<table>
+<caption>What each output can and cannot prove</caption>
+<thead><tr><th>Output</th><th>Category</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+<tbody>
+<tr><td><code>lscpu</code>, node cpulists</td><td>Topology</td><td>Number of nodes, which CPUs belong to which node, cache sizes</td><td>Actual memory latency or inter-socket bandwidth</td></tr>
+<tr><td><code>numa_node</code>, <code>local_cpulist</code></td><td>Device locality as reported by firmware (ACPI)</td><td>Which node the platform says the device is attached to</td><td>That firmware reported it correctly (−1 means "unknown")</td></tr>
+<tr><td><code>/proc/iomem</code></td><td>Physical address map</td><td>Where the BAR sits physically and that it is claimed by a driver</td><td>The memory type of each mapping; what the device sees under an IOMMU</td></tr>
+<tr><td><code>pat_memtype_list</code></td><td>Memory types (x86)</td><td>Whether a range was mapped uncached-minus, write-combining, etc.</td><td>Which code path does the stores, or their ordering</td></tr>
+<tr><td><code>/proc/interrupts</code></td><td>Interrupt counters</td><td>Which CPUs actually took each vector, and how many times</td><td>Latency of each interrupt; why one was late</td></tr>
+<tr><td>blk-mq <code>cpu_list</code></td><td>Queue mapping</td><td>Which CPUs submit on which hardware queue</td><td>Where the application's buffers live</td></tr>
+</tbody>
+</table>
+<aside class="callout linux">
+<p>To find the memory node of a buffer, use the application's tools (<code>numastat -p &lt;pid&gt;</code>, <code>numactl --hardware</code>) or <code>/proc/&lt;pid&gt;/numa_maps</code>. To see cache misses and remote memory accesses, use <code>perf stat</code> with the events your CPU supports; event names are <span class="badge impl">Implementation-dependent</span>.</p>
+</aside>
+</section>
+
+<section id="labs">
+<h2>Labs</h2>
+
+<h3>Beginner lab — Map the kitchens</h3>
+<p><span class="badge safe">Safe lab</span> Read-only.</p>
+<dl>
+<dt>Objective</dt><dd>Draw the NUMA and address-space picture of your own machine and place the NVMe device in it.</dd>
+<dt>Prerequisites</dt><dd><a href="ch01.html">Chapter 1</a>; a Linux machine with an NVMe SSD (a virtual machine also works, with fewer details).</dd>
+<dt>Setup</dt><dd>Shell access; <code>sudo</code> for real addresses.</dd>
+<dt>Procedure</dt><dd><ol><li>Run <code>lscpu</code> and record sockets, cores, NUMA nodes and cache-line size (<code>getconf LEVEL1_DCACHE_LINESIZE</code>).</li><li>Find the NVMe device's BDF with <code>lspci -nn | grep 0108</code>.</li><li>Read its <code>numa_node</code> and <code>local_cpulist</code>.</li><li>Find its BAR in <code>sudo cat /proc/iomem</code> and note the address range and whether it lies below 4 GiB.</li><li>Draw a diagram like the Architecture figure with your real values.</li></ol></dd>
+<dt>Observations</dt><dd>Node count, cache-line size, the device's node and CPUs, BAR address and size.</dd>
+<dt>Questions</dt><dd>(1) Which CPUs should submit I/O to this device for lowest latency? (2) Why might <code>numa_node</code> read −1? (3) What does the BAR's physical address tell you about which software maps it?</dd>
+<dt>Expected reasoning</dt><dd>Local CPUs avoid inter-socket crossings for SQE snoops and interrupts. −1 means firmware gave no proximity information (common on single-socket machines and VMs). The physical address is what the kernel maps with <code>ioremap()</code>; the driver uses a kernel virtual address.</dd>
+</dl>
+<details class="solution"><summary>Solution</summary><p>On a single-socket machine every CPU is local and <code>numa_node</code> is often −1 or 0 — that is correct, not a fault. On a two-socket machine you should find the device on one node and its <code>local_cpulist</code> covering that socket's CPUs. The BAR is typically below 4 GiB if it is non-prefetchable behind a bridge (see <a href="dd04.html">Module 04</a> for why), and its size matches <code>lspci -vv</code>'s "[size=16K]" or similar. A senior engineer would also note whether <code>lspci</code> and <code>/proc/iomem</code> agree, since disagreement indicates a resource reassignment after boot.</p></details>
+<p><strong>Extension:</strong> repeat on a cloud VM and compare: the VM's NUMA picture is whatever the hypervisor chooses to expose and may not match the physical host.</p>
+
+<h3>Intermediate lab — Simulate the missing barrier</h3>
+<p><span class="badge safe">Safe lab</span> Pure simulation; touches no hardware.</p>
+<dl>
+<dt>Objective</dt><dd>See how store reordering produces stale SQE fetches, and how a barrier removes them.</dd>
+<dt>Prerequisites</dt><dd>Trace 3 above; Python 3.</dd>
+<dt>Setup</dt><dd>Save the program below as <code>store_order.py</code>.</dd>
+<dt>Procedure</dt><dd><ol><li>Run it as is and record the stale-fetch rate without a barrier.</li><li>Run with <code>--barrier</code>.</li><li>Change <code>--drain-prob</code> to 0.1 and 0.9 and observe the effect.</li></ol></dd>
+</dl>
+<pre class="code" data-kind="simulation" data-lang="python" data-title="store_order.py"><code>#!/usr/bin/env python3
+"""Toy model of a weakly ordered store buffer feeding an NVMe-like device.
+
+The CPU issues 'SQE' stores (several cache lines' worth) then a 'doorbell' store.
+Without a barrier, entries leave the store buffer in random order, so the
+doorbell can become visible before all SQE words. The device fetches the SQE
+as soon as it sees the doorbell. Simulation only: real hardware is far subtler.
+"""
+import argparse
+import random
+
+def run(trials, barrier, drain_prob, seed):
+    rng = random.Random(seed)
+    stale = 0
+    for lap in range(trials):
+        memory = {"sqe0": lap - 1, "sqe1": lap - 1}   # previous lap's command
+        buf = [("sqe0", lap), ("sqe1", lap)]
+        if barrier:
+            buf.append(("BARRIER", None))
+        buf.append(("doorbell", lap))
+        visible_doorbell = False
+        while buf:
+            # find the oldest barrier; only entries before it may drain
+            limit = len(buf)
+            for i, (k, _) in enumerate(buf):
+                if k == "BARRIER":
+                    limit = i if i &gt; 0 else 1
+                    break
+            candidates = list(range(limit))
+            # weak ordering: any eligible entry may drain first
+            idx = candidates[0] if rng.random() &lt; drain_prob else rng.choice(candidates)
+            key, val = buf.pop(idx)
+            if key == "BARRIER":
+                continue
+            if key == "doorbell":
+                visible_doorbell = True
+                fetched = (memory["sqe0"], memory["sqe1"])   # device fetches now
+                if fetched != (lap, lap):
+                    stale += 1
+            else:
+                memory[key] = val
+        assert visible_doorbell
+    return stale
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--trials", type=int, default=100000)
+    ap.add_argument("--barrier", action="store_true")
+    ap.add_argument("--drain-prob", type=float, default=0.7,
+                    help="probability the oldest entry drains first (1.0 = in order)")
+    ap.add_argument("--seed", type=int, default=1)
+    a = ap.parse_args()
+    s = run(a.trials, a.barrier, a.drain_prob, a.seed)
+    print(f"barrier={a.barrier} drain_prob={a.drain_prob}: "
+          f"{s} stale fetches in {a.trials} submissions ({100.0 * s / a.trials:.2f}%)")
+
+if __name__ == "__main__":
+    main()</code></pre>
+<dl>
+<dt>Observations</dt><dd>Without a barrier a large fraction of submissions fetch a stale SQE — roughly a quarter with the default parameters, because the toy model reorders far more often than real hardware; with the barrier the count is zero. With <code>--drain-prob 1.0</code> (strictly in-order, like x86 stores to WB memory) the count is also zero without a barrier.</dd>
+<dt>Questions</dt><dd>(1) Why does in-order draining make the barrier unnecessary in this model? (2) Why is the real x86 case still not "barrier-free" in a driver? (3) Why does the stale rate depend on how rarely reordering happens — and why does that make the real bug so hard to reproduce?</dd>
+<dt>Expected reasoning</dt><dd>In-order draining means the doorbell cannot be visible before earlier stores. On x86 the compiler can still reorder unless told otherwise, and WC mappings break store order; Linux <code>writel()</code> handles both. A low reordering rate turns a deterministic bug into an intermittent one that hides in testing.</dd>
+</dl>
+<details class="solution"><summary>Solution</summary><p>(1) Program order equals visibility order, so the doorbell is last. (2) Compiler reordering of plain stores, write-combining memory, and non-temporal stores all escape x86's store ordering; the kernel accessor includes a compiler barrier and the right hardware ordering for each architecture. (3) The probability of a visible reorder at the exact moment the device fetches is small; such bugs appear under load, on particular CPU models or after unrelated code changes alter timing. The model's numbers are not predictions for any real CPU.</p></details>
+<p><strong>Extension:</strong> add a "device prefetch" option that reads the SQE slightly <em>before</em> the doorbell is visible (a buggy device) and show that the barrier no longer helps — that is how you separate host-ordering bugs from device bugs in the real world.</p>
+
+<h3>Advanced lab — Follow the interrupt</h3>
+<p><span class="badge caution">Caution lab</span> Generates read-only I/O on a real device. Use a test machine; the fio command uses <code>--readonly</code>.</p>
+<dl>
+<dt>Objective</dt><dd>Show which CPU takes each completion interrupt when I/O is submitted from a chosen CPU, and relate it to the blk-mq queue mapping.</dd>
+<dt>Prerequisites</dt><dd>Beginner lab; <code>fio</code> installed; an NVMe namespace whose contents you do not need to protect from reads (reads are harmless, but use a test system anyway).</dd>
+<dt>Setup</dt><dd>Identify the namespace block device (for example <code>/dev/nvme0n1</code>) and the IRQ numbers of its vectors (<code>grep nvme0 /proc/interrupts</code>).</dd>
+<dt>Procedure</dt><dd><ol><li>Snapshot <code>/proc/interrupts</code>.</li><li>Run <code>sudo taskset -c 2 fio --name=t --filename=/dev/nvme0n1 --readonly --rw=randread --bs=4k --direct=1 --ioengine=libaio --iodepth=8 --runtime=10 --time_based</code>.</li><li>Snapshot again and compute per-CPU deltas for each nvme vector.</li><li>Read <code>/sys/block/nvme0n1/mq/*/cpu_list</code> to find which hardware queue CPU 2 maps to.</li><li>Repeat pinned to a CPU on another NUMA node, if you have one, and compare fio's completion latency percentiles.</li></ol></dd>
+<dt>Observations</dt><dd>Which vector's counter increased and on which CPU; latency percentiles local vs remote.</dd>
+<dt>Questions</dt><dd>(1) Did the interrupts land on CPU 2? (2) If not, why? (3) How large was the local/remote latency difference, and which link crossings explain it?</dd>
+<dt>Expected reasoning</dt><dd>With per-CPU queues and managed affinity, CPU 2's queue's vector usually targets CPU 2 (or its group). If there are fewer queues than CPUs, several CPUs share a queue and the vector targets one of them. Remote submission adds crossings for SQE snoop, data and interrupt.</dd>
+</dl>
+<details class="solution"><summary>Solution</summary><p>Typically the deltas show one vector incrementing almost exclusively on CPU 2 (or a sibling in the same group). If the controller supports fewer I/O queues than the machine has CPUs, the mapping shows groups and the interrupt lands on the group's designated CPU. Remote submission typically raises median latency modestly and the high percentiles more noticeably; exact numbers are <span class="badge impl">Implementation-dependent</span>. If no deltas appear at all, check whether the driver uses polled queues (<code>poll_queues</code> module parameter) for this workload.</p></details>
+<p><strong>Extension:</strong> repeat with <code>--hipri</code> and an io_uring engine using polled queues, and observe that interrupt counts stop increasing while latency changes.</p>
+
+<h3>Senior forensic lab — The BIOS update that slowed the database</h3>
+<p><span class="badge safe">Safe lab</span> Paper exercise on synthetic evidence.</p>
+<dl>
+<dt>Objective</dt><dd>Localize a latency regression to the CPU/memory/I/O layer using mixed evidence.</dd>
+<dt>Prerequisites</dt><dd>Everything above.</dd>
+<dt>Setup</dt><dd>Evidence bundle (synthetic): after a platform firmware update on a two-socket server, database p99 read latency rose from 180 µs to 310 µs; median rose from 85 µs to 95 µs. The NVMe drive's own latency histogram (vendor log) is unchanged. Before the update <code>numa_node</code> for the SSD read 0; after, it reads −1. <code>/proc/interrupts</code> shows the SSD's vectors spread across all 64 CPUs both before and after. The database is pinned to node 0 CPUs and allocates memory on node 0. A PCIe trace taken after the update shows: doorbell → SQE fetch 0.8 µs (unchanged), media time unchanged, MSI-X written promptly, but the CQ head doorbell follows the MSI-X by a median of 4 µs and a p99 of 120 µs (before: 2.5 µs and 9 µs).</dd>
+<dt>Procedure</dt><dd>Write down (1) the first abnormal observation, (2) your hypotheses, (3) the evidence for and against each, (4) a disambiguating experiment, (5) a likely conclusion with a confidence level.</dd>
+<dt>Questions</dt><dd>What does <code>numa_node = −1</code> change in Linux's behavior? Why are interrupts "spread across all CPUs" no longer good enough?</dd>
+</dl>
+<details class="solution"><summary>Solution</summary><p><strong>First abnormal observation:</strong> <code>numa_node</code> changed from 0 to −1 — firmware stopped reporting the device's proximity. The device-side timings are unchanged, which clears the SSD. <strong>Hypotheses:</strong> (a) without proximity information, the kernel no longer prefers node-0 CPUs for the managed interrupt spreading and queue memory, so completions for node-0 submitters land on node-1 CPUs or queue memory is on node 1; (b) the firmware update changed CPU idle-state or power settings, slowing interrupt wake-up; (c) the update enabled interrupt remapping or changed IOMMU mode. <strong>Evidence:</strong> the CQ-head delay grows after a prompt MSI-X — host-side handling is slower (consistent with a, b, c); the median moved only 10 µs but p99 moved 130 µs — characteristic of occasional remote handling or deep idle wake-ups. <strong>Disambiguating experiment:</strong> compare per-CPU interrupt deltas while the pinned database runs: if vectors for its queues fire on node-1 CPUs, (a) is strongly supported; then limit CPU idle states and see whether p99 recovers (tests b); check <code>dmesg</code> for IOMMU/interrupt-remapping mode lines before and after (tests c). <strong>Likely conclusion:</strong> the missing proximity table entry (an ACPI firmware regression) caused remote queue/interrupt placement; workaround by pinning the database's I/O submission CPUs to match the queues' interrupt CPUs or by fixing firmware. Confidence: medium until the per-CPU interrupt data confirms it.</p></details>
+<p><strong>Extension:</strong> write the bug report for the firmware vendor using the template in <a href="bug-reports.html">Engineering Bug Report Training</a>, keeping proven facts and hypotheses separate.</p>
+</section>
+
+<section id="debugging">
+<h2>Debugging</h2>
+<p>Each pattern lists a confidence level for its likely conclusion given only the evidence named. Raise confidence only with the disambiguating experiment.</p>
+
+<h3>Pattern 1 — IOPS ceiling far below device capability, CPU busy</h3>
+<table><tbody>
+<tr><th>Symptom</th><td>Per-core IOPS plateau; device utilization low; CPU at 100% in the driver path.</td></tr>
+<tr><th>Possible causes</th><td>MMIO reads in the hot path; lock contention on a shared queue; excessive interrupts (no batching); debug options enabled.</td></tr>
+<tr><th>Evidence</th><td>PCIe trace with Host→Dev MRd TLPs per I/O; <code>perf</code> profile with time in register-read helpers.</td></tr>
+<tr><th>First check</th><td>Count Host→Dev MRd TLPs per second in a trace (or look for them in a short capture).</td></tr>
+<tr><th>Second check</th><td><code>perf record</code> on the submitting core.</td></tr>
+<tr><th>Disambiguating experiment</th><td>Remove or move the read to a timer; IOPS should rise to the formula's prediction.</td></tr>
+<tr><th>Likely conclusion</th><td>MMIO reads stalling the core.</td></tr>
+<tr><th>Confidence</th><td>High once MRds are seen in the trace.</td></tr>
+</tbody></table>
+
+<h3>Pattern 2 — Wrong command executed, only on one architecture</h3>
+<table><tbody>
+<tr><th>Symptom</th><td>"Invalid id" or unexpected-CID completions; occasional silent data corruption; seen on Arm servers, never on x86.</td></tr>
+<tr><th>Possible causes</th><td>Relaxed MMIO accessor without barrier; SQE written through a WC or non-temporal path without fence; device prefetching SQEs before the doorbell.</td></tr>
+<tr><th>Evidence</th><td>Trace showing fetched SQE content differing from what the host wrote; host dump of the queue showing the correct content afterwards.</td></tr>
+<tr><th>First check</th><td>Audit the doorbell write path for <code>_relaxed</code> accessors or custom inline assembly.</td></tr>
+<tr><th>Second check</th><td>Compare fetched bytes with host-side SQE log at the moment of the doorbell.</td></tr>
+<tr><th>Disambiguating experiment</th><td>Add an explicit full barrier before the doorbell: if the problem vanishes, host ordering; if not, suspect device prefetch.</td></tr>
+<tr><th>Likely conclusion</th><td>Missing write barrier.</td></tr>
+<tr><th>Confidence</th><td>Medium from symptoms; high after the experiment.</td></tr>
+</tbody></table>
+
+<h3>Pattern 3 — High tail latency on some cores only</h3>
+<table><tbody>
+<tr><th>Symptom</th><td>p99 latency differs strongly depending on which CPU the application runs on.</td></tr>
+<tr><th>Possible causes</th><td>Remote NUMA node for submitting CPU, buffers or interrupt; deep idle states on interrupt targets; noisy neighbor on the interrupt core.</td></tr>
+<tr><th>Evidence</th><td>Per-CPU interrupt counts; <code>numa_maps</code> of the application; device's own latency log unchanged.</td></tr>
+<tr><th>First check</th><td>Compare the device's <code>local_cpulist</code> with the slow cores.</td></tr>
+<tr><th>Second check</th><td>Find where the vector for the slow cores' queue lands.</td></tr>
+<tr><th>Disambiguating experiment</th><td>Pin application and memory to the device's node; then limit idle states; see which change removes the tail.</td></tr>
+<tr><th>Likely conclusion</th><td>NUMA misplacement (or idle-state wake-up latency).</td></tr>
+<tr><th>Confidence</th><td>Medium; the experiment separates the two causes.</td></tr>
+</tbody></table>
+
+<h3>Pattern 4 — Data in buffer is stale after a successful Read (non-coherent platform)</h3>
+<table><tbody>
+<tr><th>Symptom</th><td>Read completes with success, the trace shows the right data written, but the application sees old bytes.</td></tr>
+<tr><th>Possible causes</th><td>Missing cache invalidation (<code>dma_sync_*_for_cpu</code> or unmap) on a platform without coherent DMA; buffer reused before unmap; bounce buffer not copied back.</td></tr>
+<tr><th>Evidence</th><td>Trace shows correct MWr payloads to the expected IOVA; CPU reads differ.</td></tr>
+<tr><th>First check</th><td>Is the platform's DMA coherent for this device (device-tree <code>dma-coherent</code>, ACPI coherency attribute)?</td></tr>
+<tr><th>Second check</th><td>Does the driver use the streaming DMA API correctly (map before, unmap/sync after)?</td></tr>
+<tr><th>Disambiguating experiment</th><td>Enable <code>CONFIG_DMA_API_DEBUG</code> on a test kernel; it reports misuse of the mapping API.</td></tr>
+<tr><th>Likely conclusion</th><td>Cache maintenance missing in the software path; the device is correct.</td></tr>
+<tr><th>Confidence</th><td>High when the trace payload is right and CPU-visible data is wrong.</td></tr>
+</tbody></table>
+
+<h3>Pattern 5 — Latency spikes after mapping a BAR region write-combining</h3>
+<table><tbody>
+<tr><th>Symptom</th><td>After a change to map more of BAR0 as WC (for a Controller Memory Buffer), some doorbells arrive late or as combined multi-DW writes.</td></tr>
+<tr><th>Possible causes</th><td>Doorbells accidentally included in the WC range; missing fence after WC stores.</td></tr>
+<tr><th>Evidence</th><td>Trace shows MWr to 0xFE60_1008 with Len=2 (covering 1008h and 100Ch) or doorbells delayed until an unrelated fence.</td></tr>
+<tr><th>First check</th><td>Memory-type list for the BAR ranges.</td></tr>
+<tr><th>Second check</th><td>Driver code that creates the mappings.</td></tr>
+<tr><th>Disambiguating experiment</th><td>Map the doorbell page UC again; spikes disappear.</td></tr>
+<tr><th>Likely conclusion</th><td>Wrong memory type for side-effect registers. How a controller handles a combined write spanning two doorbells is <span class="badge impl">Implementation-dependent</span>.</td></tr>
+<tr><th>Confidence</th><td>High when the trace shows multi-DW or delayed doorbells.</td></tr>
+</tbody></table>
+
+<h3>Pattern 6 — Completions arrive but no interrupt is taken</h3>
+<table><tbody>
+<tr><th>Symptom</th><td>Commands time out; afterwards the CQ contains valid entries with the correct phase.</td></tr>
+<tr><th>Possible causes</th><td>MSI-X vector masked (message held, Pending Bit set); interrupt remapping entry wrong; target CPU offline; driver polling disabled after a configuration change.</td></tr>
+<tr><th>Evidence</th><td>Trace: CQE MWr present, no MSI-X MWr (masked) or MSI-X present with no counter increase (routing).</td></tr>
+<tr><th>First check</th><td>Does the trace contain the MSI-X write after the CQE?</td></tr>
+<tr><th>Second check</th><td>MSI-X capability Function Mask and the vector's mask bit; <code>dmesg</code> for interrupt-remapping faults.</td></tr>
+<tr><th>Disambiguating experiment</th><td>Read the Pending Bit Array (safe read) while a completion is outstanding.</td></tr>
+<tr><th>Likely conclusion</th><td>No MSI-X in trace → masking or device bug; MSI-X present → host routing.</td></tr>
+<tr><th>Confidence</th><td>High for the split; the trace decides the side.</td></tr>
+</tbody></table>
+</section>
+
+<section id="interview">
+<h2>Interview</h2>
+<h3>Beginner</h3>
+<ol>
+<li><p>Why does an NVMe driver put commands in memory instead of writing them into device registers?</p><details class="answer"><summary>Model answer</summary><p>Writing 64 bytes into memory is fast and cached; crossing the link with 16 register writes would be slow and serialize submitters. The device fetches the command itself with DMA, and the CPU only rings a 4-byte doorbell.</p></details></li>
+<li><p>What is a cache line, and why does it matter for a 64-byte SQE?</p><details class="answer"><summary>Model answer</summary><p>It is the unit of caching and coherence (64 bytes on most current servers). An aligned SQE occupies one line, so the device's fetch snoops one line; a misaligned one would touch two.</p></details></li>
+<li><p>What does "posted write" mean?</p><details class="answer"><summary>Model answer</summary><p>A write that receives no completion; the sender continues immediately. PCIe Memory Writes, including doorbells, data writes and MSI-X messages, are posted.</p></details></li>
+<li><p>What is NUMA?</p><details class="answer"><summary>Model answer</summary><p>Non-Uniform Memory Access: memory and devices are attached to particular sockets; access from another socket is slower because it crosses an inter-socket link.</p></details></li>
+<li><p>Is an MSI-X interrupt a wire?</p><details class="answer"><summary>Model answer</summary><p>No. It is a PCIe Memory Write of a data value to an address programmed in the MSI-X table; the platform converts it into an interrupt for a CPU.</p></details></li>
+</ol>
+<h3>Intermediate</h3>
+<ol>
+<li><p>Why are doorbells mapped uncached rather than write-combining?</p><details class="answer"><summary>Model answer</summary><p>Doorbell writes have side effects and must arrive individually, promptly and in order. WC may delay, merge or reorder them.</p></details></li>
+<li><p>Explain coherent DMA in two sentences.</p><details class="answer"><summary>Model answer</summary><p>The platform snoops CPU caches for device reads and invalidates or updates cached copies on device writes, so device and CPU agree without explicit cache flushes. Without it, the driver must clean caches before device reads and invalidate after device writes.</p></details></li>
+<li><p>Why is reading CSTS in the I/O path harmful?</p><details class="answer"><summary>Model answer</summary><p>It is a non-posted MMIO read; the core stalls for a full link round trip (around a microsecond), capping per-core IOPS.</p></details></li>
+<li><p>What does <code>writel()</code> guarantee that <code>writel_relaxed()</code> does not?</p><details class="answer"><summary>Model answer</summary><p>That prior writes to normal memory are visible to the device before the MMIO write (per Linux's documented accessor semantics). The relaxed form only orders against other accesses to the same device.</p></details></li>
+<li><p>How does a driver know a posted register write has reached the device?</p><details class="answer"><summary>Model answer</summary><p>By reading a register of the same device afterwards: PCIe ordering prevents the read from passing the earlier write, so the read's completion implies the write landed.</p></details></li>
+</ol>
+<h3>Advanced</h3>
+<ol>
+<li><p>Why is the MSI-X message ordered after the CQE by default, and what could break that?</p><details class="answer"><summary>Model answer</summary><p>Both are posted writes from the same requester; default ordering forbids a posted write passing an earlier posted write. Relaxed Ordering on the MSI-X write, or a platform that splits paths, could break it; the controller must not set Relaxed Ordering where it would violate this.</p></details></li>
+<li><p>A trace shows a correct doorbell and a protocol-correct fetch that returns an old command. Where is the bug?</p><details class="answer"><summary>Model answer</summary><p>Most likely host ordering (doorbell visible before SQE stores), or a device prefetch; the trace cannot see inside the CPU. Disambiguate with a barrier or a delay before the doorbell.</p></details></li>
+<li><p>Why might the No Snoop attribute improve performance, and why is it dangerous?</p><details class="answer"><summary>Model answer</summary><p>It lets the platform skip cache snooping for that access, saving fabric work. If software has not ensured the cache holds no dirty copy, the device reads stale data or the CPU later reads stale cache contents. Platform support is implementation-dependent.</p></details></li>
+<li><p>How do you compute the IOPS cost of one MMIO read per I/O?</p><details class="answer"><summary>Model answer</summary><p>R = 1 / (t_cpu + n_rd × t_mmio). With 1.5 µs of CPU time and one 1 µs read, the bound drops from about 667 k to 400 k per core.</p></details></li>
+<li><p>What host-side data do you need to explain a delay between MSI-X and CQ head doorbell?</p><details class="answer"><summary>Model answer</summary><p>Which CPU took the vector, that CPU's idle-state residency and load, interrupt-remapping/virtualization mode, and the queue-to-CPU mapping. The PCIe trace shows only that the delay is on the host.</p></details></li>
+</ol>
+<h3>Senior</h3>
+<ol>
+<li><p>How would you review a driver patch that changes accessors to relaxed variants "for performance"?</p><details class="answer"><summary>Model answer</summary><p>Ask for each accessor what prior memory writes the device must see; require an explicit barrier where needed; demand tests on weakly ordered hardware under load; treat the gain claim as a hypothesis to measure, because the barrier on x86 is often nearly free.</p></details></li>
+<li><p>Design a validation matrix for CPU-side correctness of an NVMe driver.</p><details class="answer"><summary>Model answer</summary><p>Axes: CPU architecture (x86, Arm), coherency (coherent, non-coherent), IOMMU mode (off, translated, passthrough), NUMA placement (local, remote), interrupt mode (MSI-X, polled), queue count vs CPU count, compiler/optimization levels. Oracles: data integrity checks, no unexpected CIDs, DMA-API debug clean.</p></details></li>
+<li><p>A customer reports latency regressions after a firmware update; the SSD log is unchanged. How do you proceed?</p><details class="answer"><summary>Model answer</summary><p>Confirm device-side timings unchanged (trace or device log), then examine host topology changes: NUMA reporting, interrupt placement, idle-state policy, IOMMU mode. Compare before/after per-CPU interrupt distribution. Report proven facts separately from hypotheses.</p></details></li>
+<li><p>Why is a stale-SQE bug a data-integrity issue and not only a reliability issue?</p><details class="answer"><summary>Model answer</summary><p>The controller executes whatever it fetches; a stale Write rewrites old data to its old LBA (or a stale Read overwrites a buffer now in use) with a successful status — silent corruption.</p></details></li>
+<li><p>When would you accept "the device is slow" as the root cause of a latency complaint?</p><details class="answer"><summary>Model answer</summary><p>Only when time between doorbell and CQE write (link-side) accounts for the latency increase and host-side intervals (submission to doorbell, MSI-X to handling) are unchanged — with evidence from both sides of the link.</p></details></li>
+</ol>
+</section>
+
+<section id="quiz">
+<h2>Quiz</h2>
+<ol class="quiz">
+<li><p>Which memory type should map NVMe doorbells?</p>
+<ul class="options" data-answer="2"><li>Write-back</li><li>Uncached</li><li>Write-combining</li><li>It does not matter</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Uncached: side-effect registers need each write to arrive individually and in order.</p></details></li>
+<li><p>An MMIO read to CSTS appears in a PCIe trace as:</p>
+<ul class="options" data-answer="3"><li>A posted MWr from the device</li><li>An MRd from the device</li><li>An MRd from the Root Complex answered by a CplD from the device</li><li>A Message TLP</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The CPU is the requester (through the Root Complex); the device completes with data.</p></details></li>
+<li><p>On a platform with coherent DMA, who makes sure the device's SQE fetch sees bytes still sitting in a CPU cache?</p>
+<ul class="options" data-answer="1"><li>The platform's coherence fabric, by snooping</li><li>The NVMe controller</li><li>The driver, by flushing the cache</li><li>The PCIe switch</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Coherent DMA means the fabric snoops caches on device accesses.</p></details></li>
+<li><p>Why does a register read after a register write prove the write arrived?</p>
+<ul class="options" data-answer="2"><li>Because reads are slower</li><li>Because PCIe ordering forbids the read request from passing the earlier posted write in the same direction</li><li>Because the device acknowledges writes</li><li>It does not prove it</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Default ordering rules; the read's completion follows the write's arrival.</p></details></li>
+<li><p>In Trace 3, what is the first abnormal event, and why is it invisible to a protocol checker?</p>
+<details class="answer"><summary>Model answer</summary><p>Row 3, the CplD carrying the old SQE. Every field is protocol-correct; only comparing its content with what the host intended shows the problem.</p></details></li>
+<li><p>Compute the per-core IOPS bound for t_cpu = 2 µs and two MMIO reads of 0.8 µs per I/O.</p>
+<details class="answer"><summary>Model answer</summary><p>1 / (2 + 1.6) µs = 1 / 3.6 µs ≈ 278,000 I/Os per second (versus 500,000 without the reads).</p></details></li>
+<li><p>Which of these is <em>not</em> defined by the PCIe Base Specification?</p>
+<ul class="options" data-answer="4"><li>That Memory Writes are posted</li><li>The MSI-X table structure</li><li>The No Snoop attribute bit</li><li>x86 Total Store Order</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Store ordering is a CPU-architecture property.</p></details></li>
+<li><p>Why can <code>numa_node</code> read −1, and is that an error?</p>
+<details class="answer"><summary>Model answer</summary><p>Firmware did not provide proximity information for the device. On single-socket systems and many VMs it is normal; on a multi-socket server it is a firmware gap that can cause poor placement.</p></details></li>
+<li><p>Where should a validation engineer look first when completions are in the CQ but no interrupt fires?</p>
+<details class="answer"><summary>Model answer</summary><p>In a trace for the MSI-X MWr after the CQE. Absent → masking or device; present → host interrupt routing.</p></details></li>
+<li><p>True or false: a CQE written by the device can become visible before the data it describes under default PCIe ordering.</p>
+<ul class="options" data-answer="2"><li>True</li><li>False</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>False under default ordering: posted writes from the same requester do not pass each other. Relaxed Ordering changes the analysis, and the controller must avoid setting it where the guarantee is required.</p></details></li>
+</ol>
+</section>
+
+<section id="teachback">
+<h2>Teach-back</h2>
+<p>Explain the CPU–device memory contract three times. Then compare with the model explanations.</p>
+<h3>To a child</h3>
+<details class="answer"><summary>Model explanation</summary><p>"The computer's brain writes a note and puts it in the big cupboard, then rings the SSD's bell. The SSD walks to the cupboard, reads the note, does the job, puts a 'done' note back in the cupboard and buzzes. The brain must finish writing before ringing the bell, or the SSD reads half a note."</p></details>
+<h3>To a junior engineer</h3>
+<details class="answer"><summary>Model explanation</summary><p>"Commands and completions live in write-back DRAM; doorbells are uncached MMIO registers. Use <code>writel()</code> for the doorbell so prior SQE stores are visible first. DMA is coherent on our servers, so the device's fetch snoops the cache. Never read device registers in the I/O path — each read stalls the core for about a microsecond. Interrupts are memory writes, ordered behind the CQE. Keep submitter, buffers and interrupt on the device's NUMA node."</p></details>
+<h3>To a senior engineer</h3>
+<details class="answer"><summary>Model explanation</summary><p>"Correctness depends on three independent contracts: the CPU architecture's store ordering and memory types, the platform's coherence of DMA, and PCIe's producer-consumer ordering for posted writes. NVMe only specifies the protocol on top. The trace sees the PCIe contract; the other two are invisible and must be inferred by comparing link content with host intent. Performance depends on avoiding non-posted MMIO in the hot path and on NUMA placement of queues, buffers and vectors; regressions with unchanged device-side timings are host-side by elimination."</p></details>
+</section>
+
+<section id="mastery">
+<h2>Mastery gate</h2>
+<aside class="callout mastery">
+<p>Do not consider this module mastered until you can:</p>
+<ul class="checklist">
+<li>explain why the doorbell must be written after a barrier and why it is mapped uncached</li>
+<li>diagram the path of one Read through store buffer, cache, Root Complex, link and back, including the interrupt</li>
+<li>identify in a trace: MMIO reads in the hot path, a stale SQE fetch, an interrupt handled late</li>
+<li>debug a latency regression by separating device-side intervals from host-side intervals</li>
+<li>distinguish this module's concepts from neighbors: PCIe ordering (<a href="dd14.html">Module 14</a>), IOMMU translation (<a href="dd02.html">Module 02</a>), BAR mapping (<a href="dd06.html">Module 06</a>), doorbell semantics (<a href="dd27.html">Module 27</a>), MSI-X (<a href="dd19.html">Module 19</a>)</li>
+<li>cite the right source for each claim: PCI Express Base Specification (ordering, MSI-X), NVMe Base 2.4 and NVMe over PCIe Transport 1.4 (queues, doorbells), the CPU architecture manual (store ordering, memory types), Linux <code>memory-barriers.txt</code> (accessors)</li>
+</ul>
+</aside>
+<p>Next: <a href="dd02.html">Module 02 — DMA and Address Translation</a>.</p>
+</section>

@@ -191,7 +191,7 @@ def render_seq(open_tag, inner):
     items = re.findall(r"<li\b([^>]*)>(.*?)</li>", inner, flags=re.S)
     has_t = any(attr(a, "data-t") for a, _ in items)
     gutter = 78 if has_t else 10
-    col = int(attr(open_tag, "data-col") or 200)
+    col = int(attr(open_tag, "data-col") or max(150, min(200, 1000 // len(actors))))
     x = {a: gutter + col / 2 + i * col for i, a in enumerate(actors)}
     width = gutter + col * len(actors) + 10
     out = []
@@ -249,16 +249,17 @@ def render_seq(open_tag, inner):
         x0, x1 = x[fr], x[to]
         sgn = 1 if x1 > x0 else -1
         lines = wrap(label, max(14, int(abs(x1 - x0) / 6.6)))
+        y += 14 * (len(lines) - 1)
         for i, ln in enumerate(lines):
             ly = y - 6 - (len(lines) - 1 - i) * 14
             body.append(f'<text x="{(x0+x1)/2:.0f}" y="{ly}" text-anchor="middle" font-size="12">{html.escape(ln)}</text>')
         body.append(f'<line class="arrow{c}{d}" x1="{x0:.0f}" y1="{y+4}" x2="{x1-sgn*9:.0f}" y2="{y+4}"/>'
                     f'<polygon class="ah{c}" points="{x1:.0f},{y+4} {x1-sgn*10:.0f},{y-1} {x1-sgn*10:.0f},{y+9}"/>')
-        y += 30 + 14 * (len(lines) - 1) + 6
+        y += 36
     for a in actors:
         out.insert(0, f'<line class="life" x1="{x[a]:.0f}" y1="{14+hh}" x2="{x[a]:.0f}" y2="{y}"/>')
     height = y + 10
-    svg = (f'<div class="svg-diagram"><svg viewBox="0 0 {width:.0f} {height:.0f}" width="{width:.0f}" role="img" '
+    svg = (f'<div class="svg-diagram"><svg viewBox="0 0 {width:.0f} {height:.0f}" width="{width:.0f}" style="min-width:{min(width, 680):.0f}px" role="img" '
            f'aria-label="Sequence diagram: {html.escape(", ".join(actors))}" xmlns="http://www.w3.org/2000/svg">'
            + "".join(out) + "".join(body) + "</svg></div>")
     return svg, "; ".join(problems) or None
@@ -314,7 +315,7 @@ def render_ring(tag):
     parts.append(f'<text x="{left}" y="{y0+100}" font-size="11" class="muted">{len(full)} of {n} slots in use; '
                  f'empty when head = tail, full when (tail + 1) mod {n} = head</text>')
     height = y0 + 110
-    return (f'<div class="svg-diagram"><svg viewBox="0 0 {width} {height}" width="{width}" role="img" '
+    return (f'<div class="svg-diagram"><svg viewBox="0 0 {width} {height}" width="{width}" style="min-width:{min(width, 680)}px" role="img" '
             f'aria-label="{html.escape(label)}: {n} slots, head {head}, tail {tail}" xmlns="http://www.w3.org/2000/svg">'
             + "".join(parts) + "</svg></div>"), None
 
@@ -799,6 +800,19 @@ def main(argv):
         (OUT / f'{p["id"]}.html').write_text(build_page(p, pages, content, toc, words, len(pages)), encoding="utf-8")
         search += search_entries(p, content)
         book_parts.append((p, content, words))
+
+    # cross-page anchor check (ids only exist after transform, which adds heading ids)
+    ids_by_page = {p["id"]: set(re.findall(r'\bid="([^"]+)"', c)) for p, c, _ in book_parts}
+    bad_anchors = 0
+    for p, content, _ in book_parts:
+        for m in re.finditer(r'href="(?:([a-z0-9-]+)\.html)?#([^"]+)"', content):
+            target = m.group(1) or p["id"]
+            if target in ids_by_page and sources.get(target) is not None and m.group(2) not in ids_by_page[target]:
+                bad_anchors += 1
+                if bad_anchors <= 60:
+                    print(f"warn  {p['id']}: anchor not found: {m.group(1) or ''}#{m.group(2)}")
+    if bad_anchors:
+        print(f"{bad_anchors} broken anchor link(s)")
 
     idx_src = "window.NVME_SEARCH=" + json.dumps(search, ensure_ascii=False, separators=(",", ":")) + ";\n"
     (OUT / "assets" / "search-index.js").write_text(idx_src, encoding="utf-8")
