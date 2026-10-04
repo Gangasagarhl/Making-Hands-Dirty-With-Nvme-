@@ -1,0 +1,277 @@
+<p class="lead">A storage failure is almost never reported by the layer that caused it. An application times out, a filesystem remounts read-only, the NVMe driver resets the controller, an Advanced Error Reporting (AER) message scrolls past — and the real cause sits in one of seven places: software, driver, NVMe, PCIe transaction, link, firmware or media. This chapter teaches the discipline that tells them apart: one timeline, the first abnormal event, evidence per layer, and decision trees — practised on six complete worked cases.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>Chapters <a href="ch42.html">42</a>–<a href="ch46.html">46</a> each taught one source of evidence: interrupts, MSI-X tables, NVMe status, PCIe errors, AER registers. Real incidents arrive as a pile of all of them at once, out of order, with different clocks, plus noise from recovery actions. A junior engineer reads the loudest line in the log and files a bug against whoever printed it. A senior engineer builds a timeline, finds the first thing that went wrong, and asks which layer could have produced it.</p>
+  <p>The difference is not knowledge of more registers. It is method. This chapter is that method.</p>
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Name the seven failure domains (software, driver, NVMe protocol, PCIe transaction, link, firmware, media) and the evidence signature of each.</li>
+    <li>Build a unified timeline from kernel log, NVMe tracepoints, AER registers, NVMe logs and a protocol-analyzer capture, including clock alignment.</li>
+    <li>Apply first-abnormal-event discipline: separate cause from cascade, and absence from presence.</li>
+    <li>Use decision trees to move from symptom to layer to root cause, and know which experiment disambiguates two candidate layers.</li>
+    <li>Read the common Linux cascade: AER event → NVMe I/O timeout → abort → controller reset → recovery or removal.</li>
+    <li>Write a root-cause statement with evidence, confidence and a regression test.</li>
+  </ul>
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq"><p>This chapter assumes all of Part XIV and XV: <a href="ch42.html">Interrupt Architecture</a>, <a href="ch43.html">MSI-X</a>, <a href="ch44.html">NVMe Errors</a>, <a href="ch45.html">PCIe Errors</a>, <a href="ch46.html">AER</a>, plus the command life cycle of <a href="ch39.html">The Most Important Chapter</a> and the command-to-TLP mapping of <a href="ch41.html">Command-to-TLP Correlation</a>.</p></aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>One morning the class goldfish is found on the floor. Everybody has a story. The cleaner says the window was open. The teacher says the tank was knocked. A child says the cat came in. Someone noticed the water was low yesterday.</p>
+    <p>A good detective does not believe the loudest person. She makes a list of everything that happened, in order, with times. Then she asks: <em>what was the very first strange thing?</em> Water low yesterday afternoon — that came before the open window, the cat, and the knocked tank. A fish with little water jumps. Everything else happened after.</p>
+    <p>She also checks things that <em>didn't</em> happen: the fish food was untouched, so nobody fed it. "Nothing happened" can be a clue too.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>Error correlation is accident investigation in aviation. Investigators gather the flight data recorder (analyzer trace), the cockpit voice recorder (kernel log), maintenance logs (SMART, error logs), air traffic control tapes (AER at the root port) and wreckage (register dumps after the fact). They synchronise every source to one clock, find the first deviation from normal operation, and then build the causal chain forward from it — refusing to stop at the dramatic final events, which are consequences.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>Hides:</strong> unlike an aircraft, most systems have no flight data recorder running; you usually have only the logs that happened to be enabled, and recovery actions (resets) actively destroy evidence. <strong>Misleads:</strong> "first abnormal event" means the first one <em>you can observe</em>. The true first cause may predate every log (a firmware bug latent since boot, a cracked solder joint). The first observed event narrows the search; it does not always end it.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>When something goes wrong with an NVMe SSD on PCIe, there are seven places it could have gone wrong:</p>
+  <table>
+    <caption>The seven failure domains</caption>
+    <thead><tr><th>Domain</th><th>What it includes</th><th>Example failure</th></tr></thead>
+    <tbody>
+      <tr><td>Software</td><td>Applications, filesystems, databases, block layer policy, CPU scheduling</td><td>Application reads past the end of a partition; CPU starvation makes I/O look slow</td></tr>
+      <tr><td>Driver</td><td>The NVMe driver, PCI core, IOMMU mappings, interrupt setup</td><td>PRP list freed before the device read it; interrupt vector left masked</td></tr>
+      <tr><td>NVMe protocol</td><td>Queues, commands, status, controller state machine as defined by NVMe</td><td>Command rejected with Invalid Field; queue full; controller not ready</td></tr>
+      <tr><td>PCIe transaction</td><td>Requests and completions: addresses, tags, completion status, ordering</td><td>Unsupported Request, Completion Timeout, Malformed TLP</td></tr>
+      <tr><td>Link</td><td>Physical and Data Link layers: signal, training, replay</td><td>Bad TLP storm, retraining, surprise link down</td></tr>
+      <tr><td>Firmware</td><td>The controller's own software: command processing, FTL, error handling</td><td>Controller hangs, sets Controller Fatal Status, returns wrong data</td></tr>
+      <tr><td>Media</td><td>The NAND (or other storage medium) and its error correction</td><td>Unrecovered Read Error on worn blocks</td></tr>
+    </tbody>
+  </table>
+  <p>Each domain leaves its own kind of fingerprints. The method is always the same:</p>
+  <ol>
+    <li><strong>Collect</strong> everything before anyone resets or reboots.</li>
+    <li><strong>Line it up</strong> on one timeline.</li>
+    <li><strong>Find the first abnormal event</strong> — the earliest thing that differs from normal.</li>
+    <li><strong>Ask which domain could produce that event</strong>, using the fingerprints.</li>
+    <li><strong>Test the hypothesis</strong> with an experiment that would come out differently if you were wrong.</li>
+  </ol>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>Evidence sources and what each can see</h3>
+  <table>
+    <caption>Evidence sources by layer of visibility</caption>
+    <thead><tr><th>Source</th><th>Sees</th><th>Blind to</th><th>Clock</th><th>Volatility</th></tr></thead>
+    <tbody>
+      <tr><td>Application / filesystem logs</td><td>User-visible symptom and its time</td><td>Everything below the syscall</td><td>Wall clock</td><td>Persistent</td></tr>
+      <tr><td>Block-layer tracing (blktrace, block tracepoints)</td><td>Request issue/complete times per I/O; host vs device time</td><td>What happened on the link</td><td>Kernel monotonic</td><td>Only if enabled</td></tr>
+      <tr><td>NVMe tracepoints (<code>nvme_setup_cmd</code>, <code>nvme_complete_rq</code>, <code>nvme_async_event</code>)</td><td>Every command's QID/CID/opcode/fields and its status</td><td>Link-level retries, interrupts</td><td>Kernel monotonic</td><td>Only if enabled</td></tr>
+      <tr><td>Kernel log (dmesg)</td><td>Timeouts, aborts, resets, AER reports, IOMMU faults, NVMe errors (rate-limited)</td><td>Successful I/O; masked errors; anything rate-limited away</td><td>Kernel monotonic (dmesg -T converts approximately)</td><td>Ring buffer; persistent if journald</td></tr>
+      <tr><td>AER registers / counters</td><td>Which PCIe errors each function detected, first error header</td><td>Time of each error, counts beyond one (status), masked signalling</td><td>None (state only)</td><td>Sticky until cleared</td></tr>
+      <tr><td>NVMe logs (Error Information, SMART, telemetry, vendor)</td><td>Controller's own view: errors, media health, internal state</td><td>Host and link</td><td>Controller power-on time (if any)</td><td>Ring/overwrite; partly survives reset</td></tr>
+      <tr><td>NVMe registers (CSTS, CC, CAP)</td><td>Controller state now</td><td>History</td><td>None</td><td>Lost on reset</td></tr>
+      <tr><td>Protocol analyzer capture</td><td>Every TLP/DLLP/ordered set on one link, nanosecond timestamps</td><td>Inside host and device; other links</td><td>Analyzer timebase</td><td>Only within capture window</td></tr>
+      <tr><td>Platform logs (BMC/SEL, firmware-first GHES, MCE/EDAC)</td><td>Power, thermal, memory errors, firmware-handled PCIe errors</td><td>NVMe semantics</td><td>BMC clock</td><td>Persistent</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Building one timeline</h3>
+  <p>Every source has its own clock. Before any reasoning, convert all events to one timebase.</p>
+  <ul>
+    <li><strong>Kernel sources</strong> (dmesg, tracepoints) share the monotonic clock. Use raw <code>dmesg</code> seconds-since-boot, not <code>dmesg -T</code>, whose wall-clock conversion drifts after suspend.</li>
+    <li><strong>Analyzer</strong>: align using an event visible in both. A practical marker: write a string to <code>/sys/kernel/tracing/trace_marker</code>, then immediately issue a distinctive admin command (for example Get Features for an unusual Feature Identifier); trigger the analyzer on that command's SQE fetch; the offset between the two timestamps is your alignment, accurate to a few microseconds.</li>
+    <li><strong>Controller time</strong>: NVMe logs that carry timestamps (if the host has set the Timestamp feature) use the controller's clock; align via a known event such as the last controller reset.</li>
+    <li><strong>Platform logs</strong>: BMC clocks can be minutes off; align on a shared event (a reboot, a link-down that the BMC also logs).</li>
+  </ul>
+  <div class="formula">
+    <div class="eq"><var>t</var><sub>common</sub> = <var>t</var><sub>source</sub> + <var>Δ</var><sub>source</sub> ± <var>ε</var><sub>source</sub></div>
+    <dl class="vars">
+      <dt>t<sub>common</sub></dt><dd>time of the event on the chosen common timebase (usually kernel monotonic seconds)</dd>
+      <dt>t<sub>source</sub></dt><dd>timestamp as recorded by the source (analyzer, BMC, controller)</dd>
+      <dt>Δ<sub>source</sub></dt><dd>offset measured from a marker event seen by both the source and the common timebase</dd>
+      <dt>ε<sub>source</sub></dt><dd>alignment uncertainty: the jitter of the marker method (µs for trace_marker + analyzer trigger; seconds for BMC logs)</dd>
+    </dl>
+  </div>
+  <aside class="callout warn"><p>Never order two events from different sources whose difference is smaller than the combined alignment uncertainty. If ε says "±2 s", an AER message and an NVMe timeout one second apart are simultaneous for reasoning purposes.</p></aside>
+
+  <h3>First-abnormal-event discipline</h3>
+  <p>Rules:</p>
+  <ol>
+    <li><strong>Write down the expected sequence first</strong> (from <a href="ch39.html">Chapter 39</a>): doorbell → SQE fetch → PRP fetch → data → CQE → interrupt → head doorbell. Deviations are only visible against expectations.</li>
+    <li><strong>Absence is an event.</strong> A missing SQE fetch, completion, interrupt or ACK is timestamped by when it <em>should</em> have occurred.</li>
+    <li><strong>Walk forward in time</strong>, not backward from the loudest symptom. Mark the first event that deviates. Everything after it is suspect as consequence.</li>
+    <li><strong>Distinguish cascade from coincidence.</strong> Ask: could event A cause event B through a known mechanism? If not, they may be independent, and you may have two problems.</li>
+    <li><strong>Exclude recovery noise.</strong> After a reset begins, you will see all-ones reads, Completion Timeouts, link down/up, aborted commands, configuration reads. These are expected effects of recovery.</li>
+    <li><strong>Record confidence.</strong> "First abnormal event observed" is not "root cause". Say what could precede it unobserved.</li>
+  </ol>
+
+  <h3>The standard Linux cascade</h3>
+  <p>Many incidents produce the same Linux sequence. Recognising it lets you skip to the beginning:</p>
+  <figure>
+    <ol class="seq" data-actors="Link / PCIe|SSD controller|Root port AER|NVMe driver|Block layer / app">
+      <li data-note="Link / PCIe">first abnormal: e.g. replay storm</li>
+      <li data-from="SSD controller" data-to="Root port AER" class="bad">ERR_NONFATAL (CmpltTO)</li>
+      <li data-from="Root port AER" data-to="NVMe driver">AER report; error_detected()</li>
+      <li data-note="NVMe driver">t+30 s: I/O timeout, abort</li>
+      <li data-from="NVMe driver" data-to="SSD controller">Abort (08h)</li>
+      <li data-note="NVMe driver">abort times out → reset controller</li>
+      <li data-from="NVMe driver" data-to="SSD controller">CC.EN=0, re-init</li>
+      <li data-from="NVMe driver" data-to="Block layer / app" class="bad">I/O errors / requeue</li>
+      <li data-note="Block layer / app">app timeout, fs read-only</li>
+    </ol>
+    <figcaption>Conceptual cascade. Each arrow after the first is a consequence; only the first abnormal event (top) is evidence about the cause.</figcaption>
+  </figure>
+  <p>Illustrative (synthetic) kernel lines for that cascade — wording depends on kernel version:</p>
+  <pre class="code" data-kind="read-only" data-lang="text" data-title="synthetic example: the Linux cascade"><code>[ 8812.104311] pcieport 0000:00:01.1: AER: Uncorrected (Non-Fatal) error message received from 0000:01:00.0
+[ 8812.104330] nvme 0000:01:00.0: PCIe Bus Error: severity=Uncorrected (Non-Fatal), type=Transaction Layer, (Requester ID)
+[ 8812.104336] nvme 0000:01:00.0:    [14] CmpltTO                (First)
+[ 8842.497120] nvme nvme0: I/O tag 523 (020b) opcode 0x1 (Write) QID 3 timeout, aborting
+[ 8872.705002] nvme nvme0: I/O tag 523 (020b) opcode 0x1 (Write) QID 3 timeout, reset controller
+[ 8873.010455] nvme nvme0: 8/0/0 default/read/poll queues
+[ 8873.011020] blk_print_req_error: I/O error, dev nvme0n1, sector 88219648 op 0x1:(WRITE) flags 0x8800 phys_seg 16 prio class 0</code></pre>
+  <p>Read it from the top. The AER Completion Timeout at 8812.10 is 30 seconds before the first NVMe timeout (the default <code>io_timeout</code>), consistent with the command having been stuck since the PCIe failure. The reset and I/O errors are consequences.</p>
+
+  <h3>Evidence signatures of the seven domains</h3>
+  <table>
+    <caption>Fingerprints by domain</caption>
+    <thead><tr><th>Domain</th><th>Typical first abnormal event</th><th>Supporting evidence</th><th>Evidence that argues against it</th></tr></thead>
+    <tbody>
+      <tr><td>Software</td><td>Application/host-side delay or a wrong request (bad offset, wrong device)</td><td>blktrace shows long queue (Q→D) time but short device (D→C) time; NVMe status 0 or host-caused status (LBA out of range)</td><td>Long D→C times; PCIe errors; controller status changes</td></tr>
+      <tr><td>Driver</td><td>Inconsistent host state: interrupt not delivered, wrong PRP, CID reuse, IOMMU fault</td><td>IOMMU faults naming the device; CQE present but not processed; "completion polled"; UR at root port for device DMA to bad address</td><td>Analyzer shows the device misbehaving with correct inputs</td></tr>
+      <tr><td>NVMe protocol</td><td>A command rejected or a queue/state rule violated</td><td>Non-zero SCT 0h/1h status; Command Sequence Error; Error log Parameter Error Location</td><td>Status 0 everywhere</td></tr>
+      <tr><td>PCIe transaction</td><td>UR, CA, Completion Timeout, Unexpected Completion, Poisoned, Malformed</td><td>AER uncorrectable bits with header log; analyzer shows bad completion status or missing completion</td><td>Clean AER on every function in the path (with AER confirmed working)</td></tr>
+      <tr><td>Link</td><td>Receiver/Bad TLP/Bad DLLP storms, replay, rollover, retrain, surprise down</td><td>Correctable error rates, LnkSta downgrade, pciehp link down, LTSSM Recovery in capture</td><td>Stable link, zero correctable errors</td></tr>
+      <tr><td>Firmware</td><td>Device stops responding at the NVMe level while PCIe is alive; CSTS.CFS; wrong data with PI errors</td><td>CSTS reads valid (not all ones) with CFS=1 or no SQE fetch after doorbell; telemetry log; reproducibility tied to firmware version</td><td>Fault follows the slot/cable, not the drive</td></tr>
+      <tr><td>Media</td><td>Media status (SCT 2h) on specific LBAs</td><td>SMART media errors rising, long read latency before error, same LBAs repeat, Error log LBA</td><td>Errors on random LBAs that vanish on retry; end-to-end reference-tag errors (more likely firmware mapping)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Decision trees</h3>
+  <h4>Master tree: from symptom to domain</h4>
+  <figure>
+<pre class="diagram">
+ SYMPTOM: I/O failed or was slow
+ │
+ ├─ Q1: Did the command get a CQE?  (tracepoint nvme_complete_rq, analyzer CQE write, CQ memory)
+ │   │
+ │   ├─ YES, status ≠ 0 ──► go to TREE A (NVMe status)
+ │   │
+ │   ├─ YES, status = 0, but slow ──► go to TREE B (latency)
+ │   │
+ │   └─ NO (timeout) ──► Q2: Is the controller reachable?  (CSTS / config read)
+ │        │
+ │        ├─ reads all ones / config fails ──► TREE C (PCIe / link)
+ │        │
+ │        ├─ CSTS.CFS = 1 ──► FIRMWARE (collect telemetry; look for earlier AEN/temperature/power)
+ │        │
+ │        └─ CSTS healthy (RDY=1, CFS=0) ──► Q3: Is the CQE in host memory?
+ │              │
+ │              ├─ YES ──► INTERRUPT path: Q4: interrupt MWr on the link?
+ │              │            ├─ YES ──► DRIVER / platform (remapping, affinity, handler)
+ │              │            └─ NO  ──► vector mask/PBA? IEN? coalescing? → DRIVER or FIRMWARE
+ │              │
+ │              └─ NO ──► Q5: Did the controller fetch the SQE (MRd after doorbell)?
+ │                         ├─ NO  ──► doorbell lost? wrong doorbell offset (DRIVER) or FW stall
+ │                         └─ YES ──► Q6: data-phase requests failing? (AER CmpltTO/UR at SSD or RP)
+ │                                     ├─ YES ──► TREE C (PCIe transaction)
+ │                                     └─ NO  ──► FIRMWARE (command stuck internally) or MEDIA (long retries)
+</pre>
+    <figcaption>Master decision tree. Each question names the evidence that answers it.</figcaption>
+  </figure>
+  <h4>Tree A: the command completed with an error</h4>
+  <figure>
+<pre class="diagram">
+ SCT 0h/1h, DNR=1 ──► request was wrong: inspect SQE fields (tracepoint) ──► SOFTWARE or DRIVER
+     (Parameter Error Location tells which field; LBA range → check partition/capacity)
+ SCT 0h SC 04h (Data Transfer Error) ──► PCIe underneath? AER at SSD and root port, IOMMU faults
+     ├─ AER/IOMMU evidence ──► TREE C
+     └─ none ──► FIRMWARE (internal DMA) — ask vendor logs
+ SCT 0h SC 06h (Internal Error) ──► FIRMWARE (telemetry, vendor log)
+ SCT 0h SC 07h/08h (aborted) ──► who aborted? host timeout handler (look earlier) or SQ deletion
+ SCT 2h (media) ──► same LBAs repeat? SMART media errors? long latency before CQE?
+     ├─ yes ──► MEDIA
+     └─ reference-tag error / random LBAs ──► FIRMWARE (mapping) or host overwrote buffer (DRIVER)
+ SCT 3h (path) ──► multipath/ANA: path or controller state change ──► fabric/path, not media
+</pre>
+    <figcaption>Tree A: classify an error completion.</figcaption>
+  </figure>
+  <h4>Tree B: success but slow</h4>
+  <figure>
+<pre class="diagram">
+ Split latency: Q (queued in host) → D (dispatched to driver/doorbell) → C (completion seen)
+ ├─ Q→D large ──► SOFTWARE (scheduler, cgroup throttle, queue depth limits, CPU starvation)
+ ├─ D→C large, analyzer shows CQE late ──► device time:
+ │     ├─ replays/retrains during the I/O ──► LINK
+ │     ├─ periodic stalls, all queues ──► FIRMWARE (GC, thermal throttling: SMART temperature)
+ │     └─ specific LBAs slow ──► MEDIA (read retries)
+ └─ D→C large, analyzer shows CQE early, interrupt late/absent ──► coalescing (policy) or DRIVER/platform
+</pre>
+    <figcaption>Tree B: separate host time, device time and notification time.</figcaption>
+  </figure>
+  <h4>Tree C: PCIe and link</h4>
+  <figure>
+<pre class="diagram">
+ Uncorrectable AER?
+ ├─ Malformed TLP ──► header Length vs MPS? ── yes ──► CONFIGURATION (driver/firmware setup)
+ │                                          └─ no ──► device or switch bug (PCIe transaction)
+ ├─ UR at root port, header = SSD DMA ──► address valid? IOMMU fault? ──► DRIVER (mapping/PRP)
+ ├─ CmpltTO at SSD ──► host side completer/path: RP errors, memory errors, link recovery ──► LINK or platform
+ ├─ CmpltTO at root port (MMIO read) ──► SSD not answering: link down? SSD hung? ──► LINK or FIRMWARE
+ ├─ Poisoned TLP at SSD ──► host memory errors (MCE/EDAC) ──► platform memory
+ └─ Surprise Down ──► power/removal/firmware crash dropping the link ──► LINK or FIRMWARE
+ Correctable only?
+ ├─ low rate ──► noise, not cause (keep looking)
+ └─ high rate / rollovers / downtraining ──► LINK (signal integrity) — and suspect as cause of latency
+</pre>
+    <figcaption>Tree C: classify PCIe evidence and name the next hop.</figcaption>
+  </figure>
+
+  <h3>Disambiguating experiments</h3>
+  <p>When two domains remain, design an experiment whose outcome differs between them:</p>
+  <table>
+    <caption>Classic disambiguation experiments</caption>
+    <thead><tr><th>Candidates</th><th>Experiment</th><th>If A</th><th>If B</th></tr></thead>
+    <tbody>
+      <tr><td>Drive (firmware/media) vs slot (link)</td><td>Swap drive to another slot, and another drive into this slot</td><td>Fault follows the drive</td><td>Fault stays with the slot</td></tr>
+      <tr><td>Link vs firmware</td><td>Force a lower link speed (e.g. Gen3) via platform setting or the downstream port's Target Link Speed</td><td>Errors vanish at lower speed → link margin</td><td>Unchanged → firmware</td></tr>
+      <tr><td>Driver mapping vs device addressing</td><td>Run with the IOMMU in passthrough on a test system</td><td>Faults disappear → mapping lifetime bug (driver)</td><td>Device writes to garbage anyway → device bug</td></tr>
+      <tr><td>Interrupt vs command stuck</td><td>Poll the CQ (debugfs or a poll queue) when the timeout would fire</td><td>CQE present → interrupt path</td><td>CQE absent → command stuck</td></tr>
+      <tr><td>Media vs firmware mapping</td><td>Re-read the failing LBA repeatedly; write then read it (test data only)</td><td>Consistent failure, cured by rewrite → media</td><td>Inconsistent, PI reference tag errors → firmware</td></tr>
+      <tr><td>Software vs device latency</td><td>Compare blktrace Q→D and D→C; run fio direct on the raw device</td><td>Only app path slow → software</td><td>Raw device slow too → device side</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The central concept on the ladder</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Find the first strange thing that happened, not the loudest one.</p></div>
+    <div class="rung" data-rung="B"><p>Merge all evidence onto one timeline; the earliest deviation from the expected command life cycle points to the failing domain; later events are usually cascade.</p></div>
+    <div class="rung" data-rung="C"><p>Each hardware block leaves specific evidence: PHY/DLL in correctable counters and LTSSM; transaction layer in AER uncorrectable bits and header logs; controller in CSTS, CQE status and NVMe logs; host in IOMMU faults and interrupt counters.</p></div>
+    <div class="rung" data-rung="D"><p>Specifications define the meaning of each piece of evidence (status codes, AER bits, CSTS fields) — not causality. Causal reasoning is derived and must be labelled as such.</p></div>
+    <div class="rung" data-rung="E"><p>Protocol order is the backbone of the timeline: doorbell, fetch, data, CQE, interrupt, head doorbell; non-posted requests and their completions; ACK/NAK.</p></div>
+    <div class="rung" data-rung="F"><p>In a capture, mark the expected sequence per command and diff; the first missing or wrong packet is the anchor. Align with kernel events via a marker.</p></div>
+    <div class="rung" data-rung="G"><p>Root-cause statement: first abnormal event, mechanism to symptom, evidence for, evidence against, confidence, fix, regression test.</p></div>
+  </div>
+
+  <h3>The 16 questions for "the first abnormal event"</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>The earliest observed event that deviates from the expected behaviour of the system.</dd>
+    <dt>2. Why was it created (as a practice)?</dt><dd>Because failure cascades bury causes under consequences; the earliest deviation is closest to the cause.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Misattribution to the loudest or last component.</dd>
+    <dt>4. What existed before it?</dt><dd>Symptom-driven debugging: start at the error message and guess.</dd>
+    <dt>5. Why is it better?</dt><dd>It is falsifiable and repeatable: two engineers with the same timeline reach the same anchor.</dd>
+    <dt>6. Who creates it?</dt><dd>The engineer, from merged evidence.</dd>
+    <dt>7. Who consumes it?</dt><dd>Root-cause analysis, bug reports, the owning team (vendor, driver, platform).</dd>
+    <dt>8. Where does it live?</dt><dd>In the incident timeline document.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>All evidence sources: logs, AER, CSTS, NVMe logs, capture buffers.</dd>
+    <dt>10. What happens before it?</dt><dd>Normal operation (or unobserved latent faults).</dd>
+    <dt>11. What happens after it?</dt><dd>The cascade: timeouts, resets, errors in other layers.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>You fix a symptom; the failure recurs; the wrong team owns the bug.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>The first missing or malformed packet relative to the expected sequence.</dd>
+    <dt>14. What does Linux show?</dt><dd>The earliest relevant kernel message — often an AER or IOMMU line, minutes or seconds before the timeouts.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>That injecting the identified first event reproduces the full cascade; that the fix prevents it.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>Missing evidence (logs not enabled, clocks misaligned, rate-limited messages), a latent earlier fault, or two independent problems.</dd>
+  </dl>
+</section>
