@@ -1,0 +1,390 @@
+<section class="part" id="part-iii"><div class="part-num">PART III</div><h1>Why NVMe Exists</h1><p class="part-intro">Every interface is an answer to a problem. NVMe's problem was simple to state and hard to solve: flash had become parallel and fast, and the interfaces in front of it were single-file and slow. This Part tells the story from SATA and AHCI through the first proprietary PCIe SSDs to NVMe 1.0, the 2.0 refactor and the August 2026 release — and quantifies, with formulas you can check, exactly what changed.</p></section>
+
+<section class="chapter" id="p1-ch03-why-nvme" data-part="PART III — WHY NVMe EXISTS">
+<h2><span class="num">3</span> From SATA/SAS to NVMe</h2>
+
+<h3>Why this chapter exists</h3>
+<p>Engineers who know <i>why</i> a protocol is shaped the way it is can predict its behaviour and its failure modes. NVMe's queue pairs, doorbells, phase tags, fixed-size entries and per-queue interrupts are not arbitrary; each removes a specific cost that AHCI and SATA imposed. Knowing those costs also tells you what NVMe <i>still</i> cannot fix — media latency, host software overhead, and interrupt handling — which is where real performance work happens.</p>
+
+<h3>Learning objectives</h3>
+<ul class="objectives">
+<li>Describe AHCI's architecture: one command list of 32 slots per port, PRD tables, FIS areas, port registers.</li>
+<li>Explain command serialization, queue limits and CPU overhead in the SATA/AHCI path, with numbers.</li>
+<li>State NVMe's queue limits precisely (up to 65,535 I/O queues; up to 65,536 entries each; admin queue up to 4,096 entries) and why a ring of N slots holds N−1 commands.</li>
+<li>Compare per-command register-access cost of AHCI and NVMe and compute its CPU impact.</li>
+<li>Compare SATA, SAS, NVMe/PCIe and NVMe-oF protocol stacks layer by layer.</li>
+<li>Narrate the history SATA → AHCI → PCIe SSDs → NVMe → NVMe 1.x → NVMe 2.0 family → NVMe 2.4, labelling dates by confidence.</li>
+<li>List NVMe's design goals and connect each to a mechanism you will study later.</li>
+</ul>
+
+<h3>Prerequisites</h3>
+<p><a href="#p1-ch01-move-data">Chapter 1</a> (registers, MMIO cost, interrupts, DMA — especially <a href="#p1-s1-4">§1.4</a> and <a href="#p1-s1-14">§1.14</a>) and <a href="#p1-ch02-storage">Chapter 2</a> (parallelism and Little's law — <a href="#p1-s2-17">§2.17</a>).</p>
+
+<h3>Story</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy — the restaurant</div>
+<p>An old restaurant has one order spike by the kitchen door that holds 32 tickets. Every waiter in the restaurant must queue at that spike, and only one waiter may touch it at a time. After pinning a ticket, the waiter must also lean into the kitchen and <i>ask</i> the cook a few questions (“Did you see my ticket? Which orders are ready?”) and wait for each answer. When food is ready, the cook rings one bell for the whole restaurant, and somebody has to go and find out whose food it is.</p>
+<p>The new restaurant gives <b>every waiter their own order rail and their own pickup shelf</b>, each with room for thousands of tickets. A waiter clips tickets on their own rail, flips a little flag to say “new tickets up to here”, and walks away — no questions, no waiting. The cooks (dozens of them now) take tickets from all rails at once. When a dish is ready, the cook puts it on that waiter's shelf with the ticket number, and buzzes that waiter's own pager.</p>
+</div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>In NVMe the “cook” (controller) walks to the waiter's rail to fetch tickets — the tickets live in host memory, not in the kitchen. The “flag” is a doorbell register write. And dishes are delivered by the cook writing directly into the waiter's memory (DMA), not by handing a plate across a counter. The restaurant analogy also hides that cooks may finish orders out of order, which is why every ticket carries a command identifier.</p></div>
+
+<h3>Beginner explanation</h3>
+<p>SATA drives are controlled through a host-side chip called an AHCI controller. AHCI was designed in the era of hard disks, when a disk could handle a few hundred operations per second and nobody cared about a few microseconds of overhead. It offers one queue of 32 commands per drive, needs the CPU to read device registers to learn what finished, and funnels everything through a single shared structure. SSDs made the drive thousands of times faster, so the overhead that used to be invisible became the bottleneck. NVMe replaced the whole design with many deep queues in host memory, written without locks and signalled with a single register write.</p>
+
+<h3>3.1 Limitations of SATA</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Limitation</th><th>Detail</th><th>Consequence for SSDs</th></tr></thead>
+<tbody>
+<tr><td>Bandwidth ceiling</td><td>6 Gb/s, 8b/10b encoding → 600 MB/s raw, ~550 MB/s achievable <span class="tag derived">derived</span></td><td>Mainstream SATA SSDs hit the ceiling around 2012–2013; flash could go faster</td></tr>
+<tr><td>Half-duplex transport</td><td>Frames flow one direction at a time on the link</td><td>Mixed read/write workloads cannot use both directions simultaneously</td></tr>
+<tr><td>Single queue of 32</td><td>NCQ tags 0–31 per device <span class="tag verified">verified</span></td><td>Cannot express enough concurrency for many-die SSDs from many cores</td></tr>
+<tr><td>ATA command set heritage</td><td>Command delivery via FIS (Frame Information Structure) transfers; many legacy modes</td><td>Extra translation and protocol steps per command</td></tr>
+<tr><td>Extra hop</td><td>CPU → PCIe → AHCI HBA → SATA link → drive controller</td><td>Additional latency and a second controller in the path</td></tr>
+</tbody></table></div>
+
+<h3>3.2 AHCI — the Advanced Host Controller Interface</h3>
+<p>AHCI is a register-level interface specification (Intel, first released in 2004 <span class="tag version">version</span>) for SATA host controllers. The AHCI HBA is itself a PCI function, class code 01h/06h/01h (mass storage, SATA, AHCI) <span class="tag verified">verified</span>. Its memory-mapped registers live in a BAR (ABAR). Per port it uses:</p>
+<ul>
+<li>a <b>command list</b> of up to <b>32 command headers</b> (“slots”) in host memory, each pointing to a <b>command table</b> containing the command FIS and a <b>Physical Region Descriptor Table (PRDT)</b> — AHCI's scatter-gather list;</li>
+<li>a <b>received-FIS</b> area in host memory where the HBA deposits frames from the device;</li>
+<li>port registers including <b>PxCI</b> (Command Issue — bit per slot), <b>PxSACT</b> (SATA Active — bit per NCQ tag), <b>PxIS</b> (Interrupt Status), <b>PxIE</b> (Interrupt Enable), and a global <b>IS</b> (Interrupt Status per port).</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 820 260" role="img" aria-label="AHCI architecture: all CPU cores share one port command list of 32 slots; HBA reads slots; SATA link to drive">
+<rect class="box accent" x="20" y="20" width="90" height="40" rx="6"/><text class="lbl" x="65" y="45" text-anchor="middle">Core 0</text>
+<rect class="box accent" x="20" y="70" width="90" height="40" rx="6"/><text class="lbl" x="65" y="95" text-anchor="middle">Core 1</text>
+<rect class="box accent" x="20" y="120" width="90" height="40" rx="6"/><text class="lbl" x="65" y="145" text-anchor="middle">Core 2</text>
+<rect class="box accent" x="20" y="170" width="90" height="40" rx="6"/><text class="lbl" x="65" y="195" text-anchor="middle">Core N</text>
+<rect class="box" x="160" y="90" width="80" height="50" rx="6"/><text class="lbl" x="200" y="112" text-anchor="middle">LOCK</text><text class="lbl small" x="200" y="129" text-anchor="middle">per port</text>
+<rect class="box alt" x="290" y="40" width="170" height="160" rx="6"/><text class="lbl" x="375" y="62" text-anchor="middle">Command list</text><text class="lbl small" x="375" y="82" text-anchor="middle">32 slots (host memory)</text><text class="lbl small" x="375" y="102" text-anchor="middle">→ command tables</text><text class="lbl small" x="375" y="122" text-anchor="middle">→ PRDT</text><text class="lbl small" x="375" y="150" text-anchor="middle">received-FIS area</text>
+<rect class="box" x="510" y="80" width="130" height="70" rx="6"/><text class="lbl" x="575" y="108" text-anchor="middle">AHCI HBA</text><text class="lbl small" x="575" y="128" text-anchor="middle">PxCI · PxSACT · PxIS</text>
+<rect class="box" x="690" y="80" width="115" height="70" rx="6"/><text class="lbl" x="747" y="108" text-anchor="middle">SATA drive</text><text class="lbl small" x="747" y="128" text-anchor="middle">NCQ ≤ 32</text>
+<path class="ln" d="M110 40 L158 105" marker-end="url(#arrow)"/><path class="ln" d="M110 90 L158 110" marker-end="url(#arrow)"/>
+<path class="ln" d="M110 140 L158 120" marker-end="url(#arrow)"/><path class="ln" d="M110 190 L158 128" marker-end="url(#arrow)"/>
+<path class="ln" d="M240 115 L288 115" marker-end="url(#arrow)"/><path class="ln" d="M460 115 L508 115" marker-end="url(#arrow)"/>
+<path class="ln" d="M640 115 L688 115" marker-end="url(#arrow)"/>
+<text class="lbl small" x="664" y="105" text-anchor="middle">6 Gb/s</text>
+<text class="lbl small" x="375" y="230" text-anchor="middle">every core funnels through one 32-slot structure per port</text>
+</svg>
+<figcaption>Figure 3.1 — AHCI: many cores, one lock, one 32-slot command list per port, an HBA and a second controller in the drive. <span class="tag conceptual">conceptual</span></figcaption>
+</figure>
+
+<h3>3.3 Command serialization and queue limitations</h3>
+<p>With AHCI, all CPU cores issuing I/O to one drive must allocate slots from the same 32-slot command list and update the same PxSACT/PxCI registers. The driver therefore serialises submission with a per-port lock. On a many-core server, cores contend on that lock and the cache lines holding the command list bounce between cores. The queue limit compounds the problem: at most 32 commands can be in flight per drive, and Little's law says</p>
+<div class="formula">IOPS<sub>max</sub> ≤ QD<sub>max</sub> / W<sub>min</sub></div>
+<ul class="vars"><li><b>IOPS<sub>max</sub></b> — upper bound on completions per second for one device</li><li><b>QD<sub>max</sub></b> — maximum outstanding commands (32 for NCQ)</li><li><b>W<sub>min</sub></b> — minimum per-command latency (seconds)</li></ul>
+<p>With W = 80 µs: 32 / 80 µs = 400,000 IOPS as an absolute ceiling, before any overhead <span class="tag derived">derived</span>. A modern NVMe SSD can exceed 1,000,000 random-read IOPS, which at 80 µs requires at least 80 commands in flight — more than NCQ allows. (In practice SATA's 600 MB/s caps 4 KiB IOPS at ~146,000 anyway: 600×10<sup>6</sup> / 4096 <span class="tag derived">derived</span>.)</p>
+
+<h3>3.4 CPU overhead — the register-access cost</h3>
+<p>From <a href="#p1-s1-4">§1.4</a>: an uncached MMIO read stalls a core for a full round trip (~1 µs order <span class="tag impl">impl</span>); a write is posted. Compare the shape of a typical submit/complete cycle:</p>
+<pre class="code" data-kind="pseudocode"><code>// AHCI-style (conceptual; real drivers differ in detail)
+submit(cmd):
+    lock(port)                          // serialise all cores
+    slot = find_free_bit(issued_mask)   // shared 32-bit bookkeeping
+    build command header + command table + PRDT in memory
+    write PxSACT |= 1&lt;&lt;slot              // MMIO write (NCQ)
+    write PxCI   |= 1&lt;&lt;slot              // MMIO write
+    unlock(port)
+irq():
+    is   = read IS                      // MMIO READ  (which port?)
+    pis  = read PxIS                    // MMIO READ  (why?)
+    write PxIS = pis                    // MMIO write (ack, RW1C)
+    sact = read PxSACT                  // MMIO READ  (which tags still active?)
+    done = issued_mask &amp; ~sact          // infer completions by difference
+    write IS = is                       // MMIO write (ack)
+
+// NVMe-style (conceptual)
+submit(cmd):                            // per-CPU queue: no lock shared with other cores
+    copy 64-byte SQE into sq[tail]; tail = (tail+1) % depth
+    wmb(); write SQyTDBL = tail         // ONE posted MMIO write (can cover many commands)
+irq():                                  // per-queue MSI-X vector, ideally on the submitting CPU
+    while cq[head].phase == expected_phase:     // plain memory reads, cache-friendly
+        complete(cq[head].cid, cq[head].status)
+        advance head (flip expected_phase on wrap)
+    write CQyHDBL = head                // ONE posted MMIO write per batch
+</code></pre>
+<div class="table-wrap"><table>
+<thead><tr><th>Per command (typical driver shape)</th><th>AHCI</th><th>NVMe</th></tr></thead>
+<tbody>
+<tr><td>Uncached MMIO reads</td><td>Several (on completion path)</td><td>0 on the fast path <span class="tag verified">verified</span> design property</td></tr>
+<tr><td>MMIO writes</td><td>Several</td><td>≈1 submission doorbell + ≈1 completion doorbell, both amortisable across batches</td></tr>
+<tr><td>Shared lock</td><td>Per-port lock across all cores</td><td>None between cores (per-core queues)</td></tr>
+<tr><td>Command format</td><td>Command header (32 B) + command table (FIS + PRDT entries, variable)</td><td>Fixed 64 B SQE; data pointer PRP/SGL</td></tr>
+<tr><td>Completion discovery</td><td>Read status registers, compute bit differences</td><td>Read CQE in memory; phase tag says “new”</td></tr>
+<tr><td>Interrupt steering</td><td>Per HBA or per port</td><td>Per completion queue, MSI-X vector per queue/CPU</td></tr>
+</tbody></table></div>
+<p>NVM Express overview material from NVMe's introduction commonly summarised this as AHCI needing about four uncacheable register reads per command (on the order of 2,000 CPU cycles) versus none for NVMe <span class="tag uncertain">uncertain</span> — treat the exact counts as illustrative of a typical driver, not a protocol constant. The derived consequence is robust:</p>
+<div class="formula">CPU<sub>stall</sub> = IOPS × R × t<sub>read</sub></div>
+<ul class="vars"><li><b>CPU<sub>stall</sub></b> — core-seconds per second spent stalled on MMIO reads (1.0 = one whole core)</li><li><b>IOPS</b> — commands per second</li><li><b>R</b> — MMIO reads per command</li><li><b>t<sub>read</sub></b> — stall per read (seconds)</li></ul>
+<p>1,000,000 IOPS × 4 reads × 0.7 µs = 2.8 cores doing nothing but waiting <span class="tag derived">derived</span> (synthetic t<sub>read</sub>). Interrupt batching reduces R per command, but the structure cannot reach zero. NVMe removes the term entirely from the fast path.</p>
+
+<h3>3.5 Latency</h3>
+<p>For HDDs, 10 µs of host-interface overhead was 0.1% of a 10 ms access. For a 70 µs flash read it is 14%; for low-latency media (SLC-class or storage-class memory with ~10 µs reads <span class="tag impl">impl</span>) it is half the total. NVMe shortens the path: no HBA, no SCSI/ATA translation layer, no register reads, interrupt delivered to the submitting core. What remains — the kernel block layer, the interrupt and context switch — is why polling modes and <code>io_uring</code> exist for the lowest-latency use cases.</p>
+
+<h3>3.6 Parallelism</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Quantity</th><th>AHCI/SATA</th><th>NVMe (PCIe transport)</th></tr></thead>
+<tbody>
+<tr><td>Queues per device</td><td>1 (per port)</td><td>1 admin + up to 65,535 I/O submission queues (and completion queues) <span class="tag verified">verified</span></td></tr>
+<tr><td>Commands per queue</td><td>32</td><td>I/O queues up to 65,536 entries (CAP.MQES, 0's-based, device-limited); admin queue up to 4,096 entries <span class="tag verified">verified</span></td></tr>
+<tr><td>Max commands in flight (theoretical)</td><td>32</td><td>~65,535 × 65,535 ≈ 4.3 × 10<sup>9</sup> <span class="tag derived">derived</span> (a ring of N slots holds N−1 commands)</td></tr>
+<tr><td>Typical real configuration</td><td>NCQ depth 31 or 32</td><td>One SQ/CQ pair per CPU core (device-limited, often 32–128+ queues), depths of 1,024 or more <span class="tag impl">impl</span></td></tr>
+<tr><td>Submission/completion pairing</td><td>Fixed</td><td>Several SQs may share one CQ</td></tr>
+</tbody></table></div>
+<div class="callout spec"><div class="callout-title">📘 Specification — why a ring holds N−1</div><p>NVMe queues are circular. The queue is empty when head equals tail, and full when tail + 1 (modulo size) equals head. One slot always stays unused so that “full” and “empty” are distinguishable <span class="tag verified">verified</span>. A 1,024-entry queue holds at most 1,023 outstanding commands.</p></div>
+
+<h3>3.7 PCIe as the transport</h3>
+<p>PCIe was already the CPU's native high-speed I/O fabric, with lanes coming directly from the processor. Attaching flash directly to it removed the HBA and offered scalable bandwidth (x1 to x16, doubling per generation), full duplex, low latency, and a mature software model (enumeration, BARs, MSI-X) every OS already understood. The missing piece was a <b>standard</b> host interface, so one driver could run every PCIe SSD. Early PCIe SSDs (late 2000s) used proprietary interfaces and vendor drivers; competing standardisation paths included SATA Express (AHCI over PCIe) and SCSI Express (SCSI over PCIe, SOP/PQI). NVMe became the dominant one <span class="tag version">version</span>.</p>
+
+<h3>3.8 NVMe design goals</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Goal</th><th>Mechanism</th><th>Where you study it</th></tr></thead>
+<tbody>
+<tr><td>Scale with CPU cores</td><td>Per-core SQ/CQ pairs, no shared locks</td><td>Part X</td></tr>
+<tr><td>Minimal per-command overhead</td><td>No MMIO reads on the fast path; one doorbell write per batch</td><td>Part X, Part XIII</td></tr>
+<tr><td>Expose media parallelism</td><td>Deep queues, out-of-order completion with command identifiers</td><td>Parts X–XI</td></tr>
+<tr><td>Efficient, simple structures</td><td>Fixed 64-byte commands, 16-byte completions, cache-line friendly</td><td>Part XI</td></tr>
+<tr><td>Efficient interrupts</td><td>MSI-X per queue, interrupt coalescing</td><td>Part XIV</td></tr>
+<tr><td>Flexible data transfer</td><td>PRP lists and SGLs</td><td>Part XII</td></tr>
+<tr><td>Enterprise features</td><td>Namespaces, multi-path/multi-controller subsystems, reservations, end-to-end protection, SR-IOV</td><td>Part XVIII</td></tr>
+<tr><td>Manageability</td><td>Log pages, features, NVMe-MI</td><td>Parts XI, XVIII</td></tr>
+<tr><td>Transport independence</td><td>Same command model over PCIe, RDMA, TCP</td><td>Part XIX</td></tr>
+<tr><td>Single standard driver</td><td>Standard class code and register interface</td><td>Part IX</td></tr>
+</tbody></table></div>
+
+<h3>3.9 Protocol stack comparison</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Layer</th><th>SATA (AHCI)</th><th>SAS</th><th>NVMe over PCIe</th><th>NVMe over TCP / RDMA</th></tr></thead>
+<tbody>
+<tr><td>Application / FS</td><td>same</td><td>same</td><td>same</td><td>same</td></tr>
+<tr><td>Linux block layer</td><td>blk-mq</td><td>blk-mq</td><td>blk-mq</td><td>blk-mq</td></tr>
+<tr><td>Command-set layer</td><td>SCSI mid-layer + libata (SCSI→ATA translation)</td><td>SCSI mid-layer</td><td>nvme-core</td><td>nvme-core (+ fabrics)</td></tr>
+<tr><td>Host driver</td><td>ahci</td><td>HBA vendor driver (e.g. mpt3sas)</td><td>nvme (PCIe)</td><td>nvme-tcp / nvme-rdma</td></tr>
+<tr><td>Host interface</td><td>AHCI registers + command lists</td><td>HBA-specific queues/firmware</td><td>NVMe registers, SQ/CQ in host memory, doorbells</td><td>Capsules over TCP / RDMA queue pairs</td></tr>
+<tr><td>Interconnect to HBA</td><td>PCIe</td><td>PCIe</td><td>— (device is on PCIe directly)</td><td>NIC on PCIe</td></tr>
+<tr><td>Storage link</td><td>SATA 6 Gb/s, half duplex</td><td>SAS 12/22.5 Gb/s, full duplex</td><td>PCIe lanes, full duplex</td><td>Ethernet / InfiniBand</td></tr>
+<tr><td>Device command set</td><td>ATA</td><td>SCSI</td><td>NVMe</td><td>NVMe</td></tr>
+<tr><td>Controllers in path</td><td>HBA + drive</td><td>HBA (+ expander) + drive</td><td>drive only</td><td>NIC + target + drive</td></tr>
+</tbody></table></div>
+<figure class="diagram">
+<svg viewBox="0 0 820 230" role="img" aria-label="Stack depth comparison: SATA has more layers than NVMe">
+<text class="lbl" x="200" y="20" text-anchor="middle">SATA / AHCI path</text>
+<rect class="box" x="60" y="30" width="280" height="24"/><text class="lbl small" x="200" y="47" text-anchor="middle">blk-mq</text>
+<rect class="box" x="60" y="58" width="280" height="24"/><text class="lbl small" x="200" y="75" text-anchor="middle">SCSI mid-layer</text>
+<rect class="box" x="60" y="86" width="280" height="24"/><text class="lbl small" x="200" y="103" text-anchor="middle">libata (SCSI → ATA)</text>
+<rect class="box" x="60" y="114" width="280" height="24"/><text class="lbl small" x="200" y="131" text-anchor="middle">ahci driver</text>
+<rect class="box alt" x="60" y="142" width="280" height="24"/><text class="lbl small" x="200" y="159" text-anchor="middle">AHCI HBA (PCIe device)</text>
+<rect class="box alt" x="60" y="170" width="280" height="24"/><text class="lbl small" x="200" y="187" text-anchor="middle">SATA link</text>
+<rect class="box accent" x="60" y="198" width="280" height="24"/><text class="lbl small" x="200" y="215" text-anchor="middle">drive controller → NAND</text>
+<text class="lbl" x="620" y="20" text-anchor="middle">NVMe over PCIe path</text>
+<rect class="box" x="480" y="30" width="280" height="24"/><text class="lbl small" x="620" y="47" text-anchor="middle">blk-mq</text>
+<rect class="box" x="480" y="58" width="280" height="24"/><text class="lbl small" x="620" y="75" text-anchor="middle">nvme-core + nvme (PCIe)</text>
+<rect class="box alt" x="480" y="86" width="280" height="24"/><text class="lbl small" x="620" y="103" text-anchor="middle">PCIe link</text>
+<rect class="box accent" x="480" y="114" width="280" height="24"/><text class="lbl small" x="620" y="131" text-anchor="middle">NVMe controller → NAND</text>
+</svg>
+<figcaption>Figure 3.2 — Software and hardware layers per I/O. Fewer layers means fewer translations, fewer locks and fewer places to lose microseconds. <span class="tag conceptual">conceptual</span></figcaption>
+</figure>
+
+<h3>3.10 Historical timeline</h3>
+<p>The story in one sentence: disks got an interface designed for disks; flash outgrew it; vendors bolted flash to PCIe with private drivers; the industry standardised one queue-based interface; then it grew features, transports and management until it needed to be split into a family of specifications.</p>
+<div class="callout warn"><div class="callout-title">⚠️ Dates and confidence</div><p>Release dates below are labelled. <span class="tag verified">verified</span> marks widely documented milestones; <span class="tag uncertain">uncertain</span> marks dates you should confirm on the NVM Express revision-changes page or the relevant standards body before citing.</p></div>
+<div class="table-wrap"><table>
+<thead><tr><th>When</th><th>Milestone</th><th>Why it mattered</th><th>Label</th></tr></thead>
+<tbody>
+<tr><td>1980s</td><td>SCSI standardised; ATA/IDE for PCs</td><td>Command sets designed around disks</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>Early 2000s</td><td>Serial ATA 1.0 (1.5 Gb/s) replaces parallel ATA; PCI Express 1.0 (2.5 GT/s) replaces PCI</td><td>Serial point-to-point links everywhere</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>2004</td><td>AHCI 1.0; SAS products appear</td><td>Standard SATA host controller with NCQ (32 commands)</td><td><span class="tag version">version</span></td></tr>
+<tr><td>2007</td><td>PCIe 2.0 (5 GT/s)</td><td>More bandwidth for add-in cards</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>~2007–2010</td><td>Early PCIe flash cards with proprietary interfaces and drivers</td><td>Proved PCIe flash; fragmented software</td><td><span class="tag uncertain">uncertain</span></td></tr>
+<tr><td>2008–2009</td><td>NVMHCI work at Intel; industry work group formed to define a standard PCIe SSD interface</td><td>Seed of NVMe</td><td><span class="tag uncertain">uncertain</span></td></tr>
+<tr><td>2009</td><td>SATA 3.0 (6 Gb/s)</td><td>Last major SATA speed step; becomes the SSD ceiling</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>2010</td><td>PCIe 3.0 (8 GT/s, 128b/130b)</td><td>~1 GB/s per lane per direction</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>March 2011</td><td><b>NVMe 1.0</b></td><td>Queue pairs, doorbells, admin + NVM command set, PRPs</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>2012</td><td>NVMe driver merged into the Linux kernel (3.3); NVMe 1.1 (late 2012) adds features such as SGLs and multi-path capabilities</td><td>In-box OS support; enterprise features begin</td><td><span class="tag uncertain">uncertain</span></td></tr>
+<tr><td>2013–2014</td><td>First broadly available NVMe SSDs; NVMe 1.2 (2014) adds namespace management, Controller Memory Buffer, Host Memory Buffer and more</td><td>Client and datacenter adoption</td><td><span class="tag uncertain">uncertain</span></td></tr>
+<tr><td>2015–2016</td><td>NVMe-MI 1.0; NVMe over Fabrics 1.0 (RDMA, Fibre Channel)</td><td>Management and networked NVMe</td><td><span class="tag uncertain">uncertain</span></td></tr>
+<tr><td>2017</td><td>NVMe 1.3 (e.g. sanitize, directives/streams, virtualization enhancements); PCIe 4.0 (16 GT/s)</td><td>Security and data-placement hints</td><td><span class="tag uncertain">uncertain</span></td></tr>
+<tr><td>2018–2019</td><td>NVMe/TCP ratified; NVMe 1.4 (e.g. I/O determinism, persistent memory region); PCIe 5.0 (32 GT/s)</td><td>NVMe over ordinary Ethernet</td><td><span class="tag uncertain">uncertain</span></td></tr>
+<tr><td>2020</td><td>Zoned Namespaces ratified</td><td>Host-managed sequential zones; lower WAF and OP</td><td><span class="tag uncertain">uncertain</span></td></tr>
+<tr><td>June 2021</td><td><b>NVMe 2.0 family</b>: refactored into Base specification, command-set specifications (NVM, ZNS, Key Value), transport specifications (PCIe, RDMA, TCP) and NVMe-MI</td><td>Modular library of specifications; new command sets possible without bloating the base</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>2022</td><td>PCIe 6.0 (64 GT/s, PAM4, FLIT mode with FEC)</td><td>Bandwidth doubling continues</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>2024</td><td>NVMe 2.1 set: adds new command sets (Computational Programs, Subsystem Local Memory) and other features</td><td>Computation and memory near storage</td><td><span class="tag uncertain">uncertain</span></td></tr>
+<tr><td>2025</td><td>PCIe 7.0 (128 GT/s) released; further NVMe 2.x revisions</td><td>Next bandwidth step</td><td><span class="tag version">version</span></td></tr>
+<tr><td><b>August 4, 2026</b></td><td><b>NVMe 2.4 set</b>: Base 2.4, NVM CS 1.3, ZNS 1.5, KV 1.4, SLM 1.3, Computational Programs 1.3, PCIe transport 1.4, RDMA 1.3, TCP 1.3, NVMe-MI 2.2, Boot 1.4; highlights Post-Quantum Cryptography, PCIe Exported NVM Subsystem Migration, Voltage Monitoring, Rate Limiting, Restore Manufacturing Default Settings</td><td>This book's baseline</td><td><span class="tag version">version</span></td></tr>
+</tbody></table></div>
+<figure class="diagram">
+<svg viewBox="0 0 820 150" role="img" aria-label="Timeline arrow from SATA to AHCI to PCIe SSDs to NVMe 1.0 to NVMe 1.x to NVMe 2.0 to NVMe 2.4">
+<path class="ln" d="M20 70 L800 70" marker-end="url(#arrow)"/>
+<rect class="box" x="20" y="40" width="90" height="60" rx="6"/><text class="lbl small" x="65" y="65" text-anchor="middle">SATA</text><text class="lbl small" x="65" y="84" text-anchor="middle">early 2000s</text>
+<rect class="box" x="130" y="40" width="90" height="60" rx="6"/><text class="lbl small" x="175" y="65" text-anchor="middle">AHCI</text><text class="lbl small" x="175" y="84" text-anchor="middle">2004</text>
+<rect class="box" x="240" y="40" width="100" height="60" rx="6"/><text class="lbl small" x="290" y="65" text-anchor="middle">PCIe SSDs</text><text class="lbl small" x="290" y="84" text-anchor="middle">late 2000s</text>
+<rect class="box accent" x="360" y="40" width="90" height="60" rx="6"/><text class="lbl small" x="405" y="65" text-anchor="middle">NVMe 1.0</text><text class="lbl small" x="405" y="84" text-anchor="middle">2011</text>
+<rect class="box" x="470" y="40" width="90" height="60" rx="6"/><text class="lbl small" x="515" y="65" text-anchor="middle">NVMe 1.x</text><text class="lbl small" x="515" y="84" text-anchor="middle">2012–2019</text>
+<rect class="box accent" x="580" y="40" width="90" height="60" rx="6"/><text class="lbl small" x="625" y="65" text-anchor="middle">NVMe 2.0</text><text class="lbl small" x="625" y="84" text-anchor="middle">2021</text>
+<rect class="box alt" x="690" y="40" width="100" height="60" rx="6"/><text class="lbl small" x="740" y="65" text-anchor="middle">NVMe 2.4</text><text class="lbl small" x="740" y="84" text-anchor="middle">Aug 2026</text>
+<text class="lbl small" x="410" y="130" text-anchor="middle">single queue · disk era  →  many queues · flash era  →  specification family</text>
+</svg>
+<figcaption>Figure 3.3 — The road from SATA to NVMe 2.4. <span class="tag version">version</span></figcaption>
+</figure>
+<p><b>The readable version of the story.</b> In the disk era, AHCI was a sensible design: one drive could only do a few hundred operations per second, so a 32-slot queue and a few register reads per command cost nothing measurable. Flash broke every one of those assumptions within a few years. Vendors first attached flash directly to PCIe with their own interfaces — fast, but every product needed its own driver, and enterprises dislike unique drivers. A consortium of companies wrote a clean-sheet interface instead, designed around the costs we quantified above: never read a register on the fast path, give every core its own queues, make commands fixed-size, let completions arrive out of order. NVMe 1.0 shipped in 2011. Over the 1.x years it grew enterprise features (namespaces, reservations, multi-path, sanitize, power and thermal management), went beyond PCIe to fabrics, and gained a management interface. By 2021 the single document had become unwieldy and was refactored into a family. Each release since has added command sets, transports and management capabilities, up to the August 2026 set that this book uses as its baseline.</p>
+
+<h3>Hardware view</h3>
+<p>SATA SSD: chipset AHCI controller (a PCIe function), SATA PHY, cable or M.2 SATA, drive controller. NVMe SSD: CPU root port lanes (or chipset lanes), M.2/U.2/EDSFF connector, NVMe controller with PCIe endpoint, NVMe queue engine, DMA. One less controller and one less serial link in the data path. Note that an M.2 slot may be wired for SATA, PCIe, or both — the connector shape does not tell you the protocol.</p>
+
+<h3>Specification view</h3>
+<p>SPECIFICATION BASELINE — DOCUMENTS: NVMe Base Specification Rev. 2.4 (queue model, admin commands, limits); NVMe over PCIe Transport Specification Rev. 1.4 (register-based doorbells, PCIe-specific queue and interrupt rules). AHCI is governed by Intel's AHCI specification; SATA by SATA-IO; SAS by INCITS T10. STATUS: NVMe baseline current as of August 4, 2026. OLDER VERSIONS THAT MAY DIFFER: in NVMe 1.x, PCIe-specific content and the NVM command set lived in the base document <span class="tag version">version</span>. What you must check in the specification: exact limits for queue identifiers and sizes; the definition of CAP.MQES and CAP.CQR; which queues the admin queue can be; how SQ head is reported in CQEs.</p>
+
+<h3>Protocol view — AHCI vs NVMe submission on the wire</h3>
+<div class="trace" data-trace="conceptual"><div class="trace-head">Conceptual trace — submitting and completing one NCQ read via AHCI (PCIe side of the HBA)</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Dir (PCIe)</th><th>TLP</th><th>Target</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>↓</td><td>MWr</td><td>ABAR + PxSACT</td><td>mark tag active</td></tr>
+<tr><td>2</td><td>↓</td><td>MWr</td><td>ABAR + PxCI</td><td>issue slot</td></tr>
+<tr><td>3</td><td>↑</td><td>MRd → CplD</td><td>command header + table</td><td>HBA fetches command; then sends FIS on SATA link</td></tr>
+<tr><td>4</td><td>↑</td><td>MWr ×n</td><td>PRDT buffers</td><td>data from drive via HBA</td></tr>
+<tr><td>5</td><td>↑</td><td>MWr</td><td>received-FIS area</td><td>Set Device Bits FIS image</td></tr>
+<tr><td>6</td><td>↑</td><td>MWr (MSI)</td><td>interrupt address</td><td>interrupt</td></tr>
+<tr><td>7</td><td>↓↑</td><td>MRd → CplD</td><td>ABAR + IS</td><td>CPU reads (stall)</td></tr>
+<tr><td>8</td><td>↓↑</td><td>MRd → CplD</td><td>ABAR + PxIS</td><td>CPU reads (stall)</td></tr>
+<tr><td>9</td><td>↓</td><td>MWr</td><td>ABAR + PxIS</td><td>ack</td></tr>
+<tr><td>10</td><td>↓↑</td><td>MRd → CplD</td><td>ABAR + PxSACT</td><td>CPU reads (stall) to find finished tags</td></tr>
+<tr><td>11</td><td>↓</td><td>MWr</td><td>ABAR + IS</td><td>ack</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="conceptual"><div class="trace-head">Conceptual trace — the same read via NVMe</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Dir (PCIe)</th><th>TLP</th><th>Target</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>↓</td><td>MWr</td><td>BAR0 + SQ tail doorbell</td><td>new tail</td></tr>
+<tr><td>2</td><td>↑</td><td>MRd → CplD</td><td>SQ slot in host memory</td><td>fetch 64-byte SQE</td></tr>
+<tr><td>3</td><td>↑</td><td>MWr ×n</td><td>PRP buffers</td><td>data</td></tr>
+<tr><td>4</td><td>↑</td><td>MWr</td><td>CQ slot</td><td>16-byte CQE</td></tr>
+<tr><td>5</td><td>↑</td><td>MWr (MSI-X)</td><td>vector address</td><td>interrupt to the right CPU</td></tr>
+<tr><td>6</td><td>↓</td><td>MWr</td><td>BAR0 + CQ head doorbell</td><td>release CQ slots</td></tr>
+</tbody></table></div></div>
+<p>The AHCI sequence is conceptual — real drivers vary in which registers they read and how they batch <span class="tag impl">impl</span> — but the structural difference is visible: AHCI's completion path contains non-posted reads (rows 7, 8, 10), each a full round-trip CPU stall; NVMe's contains none.</p>
+
+<h3>Trace view — what a senior engineer looks for</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — NVMe doorbell batching under load</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Target</th><th>Value</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0.00</td><td>↓</td><td>MWr</td><td>SQ3 tail DB</td><td>0x0011</td><td>tail 0x0D → 0x11: 4 commands in one write</td></tr>
+<tr><td>0.65</td><td>↑</td><td>MRd</td><td>SQ3 base + 0x0D×64</td><td>256 B</td><td>controller fetches 4 SQEs in one read</td></tr>
+<tr><td>1.30</td><td>↓</td><td>CplD</td><td>—</td><td>256 B</td><td>(may arrive as several completions)</td></tr>
+<tr><td>84.1</td><td>↑</td><td>MWr ×3</td><td>CQ3 slots 0x20–0x22</td><td>16 B each</td><td>3 completions, out of order: CIDs 0x47, 0x45, 0x48</td></tr>
+<tr><td>84.3</td><td>↑</td><td>MWr</td><td>MSI-X vec 4</td><td>—</td><td>one interrupt (coalescing)</td></tr>
+<tr><td>86.0</td><td>↓</td><td>MWr</td><td>CQ3 head DB</td><td>0x0023</td><td>host consumed 3</td></tr>
+</tbody></table></div></div>
+<p>Note: one doorbell covered four commands, one read fetched four SQEs, and completions arrived out of order — all normal NVMe behaviour impossible to express in the AHCI model.</p>
+
+<h3>Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code>lspci -nn | grep -i -e "SATA controller" -e "Non-Volatile"   # [0106] AHCI vs [0108] NVMe
+cat /sys/block/sda/device/queue_depth 2&gt;/dev/null            # SATA NCQ depth (often 32 or 31)
+ls /sys/block/nvme0n1/mq/ | wc -l                           # number of NVMe hardware queues mapped
+cat /sys/block/nvme0n1/mq/0/cpu_list                        # which CPUs use hw queue 0
+cat /sys/block/nvme0n1/queue/nr_requests
+sudo nvme get-feature /dev/nvme0 -f 0x07 -H                 # Number of Queues feature (read-only Get)
+sudo nvme show-regs /dev/nvme0 -H | grep -i -A2 "Maximum Queue Entries"
+</code></pre>
+<div class="table-wrap"><table>
+<thead><tr><th>Output</th><th>Proves</th><th>Does not prove</th></tr></thead>
+<tbody>
+<tr><td>Count of <code>mq/</code> directories</td><td>How many hardware queues blk-mq is using</td><td>How many the device supports (see Number of Queues feature)</td></tr>
+<tr><td>Number of Queues feature</td><td>I/O SQs/CQs allocated by the controller (0's-based)</td><td>That all are in use</td></tr>
+<tr><td>CAP.MQES</td><td>Maximum entries per I/O queue (0's-based)</td><td>The depth Linux chose</td></tr>
+</tbody></table></div>
+
+<h3>Worked example — sizing queue depth for a target</h3>
+<p>Target: 1.5 M random-read IOPS on one SSD whose loaded latency is 120 µs, from 16 cores.</p>
+<ol>
+<li>Little's law: required outstanding = 1.5×10<sup>6</sup> × 120×10<sup>−6</sup> = 180 commands.</li>
+<li>Per core: 180 / 16 ≈ 12 outstanding per queue.</li>
+<li>With AHCI: impossible — 32 max total, and SATA bandwidth caps 4 KiB at ~146 K IOPS.</li>
+<li>With NVMe: 16 queues of depth ≥ 13 suffice (remember N−1); Linux defaults (e.g. 1,024-entry queues <span class="tag impl">impl</span>) give ample headroom.</li>
+<li>Bandwidth check: 1.5 M × 4 KiB = 6.1 GB/s → needs at least a Gen4 x4 link (~7.9 GB/s raw), and the TLP overhead must still fit <span class="tag derived">derived</span>.</li>
+</ol>
+
+<h3>Common mistakes</h3>
+<ul>
+<li>Saying “NVMe supports 64 K queues of 64 K commands” without the precise limits (65,535 I/O queues; up to 65,536 entries, N−1 usable; device-advertised maxima).</li>
+<li>Assuming every NVMe device supports many queues — the controller grants a number via the Number of Queues feature.</li>
+<li>Believing M.2 means NVMe.</li>
+<li>Attributing NVMe's speed only to PCIe bandwidth; the protocol overhead reduction matters as much for small I/O.</li>
+<li>Assuming NVMe removes all host overhead — interrupts, block layer and context switches remain.</li>
+<li>Citing AHCI-vs-NVMe register-read counts as specification facts; they describe typical driver behaviour.</li>
+</ul>
+
+<h3>Debugging connection</h3>
+<p>Chapter 3's ideas become debugging tools: if a device advertises few queues, many cores share them — expect lock contention and lower IOPS; if completions arrive out of order, the host must match by CID — a driver that assumes order will corrupt request state; if one doorbell write covers several commands, a lost or mis-addressed doorbell stalls them all; if queue depth exceeds what the device can parallelise, latency rises with no errors.</p>
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>Interfaces carry their history. NVMe's admin/I/O split, its 64-byte command and its doorbell model come from 2011 assumptions about PCIe and host memory. When you see a newer feature that looks awkward — doorbell buffer configuration for virtualised guests, controller memory buffers, fabrics capsules — ask which original assumption it is compensating for. That question tells you its likely corner cases.</p></div>
+
+<h3>Labs</h3>
+<div class="lab"><div class="lab-head">🧪 Lab 3.1 — SATA vs NVMe on the same machine <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> observe queue structure differences. <b>Setup:</b> a machine with an AHCI controller (most PCs) and an NVMe SSD; or a QEMU guest with both <code>-device ahci</code>/<code>ide-hd</code> and <code>-device nvme</code>. <b>Steps:</b> run the Linux-view commands; record class codes, queue depth for the SATA disk, number of NVMe hardware queues and their CPU lists, CAP.MQES and the Number of Queues feature.</p>
+<p><b>Questions:</b> (1) How many queues and what depth for each device? (2) How are NVMe queues mapped to CPUs? (3) Is the NVMe queue count limited by CPUs or by the device?</p>
+<details class="answer"><summary>Solution</summary><p>(1) SATA: one queue, depth ~32 (Linux often reports 32 or 31). NVMe: typically one hardware queue per CPU (or per group of CPUs) with large depth. (2) Each <code>mq/N/cpu_list</code> lists the CPUs mapped to hardware queue N. (3) Compare queue count with CPU count and with the Number of Queues feature value (+1 since 0's-based); the smaller one wins <span class="tag impl">impl</span>.</p></details>
+<p><b>Extension:</b> in QEMU, change the emulated NVMe device's maximum queue count (consult your QEMU version's documentation for the property name) and observe how Linux adapts.</p>
+</div>
+<div class="lab"><div class="lab-head">🧪 Lab 3.2 — Register-access budget <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> quantify CPU cost. Assume t<sub>read</sub> = 0.8 µs, t<sub>write</sub> (CPU-side) = 0.05 µs. Driver A (AHCI-like): per command 3 MMIO reads + 4 writes. Driver B (NVMe-like): per command 0 reads + 2 writes, with doorbells batched 8 commands per write.</p>
+<p><b>Questions:</b> CPU time per command and cores needed for 1 M IOPS, for each.</p>
+<details class="answer"><summary>Solution</summary><p>A: 3×0.8 + 4×0.05 = 2.6 µs/command → 2.6 cores at 1 M IOPS just for register access. B: (2×0.05)/8 = 0.0125 µs/command → 0.0125 cores. Ratio ≈ 200× <span class="tag derived">derived</span> (inputs synthetic). Real totals include block layer and interrupt costs, which dominate for NVMe.</p></details>
+</div>
+<div class="lab"><div class="lab-head">🧪 Lab 3.3 — Verify the timeline yourself <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> practice source discipline. <b>Steps:</b> open the NVM Express specifications index and revision-changes pages; for each row in the timeline labelled <span class="tag uncertain">uncertain</span>, find a primary source (the specification's own revision history, or an NVM Express announcement) and record the exact date and document. <b>Deliverable:</b> a corrected timeline with a source per row.</p>
+<details class="answer"><summary>Solution</summary><p>There is no single answer key on purpose: the skill being tested is refusing to cite a date you have not verified. A good deliverable cites the document title, revision and its own history table for each row, and marks any row still unverified.</p></details>
+</div>
+
+<div class="quiz"><h4>Quiz — Chapter 3</h4><ol>
+<li><p>How many command slots does an AHCI port's command list have?</p><details class="answer"><summary>Answer</summary><p>32.</p></details></li>
+<li><p>Maximum number of NVMe I/O submission queues?</p><details class="answer"><summary>Answer</summary><p>65,535 (queue ID 0 is the admin queue).</p></details></li>
+<li><p>Maximum entries in an NVMe admin queue? an I/O queue?</p><details class="answer"><summary>Answer</summary><p>Admin: 4,096. I/O: 65,536, limited by the device's CAP.MQES.</p></details></li>
+<li><p>Why can a 256-entry queue hold only 255 commands?</p><details class="answer"><summary>Answer</summary><p>Full is defined as tail+1 = head; one slot stays empty to distinguish full from empty.</p></details></li>
+<li><p>What is the theoretical IOPS ceiling of NCQ at 100 µs latency?</p><details class="answer"><summary>Answer</summary><p>32 / 100 µs = 320,000 IOPS.</p></details></li>
+<li><p>Which AHCI registers indicate issued and active NCQ commands?</p><details class="answer"><summary>Answer</summary><p>PxCI (Command Issue) and PxSACT (SATA Active).</p></details></li>
+<li><p>How does an NVMe host learn which commands completed?</p><details class="answer"><summary>Answer</summary><p>By reading CQEs in host memory, identified as new by the phase tag, each carrying the CID and SQ ID.</p></details></li>
+<li><p>What major structural change came with NVMe 2.0?</p><details class="answer"><summary>Answer</summary><p>Refactoring into a family: base specification, separate command-set specifications and transport specifications.</p></details></li>
+<li><p>Name three highlights of the August 2026 NVMe release.</p><details class="answer"><summary>Answer</summary><p>Any three of: Post-Quantum Cryptography, PCIe Exported NVM Subsystem Migration, Voltage Monitoring, Rate Limiting, Restore Manufacturing Default Settings.</p></details></li>
+<li><p>Why does NVMe avoid a lock shared across cores?</p><details class="answer"><summary>Answer</summary><p>Each core gets its own SQ/CQ pair, so cores never contend on a common submission structure.</p></details></li>
+<li><p>What class code does an AHCI controller report?</p><details class="answer"><summary>Answer</summary><p>01h/06h/01h.</p></details></li>
+<li><p>Why did proprietary PCIe SSDs not become the standard?</p><details class="answer"><summary>Answer</summary><p>Each required its own driver and management tools; the industry wanted one standard interface with in-box OS drivers.</p></details></li>
+</ol></div>
+
+<div class="interview"><h4>Interview questions — Chapter 3</h4><ol>
+<li><span class="lvl">Beginner</span> Why was NVMe created? <details class="answer"><summary>Model answer</summary><p>SATA/AHCI, designed for HDDs, limited SSDs with one 32-deep queue, high per-command CPU overhead and a 600 MB/s link; NVMe offers many deep queues over PCIe with minimal overhead.</p></details></li>
+<li><span class="lvl">Beginner</span> What is AHCI? <details class="answer"><summary>Model answer</summary><p>The register-level interface for SATA host controllers, using per-port command lists of 32 slots.</p></details></li>
+<li><span class="lvl">Intermediate</span> Explain why NVMe needs no register reads to submit or complete a command. <details class="answer"><summary>Model answer</summary><p>Submission: host writes SQE to memory and the tail to a doorbell (posted). Completion: device writes CQE with phase tag to memory, host polls memory, then writes the head doorbell (posted). SQ head progress is reported inside CQEs.</p></details></li>
+<li><span class="lvl">Intermediate</span> How does out-of-order completion work in NVMe? <details class="answer"><summary>Model answer</summary><p>Each command has a CID unique within its SQ; CQEs carry CID and SQ ID, so the host matches completions regardless of order.</p></details></li>
+<li><span class="lvl">Advanced</span> If NVMe allows billions of outstanding commands, why do devices advertise far fewer? <details class="answer"><summary>Model answer</summary><p>Each queue/command costs controller resources (state, doorbells, interrupt vectors, fetch bandwidth); devices size limits to their parallelism and silicon budget.</p></details></li>
+<li><span class="lvl">Advanced</span> Compare the SATA and NVMe software stacks in Linux. <details class="answer"><summary>Model answer</summary><p>SATA: blk-mq → SCSI mid-layer → libata translation → ahci → HBA → SATA. NVMe: blk-mq → nvme-core/nvme → PCIe → device. Fewer layers and no translation.</p></details></li>
+<li><span class="lvl">Senior</span> Where does NVMe over PCIe still spend host CPU per I/O, and how would you reduce it? <details class="answer"><summary>Model answer</summary><p>Block layer, request allocation, DMA mapping/IOMMU, interrupts and context switches; reduce with batching, interrupt coalescing, polling queues, io_uring with registered buffers, user-space drivers, IOMMU passthrough where acceptable.</p></details></li>
+<li><span class="lvl">Senior</span> A team wants to keep SATA for a new low-latency product “because it's simpler”. Argue the trade-offs. <details class="answer"><summary>Model answer</summary><p>SATA: cheap, mature, adequate for low-IOPS. But QD 32 cap, 600 MB/s, HBA latency and CPU overhead; NVMe offers lower latency, scalability, richer features (namespaces, telemetry, management) and is now the commodity interface. Quantify with Little's law and the target workload.</p></details></li>
+</ol></div>
+
+<h3>Teach-back challenge</h3>
+<p>To a child: explain why giving every waiter their own order rail makes the restaurant faster. To a junior: explain the N−1 rule and phase tags. To a senior: present Lab 3.2's numbers and argue where NVMe's remaining host overhead lies.</p>
+
+<h3>Chapter summary</h3>
+<ul>
+<li>SATA/AHCI suited disks: one 32-slot queue per port, shared locks, register reads on completion, 600 MB/s.</li>
+<li>Flash needs concurrency (Little's law) and low overhead; AHCI could supply neither.</li>
+<li>NVMe: up to 65,535 I/O queues, up to 65,536 entries each (N−1 usable), admin queue up to 4,096; fixed 64 B/16 B entries; doorbell writes; no fast-path reads; per-queue MSI-X; out-of-order completion.</li>
+<li>History: SATA → AHCI → proprietary PCIe SSDs → NVMe 1.0 (2011) → 1.x features → 2.0 family (2021) → 2.4 set (August 4, 2026).</li>
+</ul>
+
+<h3>Further reading</h3>
+<ul>
+<li>NVM Express specifications index and revision-changes pages (nvmexpress.org).</li>
+<li>Serial ATA AHCI specification (Intel).</li>
+<li>SATA-IO revision documents; INCITS T10 SAS standards.</li>
+<li>Linux kernel source: <code>drivers/ata/libahci.c</code>, <code>drivers/nvme/host/pci.c</code>.</li>
+</ul>
+
+<div class="mastery"><div class="callout-title">✅ Mastery gate — Chapter 3</div><ul class="checklist">
+<li>I can draw the AHCI and NVMe submission/completion paths and mark every MMIO read.</li>
+<li>I can state NVMe queue limits precisely and explain N−1.</li>
+<li>I can compute IOPS ceilings with Little's law and register-access CPU budgets.</li>
+<li>I can compare the SATA, SAS, NVMe/PCIe and NVMe-oF stacks layer by layer.</li>
+<li>I can tell the history from SATA to NVMe 2.4, marking which dates I have verified.</li>
+<li>I completed Labs 3.1–3.3.</li>
+</ul></div>
+
+<p><b>Next:</b> Part IV — PCIe From Zero. We now study the road itself: links, lanes, layers and the packets that carry every doorbell, command, data byte, completion and interrupt you met in Parts I–III.</p>
+</section>
