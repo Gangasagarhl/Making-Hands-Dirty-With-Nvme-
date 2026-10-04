@@ -349,117 +349,148 @@ sudo trace-cmd report | awk '/nvme_setup_cmd|nvme_complete_rq/ {print}' | head</
   <h2>Code / pseudocode</h2>
   <p>The correlator implements the algorithm from <a href="#engineering">Engineering explanation</a>. It reads TLP records as comma-separated values (time, direction, type, address, length in DW, tag, Byte Count, status, payload dwords) and prints a per-TLP interpretation and a per-command summary. With no argument it runs on the abbreviated READ + WRITE demo from <a href="#trace">Trace view</a>; the lab provides the four-command trace in the same format.</p>
   <pre class="code" data-kind="executable" data-lang="python" data-title="correlate.py"><code>#!/usr/bin/env python3
-"""Classify PCIe TLPs into NVMe roles using an address map (teaching tool).
+"""Command-to-TLP correlator for synthetic traces on the course's lab system.
+Reads TLP records (CSV: time_ns,dir,type,addr,len_dw,tag,bc,status,payload)
+and rebuilds, for every NVMe command, the chain doorbell -&gt; SQE fetch -&gt;
+data -&gt; CQE -&gt; MSI-X -&gt; CQ head doorbell. Standard library only.
+Usage: python3 correlate.py [trace.csv]   (no argument: built-in demo)"""
+import csv, io, struct, sys
 
-Mirrors Part A of the "Command vs Packet vs Completion" lab trace; condensed
-rows carry a count. A TLP's role comes from: who sent it, its type, which
-region of the address map it targets, tag matching, and payload decode.
-Never from its type alone.
+BAR0, DSTRD, LBA = 0xFE60_0000, 0, 512
+QUEUES = {  # qid: SQ base, SQ entries, CQ base, CQ entries, MSI-X vector
+    1: dict(sq=0x1_2340_0000, sqn=1024, cq=0x1_2341_0000, cqn=1024, vec=1),
+    2: dict(sq=0x1_2342_0000, sqn=256, cq=0x1_2343_0000, cqn=256, vec=2),
+}
+MSIX = {(0xFEE0_2000, 0x41): 1, (0xFEE0_4000, 0x42): 2}   # illustrative
+OPS = {0x00: "Flush", 0x01: "Write", 0x02: "Read"}
+
+# Abbreviated demo: the READ of ch39 and the WRITE of ch40 behind one doorbell.
+# Only the first and last data request of each command are listed, to keep it short.
+DEMO = """\
+0,H&gt;D,MWr,0xFE601008,1,,,,0x00000007
+700,D&gt;H,MRd,0x123400140,32,0x21,,,
+1350,H&gt;D,CplD,,32,0x21,128,SC,0x102A0002 0x1 0 0 0 0 0x3000 0x2 0 0 0x102000 0 7 0 0 0 0x10310001 0x1 0 0 0 0 0x8000 0x2 0x9000 0x2 0x204000 0 15 0 0 0
+2200,D&gt;H,MRd,0x200008000,128,0x30,,,
+2350,D&gt;H,MRd,0x200009E00,128,0x3F,,,
+2900,H&gt;D,CplD,,64,0x30,512,SC,
+2936,H&gt;D,CplD,,64,0x30,256,SC,
+3980,H&gt;D,CplD,,64,0x3F,512,SC,
+4016,H&gt;D,CplD,,64,0x3F,256,SC,
+4400,D&gt;H,MWr,0x1234100B0,4,,,,0 0 0x00010007 0x00011031
+4460,D&gt;H,MWr,0xFEE02000,1,,,,0x41
+6950,H&gt;D,MWr,0xFE60100C,1,,,,0x0000000C
+57600,D&gt;H,MWr,0x200003000,64,,,,
+58200,D&gt;H,MWr,0x200003F00,64,,,,
+58280,D&gt;H,MWr,0x1234100C0,4,,,,0 0 0x00010007 0x0001102A
+58340,D&gt;H,MWr,0xFEE02000,1,,,,0x41
+60850,H&gt;D,MWr,0xFE60100C,1,,,,0x0000000D
 """
 
-DEV, RC = "0x0100", "RC"
-BAR0, SQ1, CQ1 = 0xFE60_0000, 0x1_2340_0000, 0x1_2341_0000
-REGIONS = [  # (start, end_exclusive, name) -- from enumeration + queue creation
-    (BAR0,          BAR0 + 0x1000, "controller registers"),
-    (BAR0 + 0x1000, BAR0 + 0x2000, "doorbells"),
-    (BAR0 + 0x2000, BAR0 + 0x3000, "MSI-X table"),
-    (BAR0 + 0x3000, BAR0 + 0x4000, "MSI-X PBA"),
-    (0xFEE0_0000,   0xFEF0_0000,   "MSI address window"),
-    (SQ1,           SQ1 + 0x1_0000, "SQ1"),
-    (CQ1,           CQ1 + 0x4000,   "CQ1"),
-    (0x1_5000_0000, 0x1_5100_0000, "PRP list pages"),
-    (0x2_0000_0000, 0x3_0000_0000, "data buffers"),
-]
+def num(s): return int(s, 0) if s.strip() else None
 
-# (n, time_ns, sender, type, tag, address, length_dw, count, extra)
-# For completions the sender is the completer; the address is None.
-TRACE = [
-    (1,       0, RC,  "MWr",  None, BAR0 + 0x1008, 1, 1, {"data": 0x8}),
-    (2,     650, DEV, "MRd",  0x40, SQ1 + 0x140,  48, 1, {}),
-    (3,   1_300, RC,  "CplD", 0x40, None,         32, 1, {}),
-    (4,   1_330, RC,  "CplD", 0x40, None,         16, 1, {}),
-    (5,   1_900, DEV, "MRd",  0x41, 0x1_5000_0000, 4, 1, {}),
-    (6,   2_000, RC,  "MWr",  None, BAR0 + 0x201C, 1, 1, {"data": 0x0}),
-    (7,   2_550, RC,  "CplD", 0x41, None,          4, 1, {}),
-    (8,   2_600, DEV, "MRd",  0x42, 0x2_0001_0000, 128, 1, {}),
-    (9,   2_610, DEV, "MRd",  0x43, 0x2_0001_0200, 128, 23, {}),
-    (10,  3_250, RC,  "CplD", 0x42, None,         64, 1, {}),
-    (11,  3_260, RC,  "CplD", 0x42, None,         64, 1, {}),
-    (12,  3_270, RC,  "CplD", 0x43, None,         64, 46, {}),
-    (13,  4_000, RC,  "MRd",  0x0A, BAR0 + 0x1C,   1, 1, {}),
-    (14,  4_900, DEV, "CplD", 0x0A, None,          1, 1, {"data": 0x1}),
-    (15,  9_800, DEV, "MWr",  None, CQ1 + 0x250,   4, 1, {"dw2": 0x0001_0008, "dw3": 0x0001_0062}),
-    (16,  9_810, DEV, "MWr",  None, 0xFEE0_2000,   1, 1, {"data": 0x41}),
-    (17, 12_500, RC,  "MWr",  None, BAR0 + 0x100C, 1, 1, {"data": 0x26}),
-    (18, 22_400, DEV, "MWr",  None, 0x2_0002_0800, 64, 1, {}),
-    (19, 22_410, DEV, "MWr",  None, 0x2_0002_0900, 64, 7, {}),
-    (20, 22_520, DEV, "MWr",  None, 0x2_0003_0000, 64, 8, {}),
-    (21, 22_600, DEV, "MWr",  None, CQ1 + 0x260,   4, 1, {"dw2": 0x0001_0008, "dw3": 0x0001_0063}),
-    (22, 22_610, DEV, "MWr",  None, 0xFEE0_2000,   1, 1, {"data": 0x41}),
-    (23, 25_100, RC,  "MWr",  None, BAR0 + 0x100C, 1, 1, {"data": 0x27}),
-    (24, 41_000, DEV, "MWr",  None, 0x2_0000_0000, 64, 16, {}),
-    (25, 41_200, DEV, "MWr",  None, CQ1 + 0x270,   4, 1, {"dw2": 0x0001_0008, "dw3": 0x0001_0061}),
-    (26, 41_210, DEV, "MWr",  None, 0xFEE0_2000,   1, 1, {"data": 0x41}),
-    (27, 44_000, RC,  "MWr",  None, BAR0 + 0x100C, 1, 1, {"data": 0x28}),
-]
+def classify_doorbell(addr):
+    off = addr - BAR0 - 0x1000
+    if 0 &lt;= off &lt; 0x1000 and off % (4 &lt;&lt; DSTRD) == 0:
+        idx = off // (4 &lt;&lt; DSTRD)
+        return idx // 2, "CQ head" if idx % 2 else "SQ tail"
+    return None
 
-def region(addr):
-    for lo, hi, name in REGIONS:
-        if lo &lt;= addr &lt; hi:
-            return name
-    return "unmapped"
+def in_ring(addr, base, n, size):
+    return base &lt;= addr &lt; base + n * size
 
-def classify(row, reads):
-    n, t, src, typ, tag, addr, ln, cnt, x = row
-    if typ == "CplD":
-        requester = RC if src == DEV else DEV        # a completion answers the other side
-        orig = reads.get((requester, tag))
-        if orig is None:
-            return f"PCIe completion, tag 0x{tag:02X}: no matching request seen"
-        return f"PCIe completion (completer {src}) for #{orig[0]}: {orig[1]}"
-    reg = region(addr)
-    if typ == "MRd":
-        if src == RC:
-            role = f"host MMIO read of {reg} at offset 0x{addr - BAR0:X} (not NVMe queue traffic)"
-        elif reg == "SQ1":
-            first = (addr - SQ1) // 64
-            role = f"SQE fetch, SQ1 slots {first}-{first + ln * 4 // 64 - 1}"
-        elif reg == "PRP list pages":
-            role = f"PRP list fetch, {ln * 4 // 8} entries"
-        elif reg == "data buffers":
-            role = "data read for a WRITE (host memory -&gt; device)"
-        else:
-            role = f"device read of {reg}"
-        reads[(src, tag)] = (n, role)
-        if cnt &gt; 1:                                  # condensed group: tags tag..tag+cnt-1
-            for k in range(1, cnt):
-                reads[(src, tag + k)] = (n, role)
-        return role
-    if src == RC:
-        if reg == "doorbells":
-            idx = (addr - BAR0 - 0x1000) // 4        # CAP.DSTRD = 0 -&gt; 4-byte stride
-            side = "SQ tail" if idx % 2 == 0 else "CQ head"
-            return f"doorbell: {side} of queue {idx // 2} = {x['data']}"
-        return f"host MMIO write to {reg} (not a doorbell)"
-    if reg == "CQ1":
-        dw2, dw3 = x["dw2"], x["dw3"]
-        return (f"NVMe CQE in CQ1 slot {(addr - CQ1) // 16}: CID 0x{dw3 &amp; 0xFFFF:04X} "
-                f"SQID {dw2 &gt;&gt; 16} SQHD {dw2 &amp; 0xFFFF} P={(dw3 &gt;&gt; 16) &amp; 1} "
-                f"status 0x{dw3 &gt;&gt; 17:X}")
-    if reg == "MSI address window":
-        return f"MSI-X interrupt message, data 0x{x['data']:X}"
-    if reg == "data buffers":
-        return "data write for a READ (device -&gt; host memory)"
-    return f"device write to {reg}"
+def who(c):
+    return f"SQ{c['qid']}/CID {c['cid']:#06x}" if c else "UNKNOWN command"
+
+class Correlator:
+    def __init__(self):
+        self.pending = {}    # PCIe tag -&gt; outstanding non-posted request
+        self.cmds = []       # every command seen, in fetch order
+        self.log = []
+
+    def cmd_for_addr(self, addr):
+        for c in reversed(self.cmds):
+            if not c.get("done") and any(a &lt;= addr &lt; a + n for a, n in c["ranges"]):
+                return c
+        return None
+
+    def add(self, t, d, typ, addr, ln, tag, bc, status, payload):
+        if d == "H&gt;D" and typ == "MWr":
+            q = classify_doorbell(addr)
+            self.log.append(f"{t:&gt;9} ns  QID {q[0]} {q[1]} doorbell = {payload[0]:#x}")
+        elif d == "D&gt;H" and typ == "MRd":
+            for qid, q in QUEUES.items():
+                if in_ring(addr, q["sq"], q["sqn"], 64):
+                    slot = (addr - q["sq"]) // 64
+                    self.pending[tag] = dict(kind="sqe", qid=qid, slot=slot, size=ln * 4, buf=bytearray(ln * 4))
+                    self.log.append(f"{t:&gt;9} ns  tag {tag:#04x}: fetch SQ{qid} slots {slot:#x}..{slot + ln * 4 // 64 - 1:#x}")
+                    return
+            c = self.cmd_for_addr(addr)
+            self.pending[tag] = dict(kind="data", cmd=c, addr=addr)
+            self.log.append(f"{t:&gt;9} ns  tag {tag:#04x}: data read {addr:#x} for {who(c)}")
+        elif d == "H&gt;D" and typ.startswith("Cpl"):
+            p = self.pending.get(tag)
+            if p is None:
+                self.log.append(f"{t:&gt;9} ns  tag {tag:#04x}: UNEXPECTED completion (no outstanding request)")
+                return
+            if status and status != "SC":
+                self.log.append(f"{t:&gt;9} ns  tag {tag:#04x}: completion status {status} ({who(p.get('cmd'))})")
+            if p["kind"] == "sqe" and payload:
+                off = p["size"] - bc                 # Byte Count = bytes still to come
+                p["buf"][off:off + len(payload) * 4] = struct.pack(f"&lt;{len(payload)}I", *payload)
+                if bc == len(payload) * 4:
+                    self.decode_sqes(t, p)
+            if bc is not None and bc &lt;= (ln or 0) * 4:
+                self.pending.pop(tag, None)          # last completion: tag is free again
+        elif d == "D&gt;H" and typ == "MWr":
+            for qid, q in QUEUES.items():
+                if in_ring(addr, q["cq"], q["cqn"], 16):
+                    dw2, dw3 = payload[2], payload[3]
+                    sqid, cid, ph, st = dw2 &gt;&gt; 16, dw3 &amp; 0xFFFF, dw3 &gt;&gt; 16 &amp; 1, dw3 &gt;&gt; 17
+                    match = [c for c in self.cmds if c["qid"] == sqid and c["cid"] == cid and not c.get("done")]
+                    if match:
+                        match[0]["done"], match[0]["status"] = t, st
+                    self.log.append(f"{t:&gt;9} ns  CQE CQ{qid} slot {(addr - q['cq']) // 16:#x}: SQ{sqid} CID {cid:#06x} "
+                                    f"P={ph} status={st:#x} SQHD={dw2 &amp; 0xFFFF:#x}" + ("" if match else "  &lt;- NO MATCH"))
+                    return
+            if payload and (addr, payload[0]) in MSIX:
+                v = MSIX[(addr, payload[0])]
+                cqs = [qid for qid, q in QUEUES.items() if q["vec"] == v]
+                self.log.append(f"{t:&gt;9} ns  MSI-X vector {v} (CQ {cqs})")
+                return
+            self.log.append(f"{t:&gt;9} ns  data write {addr:#x} for {who(self.cmd_for_addr(addr))}")
+
+    def decode_sqes(self, t, p):
+        for i in range(0, len(p["buf"]), 64):
+            dw = struct.unpack_from("&lt;16I", p["buf"], i)
+            op, cid, nsid = dw[0] &amp; 0xFF, dw[0] &gt;&gt; 16, dw[1]
+            prp1, prp2 = dw[6] | dw[7] &lt;&lt; 32, dw[8] | dw[9] &lt;&lt; 32
+            nbytes = ((dw[12] &amp; 0xFFFF) + 1) * LBA if op in (1, 2) else 0
+            first = min(nbytes, 4096 - prp1 % 4096)
+            ranges = [(prp1, first)] + ([(prp2, nbytes - first)] if nbytes &gt; first else [])
+            c = dict(qid=p["qid"], slot=p["slot"] + i // 64, cid=cid, op=OPS.get(op, hex(op)),
+                     slba=dw[10] | dw[11] &lt;&lt; 32, nbytes=nbytes, ranges=ranges if nbytes else [], fetched=t)
+            self.cmds.append(c)
+            self.log.append(f"{t:&gt;9} ns    SQ{c['qid']} slot {c['slot']:#x}: {c['op']} CID {cid:#06x} "
+                            f"NSID {nsid} SLBA {c['slba']:#x} {nbytes} B PRP1 {prp1:#x} PRP2 {prp2:#x}")
+
+def main():
+    text = open(sys.argv[1]).read() if len(sys.argv) &gt; 1 else DEMO
+    k = Correlator()
+    for row in csv.reader(io.StringIO(text)):
+        if not row or row[0].startswith("#"):
+            continue
+        t, d, typ, addr, ln, tag, bc, status, payload = (row + [""] * 9)[:9]
+        pl = [int(x, 0) for x in payload.split()] if payload.strip() else None
+        k.add(int(t), d, typ, num(addr), num(ln), num(tag), num(bc), status.strip(), pl)
+    print("\n".join(k.log))
+    print("\nPer-command summary (fetch order):")
+    for c in k.cmds:
+        done = f"CQE at {c['done']} ns, status {c.get('status', 0):#x}" if c.get("done") else "NO COMPLETION SEEN"
+        print(f"  SQ{c['qid']} slot {c['slot']:#x} CID {c['cid']:#06x} {c['op']:5s} -&gt; {done}")
 
 if __name__ == "__main__":
-    reads = {}
-    for row in TRACE:
-        n, t, src, typ, cnt = row[0], row[1], row[2], row[3], row[7]
-        direction = "Host-&gt;Dev" if src == RC else "Dev-&gt;Host"
-        mult = f" x{cnt}" if cnt &gt; 1 else ""
-        print(f"#{n:&lt;3}{t:&gt;7} {direction} {typ + mult:&lt;9} {classify(row, reads)}")</code></pre>
-  <p>Expected output with no argument (abbreviated):</p>
+    main()</code></pre>
+  <p>Expected output with no argument (middle lines omitted here):</p>
   <pre class="code" data-kind="simulation" data-lang="text"><code>        0 ns  QID 1 SQ tail doorbell = 0x7
       700 ns  tag 0x21: fetch SQ1 slots 0x5..0x6
      1350 ns    SQ1 slot 0x5: Read CID 0x102a NSID 1 SLBA 0x102000 4096 B PRP1 0x200003000 PRP2 0x0
@@ -470,7 +501,7 @@ if __name__ == "__main__":
 
 Per-command summary (fetch order):
   SQ1 slot 0x5 CID 0x102a Read  -&gt; CQE at 58280 ns, status 0x0
-  SQ1 slot 0x6 CID 0x1031 Write -&gt; CQE at 3500 ns, status 0x0</code></pre>
+  SQ1 slot 0x6 CID 0x1031 Write -&gt; CQE at 4400 ns, status 0x0</code></pre>
   <aside class="callout advanced">
     <p>Production correlators add: PRP-list and SGL decoding, admin-queue parsing to build the context automatically, Requester ID filtering for multi-function devices, handling of captures that start mid-stream (unknown previous doorbell values), phase-tag tracking per CQ pass, and orphan reports. See <a href="auto-trace.html">Automated Trace Analysis</a>.</p>
   </aside>

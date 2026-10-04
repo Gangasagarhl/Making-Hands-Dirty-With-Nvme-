@@ -33,3 +33,8 @@ Label all of it "Synthetic example for teaching". None of it is an official spec
 - Doorbell MWr leaves CPU → device: hundreds of ns; device SQE fetch round trip: ~0.5–1 µs;
   NAND read (TLC): tens of µs; 4 KiB data transfer at Gen4 x4: ~1–2 µs; MSI-X write to interrupt handler: ~1–3 µs.
 Always state that real values are implementation- and platform-dependent.
+
+## TLP format rule for these addresses
+Addresses below 4 GiB must use the 3-DW header (MWr32/MRd32): BAR0 doorbells and registers (0xFE60_xxxx)
+and MSI-X writes (0xFEE0_xxxx) are **MWr32**. Host-memory queue and data addresses above 4 GiB
+(0x1_xxxx_xxxx, 0x2_xxxx_xxxx) use the 4-DW header (MWr64/MRd64).
