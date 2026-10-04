@@ -79,3 +79,7 @@ through repetition.
   PCIe Transport specification — never collapse the three.
 - **Tone**: warm, precise, confident without bluffing. Short paragraphs, many headings, tables where they
   help. No marketing language. American or British spelling consistently within a page.
+
+## Scratch files
+The scratchpad directory is shared between writers. Put every scratch file under a sub-folder named after
+yourself (e.g. `<scratchpad>/w-mod-12/`) so another writer cannot overwrite it.

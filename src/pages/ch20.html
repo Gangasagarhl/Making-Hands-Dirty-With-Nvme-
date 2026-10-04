@@ -1,0 +1,667 @@
+<p class="lead">Direct Memory Access (DMA) is how an NVMe SSD moves data without the CPU touching every byte: the controller itself issues PCIe Memory Read and Memory Write requests into host memory. This chapter explains why DMA exists, how bus mastering is enabled, how an IOMMU turns the device's I/O virtual addresses into physical ones, why cache coherence matters, how the Linux DMA API prepares memory, and how it all appears on the link as MRd → host memory → Completion with Data.</p>
+
+<section id="why">
+<h2>Why this chapter exists</h2>
+<p>Almost every byte an NVM Express (NVMe) drive moves crosses the PCI Express (PCIe) link as a DMA transaction the drive itself started. The host never "sends" write data to an NVMe SSD: it puts the data in memory, describes where it is, and rings a doorbell; the SSD then reads it. The host never "receives" read data: the SSD writes it into memory and then writes a completion entry. Even the commands themselves are fetched by the SSD from host memory, and the completions and interrupts are DMA writes.</p>
+<p>So the addresses in nearly every NVMe trace are DMA addresses, and the most confusing NVMe failures — data corruption, "Data Transfer Error" statuses, IOMMU faults, hangs after suspend — are DMA failures. You need a precise model of who emits which address, who translates it, and when the CPU's caches and the device's view of memory agree.</p>
+
+<h3>Learning objectives</h3>
+<ul>
+<li>Explain why DMA exists: Programmed I/O (PIO, the CPU copying every word) versus DMA, with costs.</li>
+<li>Describe a DMA engine: source, destination, length, descriptors, scatter-gather lists — and recognise NVMe queues, PRPs and SGLs as descriptor structures.</li>
+<li>Explain bus mastering: the Command register's Bus Master Enable bit and what a function may do with and without it.</li>
+<li>Distinguish CPU virtual addresses, CPU physical addresses and I/O virtual addresses (<span class="g" data-term="iova">IOVA</span>), and explain what an <span class="g" data-term="iommu">IOMMU</span> does with the Requester ID and the IOVA.</li>
+<li>Explain cache coherence for DMA: snooping, the No Snoop attribute, and why non-coherent platforms need explicit cache maintenance.</li>
+<li>Use the Linux DMA API correctly in pseudocode: <code>dma_set_mask_and_coherent</code>, <code>dma_alloc_coherent</code>, <code>dma_map_single</code>/<code>dma_unmap_single</code>, <code>dma_map_sg</code>, sync calls and directions.</li>
+<li>Trace the NVMe controller → PCIe Memory Read → host memory → Completion with Data path, and the Memory Write path for read data, completions and MSI-X.</li>
+<li>Diagnose IOMMU faults, Bus Master disabled, use-after-unmap and coherence bugs from traces and logs.</li>
+</ul>
+
+<h3>Prerequisites</h3>
+<aside class="callout prereq">
+<p>CPU, memory and caches from <a href="ch01.html">Chapter 1</a>; MRd/MWr/CplD TLPs from <a href="ch10.html">Chapter 10</a>–<a href="ch12.html">Chapter 12</a>; tags and outstanding reads from <a href="ch13.html">Chapter 13</a>; ordering, Relaxed Ordering and No Snoop from <a href="ch14.html">Chapter 14</a>; credits from <a href="ch16.html">Chapter 16</a>; the Command register from <a href="ch18.html">Chapter 18</a>; and MMIO (the opposite direction) from <a href="ch19.html">Chapter 19</a>.</p>
+</aside>
+</section>
+
+<section id="story">
+<h2>The story</h2>
+<aside class="callout kid">
+<p>A teacher wants 500 books moved from the library to the classroom shelves. She could carry them herself, one at a time — and do no teaching all day. Instead she writes a list: "shelf 3, books 1 to 20 → classroom table A; shelf 9, books 4 to 30 → table B…" and hands it to the librarian, who has a trolley. The librarian moves the books while the teacher teaches, and rings a bell when done. The school has a rule: the librarian may only enter rooms that appear on a special map the head teacher keeps — so a librarian with a wrong list cannot wander into the head's office and rearrange it.</p>
+</aside>
+<aside class="callout analogy">
+<p>A warehouse with forklift robots. The office (CPU) does not move pallets; it prints pick lists — "4 pallets from aisle 12 bay 3, 2 pallets from aisle 40 bay 1, deliver to dock 7" — and drops them in the robots' inbox. The robots (DMA engines) execute lists autonomously. Robots navigate with their own coordinate system, translated by a gatehouse (the IOMMU) that holds a map for each robot fleet; a robot asking for a bay not on its fleet's map is stopped at the gate and the incident logged. Because the office keeps a few pallets on its own desks (CPU caches), the gatehouse also checks the desks before a robot takes or replaces a pallet, so nobody works with a stale copy.</p>
+</aside>
+<aside class="callout breaks">
+<p><strong>Where the analogy breaks.</strong> (1) Robots get the pick list by themselves reading it from the office's inbox — in NVMe, the device fetches its own commands by DMA, and even the "bell" back to the CPU (MSI-X) is a DMA write. (2) The gatehouse map is per <em>device</em> (Requester ID), and its "coordinates" (IOVA) can be anything the OS chooses, including addresses that do not exist as physical memory. (3) Checking the desks (snooping) is automatic on x86 but not on every architecture; there the office must tidy its desks explicitly before and after. (4) A real warehouse robot can drop a pallet; a PCIe read never "drops" data silently — it either completes or returns an error status, or times out.</p>
+</aside>
+</section>
+
+<section id="beginner">
+<h2>Beginner explanation</h2>
+<p>Without DMA, the CPU would have to move data itself: read a word from the device's register, store it in memory, repeat — that is <strong>Programmed I/O</strong>. At 7 GB/s, PIO would consume entire CPU cores just copying, and each MMIO read costs about a microsecond of stall (<a href="ch19.html">Chapter 19</a>). Instead, the device has a <strong>DMA engine</strong>: hardware that, given a source, a destination and a length, issues memory requests on the bus by itself.</p>
+<p>For DMA to work:</p>
+<ol>
+<li><strong>The device must be allowed to issue requests</strong> — the <span class="g" data-term="bus-master">Bus Master Enable</span> bit in its Command register must be 1.</li>
+<li><strong>The memory must be prepared</strong> — the driver allocates or "maps" buffers so the device has an address it can use, and so the CPU's caches will not hide or overwrite the data.</li>
+<li><strong>The device must be told where</strong> — via descriptors. In NVMe, the descriptors are the Submission Queue Entries, which contain Physical Region Page (PRP) entries or Scatter Gather List (SGL) descriptors pointing to the data buffers.</li>
+<li><strong>Addresses must be translated</strong> — on most modern systems an IOMMU sits between the device and memory. The device uses I/O virtual addresses; the IOMMU translates them to physical addresses and blocks anything not mapped.</li>
+</ol>
+<p>On the link, a device reading host memory sends a Memory Read request (MRd); the Root Complex fetches the data from memory and returns one or more Completions with Data (CplD). A device writing host memory sends Memory Write (MWr) requests, which are posted — no completion.</p>
+</section>
+
+<section id="engineering">
+<h2>Engineering explanation</h2>
+
+<h3>CPU copying vs DMA</h3>
+<table>
+<caption>Programmed I/O vs DMA for moving 128 KiB on the lab system (illustrative)</caption>
+<thead><tr><th></th><th>PIO (CPU copies through MMIO)</th><th>DMA (device moves data)</th></tr></thead>
+<tbody>
+<tr><td>Who issues PCIe transactions</td><td>Root Complex on behalf of CPU loads/stores</td><td>The device's DMA engine</td></tr>
+<tr><td>Transaction size</td><td>4 or 8 bytes per load/store (larger with write-combining stores)</td><td>Up to MRRS (reads) and MPS (writes): 512 B / 256 B here</td></tr>
+<tr><td>CPU time</td><td>Entire transfer; MMIO reads stall ~1 µs each → 32 768 reads ≈ 33 ms</td><td>Building one command and handling one completion: a few µs</td></tr>
+<tr><td>Link efficiency</td><td>Very low (header overhead per 4 bytes)</td><td>≈ 91 % payload efficiency with 256-byte writes</td></tr>
+<tr><td>Concurrency</td><td>One CPU, one stream</td><td>Many outstanding requests (tags), many queues</td></tr>
+</tbody>
+</table>
+<p><span class="badge derived">Derived</span> The numbers come from the lab system's MRRS/MPS and the ~1 µs MMIO read round trip; real values vary by platform.</p>
+
+<h3>DMA engines, descriptors and scatter-gather</h3>
+<p>A DMA engine executes <strong>descriptors</strong>: records that say "move <var>length</var> bytes from <var>source</var> to <var>destination</var>", often with flags (interrupt on completion, next descriptor). Because operating systems allocate memory in pages that are rarely physically contiguous, a single logical buffer is usually a <strong>scatter-gather list</strong>: a list of (address, length) segments. Engines either walk a linked list of descriptors in memory or are handed a ring.</p>
+<p>NVMe is built entirely on this idea:</p>
+<ul>
+<li><strong>Submission Queues</strong> are rings of 64-byte command descriptors in host memory; the controller fetches them by DMA (<a href="ch25.html">Chapter 25</a>).</li>
+<li><strong>PRP entries and PRP lists</strong> describe data buffers as a list of page addresses (<a href="ch36.html">Chapter 36</a>); <strong>SGLs</strong> describe them as (address, length) segments (<a href="ch37.html">Chapter 37</a>).</li>
+<li><strong>Completion Queues</strong> are rings of 16-byte entries the controller writes by DMA.</li>
+<li><strong>MSI-X interrupts</strong> are 4-byte DMA writes to an address/data pair the driver programmed.</li>
+</ul>
+<p>Source and destination depend on direction: for an NVMe Write command, the source is host memory (described by PRP/SGL) and the destination is the controller's internal buffer, then media; for a Read, the reverse.</p>
+
+<h3>Bus mastering</h3>
+<p>Bit 2 of the Command register, <strong>Bus Master Enable</strong> (BME), controls whether a function may issue memory and I/O requests. With BME = 0, an Endpoint must not issue them — no DMA, and no MSI/MSI-X (those are memory writes). On a bridge (Root Port, switch port), BME controls whether requests from below are forwarded upstream; with it clear, the bridge treats them as Unsupported Requests. Firmware leaves BME clear until a driver takes ownership; the Linux NVMe driver sets it in probe through the PCI core, and error-recovery and shutdown paths clear it to stop a misbehaving device.</p>
+<aside class="callout warn">
+<p>BME is a safety switch, not a security boundary on its own: a malicious or buggy device can ignore it. Protection against devices writing where they should not comes from the IOMMU.</p>
+</aside>
+
+<h3>Three kinds of address</h3>
+<table>
+<caption>Addresses in a DMA system</caption>
+<thead><tr><th>Address</th><th>Used by</th><th>Translated by</th><th>Lab-system example</th></tr></thead>
+<tbody>
+<tr><td>CPU virtual address (VA)</td><td>Software (kernel or user)</td><td>CPU MMU page tables</td><td>kernel pointer to a data buffer</td></tr>
+<tr><td>CPU physical address (PA)</td><td>CPU caches, memory controller</td><td>—</td><td>0x7A3C1000 (a physical page)</td></tr>
+<tr><td>I/O virtual address (IOVA) / bus address / DMA address</td><td>The device, in TLP address fields</td><td>IOMMU page tables (or identity when no IOMMU/passthrough)</td><td>0x0000_0002_0000_0000 (data buffers), 0x0000_0001_2340_0000 (SQ1)</td></tr>
+</tbody>
+</table>
+<p>The value a driver writes into an SQE's PRP field, or into ASQ, is an IOVA — the Linux type is <code>dma_addr_t</code>. It is <em>not</em> the CPU's virtual address and, with an IOMMU in translating mode, not the physical address either. Every address you see in a device-initiated TLP in a trace is an IOVA.</p>
+
+<h3>The IOMMU</h3>
+<p>An IOMMU (Intel VT-d, AMD-Vi, the Arm System MMU and others) sits in the Root Complex between PCIe and the memory system. For each device-initiated request it:</p>
+<ol>
+<li>Takes the <strong>Requester ID</strong> (Bus/Device/Function, e.g. 0x0100 for the Lab SSD) and optionally a PASID, and looks up which translation tables belong to that device (a context or device table).</li>
+<li>Walks those page tables to translate the IOVA to a physical address, checking read/write permission. Translations are cached in an IOTLB.</li>
+<li>On success, forwards the request to memory. On failure (not mapped, no permission), blocks it, records a fault (logged by the OS as a DMAR/IOMMU fault), and completes a read with an error status. <span class="badge impl">Implementation-dependent</span> Whether the completion is Unsupported Request or Completer Abort, and how a blocked write is reported, varies by platform.</li>
+</ol>
+<p>The IOMMU gives: <strong>isolation</strong> (a device can only reach memory mapped for it — essential for assigning devices to virtual machines and for protection against malicious devices); <strong>contiguity</strong> (scattered physical pages can appear contiguous in IOVA space); and <strong>addressing</strong> (a device limited to 32-bit addresses can reach memory above 4 GiB through low IOVAs). Its cost is translation latency on IOTLB misses and the CPU time to create and tear down mappings. Linux offers modes: strict or lazy invalidation, and passthrough (<code>iommu=pt</code>: identity mappings for kernel drivers, translation only for devices assigned to user space or VMs). <span class="badge impl">Implementation-dependent</span></p>
+<p>Devices can cache translations themselves using Address Translation Services (ATS), and request page faults using Page Request Interface (PRI) — optional PCIe capabilities used mostly by accelerators and shared-virtual-memory devices, rarely by NVMe SSDs today. <span class="badge optional">Optional</span></p>
+
+<h3>Cache coherence</h3>
+<p>CPUs keep copies of memory in caches. If the device reads memory while the latest data sits only in a CPU cache, it would read stale data; if the device writes memory while the CPU holds an old copy in cache, the CPU would later read stale data. Two solutions:</p>
+<ul>
+<li><strong>Hardware coherence (snooping).</strong> On x86 servers and many Arm servers, the Root Complex snoops CPU caches for every DMA access: reads get the latest data, writes invalidate or update cached copies. Software need not flush caches.</li>
+<li><strong>Software coherence.</strong> On non-coherent platforms (many embedded SoCs), the driver must clean (write back) caches before the device reads a buffer and invalidate them before the CPU reads a buffer the device wrote. The Linux DMA API does this inside map/unmap/sync calls, which is why drivers must call them even on x86, where they are cheap.</li>
+</ul>
+<p>The TLP attribute <strong>No Snoop</strong> lets a device tell the Root Complex that a particular access does not need snooping (because software guaranteed coherence), saving snoop bandwidth; it is enabled by the Enable No Snoop bit in Device Control (<a href="ch18.html">Chapter 18</a>). Whether a Root Complex honours it is platform-specific. <strong>Relaxed Ordering</strong> lets a device's writes be reordered with respect to each other for performance — safe for bulk data, not for the completion-queue entry that must arrive after its data (<a href="ch14.html">Chapter 14</a>). <span class="badge impl">Implementation-dependent</span></p>
+
+<h3>The Linux DMA API</h3>
+<p>Drivers never compute IOVAs themselves. They ask the DMA API, which knows whether there is an IOMMU, whether the platform is coherent, and whether the device can reach the memory directly. Two families of mapping exist:</p>
+<table>
+<caption>Linux DMA API essentials (see the kernel's DMA API documentation for exact signatures)</caption>
+<thead><tr><th>Call</th><th>Kind</th><th>Use</th><th>NVMe use</th></tr></thead>
+<tbody>
+<tr><td><code>dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64))</code></td><td>Setup</td><td>Declare which addresses the device can generate</td><td>Probe: NVMe controllers support 64-bit addresses</td></tr>
+<tr><td><code>dma_alloc_coherent(dev, size, &amp;dma_handle, gfp)</code></td><td>Coherent (consistent) allocation</td><td>Long-lived memory shared by CPU and device; returns a CPU pointer and a <code>dma_addr_t</code></td><td>Admin and I/O SQs and CQs, PRP list pools</td></tr>
+<tr><td><code>dma_free_coherent(...)</code></td><td>Coherent</td><td>Free it</td><td>Queue deletion</td></tr>
+<tr><td><code>dma_map_single(dev, cpu_ptr, size, dir)</code> / <code>dma_unmap_single(...)</code></td><td>Streaming</td><td>Map one existing buffer for one transfer; returns <code>dma_addr_t</code>; check with <code>dma_mapping_error</code></td><td>Small single buffers (e.g. some metadata)</td></tr>
+<tr><td><code>dma_map_sg(dev, sgl, nents, dir)</code> / <code>dma_unmap_sg(...)</code></td><td>Streaming</td><td>Map a scatter-gather list; may merge segments when an IOMMU makes them contiguous</td><td>I/O data buffers of block requests → PRPs/SGLs</td></tr>
+<tr><td><code>dma_sync_single_for_cpu / _for_device</code></td><td>Streaming</td><td>Transfer ownership of a mapped buffer between CPU and device without unmapping</td><td>Re-used buffers</td></tr>
+<tr><td>Directions <code>DMA_TO_DEVICE</code>, <code>DMA_FROM_DEVICE</code>, <code>DMA_BIDIRECTIONAL</code></td><td>Parameter</td><td>Which way data flows; determines cache maintenance and IOMMU permissions</td><td>Write command: TO_DEVICE; Read command: FROM_DEVICE</td></tr>
+</tbody>
+</table>
+<p>Ownership rules for streaming mappings: after <code>dma_map_*</code>, the <strong>device</strong> owns the buffer — the CPU must not touch it; after <code>dma_unmap_*</code> (or <code>sync_for_cpu</code>), the CPU owns it again. Breaking these rules works by accident on coherent x86 and fails on non-coherent systems or with bounce buffers.</p>
+<p><strong>Bounce buffers (swiotlb).</strong> If a device cannot reach a buffer's physical address (DMA mask too small, no IOMMU) or memory must be shared through a special region (as in confidential-computing guests), the DMA API copies data through a "bounce" buffer the device can reach. Correct, but each transfer now costs a CPU copy — a classic hidden performance problem.</p>
+
+<h3>NVMe controller → MRd → host memory → CplD</h3>
+<p>Here is the full DMA choreography of one 4 KiB NVMe Write on the lab system (data buffer at IOVA 0x2_0000_0000):</p>
+<figure>
+<ol class="seq" data-actors="Driver (CPU)|Root Complex + IOMMU|Host memory|Lab SSD">
+<li data-note="Driver (CPU)">dma_map_sg → IOVA 0x2_0000_0000; build SQE with PRP1</li>
+<li data-from="Driver (CPU)" data-to="Host memory">store 64-byte SQE in SQ1 (coherent memory)</li>
+<li data-from="Driver (CPU)" data-to="Lab SSD" data-t="0 µs">MWr SQ1 tail doorbell (BAR0+0x1008)</li>
+<li data-from="Lab SSD" data-to="Root Complex + IOMMU" data-t="0.4 µs">MRd 64 B @ SQ1 slot (IOVA)</li>
+<li data-from="Root Complex + IOMMU" data-to="Host memory">translate, snoop, read</li>
+<li data-from="Root Complex + IOMMU" data-to="Lab SSD" class="dashed" data-t="1.2 µs">CplD 64 B (the SQE)</li>
+<li data-from="Lab SSD" data-to="Root Complex + IOMMU" data-t="1.3 µs">MRd ×8, 512 B each @ 0x2_0000_0000…</li>
+<li data-from="Root Complex + IOMMU" data-to="Lab SSD" class="dashed" data-t="2–3 µs">CplD ×64 (64 B each, RCB-aligned)</li>
+<li data-note="Lab SSD">data in controller buffer; program media</li>
+<li data-from="Lab SSD" data-to="Host memory" data-t="+15 µs">MWr 16 B CQE @ CQ1 (IOVA)</li>
+<li data-from="Lab SSD" data-to="Driver (CPU)">MWr MSI-X @ 0xFEE0_xxxx</li>
+<li data-note="Driver (CPU)">ISR reads CQE; dma_unmap_sg</li>
+</ol>
+<figcaption>Synthetic sequence for a 4 KiB Write on the lab system (illustrative times). For a Read, the data phase is the SSD sending sixteen 256-byte MWr TLPs into the buffer instead of MRd/CplD.</figcaption>
+</figure>
+<p>Note the rule that a Memory Read request must not cross a 4 KiB address boundary; with MRRS = 512 bytes and a page-aligned buffer, a 4 KiB transfer is 8 MRd requests. Each completer may split its completion at Read Completion Boundary (RCB) multiples — 64 bytes on the lab system — so the device must reassemble by tag and byte count (<a href="ch13.html">Chapter 13</a>).</p>
+
+<h3>The ladder</h3>
+<div class="ladder">
+<div class="rung" data-rung="A"><p>The teacher writes a list; the librarian with the trolley moves the books and rings a bell; a map decides which rooms the librarian may enter.</p></div>
+<div class="rung" data-rung="B"><p>The driver prepares buffers, writes descriptors (SQEs with PRPs), and rings the doorbell; the controller's DMA engine reads and writes host memory itself; the IOMMU translates and polices its addresses; the device signals completion with a CQE and an MSI-X write.</p></div>
+<div class="rung" data-rung="C"><p>In the SSD: queue-fetch engine, PRP/SGL walker, data DMA engines with tag tables and completion reassembly buffers. In the host: Root Complex with IOMMU (context tables, page tables, IOTLB), cache-coherent interconnect, memory controller.</p></div>
+<div class="rung" data-rung="D"><p>PCIe Base Specification: Bus Master Enable, Memory Read/Write semantics, 4 KiB boundary rule, MRRS/MPS, RCB, attributes (No Snoop, Relaxed Ordering), ATS/PRI. NVMe Base/PCIe Transport Specifications: PRP and SGL formats, queue memory requirements. The IOMMU and the Linux DMA API are platform and OS definitions, not PCIe or NVMe specifications.</p></div>
+<div class="rung" data-rung="E"><p>Device → host MRd (non-posted, tagged) answered by CplD; device → host MWr (posted) for read data, CQEs and MSI-X. Requester ID 0x0100 on every device-initiated request.</p></div>
+<div class="rung" data-rung="F"><p>Analyzer: after a doorbell MWr, an MRd for 64 bytes at the SQ slot, then MRd bursts at the PRP addresses (Write) or MWr bursts (Read), then a 16-byte MWr to the CQ and a 4-byte MWr to 0xFEE0_xxxx.</p></div>
+<div class="rung" data-rung="G"><p>Completion with UR/CA to a data MRd + DMAR fault in dmesg → IOMMU mapping problem (unmapped too early, wrong address). No MRd after the doorbell → BME off, queue not created, or doorbell address wrong. Data mismatch with clean link → coherence or ownership bug in the driver.</p></div>
+</div>
+
+<h3>The 16 questions, for DMA</h3>
+<table>
+<caption>DMA through the sixteen questions</caption>
+<thead><tr><th>#</th><th>Question</th><th>Answer</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>What is it?</td><td>Device-initiated reads and writes of host memory, without the CPU moving the data.</td></tr>
+<tr><td>2</td><td>Why created?</td><td>CPU copying is slow and wastes CPU time; devices can move data in parallel with computation.</td></tr>
+<tr><td>3</td><td>Problem solved?</td><td>High-throughput, low-CPU data movement; device autonomy (fetching its own commands).</td></tr>
+<tr><td>4</td><td>Before?</td><td>Programmed I/O; on ISA, a shared third-party DMA controller with limited channels and addressing.</td></tr>
+<tr><td>5</td><td>Why better?</td><td>First-party bus mastering: each device has its own engines, full addressing, many outstanding requests, scatter-gather.</td></tr>
+<tr><td>6</td><td>Who creates it?</td><td>The device's DMA engines, from descriptors the driver wrote.</td></tr>
+<tr><td>7</td><td>Who consumes it?</td><td>Root Complex, IOMMU, memory controller; ultimately the CPU reads the data.</td></tr>
+<tr><td>8</td><td>Where does it live?</td><td>Descriptors and buffers in host memory; engines in the device; translation in the Root Complex.</td></tr>
+<tr><td>9</td><td>Registers/memory?</td><td>Command.BME; Device Control (MRRS, MPS, No Snoop, Relaxed Ordering); NVMe ASQ/ACQ and queue base addresses; IOMMU tables; DMA mask.</td></tr>
+<tr><td>10</td><td>Before?</td><td>Enumeration, BME set, DMA mask set, buffers allocated/mapped, descriptors written, doorbell rung.</td></tr>
+<tr><td>11</td><td>After?</td><td>CQE posted, interrupt, driver unmaps buffers, CPU consumes data.</td></tr>
+<tr><td>12</td><td>If wrong?</td><td>IOMMU faults, Data Transfer Error status, silent data corruption (no IOMMU), memory corruption of unrelated kernel data.</td></tr>
+<tr><td>13</td><td>Analyzer?</td><td>MRd/CplD and MWr TLPs from Requester ID 0x0100 with IOVA addresses; completion statuses.</td></tr>
+<tr><td>14</td><td>Linux?</td><td>IOMMU groups, DMAR/IOMMU fault messages, swiotlb messages, NVMe error statuses; no direct view of individual DMAs.</td></tr>
+<tr><td>15</td><td>Validation?</td><td>All PRP/SGL alignments and boundary crossings; MRRS/MPS settings; IOMMU strict mode; fault injection (unmapped pages); No Snoop/Relaxed Ordering on and off; data integrity with patterns.</td></tr>
+<tr><td>16</td><td>Senior suspicion?</td><td>Buffer lifetime bugs (unmap before completion), wrong direction flags, CQE overtaking data with Relaxed Ordering, IOMMU invalidation timing, bounce buffers killing performance.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="hardware">
+<h2>Hardware view</h2>
+<p>Inside the Lab SSD, several DMA engines share the PCIe core:</p>
+<ul>
+<li><strong>Command fetch engine</strong>: on a doorbell, issues MRd for new SQEs (often several at once, up to the new tail).</li>
+<li><strong>PRP/SGL walker</strong>: parses the data pointers, fetches PRP lists or SGL segments (more MRds), and produces a list of (IOVA, length) segments.</li>
+<li><strong>Data movers</strong>: for Writes, issue MRds (≤ MRRS, not crossing 4 KiB) and reassemble CplDs by tag into the controller's DRAM or SRAM buffer; for Reads, emit MWrs (≤ MPS, not crossing 4 KiB).</li>
+<li><strong>Completion engine</strong>: writes the CQE with the right phase tag, then the MSI-X message — in that order, relying on PCIe ordering so the interrupt cannot overtake the CQE.</li>
+<li><strong>Tag and completion buffer management</strong>: as many outstanding reads as tags and completion buffer allow (<a href="ch13.html">Chapter 13</a>, <a href="ch16.html">Chapter 16</a>).</li>
+</ul>
+<p>Inside the host, the Root Complex receives the TLP, extracts the Requester ID and address, consults the IOMMU (IOTLB hit: tens of ns; miss: a page walk of several memory reads), snoops CPU caches, and reads or writes DRAM through the memory controller. For a read, it then builds CplD TLPs, splitting at RCB boundaries and respecting the device's MPS.</p>
+<aside class="callout hw">
+<p>IOTLB misses are a real performance factor for NVMe at high IOPS: every new 4 KiB page touched by DMA may need a translation. Large IOVA mappings (huge pages), passthrough mode, and IOVA caching in the OS reduce the cost. When a platform shows lower throughput with the IOMMU enabled, translation is the first suspect — and, as <a href="ch16.html">Chapter 16</a> showed, slower draining at the Root Complex shows up as posted-credit starvation, not as an error.</p>
+</aside>
+</section>
+
+<section id="spec">
+<h2>Specification view</h2>
+<p>PCIe defines the transaction rules: <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Transaction Layer</cite> (Memory Read/Write, completion rules, RCB, 4 KiB boundary, attributes), <cite class="spec">Configuration Space</cite> (Bus Master Enable, Device Control), and optional <cite class="spec">Address Translation Services</cite> and Page Request Interface. NVMe defines data-pointer formats and memory requirements: <cite class="spec">NVMe Base Specification 2.4 — Data Structures (PRP, SGL)</cite> and <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite> (queue memory, PRP use over PCIe). IOMMUs are defined by vendor architecture documents (for example the <cite class="spec">Intel Virtualization Technology for Directed I/O Architecture Specification</cite> and the <cite class="spec">AMD I/O Virtualization Technology (IOMMU) Specification</cite>); the DMA API by the Linux kernel documentation.</p>
+<aside class="callout verified">
+<p>Command register bit 2 is Bus Master Enable. Memory Read requests must not cross a 4 KiB boundary; request size is limited by MRRS and write payload by MPS. Completions may be split at RCB boundaries. No Snoop and Relaxed Ordering are TLP attributes enabled through Device Control. NVMe queues and data buffers are in host memory and accessed by the controller via DMA, using addresses the host supplies.</p>
+</aside>
+<aside class="callout derived">
+<p>The PIO vs DMA cost comparison, the 8-MRd breakdown of a 4 KiB Write, and the claim that IOMMU translation latency appears as credit starvation are reasoned from the rules and the lab system's parameters.</p>
+</aside>
+<aside class="callout impl">
+<p>IOMMU behaviour on faults (completion status, logging), IOTLB size, page-walk cost; Root Complex completion sizes (64 B vs larger); whether No Snoop is honoured; controller DMA engine counts and policies; Linux IOMMU modes and swiotlb sizing.</p>
+</aside>
+<aside class="callout version">
+<p>ATS, PRI and PASID were added to PCIe in later revisions and evolve with each; 10-bit and 14-bit tags (PCIe 4.0 and 6.0) raise outstanding-read limits; NVMe SGL support and options grew across NVMe 1.x and 2.x; the Linux DMA API's internals (e.g. IOVA caching, DMA-API debugging) change between kernel versions.</p>
+</aside>
+<aside class="callout notsaid">
+<p>Check in the specifications: exact RCB rules and completion splitting; which attributes a completer must preserve; ATS/PRI details; PRP alignment rules (<a href="ch36.html">Chapter 36</a>). The PCIe and NVMe specifications do <strong>not</strong> define IOMMUs, IOVAs, cache coherence policy or the Linux DMA API — be careful not to cite them for those.</p>
+</aside>
+<aside class="callout warn">
+<p>Never assume a TLP address is a physical address; never assume a DMA has finished because a doorbell was written; never touch a streaming-mapped buffer from the CPU while the device owns it; never assume x86 coherence semantics on other architectures.</p>
+</aside>
+</section>
+
+<section id="protocol">
+<h2>Protocol view</h2>
+<table>
+<caption>DMA transactions in an NVMe command, with direction and type</caption>
+<thead><tr><th>Purpose</th><th>Direction</th><th>TLP</th><th>Posted?</th><th>Address kind</th></tr></thead>
+<tbody>
+<tr><td>Fetch SQE</td><td>Dev → Host</td><td>MRd + CplD</td><td>No</td><td>IOVA (SQ base + slot × 64)</td></tr>
+<tr><td>Fetch PRP list / SGL segment</td><td>Dev → Host</td><td>MRd + CplD</td><td>No</td><td>IOVA from PRP2 / SGL descriptor</td></tr>
+<tr><td>Write command: fetch data</td><td>Dev → Host</td><td>MRd + CplD</td><td>No</td><td>IOVA from PRP/SGL</td></tr>
+<tr><td>Read command: deliver data</td><td>Dev → Host</td><td>MWr</td><td>Yes</td><td>IOVA from PRP/SGL</td></tr>
+<tr><td>Post CQE</td><td>Dev → Host</td><td>MWr (16 B)</td><td>Yes</td><td>IOVA (CQ base + slot × 16)</td></tr>
+<tr><td>Interrupt</td><td>Dev → Host</td><td>MWr (4 B)</td><td>Yes</td><td>MSI-X address (0xFEE0_xxxx on x86; remapped by interrupt remapping if enabled)</td></tr>
+</tbody>
+</table>
+<p>Ordering matters at two points: the CQE must not be observed before its data (read data MWrs and the CQE MWr are both posted and stay in order unless Relaxed Ordering is used on the data), and the MSI-X MWr must not overtake the CQE (same rule). The doorbell MWr from the host and the device's subsequent MRd are causally ordered by the device itself.</p>
+</section>
+
+<section id="trace">
+<h2>Trace view</h2>
+<p>All traces are <strong>synthetic examples for teaching</strong> on the lab system: SQ1 at IOVA 0x1_2340_0000, data buffers from 0x2_0000_0000, MRRS 512 B, MPS 256 B, RCB 64 B, IOMMU enabled.</p>
+<h3>Trace 1 — normal 4 KiB Write: SQE fetch and data fetch</h3>
+<div class="trace" data-kind="synthetic" data-title="4 KiB WRITE, CID 0x0011, PRP1 = 0x2_0000_0000 (Gen4 x4)">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Len=1 Data=0x00000006 ReqID=RC</td><td>SQ1 tail = 6</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>420</td><td>MRd64</td><td>Addr=0x1_2340_0140 Len=16DW Tag=0x10 ReqID=0x0100</td><td>Fetch SQE in slot 5 (5 × 64 = 0x140)</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1180</td><td>CplD</td><td>Tag=0x10 Len=16DW ByteCount=64 SC</td><td>SQE: opcode 01h (Write), CID 0x0011, PRP1=0x2_0000_0000</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1300</td><td>MRd64</td><td>Addr=0x2_0000_0000 Len=128DW Tag=0x20</td><td>First 512 B of data</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1310</td><td>MRd64</td><td>Addr=0x2_0000_0200 Len=128DW Tag=0x21</td><td></td></tr>
+<tr class="dir-up"><td>…</td><td>Dev→Host</td><td>…</td><td>MRd64 ×6</td><td>Tags 0x22–0x27 up to Addr=0x2_0000_0E00</td><td>8 requests cover the 4 KiB page; none crosses 0x2_0000_1000</td></tr>
+<tr class="dir-down"><td>12</td><td>Host→Dev</td><td>2050</td><td>CplD</td><td>Tag=0x20 Len=16DW ByteCount=512 SC</td><td>first 64-byte piece of tag 0x20</td></tr>
+<tr class="dir-down"><td>13</td><td>Host→Dev</td><td>2060</td><td>CplD</td><td>Tag=0x20 Len=16DW ByteCount=448 SC</td><td>byte count decreases: 448 still to come</td></tr>
+<tr class="dir-down"><td>…</td><td>Host→Dev</td><td>…</td><td>CplD ×62</td><td>…</td><td>all 8 tags complete (completions for different tags may interleave)</td></tr>
+<tr class="note"><td colspan="6">Then (≈ tens of µs later): MWr64 16 B to CQ1 slot, MWr32 MSI-X vector 1. Covered in <a href="ch40.html">Chapter 40 (End-to-End Write)</a>.</td></tr>
+</tbody>
+</table>
+<p>What a healthy DMA read looks like: requests aligned and ≤ MRRS; every tag eventually completes with SC and byte counts that reach the request size; addresses within the buffer the PRP describes.</p>
+</div>
+
+<h3>Trace 2 — IOMMU fault: buffer unmapped too early (abnormal)</h3>
+<div class="trace" data-kind="synthetic" data-title="Data fetch hits an unmapped IOVA; NVMe reports a data transfer error">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000007</td><td>SQ1 tail = 7 (CID 0x0012, 16 KiB Write)</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>410</td><td>MRd64</td><td>Addr=0x1_2340_0180 Len=16DW Tag=0x11</td><td>SQE fetch</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1170</td><td>CplD</td><td>Tag=0x11 SC</td><td>PRP1=0x2_0010_0000, PRP2=list at 0x1_5000_0000</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1290</td><td>MRd64</td><td>Addr=0x1_5000_0000 Len=6DW Tag=0x12</td><td>Fetch PRP list (3 entries)</td></tr>
+<tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2010</td><td>CplD</td><td>Tag=0x12 SC Data=0x2_0010_1000, 0x2_0010_2000, 0x2_0010_3000</td><td></td></tr>
+<tr class="dir-up"><td>…</td><td>Dev→Host</td><td>2100–2300</td><td>MRd64 ×24</td><td>pages 0x2_0010_0000 … 0x2_0010_2E00</td><td>Completed normally</td></tr>
+<tr class="dir-up"><td>30</td><td>Dev→Host</td><td>2310</td><td>MRd64</td><td>Addr=0x2_0010_3000 Len=128DW Tag=0x3C</td><td>Fourth page</td></tr>
+<tr class="abnormal"><td>31</td><td>Host→Dev</td><td>2900</td><td>Cpl</td><td>Tag=0x3C Status=UR (no data)</td><td>First abnormal event: IOMMU blocked the read — IOVA page 0x2_0010_3000 not mapped</td></tr>
+<tr class="dir-up"><td>32</td><td>Dev→Host</td><td>+40 µs</td><td>MWr64</td><td>CQE: CID 0x0012, Status = Data Transfer Error</td><td>Controller aborts the command</td></tr>
+<tr class="note"><td colspan="6">dmesg (illustrative; wording varies by IOMMU and kernel): "DMAR: [DMA Read] Request device [01:00.0] fault addr 0x200103000 … " followed by an NVMe I/O error for the request.</td></tr>
+</tbody>
+</table>
+<p>Reasoning:</p>
+<ol>
+<li>The first three pages read fine; the fourth faults. A wrong PRP would usually fault on the first page or point outside the buffer; here the address is exactly where the buffer should continue, so the <em>mapping</em> was missing, not the pointer.</li>
+<li>Two classic causes: the driver unmapped (or the IOMMU invalidated) the last page before the device finished — a lifetime bug, often in an error or timeout path; or the mapping was created for 12 KiB instead of 16 KiB (length bug in the SG list).</li>
+<li>Evidence to collect: the IOMMU fault address and Requester ID (identifies device and page), the NVMe status and CID (identifies the command), the driver's mapping log (DMA-API debug facilities can catch unmap-while-active bugs in a lab).</li>
+<li>Without an IOMMU, the same bug would have read whatever physical memory that page now held — silent corruption on disk. The IOMMU turned a silent corruption into a loud error.</li>
+</ol>
+</div>
+
+<h3>Trace 3 — Bus Master Enable not set (abnormal)</h3>
+<div class="trace" data-kind="synthetic" data-title="Test driver forgot to enable bus mastering">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Command register = 0x0002 (Mem+ only). The controller is enabled (CC.EN=1, CSTS.RDY=1): register access works through MMIO.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x00000001</td><td>Admin SQ0 tail = 1 (Identify)</td></tr>
+<tr class="abnormal"><td>2</td><td>—</td><td>0 … 60 s</td><td>(nothing)</td><td>no MRd from 0x0100</td><td>First abnormal event: the expected SQE fetch never appears</td></tr>
+<tr class="note"><td colspan="6">The driver's admin command times out. MMIO reads of CSTS still succeed (MMIO does not need BME), which misleads people into thinking the controller is healthy.</td></tr>
+</tbody>
+</table>
+<p>Reasoning: "registers work, nothing else does" points at the device's ability to initiate requests: BME, or a bridge above with BME clear, or the IOMMU blocking every request (which would produce faults — there are none). Check <code>lspci -vvv</code> "BusMaster+" on the device and every bridge above it.</p>
+</div>
+
+<h3>Trace 4 — coherence/ownership bug (ambiguous)</h3>
+<div class="trace" data-kind="synthetic" data-title="Write data on media differs from what the application wrote; link and IOMMU clean">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64</td><td>Addr=0x2_0020_0000 Len=128DW Tag=0x40 Attr: NoSnoop=1</td><td>Data fetch with No Snoop set</td></tr>
+<tr class="dir-down"><td>2</td><td>Host→Dev</td><td>700</td><td>CplD</td><td>Tag=0x40 SC Data=00 00 00 00 …</td><td>Zeros returned: memory had not yet received the CPU's dirty cache lines</td></tr>
+<tr class="note"><td colspan="6">No errors anywhere. The analyzer proves what the device received; the application believes it wrote a non-zero pattern.</td></tr>
+</tbody>
+</table>
+<p>Reasoning: the device asked the Root Complex not to snoop, so data still in a CPU cache was not seen. Either the device set No Snoop on a buffer whose coherence the driver had not guaranteed, or the platform honours No Snoop on a path the OS assumed coherent. The first abnormal event is arguably #1 (attribute choice), not #2. Disambiguating experiment: clear Enable No Snoop in Device Control on a lab system and repeat — if the corruption disappears, the attribute is the cause. This is "ambiguous" because the same symptom also arises from a driver touching the buffer after mapping it; only the attribute bit in the trace separates the hypotheses.</p>
+</div>
+</section>
+
+<section id="linux">
+<h2>Linux view</h2>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Is bus mastering enabled on the SSD and every bridge above it?</span>
+sudo lspci -vvv -s 0000:01:00.0 | grep -E "Control:"
+sudo lspci -vvv -s 0000:00:01.1 | grep -E "Control:"
+
+<span class="cm"># IOMMU present and in which mode?</span>
+sudo dmesg | grep -iE "DMAR|IOMMU|AMD-Vi|SMMU" | head
+cat /proc/cmdline                                   <span class="cm"># iommu=pt, intel_iommu=on, ...</span>
+ls /sys/class/iommu/ 2&gt;/dev/null
+
+<span class="cm"># Which IOMMU group is the SSD in, and its default domain type?</span>
+readlink /sys/bus/pci/devices/0000:01:00.0/iommu_group
+cat /sys/bus/pci/devices/0000:01:00.0/iommu_group/type 2&gt;/dev/null
+
+<span class="cm"># Device DMA-related settings: MRRS, MPS, Relaxed Ordering, No Snoop</span>
+sudo lspci -vvv -s 0000:01:00.0 | grep -A2 "DevCtl:"
+
+<span class="cm"># Faults and bounce buffering</span>
+sudo dmesg | grep -iE "fault addr|swiotlb|software IO TLB"</code></pre>
+<aside class="callout linux">
+<p><strong>What this proves:</strong> whether BME is set, whether an IOMMU is active and in which domain mode, the device's DMA-related settings, and any faults the IOMMU reported. <strong>What it cannot prove:</strong> which IOVAs were mapped at the time of a failure, whether a buffer was accessed by the CPU while the device owned it, or whether data was coherent. For driver development, the kernel's DMA-API debugging option (CONFIG_DMA_API_DEBUG) checks mapping/unmapping discipline at run time — on a test kernel.</p>
+</aside>
+</section>
+
+<section id="code">
+<h2>Code / pseudocode</h2>
+<h3>How an NVMe driver uses the DMA API (pseudocode)</h3>
+<pre class="code" data-kind="pseudocode" data-lang="c"><code>/* probe */
+pci_set_master(pdev);                                   /* Command.BME = 1 */
+if (dma_set_mask_and_coherent(&amp;pdev-&gt;dev, DMA_BIT_MASK(64)))
+        fail("no usable DMA addressing");
+
+/* queue creation: long-lived, shared, coherent memory */
+sq_cpu = dma_alloc_coherent(&amp;pdev-&gt;dev, depth * 64, &amp;sq_dma, GFP_KERNEL);
+cq_cpu = dma_alloc_coherent(&amp;pdev-&gt;dev, depth * 16, &amp;cq_dma, GFP_KERNEL);
+/* sq_dma / cq_dma are IOVAs: they go into Create I/O SQ/CQ commands (or ASQ/ACQ) */
+
+/* per I/O: streaming mapping of the request's pages */
+nents = dma_map_sg(&amp;pdev-&gt;dev, sgl, nr_segments,
+                   is_write ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+if (nents == 0) fail("mapping failed");
+build PRP1/PRP2 (or SGL) from sg_dma_address(sg) / sg_dma_len(sg);
+copy SQE into sq_cpu[tail]; tail = (tail + 1) % depth;
+wmb();                                                  /* SQE visible before doorbell */
+writel(tail, sq_tail_doorbell);                         /* MMIO, Chapter 19 */
+
+/* completion (interrupt handler) */
+while (cqe_phase_matches(cq_cpu[head])) {
+        dma_rmb();                                      /* read CQE fields after phase */
+        req = lookup(cqe.cid);
+        dma_unmap_sg(&amp;pdev-&gt;dev, req-&gt;sgl, req-&gt;nr_segments, req-&gt;dir);
+        complete(req, cqe.status);                      /* CPU owns the buffer again */
+        head = (head + 1) % depth;
+}
+writel(head, cq_head_doorbell);
+
+/* teardown: only after the controller is disabled and no DMA can be in flight */
+dma_free_coherent(&amp;pdev-&gt;dev, depth * 64, sq_cpu, sq_dma);</code></pre>
+<p>Note the order in error paths: a command that timed out may still be executing in the device. Unmapping its buffers before the controller has been reset or the command aborted is exactly the bug in Trace 2.</p>
+
+<h3>Simulation: IOVA translation and MRd splitting</h3>
+<p>This standard-library simulation maps four scattered physical pages to a contiguous IOVA range, splits a 16 KiB device read into MRd requests (≤ MRRS, never crossing 4 KiB), translates each through a toy IOMMU, splits completions at 64-byte boundaries, and finally shows the fault when a page is unmapped too early.</p>
+<pre class="code" data-kind="simulation" data-lang="python" data-title="dma_sim.py"><code>"""From a driver's buffer to PCIe TLPs: IOMMU translation, scatter-gather and
+Memory Read splitting (simulation, standard library only).
+
+Models the Lab SSD fetching write data for a 16 KiB NVMe Write:
+  - the buffer is 4 physically scattered 4 KiB pages,
+  - the driver maps it to a contiguous IOVA range (as an IOMMU allows),
+  - the device issues MRd requests no larger than MRRS that never cross 4 KiB,
+  - the Root Complex returns completions in RCB-aligned pieces."""
+
+PAGE = 4096
+MRRS = 512            # Max Read Request Size (bytes)
+CPL_CHUNK = 64        # Root Complex returns 64-byte completions (RCB = 64)
+
+class Iommu:
+    def __init__(self):
+        self.ptes = {}                       # IOVA page number -&gt; physical page number
+    def map(self, iova, phys_pages):
+        for i, ppn in enumerate(phys_pages):
+            self.ptes[iova // PAGE + i] = ppn
+    def unmap(self, iova, npages):
+        for i in range(npages):
+            self.ptes.pop(iova // PAGE + i, None)
+    def translate(self, iova):
+        ppn = self.ptes.get(iova // PAGE)
+        if ppn is None:
+            raise LookupError(f"IOMMU fault: IOVA {iova:#x} not mapped")
+        return ppn * PAGE + iova % PAGE
+
+def device_reads(iova, length, tag0=0x20):
+    """Split a DMA read into MRd requests: &lt;= MRRS, never crossing a 4 KiB boundary."""
+    reqs, tag = [], tag0
+    while length:
+        to_boundary = PAGE - iova % PAGE
+        n = min(length, MRRS, to_boundary)
+        reqs.append((tag, iova, n))
+        iova, length, tag = iova + n, length - n, tag + 1
+    return reqs
+
+def root_complex(iommu, tag, iova, n):
+    """Translate, then return completions split at RCB-aligned boundaries."""
+    pa = iommu.translate(iova)
+    cpls, remaining, addr = [], n, iova
+    while remaining:
+        chunk = min(remaining, CPL_CHUNK - addr % CPL_CHUNK)
+        remaining -= chunk
+        cpls.append((tag, chunk, remaining + chunk))     # (tag, length, byte count)
+        addr += chunk
+    return pa, cpls
+
+if __name__ == "__main__":
+    iommu = Iommu()
+    phys = [0x7A3C1, 0x11F02, 0x7A3C9, 0x3300A]          # scattered physical pages
+    iova = 0x2_0000_0000                                  # contiguous IOVA (lab system)
+    iommu.map(iova, phys)
+    print("driver: dma_map_sg -&gt; IOVA", hex(iova), "for pages",
+          [hex(p * PAGE) for p in phys])
+    reqs = device_reads(iova, 4 * PAGE)
+    print(f"device: {len(reqs)} MRd requests (MRRS={MRRS})")
+    for tag, a, n in reqs[:3]:
+        pa, cpls = root_complex(iommu, tag, a, n)
+        print(f"  MRd64 Tag={tag:#04x} Addr={a:#x} Len={n // 4}DW -&gt; PA {pa:#x}, "
+              f"{len(cpls)} CplD: first ByteCount={cpls[0][2]}, last ByteCount={cpls[-1][2]}")
+    print("  ...")
+    tag, a, n = reqs[8]
+    pa, _ = root_complex(iommu, tag, a, n)
+    print(f"  MRd64 Tag={tag:#04x} Addr={a:#x} -&gt; PA {pa:#x} (second page, different frame)")
+    # A buggy driver unmaps before the device has finished:
+    iommu.unmap(iova + 3 * PAGE, 1)
+    try:
+        root_complex(iommu, 0x3F, iova + 3 * PAGE, 512)
+    except LookupError as e:
+        print("  ", e, "-&gt; Root Complex completes the MRd with an error status (UR/CA)")</code></pre>
+<p>Output:</p>
+<pre class="code" data-kind="simulation" data-lang="text"><code>driver: dma_map_sg -&gt; IOVA 0x200000000 for pages ['0x7a3c1000', '0x11f02000', '0x7a3c9000', '0x3300a000']
+device: 32 MRd requests (MRRS=512)
+  MRd64 Tag=0x20 Addr=0x200000000 Len=128DW -&gt; PA 0x7a3c1000, 8 CplD: first ByteCount=512, last ByteCount=64
+  MRd64 Tag=0x21 Addr=0x200000200 Len=128DW -&gt; PA 0x7a3c1200, 8 CplD: first ByteCount=512, last ByteCount=64
+  MRd64 Tag=0x22 Addr=0x200000400 Len=128DW -&gt; PA 0x7a3c1400, 8 CplD: first ByteCount=512, last ByteCount=64
+  ...
+  MRd64 Tag=0x28 Addr=0x200001000 -&gt; PA 0x11f02000 (second page, different frame)
+   IOMMU fault: IOVA 0x200003000 not mapped -&gt; Root Complex completes the MRd with an error status (UR/CA)</code></pre>
+</section>
+
+<section id="worked">
+<h2>Worked example</h2>
+<p><strong>Problem.</strong> A 12 KiB NVMe Read lands in a buffer starting at IOVA 0x2_0000_0F00 (not page-aligned). MPS = 256 B. How many MWr TLPs does the SSD send for the data, and what are the first three?</p>
+<p><strong>Step 1 — boundaries.</strong> The buffer spans 0x2_0000_0F00 to 0x2_0000_3EFF. Writes must not cross 4 KiB boundaries (0x…1000, 0x…2000, 0x…3000) and carry at most 256 bytes.</p>
+<p><strong>Step 2 — first segment.</strong> From 0x…0F00 to 0x…0FFF is 256 bytes: one MWr of 64 DW at 0x2_0000_0F00.</p>
+<p><strong>Step 3 — full pages.</strong> 0x…1000–0x…1FFF and 0x…2000–0x…2FFF: 4096 / 256 = 16 MWr each → 32.</p>
+<p><strong>Step 4 — tail.</strong> 0x…3000–0x…3EFF = 3840 bytes = 15 MWr.</p>
+<p><strong>Total</strong> 1 + 32 + 15 = 48 MWr TLPs (12 288 / 256 = 48 — the misalignment happened to fall on a 256-byte boundary, so no extra TLP). First three: MWr64 Addr=0x2_0000_0F00 Len=64DW; Addr=0x2_0000_1000 Len=64DW; Addr=0x2_0000_1100 Len=64DW. If the buffer had started at 0x2_0000_0F80, the first TLP would be only 128 bytes and the total 49 — misaligned buffers cost extra TLPs. <span class="badge derived">Derived</span> PRP rules about offsets are in <a href="ch36.html">Chapter 36</a>.</p>
+</section>
+
+<section id="mistakes">
+<h2>Common mistakes</h2>
+<ul>
+<li><strong>Putting a CPU virtual address (or a physical address with an IOMMU) in a PRP.</strong> Always use the <code>dma_addr_t</code> from the DMA API.</li>
+<li><strong>Unmapping before the device is done</strong>, especially in timeout and error paths.</li>
+<li><strong>Wrong direction flag</strong>: DMA_TO_DEVICE for a Read command buffer makes the IOMMU mapping read-only — the device's MWr faults.</li>
+<li><strong>Forgetting <code>pci_set_master</code></strong> in custom or test drivers.</li>
+<li><strong>Assuming "it works on x86" proves correctness</strong> of cache handling.</li>
+<li><strong>Using coherent memory for bulk data</strong>: coherent mappings may be uncached on some platforms and slow for CPU access; use streaming mappings for data.</li>
+<li><strong>Ignoring swiotlb messages</strong>: bounce buffering silently halves throughput.</li>
+<li><strong>Confusing MMIO with DMA direction</strong>: doorbells are CPU→device MMIO; data is device-initiated DMA.</li>
+</ul>
+</section>
+
+<section id="debugging">
+<h2>Debugging connection</h2>
+<table>
+<caption>DMA failure patterns</caption>
+<thead><tr><th>Symptom</th><th>Possible causes</th><th>Evidence</th><th>First check</th><th>Disambiguating experiment</th></tr></thead>
+<tbody>
+<tr><td>Commands time out; registers readable</td><td>BME off; queue memory wrong; IOMMU blocking all</td><td>No device MRd after doorbell (analyzer); no faults</td><td>BusMaster+ on device and bridges</td><td>Enable BME in a lab and retry</td></tr>
+<tr><td>Data Transfer Error status + IOMMU fault</td><td>Unmap too early; wrong length; wrong direction</td><td>Fault address/RID; CID</td><td>Map/unmap timeline for that request</td><td>DMA-API debug kernel; IOMMU strict mode</td></tr>
+<tr><td>Silent data corruption, link clean</td><td>Ownership/coherence bug; No Snoop misuse; firmware bug</td><td>Analyzer shows wrong data leaving or entering memory</td><td>Compare analyzer payload with application data</td><td>Disable No Snoop / Relaxed Ordering; enable IOMMU</td></tr>
+<tr><td>Throughput drops with IOMMU on</td><td>IOTLB misses; invalidation cost; bounce buffers</td><td>CPU profile (IOMMU map/unmap time); credit stalls</td><td>swiotlb messages, IOMMU mode</td><td>Compare passthrough vs translated in a lab</td></tr>
+<tr><td>Completion Timeout logged by the device</td><td>Root Complex never completed an MRd (blocked, lost, or link issue)</td><td>AER Completion Timeout at device; tag with no CplD</td><td>Root Port AER and IOMMU logs at that time</td><td>Analyzer trigger on the tag</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="senior">
+<h2>Senior engineer insight</h2>
+<aside class="callout insight" data-title="Buffer lifetime is the real DMA contract">
+<p>Almost every serious DMA bug is a lifetime bug: memory reused, freed or unmapped while a device can still access it. The hardest cases involve resets and timeouts — the driver gives up on a command, but the device has not. A robust driver makes "the device can no longer touch this memory" an explicit, verified state (controller disabled, queues deleted, BME cleared, IOMMU domain detached) before freeing anything. Ask for that proof in every design review of an error path.</p>
+</aside>
+<aside class="callout insight" data-title="Turn silent failures into loud ones">
+<p>On test and validation systems, run with the IOMMU in strict, translated mode and DMA-API debugging enabled. Production may run in passthrough for performance, but validation should run in the mode that converts corruption into faults. The same principle — make the first abnormal event observable — runs through the whole course.</p>
+</aside>
+</section>
+
+<section id="lab">
+<h2>Lab</h2>
+<h3>Lab 20 — Follow the addresses</h3>
+<aside class="callout safety"><p><span class="badge safe">Safe lab</span> Read-only inspection and simulation. Do not change IOMMU or BME settings on a machine you depend on.</p></aside>
+<h4>Objective</h4>
+<p>Identify which addresses in an NVMe trace are IOVAs and which are MMIO physical addresses; predict the MRd/MWr pattern of a transfer; inspect your system's DMA configuration.</p>
+<h4>Skills</h4>
+<ul><li>Address-space reasoning.</li><li>Applying MRRS/MPS/4 KiB/RCB rules.</li><li>Reading IOMMU and BME state in Linux.</li></ul>
+<h4>Hardware required</h4>
+<p>Optional Linux machine with an NVMe SSD.</p>
+<h4>Software required</h4>
+<p>Python 3, <code>dma_sim.py</code>, <code>pciutils</code>.</p>
+<h4>Input</h4>
+<p>Trace 1 and Trace 2 of this chapter; a 16 KiB Read to IOVA 0x2_0000_0800 (MPS 256).</p>
+<h4>Expected output</h4>
+<p>An annotated list of every address in Traces 1–2 with its kind; the TLP list for the 16 KiB Read; a description of your system's IOMMU mode and BME state.</p>
+<h4>Background</h4>
+<p>Sections "Three kinds of address", "The IOMMU" and "NVMe controller → MRd → host memory → CplD".</p>
+<h4>Step 1</h4>
+<p>Classify every address in Traces 1 and 2: MMIO (BAR0 range) or IOVA (host memory).</p>
+<h4>Step 2</h4>
+<p>Compute the MWr TLPs for the 16 KiB Read at 0x2_0000_0800.</p>
+<h4>Step 3</h4>
+<p>Modify <code>dma_sim.py</code> so the device read starts at IOVA + 0x800 and check the request split.</p>
+<h4>Step 4</h4>
+<p>On your machine, run the Linux-view commands and record IOMMU mode, group and BME.</p>
+<h4>Observation</h4>
+<p>How many TLPs did misalignment cost? Is your IOMMU translating or passthrough?</p>
+<h4>Questions</h4>
+<ol><li>Why does the MSI-X write address not go through normal IOMMU page tables on x86 with interrupt remapping?</li><li>What changes in Trace 2 if the IOMMU is in passthrough mode?</li><li>Which Linux call produced the address 0x1_2340_0000?</li></ol>
+<h4>Challenge</h4>
+<p>Add a "direction" permission to the simulator's IOMMU (read-only vs read-write mappings) and reproduce the wrong-direction bug: a Read command whose buffer was mapped DMA_TO_DEVICE.</p>
+<details class="hint"><summary>Hint</summary><p>0x2_0000_0800 + 16 KiB = 0x2_0000_4800: the transfer touches five 4 KiB pages (0x0…, 0x1…, 0x2…, 0x3…, 0x4…).</p></details>
+<details class="solution"><summary>Solution</summary>
+<p>(Step 1) 0xFE60_xxxx addresses are MMIO in BAR0 (CPU physical, no IOMMU); 0x1_2340_xxxx (SQ), 0x1_5000_0000 (PRP list) and 0x2_00xx_xxxx (data) are IOVAs. (Step 2) 0x…0800–0x…0FFF: 2048 B = 8 MWr; three full pages = 48 MWr; 0x…4000–0x…47FF: 8 MWr; total 64 = 16 384 / 256 — again aligned to 256 B so no extra TLPs, but five pages touched, so potentially five IOTLB lookups instead of four. (Questions) (1) On x86, the 0xFEE0_xxxx range is the interrupt window; with interrupt remapping, the IOMMU treats these writes as interrupt requests and translates them through an interrupt remapping table rather than DMA page tables. (2) No fault; the device would read whatever physical memory corresponds to the identity-mapped IOVA — potentially stale or reused data, silently. (3) <code>dma_alloc_coherent</code> (its <code>dma_handle</code> output) when the queue was created.</p>
+</details>
+<h4>What a senior engineer notices</h4>
+<p>That address classification is the fastest way to orient in any NVMe trace: MMIO addresses tell you what the host did; IOVA addresses tell you what the device did; Requester IDs tell you who.</p>
+<h4>Failure variants</h4>
+<ul><li>Device limited to 32-bit DMA without an IOMMU: buffers above 4 GiB bounce through swiotlb.</li><li>Device assigned to a VM (VFIO): IOVAs are guest physical addresses; faults are reported against the host's view of the device.</li></ul>
+<h4>Extension</h4>
+<p>Extend the simulator with an IOTLB of 8 entries and count misses for sequential versus random 4 KiB reads across a 1 GiB IOVA range.</p>
+</section>
+
+<section id="exercises">
+<h2>Exercises</h2>
+<ol>
+<li>A 2 KiB Write's data starts at IOVA 0x2_0000_0F00. List the MRd requests (MRRS 512).</li>
+<li>Name the Linux DMA API call for (a) an Admin Completion Queue, (b) the pages of a 1 MiB Read request, (c) declaring 64-bit addressing.</li>
+<li>Why must the CQE be written after the data, and what PCIe rule guarantees the host sees them in that order?</li>
+<li>What does an IOMMU need from a TLP to translate it?</li>
+<li>Give two reasons an NVMe controller might set No Snoop and one risk.</li>
+</ol>
+<details class="answer"><summary>Model answers</summary>
+<p>(1) 0x…0F00 len 256 B (stops at the 4 KiB boundary); 0x…1000 len 512; 0x…1200 len 512; 0x…1400 len 512; 0x…1600 len 256 — total 2048. (2) (a) <code>dma_alloc_coherent</code>; (b) <code>dma_map_sg</code> with DMA_FROM_DEVICE; (c) <code>dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64))</code>. (3) The host treats the CQE (with the right phase) as "data ready"; posted writes from the same requester are not reordered unless Relaxed Ordering permits it, so data MWrs (without RO) arrive before the CQE MWr. (4) The Requester ID (and PASID if used) to select the translation tables, the address, and the access type (read/write). (5) Reasons: avoid snoop traffic for bulk data the driver keeps coherent; reduce latency. Risk: stale data if the CPU caches hold newer data (coherence not actually guaranteed).</p>
+</details>
+</section>
+
+<section id="quiz">
+<h2>Quiz</h2>
+<ol class="quiz">
+<li><p>Which Command register bit must be set for an NVMe controller to fetch SQEs?</p>
+<ul class="options" data-answer="3"><li>Memory Space Enable (bit 1)</li><li>I/O Space Enable (bit 0)</li><li>Bus Master Enable (bit 2)</li><li>Interrupt Disable (bit 10)</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Fetching SQEs is a device-initiated MRd, which requires BME.</p></details></li>
+<li><p>An address in a device-initiated MRd on an IOMMU-enabled system is:</p>
+<ul class="options" data-answer="2"><li>A CPU virtual address</li><li>An IOVA</li><li>Always a physical address</li><li>A BAR address</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The device uses the IOVA the driver obtained from the DMA API; the IOMMU translates it.</p></details></li>
+<li><p>Which Linux call is appropriate for an I/O Submission Queue?</p>
+<ul class="options" data-answer="1"><li>dma_alloc_coherent</li><li>dma_map_single per command</li><li>kmalloc and virt_to_phys</li><li>ioremap</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Queues are long-lived, shared CPU/device memory: coherent allocation. ioremap is for MMIO.</p></details></li>
+<li><p>A Memory Read request may not:</p>
+<ul class="options" data-answer="4"><li>Use a 64-bit address</li><li>Be split into several completions</li><li>Carry a tag</li><li>Cross a 4 KiB address boundary</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The 4 KiB boundary rule applies to requests.</p></details></li>
+<li><p>On a non-coherent platform, before the device reads a buffer the CPU wrote, the DMA API must:</p>
+<ul class="options" data-answer="2"><li>Invalidate CPU caches</li><li>Clean (write back) CPU caches</li><li>Disable the IOMMU</li><li>Set No Snoop</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Dirty lines must reach memory before the device reads it. Invalidation is needed before the CPU reads device-written data.</p></details></li>
+<li><p>For an NVMe Read command, how does data travel?</p>
+<ul class="options" data-answer="3"><li>CPU MMIO reads from BAR0</li><li>Device MRd, host CplD</li><li>Device MWr into host memory</li><li>CfgWr</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The device writes read data into host memory with posted MWrs.</p></details></li>
+<li><p>Open: Why does an IOMMU turn some silent corruptions into visible errors?</p>
+<details class="answer"><summary>Model answer</summary><p>Without an IOMMU, a device access to a wrong or stale address reaches whatever memory is there. With an IOMMU, only explicitly mapped IOVAs translate; other accesses are blocked and logged as faults, and reads complete with an error status that the device reports.</p></details></li>
+<li><p>Open: Describe the controller → MRd → host memory → CplD path, naming who translates what.</p>
+<details class="answer"><summary>Model answer</summary><p>The controller's DMA engine issues an MRd with its Requester ID and an IOVA from the PRP. The Root Complex's IOMMU uses the Requester ID to select tables and translates the IOVA to a physical address, checking permission; the coherent fabric snoops caches; the memory controller reads DRAM; the Root Complex returns CplD TLPs with the same tag, split at RCB boundaries, to the controller, which reassembles them.</p></details></li>
+<li><p>Open: An NVMe driver frees a buffer when a command times out, and occasional corruption appears in unrelated kernel data. Explain.</p>
+<details class="answer"><summary>Model answer</summary><p>The command was still active in the device. When it eventually performed its DMA (a Read writing data into the freed buffer), it overwrote memory that had been reallocated to someone else. Without an IOMMU (or with lazy invalidation), nothing blocked it. The fix is to ensure the device cannot access the buffer (abort/reset completed) before freeing.</p></details></li>
+</ol>
+</section>
+
+<section id="interview">
+<h2>Interview questions</h2>
+<ol>
+<li><p><strong>Beginner:</strong> Why do storage devices use DMA instead of letting the CPU copy data?</p>
+<details class="answer"><summary>Model answer</summary><p>CPU copying through MMIO is slow (non-posted reads stall the CPU, small transactions waste link bandwidth) and consumes CPU time; DMA lets the device move data in large, pipelined transactions while the CPU does other work.</p></details></li>
+<li><p><strong>Beginner:</strong> What is bus mastering?</p>
+<details class="answer"><summary>Model answer</summary><p>A device's ability to initiate memory transactions on the bus, controlled by the Bus Master Enable bit in its Command register (and in the bridges above it).</p></details></li>
+<li><p><strong>Intermediate:</strong> What is the difference between dma_alloc_coherent and dma_map_single?</p>
+<details class="answer"><summary>Model answer</summary><p>Coherent allocation creates long-lived memory that CPU and device can both access at any time without explicit syncs; streaming mapping maps existing memory for a transfer, transferring ownership to the device until unmap or sync, with cache maintenance done at those points.</p></details></li>
+<li><p><strong>Intermediate:</strong> What does an IOMMU do and why does NVMe care?</p>
+<details class="answer"><summary>Model answer</summary><p>It translates device-issued IOVAs to physical addresses per device and blocks unmapped accesses. NVMe cares because every queue, PRP list and data buffer address is an IOVA, faults surface as Data Transfer Errors, and translation cost affects throughput.</p></details></li>
+<li><p><strong>Advanced:</strong> How can Relaxed Ordering cause an NVMe correctness problem, and how is it avoided?</p>
+<details class="answer"><summary>Model answer</summary><p>If the CQE write were allowed to pass earlier data writes, software could see the completion before the data is in memory. Controllers set Relaxed Ordering only on data writes and not on the CQE (or rely on rules that RO does not let later writes pass earlier ones in a way that breaks this), and platforms that mishandle RO have it disabled via Device Control.</p></details></li>
+<li><p><strong>Senior:</strong> Design a validation plan for DMA in a new NVMe controller.</p>
+<details class="answer"><summary>Model answer</summary><p>Cover every PRP/SGL alignment and length class, 4 KiB boundary crossings, MRRS/MPS combinations, completion splitting by the host (various RCB behaviours), tag exhaustion, error completions (UR/CA) at every point of a transfer and the resulting NVMe statuses, IOMMU strict mode with fault injection, No Snoop and Relaxed Ordering on/off, reset and timeout during active DMA with checks that no access occurs after abort, and data-integrity patterns across power cycles.</p></details></li>
+</ol>
+</section>
+
+<section id="teachback">
+<h2>Teach-back challenge</h2>
+<ul>
+<li><strong>To a child:</strong> the teacher's list, the librarian's trolley and the map of allowed rooms.</li>
+<li><strong>To a junior engineer:</strong> the three addresses (VA, PA, IOVA) of one NVMe data buffer, and who uses each.</li>
+<li><strong>To a senior engineer:</strong> why buffer lifetime in timeout paths is the most dangerous part of an NVMe driver.</li>
+</ul>
+<details class="answer"><summary>Model explanations</summary>
+<p><strong>Child:</strong> "The teacher writes where the books are and where they go. The librarian moves them with a trolley while the teacher keeps teaching, then rings a bell. A map says which rooms the librarian may enter, so mistakes can't mess up the wrong room."</p>
+<p><strong>Junior:</strong> "The block layer's buffer has a kernel VA used by the CPU; its pages have physical addresses the memory controller uses; <code>dma_map_sg</code> gives IOVAs that go into the PRPs, and the controller uses those in its MRd/MWr TLPs. The IOMMU turns IOVAs back into physical addresses for this device only."</p>
+<p><strong>Senior:</strong> "A timeout means the host lost confidence, not that the device stopped. Until the controller is reset or the command verifiably aborted, the device may still DMA. Freeing or unmapping earlier creates use-after-free by hardware — either IOMMU faults or, without strict IOMMU, corruption of whatever reuses the memory. Error paths must prove quiescence before releasing memory."</p>
+</details>
+</section>
+
+<section id="summary">
+<h2>Chapter summary</h2>
+<p>DMA lets the NVMe controller move commands, data, completions and interrupts itself, using its own engines driven by descriptors in host memory (SQEs, PRPs/SGLs). It requires Bus Master Enable, prepared memory, and correct addresses. The device emits I/O virtual addresses; the IOMMU translates them per Requester ID and blocks anything unmapped, turning silent corruption into faults. Cache coherence is maintained by snooping on coherent platforms and by explicit cache maintenance (inside the DMA API) on others; No Snoop and Relaxed Ordering trade safety for performance. Linux drivers use <code>dma_set_mask_and_coherent</code>, <code>dma_alloc_coherent</code> for queues, and streaming mappings (<code>dma_map_sg</code>/<code>dma_map_single</code>) with strict ownership rules for data. On the link, a device read of host memory is MRd (≤ MRRS, not crossing 4 KiB) answered by CplDs split at RCB; a device write is a posted MWr (≤ MPS).</p>
+<aside class="callout mastery">
+<p>Do not move on until you can:</p>
+<ul class="checklist">
+<li>explain PIO vs DMA with numbers</li>
+<li>name what BME enables and what it does not protect against</li>
+<li>classify any address in an NVMe trace as MMIO or IOVA</li>
+<li>explain IOMMU translation, faults and modes</li>
+<li>explain snooping, No Snoop and why the DMA API's sync calls exist</li>
+<li>write the DMA API sequence of an NVMe driver from probe to completion</li>
+<li>predict the MRd/CplD or MWr TLPs for any buffer, alignment and size</li>
+<li>diagnose BME-off, IOMMU fault and coherence failures from traces</li>
+</ul>
+</aside>
+</section>
+
+<section id="next">
+<h2>Further reading and next chapter</h2>
+<ul>
+<li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Transaction Layer</cite> (memory transactions, completion rules, attributes) and <cite class="spec">Address Translation Services</cite>.</li>
+<li><cite class="spec">NVMe Base Specification 2.4 — PRP and SGL data structures</cite>; <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite>.</li>
+<li>Linux kernel documentation: <em>Dynamic DMA mapping using the generic device</em> (DMA-API), <em>Dynamic DMA mapping Guide</em> (DMA-API-HOWTO), and IOMMU documentation for your platform.</li>
+<li>Platform IOMMU architecture specifications (Intel VT-d, AMD IOMMU, Arm SMMU).</li>
+<li>Deep dives: <a href="dd02.html">Module 2 — DMA and Address Translation</a> and <a href="dd36.html">Module 36 — DMA with NVMe</a>; PRPs in <a href="ch36.html">Chapter 36</a>, SGLs in <a href="ch37.html">Chapter 37</a>.</li>
+</ul>
+<p><strong>Next:</strong> you now have every PCIe building block an NVMe controller relies on — links, packets, reliability, credits, configuration, BARs and DMA. <a href="ch21.html">Chapter 21 — What Is NVMe?</a> builds the NVMe mental model on top of them.</p>
+</section>
