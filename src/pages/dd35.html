@@ -1,0 +1,752 @@
+<p class="lead">A Scatter Gather List (SGL) is a small program the controller executes: read a descriptor, move or skip some bytes, maybe jump to another segment. Like any program it can be malformed, slow or ambiguous. This module goes into the SGL engine: how it walks chains, what Bit Buckets really cost, why one controller is quick with SGLs and another is not, and how to prove whether host or controller broke a rule.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p><a href="ch37.html">Chapter 37 (Scatter Gather Lists)</a> taught the 16-byte descriptor, the types, segments and chaining, the SGL Support (SGLS) field, the PRP or SGL Data Transfer (PSDT) field and the SGL status family. <a href="ch38.html">Chapter 38 (PRP/SGL Debugging Lab)</a> worked SGLs on a controller without support (Case 7) and byte-aligned SGLs on a dword-granular controller (Case 8). This module goes beneath: the <em>controller's SGL walker</em> and its validation order, <em>chained segments with Bit Buckets</em> on reads, <em>descriptor fetch strategies</em> and why fragment-heavy SGLs can be slow, <em>length rules</em> and the ambiguous "SGL longer than the transfer" case, metadata SGLs, and how a host driver chooses between PRPs and SGLs.</p>
+  <aside class="callout prereq">
+    <p>Read first: <a href="ch37.html">Scatter Gather Lists</a>, <a href="ch38.html">PRP/SGL Debugging Lab</a>, and <a href="dd34.html">Deep dive: PRP</a> (list-fetch strategies, page-size agreement).</p>
+  </aside>
+  <p>Where it goes next: <a href="dd36.html">Deep dive: DMA with NVMe</a>, <a href="dd02.html">Deep dive: DMA and Address Translation</a>, and the fabrics chapters <a href="ch66.html">NVMe over RDMA</a> and <a href="ch67.html">NVMe over TCP</a>, where every command carries an SGL.</p>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives for this module</caption>
+    <thead><tr><th>Level</th><th>Objective</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Decode any 16-byte descriptor from raw bytes and say what the controller will fetch or move next.</td></tr>
+      <tr><td>Intermediate</td><td>Walk a chained SGL with Segment, Last Segment, Data Block and Bit Bucket descriptors and map every command byte to its destination.</td></tr>
+      <tr><td>Advanced</td><td>Compare PRP and SGL descriptor traffic for different buffer shapes, and recognise descriptor-fetch strategies in a trace.</td></tr>
+      <tr><td>Senior</td><td>Diagnose an SGL performance regression involving the IOMMU mode, the driver's selection policy and the controller's SGL path, and specify which side owns the fix.</td></tr>
+      <tr><td>Trace analysis</td><td>Predict each segment fetch from the descriptor that points to it; use the first divergence as the first abnormal event.</td></tr>
+      <tr><td>Debugging</td><td>Work six SGL failure patterns, including segment-type, descriptor-count, Bit Bucket, metadata and edge-alignment problems.</td></tr>
+      <tr><td>Validation</td><td>Produce an SGL test matrix and a reference walker that checks every rule a careful controller should check.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>A different treasure hunt. This time every note says exactly how far to go: "pick up 12 shells starting at the big rock". Some notes say "walk past 4 shells without picking any up". The last line of a note may say "the next note is in the red mailbox and has 3 lines", or "the next note is in the blue mailbox, has 2 lines, and is the final note".</p>
+    <p>You can describe a messy beach with very few notes, or a beach in one note if all the shells are in a single row. But you must read the notes in order to know where shell number 100 is, and if the mailbox is far away, every trip to fetch a note is a long walk. And if the final note itself says "go to another mailbox", the hunter stops: the instructions broke their own promise.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <aside class="callout breaks">
+    <p><strong>What it represents.</strong> Notes are SGL segments; "pick up 12 shells at the rock" is a Data Block (address and byte length); "walk past 4" is a Bit Bucket; the mailbox line is a Segment or Last Segment descriptor; the promise "this is the final note" is the Last Segment type; the walk to a mailbox is a PCIe Memory Read round trip.</p>
+    <p><strong>What it hides.</strong> The hunter cannot see the total until the end; the controller compares the sum with the transfer length it computed from the command, and lengths, alignment and types are each checked against capabilities the controller advertises. The beach is I/O virtual address space behind an IOMMU, which can make a scattered beach look like one row.</p>
+    <p><strong>Where it becomes misleading.</strong> A real hunter collects shells in note order; a controller can expand the whole list into a table and move bytes in any order. "Walk past" costs the hunter time; a Bit Bucket costs no link traffic at all — but the drive still reads those bytes from media.</p>
+  </aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Terms for this module (descriptor basics are in <a href="ch37.html">Chapter 37</a>)</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="sgl">SGL</span> walker</td><td>The note reader</td><td>Controller logic that fetches segments, parses descriptors in order and emits (address, length, command offset) tuples</td><td>Feeds the DMA engine</td><td>Assuming the walker and the DMA engine run in lockstep</td></tr>
+      <tr><td>Segment</td><td>One note</td><td>Contiguous array of 16-byte descriptors in memory, any multiple of 16 bytes</td><td>Pointed to by Segment (2h) or Last Segment (3h)</td><td>Thinking segments must be page-sized or page-aligned</td></tr>
+      <tr><td>Last segment promise</td><td>"Final note"</td><td>A segment reached through a Last Segment descriptor contains no Segment or Last Segment descriptors</td><td>Lets the controller size its fetch and stop</td><td>Treating the type as cosmetic</td></tr>
+      <tr><td><span class="g" data-term="bit-bucket">Bit Bucket</span></td><td>"Walk past"</td><td>Descriptor (1h) whose length counts toward the transfer but whose data is discarded on reads</td><td>Optional; SGLS bit 16</td><td>Using it on writes; assuming media is not read</td></tr>
+      <tr><td>Descriptor cache / window</td><td>How much of a note you carry</td><td>Controller-side buffer of descriptors fetched ahead of use</td><td>Decides dependent round trips</td><td>Assuming a segment is fetched in one read</td></tr>
+      <tr><td>Expansion</td><td>Copying notes into a table</td><td>Controller converts an SGL into an internal scatter table before moving data</td><td>Enables out-of-order data</td><td>Assuming no cost before first data</td></tr>
+      <tr><td>Transfer length</td><td>How many shells you need</td><td>(NLB + 1) × LBA data size (plus metadata if interleaved)</td><td>Must equal SGL sum unless longer SGLs are allowed</td><td>Computing it separately in two code paths</td></tr>
+      <tr><td>Metadata SGL</td><td>A note for the labels</td><td>With PSDT 10b, the Metadata Pointer (MPTR) addresses an SGL describing the metadata buffer</td><td>Separate from the data SGL</td><td>Assuming metadata follows the data SGL</td></tr>
+      <tr><td>SGL threshold</td><td>When to use notes</td><td>Linux module parameter: average segment size at which the PCIe driver prefers SGLs</td><td>Host policy, not a specification rule</td><td>Thinking SGLs are always faster</td></tr>
+      <tr><td><span class="g" data-term="iova">IOVA</span> merging</td><td>Making the beach a row</td><td>DMA mapping that maps scattered pages to one contiguous IOVA range</td><td>Turns many fragments into one Data Block</td><td>Assuming it happens in passthrough (identity) mode</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <figure>
+    <pre class="diagram">
+ HOST                                                 CONTROLLER SGL ENGINE
+ bio / iovec fragments ─► DMA map ─► IOVA ranges        ┌────────────────────────────────────────┐
+     │ (translated: may merge; identity: no merge)      │ 1 decode PSDT, SGL1 type (byte 15)     │
+     ▼                                                  │ 2 check SGLS: support, alignment, BB   │
+ driver policy: PRP or SGL? (threshold, SGLS)           │ 3 fetch segment (all, or by window)    │◄─ MRd segment
+ SGL builder: Data Blocks, Bit Buckets, segments       │ 4 parse in order: DB / BB / chain      │
+     ├─ SGL1 in SQE (DW6–9), PSDT=01b                   │ 5 validate: position, type, length sum │
+     ├─ segments in pool 0x1_5000_xxxx                  │ 6 table → DMA: MRd (write)/MWr (read)  │◄─► data TLPs
+     └─ MPTR (PSDT 10b → metadata SGL)                  │   cut at MRRS/MPS, 4 KiB, byte enables │
+                                                        │ 7 CQE; status from SGL family if bad   │
+ Identify Controller SGLS ── read once, obeyed always ──┴────────────────────────────────────────┘
+    </pre>
+    <figcaption>The SGL path. Steps 3–5 can interleave or run to completion before data moves, depending on the controller. Conceptual.</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture of an SGL-described transfer</caption>
+    <thead><tr><th>Aspect</th><th>Content</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>PSDT, SGL1 (Data Pointer, DPTR), MPTR, transfer length, SGLS capabilities.</td></tr>
+      <tr><td>Outputs</td><td>Ordered (address or discard, length) list; segment fetches; data TLPs; status.</td></tr>
+      <tr><td>Actors</td><td>Block layer and driver (fragments, policy, builder), IOMMU, controller SGL walker and DMA engine.</td></tr>
+      <tr><td>State</td><td>Host: segment allocations per command. Controller: current segment, descriptor cache, running offset, "last segment" flag, expanded table if any.</td></tr>
+      <tr><td>Memory</td><td>Segments (often a small pool such as 256-byte blocks plus 4 KiB pages), data fragments, controller SRAM.</td></tr>
+      <tr><td>Registers / identify fields</td><td>Identify Controller SGLS; CC and CAP are irrelevant to SGL layout (no page size in SGLs) — a common surprise.</td></tr>
+      <tr><td>Interfaces</td><td>SQE DW0 (PSDT), DW4–5 (MPTR), DW6–9 (SGL1); PCIe memory requests.</td></tr>
+      <tr><td>Dependencies</td><td>Segments and data stay mapped until the Completion Queue Entry (CQE) is consumed; builder and command compute length from one source.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>A 16 KiB Read (CID 0x1100) on namespace 1 whose 16 KiB is gathered into four fragments with a 4 KiB hole discarded by a Bit Bucket. SGL1 is a Segment descriptor; the chain has two segments.</p>
+  <ol>
+    <li><strong>Check capabilities.</strong> Who: driver at initialisation. What: SGLS bits 1:0 = 01b (byte granular), bit 16 = 1 (Bit Bucket supported). Where: Identify Controller. Evidence: <code>nvme id-ctrl -H</code>.</li>
+    <li><strong>Build segments.</strong> Who: driver. What: segment A at 0x1_5000_1000, 64 bytes: Data Block 0x2_0040_0000/4096, Bit Bucket 4096, Data Block 0x2_0041_0200/2048, Last Segment → 0x1_5000_2000 length 32. Segment B: Data Block 0x2_0042_0000/4096, Data Block 0x2_0043_0000/2048. Where: segment pool. Evidence: memory dump.</li>
+    <li><strong>Build the SQE.</strong> Who: driver. What: opcode 02h, PSDT = 01b, SGL1 = Segment (byte 15 = 0x20) → 0x1_5000_1000, length 0x40; NLB = 31. Where: SQ1 slot 0xB0 (0x1_2340_2C00). Evidence: SQE bytes.</li>
+    <li><strong>Doorbell and SQE fetch.</strong> Who: driver, then controller. What: tail 0xB1; 64-byte Memory Read (MRd). Evidence: two Transaction Layer Packets (TLPs).</li>
+    <li><strong>Fetch segment A.</strong> Who: SGL walker. What: MRd of exactly 64 bytes at 0x1_5000_1000. Evidence: MRd Len = 16 DW.</li>
+    <li><strong>Parse A.</strong> Who: walker. What: three data-carrying descriptors (sum 10,240 B), then a Last Segment descriptor in the final slot — legal. Evidence: next MRd target.</li>
+    <li><strong>Fetch segment B.</strong> Who: walker. What: MRd of 32 bytes at 0x1_5000_2000; marks "last". Evidence: dependent MRd.</li>
+    <li><strong>Validate.</strong> Who: walker. What: no chain descriptors in B; sum = 16,384 = 32 × 512. Evidence: absence of an error CQE.</li>
+    <li><strong>Read media and move data.</strong> Who: controller. What: reads all 32 LBAs from media; sends Memory Writes (MWr) for 12 KiB to four fragments; discards bytes 4096–8191. Evidence: 48 MWrs of 256 B, none for the hole.</li>
+    <li><strong>Complete.</strong> Who: controller then driver. What: CQE; driver frees both segments. Evidence: CQE MWr, interrupt.</li>
+  </ol>
+  <figure>
+    <ol class="seq" data-actors="Driver|Host memory|SGL walker|DMA engine">
+      <li data-from="Driver" data-to="Host memory">segments A (64 B) and B (32 B)</li>
+      <li data-from="Driver" data-to="SGL walker" data-t="0 µs">doorbell: slot 0xB0</li>
+      <li data-from="SGL walker" data-to="Host memory" data-t="0.8 µs">MRd 64 B: SQE</li>
+      <li data-from="SGL walker" data-to="Host memory" data-t="1.5 µs">MRd 64 B: segment A</li>
+      <li data-from="Host memory" data-to="SGL walker" class="dashed" data-t="2.1 µs">DB, BB, DB, Last Segment</li>
+      <li data-from="SGL walker" data-to="Host memory" data-t="2.2 µs">MRd 32 B: segment B</li>
+      <li data-from="Host memory" data-to="SGL walker" class="dashed" data-t="2.8 µs">DB, DB</li>
+      <li data-note="SGL walker">sum 16,384 = transfer length</li>
+      <li data-from="SGL walker" data-to="DMA engine">table: 4 fragments + 1 hole</li>
+      <li data-from="DMA engine" data-to="Host memory" data-t="62 µs">MWr ×48 (no TLP for hole)</li>
+      <li data-from="DMA engine" data-to="Driver" data-t="64.5 µs">CQE</li>
+    </ol>
+    <figcaption>A chained SGL Read with a Bit Bucket. Synthetic example for teaching.</figcaption>
+  </figure>
+  <h3>The central concept on the ladder: an SGL is a program whose result is checked against the command</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Notes tell you how far to walk and where the next note is; at the end you must have exactly as many shells as the order asked for.</p></div>
+    <div class="rung" data-rung="B"><p>The SGL is executed in order; the sum of Data Block and Bit Bucket lengths must match the transfer length; chain descriptors appear only at segment ends and never in the last segment.</p></div>
+    <div class="rung" data-rung="C"><p>The command's length (NLB and LBA format) and the SGL's length come from different code; the controller is the only place where both meet, and it reports mismatches with the SGL status family.</p></div>
+    <div class="rung" data-rung="D"><p><cite class="spec">NVM Express Base Specification, Revision 2.4 — Scatter Gather List; SGL descriptor formats; Identify Controller SGLS; Generic Command Status values</cite>; <cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite> for PCIe-specific data pointer rules.</p></div>
+    <div class="rung" data-rung="E"><p>Each segment fetch must equal the pointing descriptor's address and length; data TLPs must partition the Data Blocks; holes have no TLPs.</p></div>
+    <div class="rung" data-rung="F"><p>Decode SGL1 from byte 15 of DPTR, predict the first fetch, then walk descriptor by descriptor, comparing predicted and observed requests.</p></div>
+    <div class="rung" data-rung="G"><p>When the walk fails, decide whether the SGL broke a rule (host bug, controller should reject) or the controller mis-executed a valid SGL (controller bug) — the reference walker is the arbiter.</p></div>
+  </div>
+  <p>The sixteen questions for SGLs are answered in <a href="ch37.html#engineering">Chapter 37</a>.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <p>Applicable: <cite class="spec">NVM Express Base Specification, Revision 2.4</cite>, <cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite>, and for fabrics <cite class="spec">NVMe over RDMA Transport Specification, Revision 1.3</cite> and <cite class="spec">NVMe over TCP Transport Specification, Revision 1.3</cite>.</p>
+  <table>
+    <caption>Classifying SGL behaviour</caption>
+    <thead><tr><th>Behaviour</th><th>Class</th></tr></thead>
+    <tbody>
+      <tr><td>Descriptor format, type codes, segment rules, PSDT meanings</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>SGLs for I/O on PCIe; Bit Bucket; Keyed and Transport Data Blocks</td><td><span class="badge optional">Optional</span>, advertised in SGLS</td></tr>
+      <tr><td>Admin commands on PCIe use PRPs</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>SGL longer than the transfer accepted</td><td><span class="badge optional">Optional</span> capability in SGLS (bit position: confirm; the author has seen it as bit 18)</td></tr>
+      <tr><td>Status reported for each malformed structure; whether data moves before validation completes</td><td>Status names defined; choice and timing <span class="badge impl">Implementation-dependent</span> — confirm</td></tr>
+      <tr><td>Descriptor fetch strategy, cache size, expansion, data order</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+      <tr><td>Maximum descriptors a controller accepts per segment or per command on PCIe</td><td><span class="badge impl">Implementation-dependent</span>; Identify has a fabrics-oriented Maximum SGL Data Block Descriptors field (confirm its scope)</td></tr>
+      <tr><td>SGLS bits added over revisions</td><td><span class="badge version">Version-dependent</span></td></tr>
+      <tr><td>Linux selection policy (<code>sgl_threshold</code>)</td><td><span class="badge impl">Implementation-dependent</span> (kernel version)</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout notsaid">
+    <p>The specification does not say a controller must validate the whole SGL before moving data, does not limit segment sizes to pages, does not require segments to be aligned to more than the stated descriptor alignment (confirm the exact rule for segment addresses), and does not say SGLs perform better than PRPs. Check in the specification: the SGL status values (0Dh–11h in revisions the author has read), the exact SGLS bit positions beyond bits 1:0, 2 and 16, the restriction on metadata SGLs with PSDT 10b, and the treatment of zero-length Data Blocks.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never mark SGL1 as Last Segment before you know chaining is unnecessary; never put a Bit Bucket in a write; never use byte-aligned fragments without SGLS 01b; never rely on "longer SGL" acceptance without the capability bit; never infer SGL support from the presence of a fabrics transport on the same system.</p>
+  </aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Hardware in SGL handling</caption>
+    <thead><tr><th>Category</th><th>Components</th></tr></thead>
+    <tbody>
+      <tr><td>Must participate</td><td>CPU (builder), host DRAM (segments, data), root complex, controller SGL walker, DMA engine</td></tr>
+      <tr><td>May participate</td><td>IOMMU (each fragment and segment translated; may merge fragments), Controller Memory Buffer (segments or data inside the device, if supported), switches</td></tr>
+      <tr><td>Observable</td><td>SQE bytes, segment MRds and payloads, data TLPs with byte enables, missing TLPs for holes, status codes</td></tr>
+      <tr><td>Internal, unobservable</td><td>Descriptor cache size, validation order, expansion table, firmware versus hardware walk</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw" data-title="Why some controllers are slower with SGLs">
+    <p>A PRP engine computes addresses with shifts and masks. An SGL engine must sum variable lengths and handle byte-granular edges, so many designs walk SGLs in firmware or expand them into a page table before data moves. That costs latency per descriptor, not per byte: harmless for one large Data Block, noticeable for hundreds of small fragments. Whether a given controller does this is invisible except through measurement — which is why Linux uses a threshold rather than "SGL whenever supported".</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>Requests an SGL causes (lab system: MRRS 512 B, Max Payload Size 256 B)</caption>
+    <thead><tr><th>SGL element</th><th>Link activity</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>SGL1 = Data Block</td><td>None for descriptors</td><td>Best case: whole contiguous buffer in the SQE</td></tr>
+      <tr><td>Segment or Last Segment</td><td>MRd(s) totalling its length, at its address</td><td>Strategy-dependent split; dependent on the previous segment</td></tr>
+      <tr><td>Data Block (write)</td><td>MRds ≤ MRRS, never crossing 4 KiB</td><td>Unaligned edges use partial byte enables</td></tr>
+      <tr><td>Data Block (read)</td><td>MWrs ≤ Max Payload Size, never crossing 4 KiB</td><td>As above</td></tr>
+      <tr><td>Bit Bucket (read)</td><td>None</td><td>Media still read; bandwidth saved on the link only</td></tr>
+      <tr><td>Malformed structure</td><td>CQE with SGL-family status; data may or may not have moved</td><td>Validation order is implementation-dependent</td></tr>
+    </tbody>
+  </table>
+  <h3>Ordering, completion and errors</h3>
+  <ul>
+    <li><strong>Causal order.</strong> Segment n + 1 can be fetched only after the chain descriptor at the end of segment n is read. Within a segment, a cached descriptor can be used in any order.</li>
+    <li><strong>Data order.</strong> Not prescribed; a controller that expands the SGL may move fragments as media completes.</li>
+    <li><strong>Error timing.</strong> A walker that streams (validates as it goes) can move data for early descriptors before discovering a later error; one that validates first moves nothing. Both end with an error CQE; the host must treat buffer contents as undefined.</li>
+    <li><strong>Fabrics.</strong> The same descriptors appear in command capsules; data moves as RDMA operations or TCP data units, not TLPs (see <a href="ch66.html">Chapter 66</a> and <a href="ch67.html">Chapter 67</a>).</li>
+  </ul>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Four synthetic traces from the lab system (Gen4 x4, IOMMU on, queue pair 1, namespace 1 with 512-byte LBAs, SGLS 01b with Bit Bucket support unless stated). Times are illustrative.</p>
+
+  <h3>Normal: chained segments and a Bit Bucket</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M35-N — 16 KiB Read CID 0x1100, SGL1 = Segment 0x1_5000_1000 / 64">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x000000B1</td><td>SQ1 tail: slot 0xB0</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>760</td><td>MRd64</td><td>Addr=0x1_2340_2C00 Len=16 Tag=0x10</td><td>SQE fetch</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,400</td><td>CplD</td><td>BC=64 SC</td><td>opc 02h, PSDT 01b, NLB 0x1F; SGL1 = 00 10 00 50 01 00 00 00 40 00 00 00 00 00 00 20 → Segment, 0x1_5000_1000, 64 B</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,470</td><td>MRd64</td><td>Addr=0x1_5000_1000 Len=16 Tag=0x11</td><td>Segment A, exactly 64 B</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2,090</td><td>CplD</td><td>BC=64 SC</td><td>DB 0x2_0040_0000/4096; BB 4096; DB 0x2_0041_0200/2048; Last Segment 0x1_5000_2000/32</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>2,160</td><td>MRd64</td><td>Addr=0x1_5000_2000 Len=8 Tag=0x12</td><td>Segment B (last), exactly 32 B</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>2,780</td><td>CplD</td><td>BC=32 SC</td><td>DB 0x2_0042_0000/4096; DB 0x2_0043_0000/2048 — sum 16,384 ✓</td></tr>
+        <tr class="note"><td colspan="6">Media read of 32 LBAs (≈59 µs).</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>61,900…</td><td>MWr64 ×16</td><td>0x2_0040_0000 … 0x2_0040_0F00, 256 B each</td><td>Command bytes 0–4095</td></tr>
+        <tr class="note"><td colspan="6">No TLPs for command bytes 4096–8191 (Bit Bucket).</td></tr>
+        <tr class="dir-up"><td>9</td><td>Dev→Host</td><td>…</td><td>MWr64 ×8</td><td>0x2_0041_0200 … 0x2_0041_0900</td><td>Bytes 8192–10239</td></tr>
+        <tr class="dir-up"><td>10</td><td>Dev→Host</td><td>…</td><td>MWr64 ×24</td><td>0x2_0042_0000 …; 0x2_0043_0000 …</td><td>Bytes 10240–16383</td></tr>
+        <tr class="dir-up"><td>11</td><td>Dev→Host</td><td>64,500</td><td>MWr64</td><td>Addr=0x1_2341_0B00 CID=0x1100 SC=00h</td><td>Success</td></tr>
+        <tr class="dir-up"><td>12</td><td>Dev→Host</td><td>64,520</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x41</td><td>MSI-X vector 1</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Every prediction holds: the SGL1 bytes predict segment A's fetch; segment A's last descriptor predicts segment B's; the sum matches 32 × 512; 48 data MWrs (12 KiB) and none for the hole. The controller fetched both segments before media data was ready, so the chain cost nothing visible on a read. Note the third fragment starts at 0x…0200: legal with SGLS 01b and also with 10b (it is dword aligned). With PRPs this buffer is impossible to describe without a bounce buffer: the hole and the 0x200 offset in the middle break the page rules.</p>
+  </div>
+
+  <h3>Slow: hundreds of fragments and a small descriptor cache</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M35-S — 128 KiB Write CID 0x1180, 256 × 512 B fragments, round trip ≈3 µs">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>CplD</td><td>SQE: Write NLB 0xFF, SGL1 = Last Segment 0x1_5000_8000 / 4096</td><td>256 Data Blocks of 512 B (a log writer gathering records)</td></tr>
+        <tr class="abnormal"><td>2</td><td>Dev→Host</td><td>0.1</td><td>MRd64</td><td>Addr=0x1_5000_8000 Len=64 Tag=0x20</td><td>First abnormal event: 256 B fetched of a 4096 B segment — 16 descriptors only</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>3.1</td><td>CplD</td><td>BC=256 ×2</td><td>Descriptors 0–15</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>3.2</td><td>MRd64 ×16</td><td>0x2_0080_0000, 0x2_0080_1000, … 512 B each</td><td>Data for fragments 0–15</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>3.3</td><td>MRd64</td><td>Addr=0x1_5000_8100 Len=64</td><td>Next 16 descriptors only now</td></tr>
+        <tr class="note"><td colspan="6">Repeats 16 times: a dependent ≈3.1 µs descriptor round trip per 8 KiB of data.</td></tr>
+        <tr class="dir-up"><td>—</td><td>Dev→Host</td><td>≈54</td><td>MWr64</td><td>CQE CID=0x1180 SC=00h</td><td>Success (an eager fetch of the whole segment would finish ≈22 µs)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Legal and correct, but each 16-descriptor window costs a host round trip, so the command is bound by descriptor latency, not by the link. The advanced lab counts it: 4,096 bytes of descriptors in 8 MRds eagerly (one dependent round) versus 16 dependent rounds with a 256-byte window. Disambiguate: repeat with 32 × 4 KiB fragments (32 descriptors, two windows): if the time drops sharply, descriptor fetch, not fragment size on the media side, dominates. Mitigation on the host: merge fragments (bounce or contiguous IOVA), or let the driver's threshold choose PRPs when the average fragment is small — impossible here because 512-byte fragments cannot be PRPs, so a bounce buffer is the host-side choice. Owner of the slowness: controller design (window too small for realistic round trips); report it with this evidence.</p>
+  </div>
+
+  <h3>Failed: a chain inside the last segment</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M35-F — 128 KiB Write CID 0x1240, SGL1 = Last Segment but the segment chains">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x000000C1</td><td>Slot 0xC0</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>760</td><td>MRd64</td><td>Addr=0x1_2340_3000 Len=16</td><td>SQE fetch</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,400</td><td>CplD</td><td>BC=64 SC</td><td>opc 01h NLB 0xFF; SGL1 byte 15 = 0x30 → Last Segment 0x1_5000_3000, length 0x100 (16 descriptors)</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,470</td><td>MRd64</td><td>Addr=0x1_5000_3000 Len=64</td><td>Fetch 256 B</td></tr>
+        <tr class="abnormal"><td>5</td><td>Host→Dev</td><td>2,090</td><td>CplD</td><td>BC=256 SC</td><td>First abnormal event: slots 0–14 Data Blocks (15 × 4 KiB), slot 15 byte 15 = 0x20 → Segment 0x1_5000_4000 / 272 inside a last segment</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>2,400</td><td>MWr64</td><td>Addr=0x1_2341_0C00 CID=0x1240 SCT=0h SC=0Dh DNR=1</td><td>Invalid SGL Segment Descriptor (value: confirm)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The SGL broke its own promise: a Last Segment descriptor declares that the target contains no chain descriptors. The status is the symptom; the descriptor content in row 5 is the first abnormal event. The host's builder allocated segments from a 256-byte pool (16 descriptors) and chained correctly when a command needed more — but it chose SGL1's type with a "≤ 256 descriptors fits one page" test written for an older 4 KiB pool. The 32-fragment command fitted the old test and not the new pool. This controller validated the segment before moving data; a streaming walker might have pulled 60 KiB first and then failed — either way the command fails. Fix: choose each pointing descriptor's type only after the target segment's contents are known (Last Segment if and only if the target has no chain). <code>sgl_walk.py</code> in the Labs reproduces this case.</p>
+  </div>
+
+  <h3>Ambiguous: the SGL describes more than the command moves</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M35-A — 8 KiB Read CID 0x12A0, SGL totals 12 KiB, Success">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>1.4</td><td>CplD</td><td>SQE: Read NLB 0x0F (8 KiB), SGL1 = Last Segment 0x1_5000_5000 / 32</td><td></td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>1.5</td><td>MRd64</td><td>Addr=0x1_5000_5000 Len=8</td><td>Segment fetch</td></tr>
+        <tr class="abnormal"><td>3</td><td>Host→Dev</td><td>2.1</td><td>CplD</td><td>BC=32</td><td>First abnormal event: DB 0x2_0060_0000/8192 + DB 0x2_0062_0000/4096 = 12,288 B &gt; 8,192 B</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>60.8–62.0</td><td>MWr64 ×32</td><td>0x2_0060_0000 … 0x2_0060_1F00</td><td>8 KiB to the first Data Block only</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>62.6</td><td>MWr64</td><td>CQE CID=0x12A0 SC=00h</td><td>Success</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Two readings are possible. (1) The controller advertises the SGLS capability "SGL longer than the data transfer" and the host deliberately reuses a 12 KiB SGL — legal, and the extra descriptor is simply unused. (2) The controller does not advertise it and does not check sums; the host has a length bug (as in Chapter 37's short-SGL trace, but in the other direction) that this controller masks and a stricter one will reject with Data SGL Length Invalid. Evidence that decides: the SGLS bit (read Identify Controller), and the host code — does it intend longer SGLs? If the bit is clear, file a host bug and a controller validation gap. Note the risk of reading (2): on a <em>Write</em>, a non-checking controller would quietly ignore host data, and the host would believe 12 KiB was written.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Read-only commands; outputs vary by version and are not reproduced.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># SGL support, alignment mode, Bit Bucket and other SGLS capabilities (decoded)</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -i -A16 '^sgls'
+
+<span class="cm"># Driver selection policy for PCIe I/O (bytes; 0 disables SGLs; version-dependent)</span>
+cat /sys/module/nvme/parameters/sgl_threshold 2&gt;/dev/null
+
+<span class="cm"># IOMMU mode for the SSD's group: "DMA"/"DMA-FQ" (translated) or "identity" (passthrough)</span>
+cat /sys/bus/pci/devices/0000:01:00.0/iommu_group/type 2&gt;/dev/null
+
+<span class="cm"># Block-layer fragment limits that shape the SGL</span>
+grep . /sys/block/nvme0n1/queue/{max_segments,max_segment_size,virt_boundary_mask,dma_alignment} 2&gt;/dev/null</code></pre>
+  <table>
+    <caption>What the outputs prove</caption>
+    <thead><tr><th>Output</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>SGLS decode</td><td>Whether SGLs, byte granularity, Bit Buckets and longer SGLs are permitted</td><td>How fast the controller's SGL path is</td></tr>
+      <tr><td><code>sgl_threshold</code></td><td>The kernel's policy knob value</td><td>Which commands actually used SGLs (needs a trace or instrumentation)</td></tr>
+      <tr><td>IOMMU group type</td><td>Whether fragments may be merged into contiguous IOVAs</td><td>Whether a particular request was merged</td></tr>
+      <tr><td>Queue limits</td><td>Fragment shapes the block layer passes down</td><td>User-space drivers' behaviour</td></tr>
+    </tbody>
+  </table>
+  <p>In the kernels the author has read, the PCIe driver uses SGLs for a request when the controller supports them, the request is not on the admin queue, and the average segment size (bytes ÷ physical segments) reaches the threshold; otherwise PRPs. The logic and default have changed between versions; confirm in <code>drivers/nvme/host/pci.c</code> for your kernel.</p>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+
+  <h3>Beginner lab — decode descriptors by eye</h3>
+  <p><span class="badge safe">Safe lab</span> Paper or the <a href="tool-nvme-decoder.html">NVMe decoder</a>.</p>
+  <dl>
+    <dt>Objective</dt><dd>Read type, sub type, address and length from raw bytes, and judge validity in context.</dd>
+    <dt>Prerequisites</dt><dd><a href="ch37.html#engineering">Chapter 37 descriptor layout</a>.</dd>
+    <dt>Setup</dt><dd>Five descriptors (bytes 0→15):
+      <br>(a) <code>00 00 40 00 02 00 00 00 00 10 00 00 00 00 00 00</code>
+      <br>(b) <code>00 00 00 00 00 00 00 00 00 10 00 00 00 00 00 10</code>
+      <br>(c) <code>00 20 00 50 01 00 00 00 28 00 00 00 00 00 00 30</code>
+      <br>(d) <code>03 00 70 00 02 00 00 00 00 10 00 00 00 00 00 00</code>
+      <br>(e) <code>00 30 00 50 01 00 00 00 00 01 00 00 00 00 00 20</code></dd>
+    <dt>Procedure</dt><dd>Decode each. Then judge: (b) in a Write; (c) as a pointer; (d) on an SGLS 10b controller; (e) as the last descriptor of a segment reached by Last Segment.</dd>
+    <dt>Observations</dt><dd>Which judgments need information outside the descriptor?</dd>
+    <dt>Questions</dt><dd>(1) What is wrong with (c)? (2) Which status family would you expect for each invalid case?</dd>
+    <dt>Expected reasoning</dt><dd>Byte 15 first; then address and length little-endian; then context.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>(a) Data Block 0x2_0040_0000, 4096 B — valid anywhere. (b) Bit Bucket, 4096 B — invalid in a Write (SGL Descriptor Type Invalid, confirm). (c) Last Segment → 0x1_5000_2000, length 0x28 = 40 B: not a multiple of 16 — invalid segment descriptor. (d) Data Block 0x2_0070_0003, 4096 B — address not dword aligned: rejected under SGLS 10b (status: confirm, see <a href="ch38.html">Chapter 38 Case 8</a>). (e) Segment → 0x1_5000_3000, 256 B — invalid inside a last segment (Invalid SGL Segment Descriptor, confirm). Context needed: direction (b), SGLS (d), position (e).</p>
+  </details>
+  <p><strong>Extension.</strong> Encode a Data Block descriptor using sub type 1h (offset) and explain why it is meaningless on PCIe in-memory data (see Chapter 37's sub type notes).</p>
+
+  <h3>Intermediate lab — a reference SGL walker</h3>
+  <p><span class="badge safe">Safe lab</span> Python 3, standard library.</p>
+  <dl>
+    <dt>Objective</dt><dd>Walk SGLs exactly as a strict controller should, and reproduce traces M35-N, M35-F and M35-A.</dd>
+    <dt>Prerequisites</dt><dd>Beginner lab.</dd>
+    <dt>Setup</dt><dd>Save as <code>sgl_walk.py</code>.</dd>
+  </dl>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="sgl_walk.py"><code># sgl_walk.py - walk an NVMe SGL the way a careful PCIe controller would.
+# Memory is a dict {address: bytes}. Status names follow the Base
+# Specification's Generic Command Status table (confirm values there).
+import struct
+
+DATA, BITBUCKET, SEGMENT, LAST = 0x0, 0x1, 0x2, 0x3
+NAMES = {0x0: "Data Block", 0x1: "Bit Bucket", 0x2: "Segment",
+         0x3: "Last Segment"}
+
+def desc(kind, addr=0, length=0, sub=0):
+    """Encode one 16-byte descriptor (little-endian)."""
+    return struct.pack("&lt;QI3xB", addr, length, (kind &lt;&lt; 4) | sub)
+
+def parse(raw):
+    addr, length, ident = struct.unpack("&lt;QI3xB", raw)
+    return ident &gt;&gt; 4, ident &amp; 0xF, addr, length
+
+def walk(sgl1, mem, xfer_len, is_read, sgls_mode=1, bit_bucket=True,
+         max_desc=256):
+    """Return (status, chunks, fetches). chunks: (addr or None, length)."""
+    chunks, fetches = [], []
+    kind, sub, addr, length = parse(sgl1)
+    if kind in (DATA, BITBUCKET):          # whole SGL is in the SQE
+        todo = [(kind, sub, addr, length)]
+        last = True
+    elif kind in (SEGMENT, LAST):
+        todo, last = None, kind == LAST
+        seg_addr, seg_len = addr, length
+    else:
+        return "SGL Descriptor Type Invalid", chunks, fetches
+    while True:
+        if todo is None:                    # fetch the next segment
+            if seg_len == 0 or seg_len % 16:
+                return "Invalid SGL Segment Descriptor", chunks, fetches
+            if seg_len // 16 &gt; max_desc:
+                return "Invalid Number of SGL Descriptors", chunks, fetches
+            raw = mem.get(seg_addr)
+            fetches.append((seg_addr, seg_len))
+            if raw is None or len(raw) &lt; seg_len:
+                return "Data Transfer Error (segment unreadable)", chunks, fetches
+            todo = [parse(raw[i:i + 16]) for i in range(0, seg_len, 16)]
+        nxt = None
+        for i, (k, s, a, n) in enumerate(todo):
+            if k in (SEGMENT, LAST):
+                if last or i != len(todo) - 1:
+                    return "Invalid SGL Segment Descriptor", chunks, fetches
+                nxt = (k, a, n)
+            elif k == DATA:
+                if s != 0:
+                    return "SGL Descriptor Type Invalid", chunks, fetches
+                if sgls_mode == 2 and (a % 4 or n % 4):
+                    return "rejected: dword rule (status: confirm)", chunks, fetches
+                chunks.append((a, n))
+            elif k == BITBUCKET:
+                if not bit_bucket or not is_read:
+                    return "SGL Descriptor Type Invalid", chunks, fetches
+                chunks.append((None, n))
+            else:
+                return "SGL Descriptor Type Invalid", chunks, fetches
+        if nxt is None:
+            break
+        last = nxt[0] == LAST
+        seg_addr, seg_len, todo = nxt[1], nxt[2], None
+    total = sum(n for _, n in chunks)
+    if total != xfer_len:
+        return "Data SGL Length Invalid (%d != %d)" % (total, xfer_len), chunks, fetches
+    return "Success", chunks, fetches
+
+def show(title, sgl1, mem, xfer_len, is_read=True, **kw):
+    status, chunks, fetches = walk(sgl1, mem, xfer_len, is_read, **kw)
+    print("--- " + title)
+    for a, n in fetches:
+        print("    fetch segment 0x%X, %d bytes" % (a, n))
+    off = 0
+    for a, n in chunks:
+        where = "discard" if a is None else "0x%X" % a
+        print("    cmd bytes %5d..%5d -&gt; %s" % (off, off + n - 1, where))
+        off += n
+    print("    status: " + status)
+
+# Trace M35-N: Read of 16 KiB, two chained segments with a Bit Bucket
+mem = {
+    0x150001000: desc(DATA, 0x200400000, 4096) + desc(BITBUCKET, 0, 4096)
+               + desc(DATA, 0x200410200, 2048) + desc(LAST, 0x150002000, 32),
+    0x150002000: desc(DATA, 0x200420000, 4096) + desc(DATA, 0x200430000, 2048),
+}
+show("M35-N chained Read with Bit Bucket", desc(SEGMENT, 0x150001000, 64),
+     mem, 16384)
+
+# The same SGL used for a Write: a Bit Bucket is not allowed there
+show("same SGL on a Write", desc(SEGMENT, 0x150001000, 64), mem, 16384,
+     is_read=False)
+
+# Trace M35-F: SGL1 says Last Segment, but the builder chained anyway
+mem2 = {0x150003000: b"".join(desc(DATA, 0x200500000 + i * 0x1000, 4096)
+                              for i in range(15))
+                     + desc(SEGMENT, 0x150004000, 272)}
+show("M35-F Segment descriptor inside a last segment",
+     desc(LAST, 0x150003000, 256), mem2, 32 * 4096, is_read=False)
+
+# Trace M35-A: SGL describes 12 KiB, command moves 8 KiB
+mem3 = {0x150005000: desc(DATA, 0x200600000, 8192) + desc(DATA, 0x200620000, 4096)}
+show("M35-A SGL longer than the transfer", desc(LAST, 0x150005000, 32),
+     mem3, 8192)
+
+# Byte-aligned fragment sent to a dword-granular controller (SGLS 10b)
+show("byte-aligned Data Block, SGLS 10b",
+     desc(DATA, 0x200700003, 4096), {}, 4096, sgls_mode=2)</code></pre>
+  <dl>
+    <dt>Procedure</dt><dd>(1) Run it; five cases print. (2) Add an <code>allow_longer</code> parameter that accepts a sum larger than the transfer and truncates the chunk list. (3) Add a zero-length Data Block and decide what your walker should do.</dd>
+    <dt>Observations</dt><dd>For the failing cases, note how many chunks were produced before the error: a streaming controller would already have moved those bytes.</dd>
+    <dt>Questions</dt><dd>(a) Why does the Write case fail after the first chunk? (b) In M35-F, how much data could a streaming walker have moved? (c) Why is the walker's order of checks itself a design choice?</dd>
+    <dt>Expected reasoning</dt><dd>Validation timing decides how much data moves before an error.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>Output: M35-N fetches 64 B then 32 B and maps bytes 0–4095, discards 4096–8191, then maps the rest — Success. The Write with a Bit Bucket stops at the second descriptor with SGL Descriptor Type Invalid. M35-F maps 15 chunks (61,440 B) then reports Invalid SGL Segment Descriptor. M35-A reports Data SGL Length Invalid (12,288 ≠ 8,192). The byte-aligned case is rejected under the dword rule. (a) The Bit Bucket is the second descriptor. (b) Up to 60 KiB. (c) The specification defines the errors, not when to detect them; validate-first costs latency, streaming risks partial transfers. For (2), with <code>allow_longer</code>, M35-A succeeds with only the first 8 KiB mapped. For (3), the author's suggestion is to reject or skip consistently and record which — confirm the specification's treatment of zero-length Data Blocks.</p>
+  </details>
+  <p><strong>Extension.</strong> Add a metadata SGL for PSDT 10b: a single descriptor pointed to by MPTR, checked against the metadata length (Metadata SGL Length Invalid on mismatch).</p>
+
+  <h3>Advanced lab — PRP versus SGL descriptor traffic</h3>
+  <p><span class="badge safe">Safe lab</span> Python 3, standard library.</p>
+  <dl>
+    <dt>Objective</dt><dd>Count descriptor bytes, fetch requests, dependent rounds and data requests for four buffer shapes.</dd>
+    <dt>Prerequisites</dt><dd><a href="dd34.html#labs">Deep dive: PRP advanced lab</a>.</dd>
+    <dt>Setup</dt><dd>Save as <code>sgl_cost.py</code>.</dd>
+  </dl>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="sgl_cost.py"><code># sgl_cost.py - descriptor traffic for PRPs versus SGLs, per buffer shape.
+# Lab system: 4 KiB controller pages, MRRS 512 B. Fragments are IOVA ranges.
+PS, MRRS = 4096, 512
+
+def prp_possible(frags):
+    """PRPs need every fragment boundary inside the buffer to be a page edge."""
+    for i, (a, n) in enumerate(frags):
+        if i &gt; 0 and a % PS:
+            return False
+        if i &lt; len(frags) - 1 and (a + n) % PS:
+            return False
+    return True
+
+def reads(addr, length):
+    """Memory Read requests to fetch [addr, addr+length): MRRS and 4 KiB cuts."""
+    count, end = 0, addr + length
+    while addr &lt; end:
+        step = min(MRRS - addr % MRRS if addr % MRRS else MRRS,
+                   PS - addr % PS, end - addr)
+        addr += step
+        count += 1
+    return count
+
+def prp_cost(frags):
+    pages = sum(-(-((a % PS) + n) // PS) for a, n in frags)
+    entries = max(pages - 1, 0) if pages &gt; 2 else 0
+    list_bytes = 8 * entries
+    # list at a page-aligned pool address: one segment per 511 entries
+    rounds = -(-entries // 511) if entries else 0
+    return pages, list_bytes, reads(0, list_bytes) if list_bytes else 0, rounds
+
+def sgl_cost(frags, window=None):
+    d = len(frags)
+    if d == 1:
+        return d, 0, 0, 0            # one Data Block, inside the SQE
+    seg_bytes = 16 * d                # chained: 255 data + 1 chain per 4 KiB
+    segs = -(-d // 255) if d &gt; 256 else 1
+    seg_bytes += 16 * (segs - 1)
+    fetch_reqs = reads(0, seg_bytes)
+    rounds = segs if window is None else -(-seg_bytes // window)
+    return d, seg_bytes, fetch_reqs, rounds
+
+def data_cost(frags):
+    edges = sum((a % 4 != 0) + ((a + n) % 4 != 0) for a, n in frags)
+    return sum(reads(a, n) for a, n in frags), edges
+
+SHAPES = {
+    "128 KiB, one IOVA range": [(0x200800000, 131072)],
+    "128 KiB, 32 scattered pages": [(0x200800000 + i * 0x10000, 4096)
+                                    for i in range(32)],
+    "128 KiB, 256 x 512 B pieces": [(0x200800000 + i * 0x1000, 512)
+                                    for i in range(256)],
+    "8 KiB, 3 byte-aligned pieces": [(0x200900003, 1021), (0x200910000, 3000),
+                                     (0x200920101, 4171)],
+}
+
+print("%-30s %-28s %-36s %s" % ("shape", "PRP: pages/list B/reqs/dep",
+                                "SGL: descs/seg B/reqs/dep (lazy 256)",
+                                "data MRds, odd edges"))
+for name, frags in SHAPES.items():
+    if prp_possible(frags):
+        p = "%d / %d / %d / %d" % prp_cost(frags)
+    else:
+        p = "not describable"
+    d, sb, fr, rd = sgl_cost(frags)
+    lazy = sgl_cost(frags, window=256)[3]
+    s = "%d / %d / %d / %d (%d)" % (d, sb, fr, rd, lazy)
+    mrd, odd = data_cost(frags)
+    print("%-30s %-28s %-36s %d, %d" % (name, p, s, mrd, odd))</code></pre>
+  <dl>
+    <dt>Procedure</dt><dd>(1) Run it. (2) Change the 256 × 512 B shape to 600 × 512 B (beyond one MDTS on the lab system, but useful for chaining) and read the chain count. (3) Add a shape of 32 pages where the IOMMU merged pairs (16 × 8 KiB).</dd>
+    <dt>Observations</dt><dd>Where do SGLs win, lose, or offer the only option?</dd>
+    <dt>Questions</dt><dd>(a) Why does the one-range shape still need a 248-byte PRP list? (b) Why does the scattered-pages shape cost more descriptor bytes as an SGL? (c) What do "odd edges" mean on the link?</dd>
+    <dt>Expected reasoning</dt><dd>PRPs scale with pages; SGLs scale with fragments.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>Output: one range — PRP 32 pages, 248 B list, one fetch; SGL one Data Block in the SQE, no fetch. Scattered pages — PRP 248 B; SGL 32 descriptors, 512 B (two rounds with a 256 B window). 256 × 512 B — PRP impossible; SGL 4,096 B in 8 MRds, one round eagerly or 16 with a 256 B window (Trace M35-S). Three byte-aligned pieces — PRP impossible; SGL 48 B; 17 data MRds and 2 unaligned edges. (a) PRPs cannot express contiguity beyond a page. (b) 16 bytes per fragment versus 8 per page. (c) Requests whose first or last dword uses partial byte enables. For (2) the model chains every 255 data descriptors: 3 segments, 3 dependent rounds. For (3) 16 descriptors, 256 B, one window.</p>
+  </details>
+  <p><strong>Extension.</strong> Add a time model like <code>prp_fetch.py</code> with a per-descriptor processing cost and find the fragment count at which SGLs lose to PRPs for scattered 4 KiB pages.</p>
+
+  <h3>Senior forensic lab — latency regression after an IOMMU change</h3>
+  <p><span class="badge safe">Safe lab</span> Evidence analysis.</p>
+  <dl>
+    <dt>Objective</dt><dd>Attribute a performance regression across host policy, IOMMU and controller.</dd>
+    <dt>Prerequisites</dt><dd>This module.</dd>
+    <dt>Setup (evidence pack, synthetic)</dt><dd>
+      <ul>
+        <li>A fleet switched its servers from IOMMU passthrough to translated mode for security. On SSD model Q only, 128 KiB direct-I/O read latency rose from 180 µs to 260 µs at queue depth 1; 4 KiB reads did not change. Another SSD model improved slightly.</li>
+        <li>Model Q reports SGLS 01b. <code>sgl_threshold</code> is 32768.</li>
+        <li>Captures: before the change, 128 KiB reads had PSDT 00b with a 248-byte PRP list. After, PSDT 01b with SGL1 = a single Data Block of 131,072 B. After the SQE fetch, the controller takes 78 µs longer before the first data MWr; the media read time reported by vendor telemetry is unchanged.</li>
+        <li>Setting <code>sgl_threshold=0</code> on a test machine restores 180 µs.</li>
+      </ul></dd>
+    <dt>Procedure</dt><dd>Explain the chain of causes, the first abnormal event, owner, fix and test.</dd>
+    <dt>Observations</dt><dd>What changed in the requests, and what did not change in the media?</dd>
+    <dt>Questions</dt><dd>(1) Why did enabling translation make the driver choose SGLs? (2) Why are 4 KiB reads unaffected? (3) Who should fix what?</dd>
+    <dt>Expected reasoning</dt><dd>Host policy changed the descriptor type; the controller's SGL path is the slow element.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>(1) In translated mode, the DMA mapping merged 32 scattered pages into one contiguous IOVA range, so the request had one segment of 128 KiB; average segment size crossed the threshold and the driver chose SGLs. (2) A 4 KiB request is a single segment of 4 KiB, below the threshold: still PRPs. First abnormal event: the 78 µs gap between SQE fetch and first data on SGL commands with unchanged media time — the controller's SGL path is slow even for one descriptor (for example a firmware walk or expansion into page entries). Owner: controller vendor (performance defect, not a protocol violation); immediate host workaround: per-controller policy (<code>sgl_threshold=0</code> or a quirk entry) for model Q. Test: latency matrix PSDT 00b versus 01b per size, under both IOMMU modes, added to qualification. Confidence: high for attribution; the internal cause in the controller is an inference.</p>
+  </details>
+  <p><strong>Extension.</strong> The security team asks to keep translated mode. Write the fleet change: which knob, scoped how, with what monitoring.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <p>Six patterns, complementing Cases 7–8 of <a href="ch38.html">Chapter 38</a> and the short-SGL trace in <a href="ch37.html#trace">Chapter 37</a>.</p>
+
+  <h3>Invalid SGL Segment Descriptor only on large I/O</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Writes above a certain fragment count fail; smaller ones succeed (Trace M35-F).</dd>
+    <dt>Possible causes</dt><dd>SGL1 typed as Last Segment while the target chains; chain descriptor not in the last slot; segment length not a multiple of 16.</dd>
+    <dt>Evidence</dt><dd>SGL1 byte 15; segment contents; position of chain descriptors.</dd>
+    <dt>First check</dt><dd>Does any segment reached through a Last Segment descriptor contain a chain descriptor?</dd>
+    <dt>Second check</dt><dd>Are chain descriptors only in final slots?</dd>
+    <dt>Disambiguating experiment</dt><dd>Sweep fragment counts across segment-pool sizes (15, 16, 17, 255, 256, 257).</dd>
+    <dt>Likely conclusion</dt><dd>Builder type selection.</dd>
+    <dt>Confidence</dt><dd>High.</dd>
+  </dl>
+
+  <h3>Data SGL Length Invalid after enabling protection information</h3>
+  <dl>
+    <dt>Symptom</dt><dd>After formatting with 8 bytes of metadata per block in extended-LBA format, every SGL I/O fails with Data SGL Length Invalid; PRP I/O seems fine.</dd>
+    <dt>Possible causes</dt><dd>Interleaved metadata adds to the transfer length; the builder sums only data bytes. PRP I/O "works" because PRPs have no length to compare — the controller may be writing past the buffer.</dd>
+    <dt>Evidence</dt><dd>Format (LBA size, metadata size, extended or separate), SGL sum, expected (NLB + 1) × (data + metadata).</dd>
+    <dt>First check</dt><dd>Compute the expected length including metadata.</dd>
+    <dt>Second check</dt><dd>For PRP I/O, does data extend beyond the buffer (IOMMU faults, guard pages)?</dd>
+    <dt>Disambiguating experiment</dt><dd>Repeat with separate metadata buffers (MPTR); SGL errors should vanish.</dd>
+    <dt>Likely conclusion</dt><dd>Host length computation ignores interleaved metadata; the PRP path hides a real overrun.</dd>
+    <dt>Confidence</dt><dd>High.</dd>
+  </dl>
+
+  <h3>Invalid Number of SGL Descriptors with vectored I/O</h3>
+  <dl>
+    <dt>Symptom</dt><dd>An application using many small buffers fails with Invalid Number of SGL Descriptors (0Eh, confirm) on one controller.</dd>
+    <dt>Possible causes</dt><dd>Controller limit on descriptors per segment or per command (implementation-dependent); empty segment.</dd>
+    <dt>Evidence</dt><dd>Descriptor counts per segment; vendor documentation; any Identify limit (confirm which fields apply on PCIe).</dd>
+    <dt>First check</dt><dd>Largest segment size in failing commands.</dd>
+    <dt>Second check</dt><dd>Any zero-length segment?</dd>
+    <dt>Disambiguating experiment</dt><dd>Split segments into smaller chained segments with the same total; if success, it is a per-segment limit.</dd>
+    <dt>Likely conclusion</dt><dd>Controller limit; host should cap segment size or merge fragments.</dd>
+    <dt>Confidence</dt><dd>Medium.</dd>
+  </dl>
+
+  <h3>SGL Descriptor Type Invalid from a read-ahead feature</h3>
+  <dl>
+    <dt>Symptom</dt><dd>A new driver feature that skips unwanted blocks with Bit Buckets fails on some drives and on writes generally.</dd>
+    <dt>Possible causes</dt><dd>SGLS bit 16 clear; Bit Bucket used in a Write; a type from a fabrics transport used on PCIe.</dd>
+    <dt>Evidence</dt><dd>SGLS; command direction; descriptor types used.</dd>
+    <dt>First check</dt><dd>SGLS bit 16.</dd>
+    <dt>Second check</dt><dd>Direction of failing commands.</dd>
+    <dt>Disambiguating experiment</dt><dd>Replace the Bit Bucket by a Data Block into a scratch buffer.</dd>
+    <dt>Likely conclusion</dt><dd>Unadvertised or misused descriptor type.</dd>
+    <dt>Confidence</dt><dd>High.</dd>
+  </dl>
+
+  <h3>Corruption at the edges of byte-aligned fragments</h3>
+  <dl>
+    <dt>Symptom</dt><dd>On a controller reporting SGLS 01b, reads into odd-aligned network buffers occasionally have wrong bytes at fragment edges; the middle is correct.</dd>
+    <dt>Possible causes</dt><dd>Controller partial-byte-enable bug on MWr edges; host fragment length off by one; root-complex handling of partial writes (rare).</dd>
+    <dt>Evidence</dt><dd>Captured MWr byte enables and lengths at edges; descriptor addresses and lengths; which bytes differ.</dd>
+    <dt>First check</dt><dd>Do the MWrs' First/Last DW Byte Enables match the fragment edges exactly?</dd>
+    <dt>Second check</dt><dd>Do fragment lengths in the SGL sum correctly and match the application's buffers?</dd>
+    <dt>Disambiguating experiment</dt><dd>Sweep start offsets 0–7 and lengths n, n ± 1..3 with a pattern oracle; capture any failing offset.</dd>
+    <dt>Likely conclusion</dt><dd>The capture assigns it: wrong byte enables → controller; correct TLPs but wrong lengths → host.</dd>
+    <dt>Confidence</dt><dd>High once captured.</dd>
+  </dl>
+
+  <h3>Metadata SGL Length Invalid with PSDT 10b</h3>
+  <dl>
+    <dt>Symptom</dt><dd>A driver moving to separate metadata buffers described by SGL gets Metadata SGL Length Invalid (10h, confirm).</dd>
+    <dt>Possible causes</dt><dd>Metadata length computed with the wrong per-block size; MPTR points to a segment with several descriptors where one is expected; PSDT 01b used with an MPTR that is an SGL.</dd>
+    <dt>Evidence</dt><dd>PSDT, MPTR target contents, format's metadata size.</dd>
+    <dt>First check</dt><dd>Metadata descriptor length versus (NLB + 1) × metadata size.</dd>
+    <dt>Second check</dt><dd>PSDT value and the number of descriptors at MPTR.</dd>
+    <dt>Disambiguating experiment</dt><dd>Use PSDT 01b with a contiguous metadata buffer.</dd>
+    <dt>Likely conclusion</dt><dd>Metadata length or structure error.</dd>
+    <dt>Confidence</dt><dd>Medium to high.</dd>
+  </dl>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>Which byte identifies an SGL descriptor's type?</p><details class="answer"><summary>Model answer</summary><p>Byte 15, bits 7:4 (type) and 3:0 (sub type).</p></details></li>
+    <li><p>Where is the first descriptor?</p><details class="answer"><summary>Model answer</summary><p>In the SQE's DPTR (SGL1), with PSDT 01b or 10b.</p></details></li>
+    <li><p>What does a Bit Bucket do?</p><details class="answer"><summary>Model answer</summary><p>Counts toward the transfer length but discards those read bytes; no data TLPs.</p></details></li>
+    <li><p>Can admin commands on PCIe use SGLs?</p><details class="answer"><summary>Model answer</summary><p>No; they use PRPs.</p></details></li>
+    <li><p>How does a host know SGLs are supported?</p><details class="answer"><summary>Model answer</summary><p>SGLS bits 1:0 in Identify Controller: 00b none, 01b byte, 10b dword granular.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>Why have both Segment and Last Segment types?</p><details class="answer"><summary>Model answer</summary><p>The controller knows when to stop chaining, can size the fetch, and can detect chains in the last segment as errors.</p></details></li>
+    <li><p>Must segments be page aligned?</p><details class="answer"><summary>Model answer</summary><p>No page requirement; length is a multiple of 16; check the specification's exact alignment rule for segment addresses.</p></details></li>
+    <li><p>What does SGL1 = Data Block mean?</p><details class="answer"><summary>Model answer</summary><p>The whole transfer is one contiguous range; no segment fetch.</p></details></li>
+    <li><p>Why can a buffer with a 4 KiB hole be read with an SGL but not with PRPs?</p><details class="answer"><summary>Model answer</summary><p>A Bit Bucket covers the hole, and Data Blocks may start at any (allowed) offset.</p></details></li>
+    <li><p>Does a Bit Bucket save media reads?</p><details class="answer"><summary>Model answer</summary><p>No; it saves link and host-memory bandwidth.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>How can a correct SGL be slow?</p><details class="answer"><summary>Model answer</summary><p>Many small fragments with a small descriptor window cause dependent round trips; firmware walks add per-descriptor cost.</p></details></li>
+    <li><p>Why does SGL validation order matter?</p><details class="answer"><summary>Model answer</summary><p>Streaming walkers may move data before detecting a later error; buffer contents become undefined.</p></details></li>
+    <li><p>How do you predict segment fetches from a trace?</p><details class="answer"><summary>Model answer</summary><p>Each fetch equals the pointing descriptor's address and length (split by strategy).</p></details></li>
+    <li><p>What does an SGL longer than the transfer imply?</p><details class="answer"><summary>Model answer</summary><p>Legal only with the SGLS capability; otherwise a host bug, possibly masked by a non-checking controller.</p></details></li>
+    <li><p>How does the IOMMU affect SGL use?</p><details class="answer"><summary>Model answer</summary><p>Merging pages into contiguous IOVAs turns many fragments into one Data Block and can change the driver's PRP/SGL choice.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>Design an SGL validation matrix.</p><details class="answer"><summary>Model answer</summary><p>Every descriptor type and sub type; chain positions; Last Segment promises; segment lengths 0, 16, non-multiples; descriptor counts at pool and controller limits; sums equal, short and long (with and without the capability); Bit Buckets in reads and writes; byte offsets 0–7 under 01b and 10b; metadata SGLs; validation timing; latency per fragment count.</p></details></li>
+    <li><p>How should a driver choose PRPs or SGLs?</p><details class="answer"><summary>Model answer</summary><p>By measured per-controller cost, capability and buffer shape; default threshold plus quirks for slow SGL paths.</p></details></li>
+    <li><p>Who owns a slow but legal SGL path?</p><details class="answer"><summary>Model answer</summary><p>The vendor as a performance defect; the host mitigates with policy until fixed.</p></details></li>
+    <li><p>What should a strict controller check, and in what order?</p><details class="answer"><summary>Model answer</summary><p>PSDT and support, SGL1 type, each segment's length and fetch result, descriptor positions and types, alignment mode, Bit Bucket direction, total length — before data moves if latency allows.</p></details></li>
+    <li><p>Why is fabrics experience relevant to PCIe SGL debugging?</p><details class="answer"><summary>Model answer</summary><p>Fabrics carry SGLs in every command; the descriptor reading skill and the length rules are the same.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>Byte 15 of SGL1 is 0x20. SGL1 is a</p>
+      <ul class="options" data-answer="3"><li>Data Block</li><li>Bit Bucket</li><li>Segment</li><li>Last Segment</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Type 2h.</p></details>
+    </li>
+    <li>
+      <p>A segment reached through a Last Segment descriptor may contain</p>
+      <ul class="options" data-answer="2"><li>A Segment descriptor in its last slot</li><li>Data Blocks and Bit Buckets only</li><li>A Last Segment descriptor in its last slot</li><li>Any descriptor type</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The last segment contains no chain descriptors.</p></details>
+    </li>
+    <li>
+      <p>A 16 KiB Read with a 4 KiB Bit Bucket produces how many 256 B data MWrs?</p>
+      <ul class="options" data-answer="3"><li>64</li><li>16</li><li>48</li><li>32</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>12 KiB of host data ÷ 256 B.</p></details>
+    </li>
+    <li>
+      <p>A segment descriptor has length 40. The controller should</p>
+      <ul class="options" data-answer="4"><li>Fetch 48 bytes</li><li>Fetch 32 bytes</li><li>Ignore the last 8</li><li>Reject the SGL</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Segment lengths are multiples of 16; an invalid segment descriptor.</p></details>
+    </li>
+    <li>
+      <p>Which buffer gains most from an SGL over PRPs?</p>
+      <ul class="options" data-answer="1"><li>128 KiB in one contiguous IOVA range</li><li>32 scattered page-aligned 4 KiB pages</li><li>One 4 KiB page</li><li>An admin Identify buffer</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>One Data Block in the SQE replaces a 31-entry list.</p></details>
+    </li>
+    <li>
+      <p>SGLS bits 1:0 = 10b. Which Data Block is acceptable?</p>
+      <ul class="options" data-answer="2"><li>0x2_0000_0002 / 512</li><li>0x2_0000_0004 / 508</li><li>0x2_0000_0004 / 511</li><li>0x2_0000_0001 / 4</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Address and length must be dword multiples.</p></details>
+    </li>
+    <li><p>Why is the first abnormal event in Trace M35-F row 5 rather than the CQE?</p><details class="answer"><summary>Model answer</summary><p>The segment contents already violate the Last Segment promise; the CQE is the consequence.</p></details></li>
+    <li><p>Name two explanations for Trace M35-A and the evidence that separates them.</p><details class="answer"><summary>Model answer</summary><p>Permitted longer SGL (SGLS capability set, intentional host design) versus host length bug masked by a non-checking controller (capability clear).</p></details></li>
+    <li><p>Why did 4 KiB reads not change in the senior lab?</p><details class="answer"><summary>Model answer</summary><p>Their average segment size stayed below the threshold, so they kept using PRPs.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <ol>
+    <li><p><strong>To a child:</strong> how notes with "walk past" and "final note" help the treasure hunter.</p>
+      <details class="answer"><summary>Model explanation</summary><p>Notes say how many shells to pick up or skip, and where the next note is. "Final note" tells her she can stop looking for more mailboxes. If the final note points to another mailbox, the instructions are broken and she refuses.</p></details></li>
+    <li><p><strong>To a junior engineer:</strong> how to check an SGL from a capture.</p>
+      <details class="answer"><summary>Model explanation</summary><p>Check PSDT and SGLS; decode SGL1 from byte 15; predict each segment fetch from its pointing descriptor; parse descriptors in order, checking chain positions and the last-segment rule; sum Data Blocks and Bit Buckets against (NLB + 1) × block size including interleaved metadata; partition Data Blocks into expected TLPs, with no TLPs for holes. The first divergence is the first abnormal event.</p></details></li>
+    <li><p><strong>To a senior engineer:</strong> how to decide between PRPs and SGLs for a product.</p>
+      <details class="answer"><summary>Model explanation</summary><p>SGLs describe fragments, PRPs describe pages: SGLs win for contiguous IOVA ranges and byte-granular or holey buffers, PRPs for scattered pages on controllers with fast PRP paths. Measure per controller (latency per fragment count, per PSDT, under both IOMMU modes), use a threshold with per-device overrides, keep one length source for both builders, and validate with a strict reference walker so that host bugs are not masked by lenient controllers.</p></details></li>
+  </ol>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain the SGL walk, the last-segment promise and the length rule, and how validation timing affects partial transfers;</li>
+      <li>diagram a chained SGL with a Bit Bucket and the fetches and data TLPs it causes;</li>
+      <li>identify descriptor-fetch strategy, malformed chains and length ambiguities in a trace;</li>
+      <li>debug the six patterns above and Chapter 38's SGL cases;</li>
+      <li>distinguish SGLs from PRPs (<a href="dd34.html">Deep dive: PRP</a>), from IOMMU translation (<a href="dd02.html">Deep dive: DMA and Address Translation</a>), and from fabrics data transport (<a href="ch66.html">Chapter 66</a>);</li>
+      <li>cite the NVMe Base Specification 2.4 (SGL, SGLS, status values) and NVMe over PCIe Transport 1.4 for each rule.</li>
+    </ul>
+  </aside>
+  <p>Next: <a href="dd36.html">Deep dive: DMA with NVMe</a>.</p>
+</section>
