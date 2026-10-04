@@ -42,4 +42,4 @@ and MSI-X writes (0xFEE0_xxxx) are **MWr32**. Host-memory queue and data address
 ## Canonical register values (from ch24 — reuse these)
 CAP = 0x0040_0830_1401_0FFF (MQES 4096 entries, CQR 1, TO 10 s, DSTRD 0, NSSRS 1, CSS bits 37 and 43, MPSMIN 4 KiB, MPSMAX 64 KiB);
 VS = 0x0002_0000 (2.0.0); CC = 0x0046_0061; CSTS = 0x1; AQA = 0x001F_001F; Identify Controller NN = 32, MDTS = 5 (128 KiB);
-MSI-X vector 1: address 0xFEE0_1000, data 0x41. SQ2/CQ2 bases 0x1_2342_0000 / 0x1_2343_0000.
+MSI-X vector 0 (admin): address 0xFEE0_0000, data 0x40. Vector k (1–32): address 0xFEE0_k000, data 0x40 + k; so vector 1 is 0xFEE0_1000, data 0x41. SQ2/CQ2 bases 0x1_2342_0000 / 0x1_2343_0000.
