@@ -1,0 +1,431 @@
+<section class="part" id="p6-part-xvii"><div class="part-num">PART XVII</div><h1>Advanced PCIe</h1><p class="part-intro">You already know what a Transaction Layer Packet (TLP) is, how a link trains, and how an NVMe command turns into memory reads and writes. This part opens the hood on the rules that make that traffic <em>correct</em> under stress: who may overtake whom (ordering), how answers to reads come back (completion rules), how a sender knows the receiver has room (flow-control credits), how a 32 GT/s or 64 GT/s link makes its electrical eye open (equalization), how errors are logged and contained (AER and DPC), and how one physical SSD pretends to be many (SR-IOV). Every chapter ends with the same question a senior engineer always asks: <em>what would this look like in a trace, and what would I suspect when it breaks?</em></p></section>
+
+<section class="chapter" id="p6-ch51-ordering" data-part="PART XVII — ADVANCED PCIe">
+<h2><span class="num">51</span> PCIe Ordering — Who May Overtake Whom</h2>
+
+<div class="callout spec"><div class="callout-title">📘 Specification baseline</div>
+<p><b>DOCUMENT:</b> PCI Express Base Specification (PCI-SIG), Transaction Ordering section and its ordering table. <b>REVISION:</b> the rules discussed here have been stable in spirit since PCIe 1.x; Relaxed Ordering (RO) comes from PCI-X heritage, ID-Based Ordering (IDO) was added in the 2.x era, and FLIT-mode (6.0+) changes the packet framing but not the producer/consumer intent. <b>STATUS:</b> normative. <b>OLDER VERSIONS THAT MAY DIFFER:</b> the exact cell entries of the ordering table (especially the “Yes / No / Y/N” sub-cases for RO and IDO) were refined across revisions — read the table in the revision your silicon claims. <b>SOURCE:</b> PCI-SIG members’ specification library. <span class="tag version">version</span></p></div>
+
+<h3>51.1 Why this chapter exists</h3>
+<p>An NVMe SSD finishes a 4 KiB read by doing three things on the wire, all of them posted Memory Write (MWr) TLPs going upstream: it writes the data into the host buffer, it writes a 16-byte Completion Queue Entry (CQE) into the host Completion Queue (CQ), and it writes an MSI-X (Message Signaled Interrupt – Extended) message. Software trusts that when it sees the CQE’s phase tag flip, the data is already in memory. Nothing in NVMe itself enforces that. <b>PCIe ordering rules do.</b> If you do not understand ordering you cannot explain the most frightening class of storage bug: the one where the completion arrives, the checksum fails, and five seconds later the same buffer is correct.</p>
+
+<ul class="objectives">
+<li><b>Beginner:</b> name the three ordering classes (Posted, Non-Posted, Completion) and say which TLPs belong to each.</li>
+<li><b>Intermediate:</b> state the producer/consumer guarantee and show why “data write, then CQE write, then MSI-X write” is safe by default.</li>
+<li><b>Advanced:</b> explain Relaxed Ordering (Attr[1]), ID-Based Ordering (Attr[2]) and No Snoop (Attr[0]) and which NVMe writes may safely use them.</li>
+<li><b>Senior:</b> reason about deadlock avoidance (why posted writes must be able to pass non-posted requests) and about ordering across switches and the Root Complex.</li>
+<li><b>Trace analysis:</b> given a synthetic trace, identify whether a CQE could have become visible before its data.</li>
+<li><b>Debugging / validation:</b> design an experiment that distinguishes an ordering violation from a host-side cache or driver bug.</li>
+</ul>
+
+<p><b>Prerequisites.</b> TLP types and headers (MRd, MWr, CplD — see glossary <a class="gl" href="#g-tlp">TLP</a>, <a class="gl" href="#g-mwr">MWr</a>, <a class="gl" href="#g-mrd">MRd</a>, <a class="gl" href="#g-cpld">CplD</a>); the NVMe completion path (CQE, phase tag, <a class="gl" href="#g-msix">MSI-X</a>). Flow control is covered next door in <a href="#p6-ch53-flow-control">Chapter 53</a>; you need it to understand why ordering and deadlock are linked.</p>
+
+<h3>51.2 Story and analogy</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div>
+<p>Imagine a one-lane mountain road from the library (the SSD) to the school (the host). The librarian sends a truck full of books (the data), then a postcard saying “your books arrived” (the CQE), then rings the school bell (the interrupt). Because the road is one lane and nobody overtakes, by the time the postcard arrives the books are already on the teacher’s desk. Now imagine the road gets a passing lane, and the postcard truck is small and fast. If it is allowed to overtake, the teacher reads “your books arrived”, looks at the desk, and finds… nothing. Ordering rules are the traffic law that says which trucks may use the passing lane.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div>
+<p>Real PCIe has several independent “lanes” per direction in the logical sense (separate buffers for Posted, Non-Posted and Completion traffic, per Virtual Channel), the rules differ by <em>pair</em> of packet classes, and some overtaking is <em>mandatory</em> (to avoid deadlock), not merely permitted. Also, “arrived” really means “became visible to a reader of that memory”, which involves the Root Complex and CPU cache coherency, not just the wire.</p></div>
+
+<h3>51.3 Beginner view — three classes of traffic</h3>
+<div class="table-wrap"><table><thead><tr><th>Class</th><th>Examples</th><th>Needs an answer?</th><th>NVMe example</th></tr></thead><tbody>
+<tr><td>Posted (P)</td><td>Memory Write (MWr), Messages (Msg/MsgD), MSI/MSI-X writes (which are MWr)</td><td>No — fire and forget</td><td>Doorbell write host→SSD; data/CQE/MSI-X writes SSD→host</td></tr>
+<tr><td>Non-Posted (NP)</td><td>Memory Read (MRd), I/O Read/Write, Configuration Read/Write (CfgRd/CfgWr), AtomicOps</td><td>Yes — a Completion must return</td><td>SSD reading an SQE or PRP list or write-data from host memory; host reading a BAR register</td></tr>
+<tr><td>Completion (Cpl)</td><td>Cpl (no data), CplD (with data), locked variants</td><td>It <em>is</em> the answer</td><td>Root Complex returning SQE bytes to the SSD; SSD returning CSTS register value to the CPU</td></tr>
+</tbody></table></div>
+<p><span class="tag verified">verified</span> These three classes and their membership are defined by the PCIe Base Specification; each Virtual Channel keeps them in separate flow-control buffers (<a href="#p6-ch53-flow-control">Chapter 53</a>).</p>
+
+<h3>51.4 Engineering view — the rules that matter</h3>
+<p>The ordering table in the PCIe Base Specification is a grid of “row = later TLP, column = earlier TLP, may the later one pass the earlier one?”. Each cell says <em>No</em> (must not pass), <em>Yes</em> (must be allowed to pass — required for deadlock freedom) or <em>Y/N</em> (permitted, not required). You do not need to memorise every cell. You need the five rules that drive real bugs:</p>
+<ol>
+<li><b>Posted must not pass Posted</b> (default, Relaxed Ordering clear). A later MWr may not overtake an earlier MWr in the same direction. <span class="tag verified">verified</span> This is what makes “data, then CQE, then MSI-X” safe.</li>
+<li><b>Posted must be able to pass Non-Posted.</b> A write must never get stuck behind a read that cannot complete. <span class="tag verified">verified</span> This is the deadlock-avoidance rule: if a read’s completion depends on a write getting through (for example, through a bridge), blocking writes behind reads could lock the fabric.</li>
+<li><b>Non-Posted must not pass Posted</b> (default). A read issued after a write must not overtake it, so a read “flushes” earlier writes in the same direction. <span class="tag verified">verified</span> Drivers rely on this: a read of a device register after an MMIO write guarantees the write has reached the device (the classic “posted write flush” pattern).</li>
+<li><b>Completion must not pass Posted</b> (default). A read completion travelling in the same direction as earlier writes may not overtake them. <span class="tag verified">verified</span> This is the producer/consumer guarantee for “write data, then let the consumer read a flag”.</li>
+<li><b>Completions for the same request stay in address order.</b> When a read is answered by several CplD TLPs (split at Read Completion Boundaries), they return in increasing address order. <span class="tag verified">verified</span> (Details in <a href="#p6-ch52-completions">Chapter 52</a>.)</li>
+</ol>
+
+<figure class="diagram"><svg viewBox="0 0 800 300" role="img" aria-label="Upstream posted queue from SSD to host carrying data write, CQE write and MSI-X write in order">
+<rect class="box" x="20" y="100" width="150" height="90" rx="8"/><text class="lbl" x="95" y="140" text-anchor="middle">NVMe SSD</text><text class="lbl small" x="95" y="162" text-anchor="middle">(Endpoint)</text>
+<rect class="box" x="630" y="100" width="150" height="90" rx="8"/><text class="lbl" x="705" y="140" text-anchor="middle">Root Complex</text><text class="lbl small" x="705" y="162" text-anchor="middle">→ host memory</text>
+<rect class="box alt" x="200" y="40" width="400" height="60" rx="6"/><text class="lbl small" x="400" y="62" text-anchor="middle">Posted buffer (upstream), FIFO unless RO set</text>
+<rect class="box accent" x="215" y="70" width="110" height="24" rx="4"/><text class="lbl small" x="270" y="87" text-anchor="middle">③ MSI-X MWr</text>
+<rect class="box accent" x="340" y="70" width="110" height="24" rx="4"/><text class="lbl small" x="395" y="87" text-anchor="middle">② CQE MWr</text>
+<rect class="box accent" x="465" y="70" width="120" height="24" rx="4"/><text class="lbl small" x="525" y="87" text-anchor="middle">① Data MWr×N</text>
+<rect class="box alt" x="200" y="130" width="400" height="40" rx="6"/><text class="lbl small" x="400" y="155" text-anchor="middle">Non-Posted buffer: MRd (fetch SQE / PRP list / write data)</text>
+<rect class="box alt" x="200" y="200" width="400" height="40" rx="6"/><text class="lbl small" x="400" y="225" text-anchor="middle">Completion buffer (downstream direction carries CplD back)</text>
+<path class="ln" d="M170 120 L200 80" marker-end="url(#arrow)"/><path class="ln" d="M600 80 L630 120" marker-end="url(#arrow)"/>
+<path class="ln" d="M170 150 L200 150" marker-end="url(#arrow)"/><path class="ln" d="M600 150 L630 150" marker-end="url(#arrow)"/>
+<path class="ln" d="M630 220 L600 220" marker-end="url(#arrow)"/><path class="ln" d="M200 220 L170 180" marker-end="url(#arrow)"/>
+<text class="lbl small" x="400" y="275" text-anchor="middle">Rule 1: ② may not pass ① and ③ may not pass ② (no RO). Rule 2: P may pass NP.</text>
+</svg><figcaption>Figure 51.1 — Conceptual ordering buffers for one Virtual Channel. Exact buffer organisation is implementation-dependent; the ordering <em>semantics</em> are normative.</figcaption></figure>
+
+<h3>51.5 The attribute bits</h3>
+<div class="table-wrap"><table><thead><tr><th>Attribute</th><th>Header bit</th><th>Meaning when set</th><th>Enabled by</th><th>Safe for NVMe?</th></tr></thead><tbody>
+<tr><td>No Snoop (NS)</td><td>Attr[0]</td><td>Hardware need not snoop CPU caches for this transaction; software guarantees coherency</td><td>Device Control register “Enable No Snoop” bit</td><td><span class="tag impl">impl</span> Only if the host platform and driver manage cache coherency for those buffers. Linux NVMe does not ask for it; devices should not set it unless enabled.</td></tr>
+<tr><td>Relaxed Ordering (RO)</td><td>Attr[1]</td><td>This TLP may pass earlier Posted TLPs (and a completion with RO may pass earlier writes)</td><td>Device Control register “Enable Relaxed Ordering” bit</td><td><span class="tag derived">derived</span> Safe on <em>data</em> writes, because they may reorder among themselves. <b>Unsafe on the CQE write</b>, because a CQE with RO set could pass its own data. The MSI-X write must not pass the CQE either.</td></tr>
+<tr><td>ID-Based Ordering (IDO)</td><td>Attr[2] (header bit placement version-dependent)</td><td>Ordering only enforced between TLPs from the same Requester/Completer ID</td><td>Device Control 2 “IDO Request Enable” / “IDO Completion Enable”</td><td><span class="tag impl">impl</span> Useful in switches with many functions (e.g. SR-IOV VFs) so one function’s traffic is not blocked behind another’s.</td></tr>
+</tbody></table></div>
+<div class="callout warn"><div class="callout-title">⚠️ Warning — the RO trap</div>
+<p>Some platforms have had errata where Relaxed Ordering was unsafe or slow in the Root Complex, and operating systems have quirk lists that clear the Enable Relaxed Ordering bit for devices below specific root ports. <span class="tag impl">impl</span> Never conclude “the SSD violated ordering” until you have checked (a) the Device Control register value the OS actually programmed (<code>lspci -vvv</code> shows <code>RlxdOrd+/-</code> and <code>NoSnoop+/-</code> under DevCtl), and (b) the Attr bits in the captured TLP header.</p></div>
+
+<h3>51.6 Hardware view</h3>
+<div class="callout hw"><div class="callout-title">🔧 Hardware</div>
+<p>Inside the SSD controller, the DMA engine that streams read data and the completion engine that posts CQEs are often separate blocks. A correct design either funnels both into a single in-order posted queue toward the PCIe core, or tags the data writes with RO and keeps the CQE strictly ordered behind them. Inside the Root Complex, writes may be committed to memory through multiple paths (different memory controllers, different coherency agents). The Root Complex must still honour PCIe ordering for what a consumer can <em>observe</em>. <span class="tag impl">impl</span> How it does that (write-combining buffers, coherency fences) is not visible in a PCIe trace.</p></div>
+
+<h3>51.7 Protocol and trace view</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal 4 KiB read completion path (upstream, single VC, MPS = 256 B)</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Time (ns, relative)</th><th>Dir</th><th>TLP</th><th>Address</th><th>Len</th><th>Attr (NS/RO/IDO)</th><th>Note</th></tr></thead><tbody>
+<tr><td>1</td><td>0</td><td>↓</td><td>MWr</td><td>BAR0+1008h</td><td>1 DW</td><td>0/0/0</td><td>SQ1 tail doorbell</td></tr>
+<tr><td>2</td><td>610</td><td>↑</td><td>MRd</td><td>SQ1 slot 5</td><td>16 DW</td><td>0/0/0</td><td>Fetch 64-byte SQE</td></tr>
+<tr><td>3</td><td>1 020</td><td>↓</td><td>CplD</td><td>—</td><td>16 DW</td><td>0/0/0</td><td>SQE returned</td></tr>
+<tr><td>4–19</td><td>58 000–59 900</td><td>↑</td><td>MWr ×16</td><td>buffer+0 … +F00h</td><td>64 DW each</td><td>0/1/0</td><td>Data, RO set (permitted)</td></tr>
+<tr><td>20</td><td>60 050</td><td>↑</td><td>MWr</td><td>CQ1 slot 5</td><td>4 DW</td><td>0/0/0</td><td>CQE, RO clear — cannot pass 4–19</td></tr>
+<tr><td>21</td><td>60 120</td><td>↑</td><td>MWr</td><td>MSI-X address</td><td>1 DW</td><td>0/0/0</td><td>Interrupt</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: CQE marked Relaxed Ordering</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Time (ns)</th><th>Dir</th><th>TLP</th><th>Address</th><th>Attr (NS/RO/IDO)</th><th>Note</th></tr></thead><tbody>
+<tr><td>4–19</td><td>58 000–59 900</td><td>↑</td><td>MWr ×16</td><td>buffer+…</td><td>0/1/0</td><td>Data</td></tr>
+<tr class="first-bad"><td>20</td><td>60 050</td><td>↑</td><td>MWr</td><td>CQ1 slot 5</td><td>0/1/0</td><td>CQE with RO set — now permitted to pass data in the Root Complex</td></tr>
+<tr class="bad"><td>21</td><td>60 120</td><td>↑</td><td>MWr</td><td>MSI-X</td><td>0/1/0</td><td>Interrupt also RO</td></tr>
+<tr class="bad"><td>—</td><td>host</td><td>—</td><td>—</td><td>—</td><td>—</td><td>Application checksum mismatch, rare, load-dependent; re-read of buffer is correct</td></tr>
+</tbody></table></div></div>
+<div class="callout trace"><div class="callout-title">🔍 Reading the failed trace</div>
+<p>The wire order of TLPs 4–21 still looks perfect: the CQE was <em>transmitted</em> after the data. That is the trap. Ordering is about what the Root Complex is allowed to do after receipt. With RO set on the CQE write, the Root Complex may commit it to memory before the last data write is visible. An analyzer on the link cannot show you the inside of the Root Complex; it can only show you that the device <em>gave permission</em> to reorder. That is enough to file the bug. <span class="tag derived">derived</span></p></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: MMIO write flushed by read</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Dir</th><th>TLP</th><th>Address</th><th>Note</th></tr></thead><tbody>
+<tr><td>1</td><td>↓</td><td>MWr</td><td>BAR0+14h (CC)</td><td>Driver sets CC.EN = 0</td></tr>
+<tr><td>2</td><td>↓</td><td>MRd</td><td>BAR0+1Ch (CSTS)</td><td>Driver polls CSTS.RDY</td></tr>
+<tr><td>3</td><td>↑</td><td>CplD</td><td>—</td><td>CSTS.RDY = 1 (still ready)</td></tr>
+</tbody></table></div></div>
+<p>Is TLP 3 a bug? No. The read (NP) could not pass the write (P), so the device had received CC.EN = 0 before it answered — but the specification gives the controller time to transition CSTS.RDY to 0 (bounded by CAP.TO). Ordering guarantees <em>arrival</em>, not <em>completion of the side effect</em>. <span class="tag derived">derived</span></p>
+
+<h3>51.8 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code># Which ordering attributes may this function use? (read-only)
+sudo lspci -vvv -s 0000:3b:00.0 | grep -E 'DevCtl:|DevCtl2:|RlxdOrd|NoSnoop|IDO'
+# Walk the path to the root port: each bridge has its own DevCtl
+lspci -tv
+# Kernel quirks that disable RO appear in the boot log on some platforms
+journalctl -k | grep -i -E 'relaxed|ordering'</code></pre>
+<p><b>What this proves:</b> whether the function was <em>allowed</em> to set RO/NS/IDO. <b>What it cannot prove:</b> whether the device actually set the bits in a given TLP (you need a protocol analyzer), or how the Root Complex handled them.</p>
+
+<h3>51.9 Worked example — is this design safe?</h3>
+<p>A firmware engineer proposes: “To speed up completions, the CQE write engine will run on a separate PCIe virtual channel (VC1) from the data engine (VC0).” <b>Analysis:</b> ordering rules apply <em>within</em> a Virtual Channel (and traffic class mapping); there is no ordering between VCs. <span class="tag verified">verified</span> So the CQE on VC1 may become visible before data on VC0. The design is unsafe unless the device explicitly waits for data to be committed — which a posted write cannot report. <span class="tag derived">derived</span> The engineer would have to issue a zero-length or ordinary read after the data writes (a read completion cannot pass the writes) before sending the CQE, which costs latency. Most NVMe devices simply use one VC. <span class="tag impl">impl</span></p>
+
+<h3>51.10 Common mistakes</h3>
+<ul>
+<li>Believing wire order equals visibility order. It does only for the default (strong) ordering case.</li>
+<li>Assuming an MMIO write has taken effect when it returns to the CPU. Posted writes return immediately; use a read-back to flush.</li>
+<li>Assuming ordering holds across different Requester IDs when IDO is enabled.</li>
+<li>Blaming the SSD for a stale buffer when the driver forgot a DMA sync / memory barrier on a non-coherent platform.</li>
+<li>Forgetting that peer-to-peer traffic through a switch follows the same rules but different paths.</li>
+</ul>
+
+<h3>51.11 Debugging connection — five failure patterns</h3>
+<div class="table-wrap"><table><thead><tr><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Confidence</th></tr></thead><tbody>
+<tr><td>Rare data miscompare right after completion; data correct on re-read</td><td>CQE/MSI-X with RO; driver missing barrier; IOMMU/cache issue</td><td>DevCtl RO enable on device and bridges</td><td>Capture TLP Attr bits of CQE writes</td><td>Disable RO via OS quirk/setting (lab only) and rerun stress</td><td>Medium-high if Attr[1]=1 on CQE</td></tr>
+<tr><td>System hang under mixed peer-to-peer read/write</td><td>Posted traffic blocked behind non-posted in a non-compliant bridge</td><td>Is P blocked while NP outstanding? (analyzer)</td><td>Credit state for P vs NP</td><td>Stop peer reads; does hang disappear?</td><td>Medium</td></tr>
+<tr><td>Register value read back looks stale after write</td><td>Expected side-effect latency, not ordering</td><td>Spec timing for that register</td><td>Repeat read with delay</td><td>Poll with bounded timeout</td><td>High</td></tr>
+<tr><td>Interrupt arrives, CQ empty (phase not flipped)</td><td>MSI-X passed CQE (RO / different VC); spurious vector; shared vector</td><td>Attr of MSI-X write</td><td>Vector-to-CQ mapping</td><td>Count “empty” interrupts per vector</td><td>Medium</td></tr>
+<tr><td>Throughput drops when RO disabled</td><td>Root Complex serialises writes</td><td>Compare with RO on</td><td>Platform errata</td><td>A/B test on same link</td><td>Implementation-dependent</td></tr>
+</tbody></table></div>
+
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div>
+<p>Ordering bugs are statistical. They hide at low queue depth and appear under exactly the conditions that make the Root Complex reorder: many outstanding writes, multiple memory channels, remote NUMA memory. When you see “rare, load-dependent, self-healing corruption”, put ordering on the suspect list <em>before</em> media errors, and prove or disprove it with Attr bits in the trace.</p></div>
+
+<div class="lab"><div class="lab-head">🧪 Lab 51.1 — Ordering audit of a synthetic capture <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> classify every TLP in a 30-line synthetic capture and decide whether any consumer could observe a CQE before its data. <b>Setup:</b> paper or spreadsheet; the two synthetic traces above. <b>Steps:</b> (1) label each TLP P/NP/Cpl; (2) mark Attr bits; (3) for each CQE, list the earlier posted writes to the same buffer; (4) decide “may pass?” using the five rules. <b>Observations:</b> the normal trace has RO only on data. <b>Questions:</b> What changes if the CQE goes on VC1? What if the data writes target a peer device instead of host memory?</p>
+<details class="answer"><summary>Solution</summary><p>Normal trace: no CQE may pass its data because CQE has RO = 0 and is in the same VC. Failed trace: TLP 20 may pass any of 4–19 in the Root Complex. VC1 variant: no ordering relationship exists between VCs, so unsafe. Peer target: ordering still holds along the path, but visibility depends on the peer’s internal behaviour — implementation-dependent.</p></details>
+<p><b>Extension:</b> write a 30-line script that ingests a CSV of TLPs and flags any MWr to a CQ address with Attr[1]=1.</p></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Why must Posted requests be able to pass Non-Posted requests?</p><details class="answer"><summary>Answer</summary><p>To avoid deadlock: if a read cannot complete until some write gets through, blocking writes behind reads could lock the fabric permanently.</p></details></li>
+<li><p>Which NVMe write is it safe to mark Relaxed Ordering?</p><details class="answer"><summary>Answer</summary><p>Data writes into host buffers (they may reorder among themselves). Not the CQE and not the MSI-X write that follows it.</p></details></li>
+<li><p>Why does reading CSTS after writing CC “flush” the CC write?</p><details class="answer"><summary>Answer</summary><p>Non-Posted requests must not pass Posted requests in the same direction, so the read reaches the device after the write. The completion therefore proves the write arrived (not that its effect finished).</p></details></li>
+<li><p>Does an analyzer on the SSD link prove that the host observed data before the CQE?</p><details class="answer"><summary>Answer</summary><p>No. It proves transmit order and attribute bits. Visibility inside the Root Complex and memory system is not observable on that link.</p></details></li>
+</ol></div>
+
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> What are the three PCIe ordering classes? <details class="answer"><summary>Model answer</summary>Posted (MWr, Msg), Non-Posted (MRd, CfgRd/Wr, IORd/Wr, AtomicOps), Completion (Cpl, CplD).</details></li>
+<li><span class="lvl">Intermediate</span> Explain producer/consumer ordering using an NVMe read. <details class="answer"><summary>Model answer</summary>The SSD (producer) writes data then writes the CQE flag; both posted, same VC, no RO on the CQE, so the CQE cannot pass the data. The CPU (consumer) sees the flag only after the data is visible.</details></li>
+<li><span class="lvl">Advanced</span> What does IDO buy you in an SR-IOV device? <details class="answer"><summary>Model answer</summary>Traffic from different Requester IDs (different VFs) need not be ordered with respect to each other, so a stalled VF does not head-of-line-block another VF’s writes.</details></li>
+<li><span class="lvl">Senior</span> A customer reports rare silent corruption only on one server model. How do you approach it? <details class="answer"><summary>Model answer</summary>Check platform RO errata and quirks, compare DevCtl settings across models, capture Attr bits on CQE/MSI-X writes, run A/B with RO disabled, and correlate with NUMA placement; only then suspect media.</details></li>
+</ol></div>
+
+<div class="callout remember"><div class="callout-title">📌 Summary</div>
+<p>Posted writes in one VC stay in order unless RO says otherwise; reads and completions do not overtake earlier writes; writes must be able to overtake reads. NVMe’s “data → CQE → interrupt” correctness rests entirely on these rules. A trace shows permission to reorder, not reordering itself.</p></div>
+<p><b>Teach-back:</b> explain to a child why the postcard must not overtake the book truck; to a junior why RO is fine on data but not on the CQE; to a senior why ordering and flow-control deadlock are the same design problem.</p>
+<p><b>Further reading:</b> PCIe Base Specification, Transaction Ordering; your SSD controller’s DMA engine documentation; Linux <code>drivers/pci/quirks.c</code> (search for relaxed ordering). <b>Next:</b> <a href="#p6-ch52-completions">Chapter 52 — Completion Rules</a>.</p>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can classify any TLP into P / NP / Cpl.</li>
+<li>I can state the five practical ordering rules from memory and justify each.</li>
+<li>I can explain why the CQE write must not carry RO.</li>
+<li>I can point to the Attr field in a TLP header and read NS/RO/IDO.</li>
+<li>I can explain what a link-level trace can and cannot prove about visibility.</li>
+</ul></div>
+</section>
+
+<section class="chapter" id="p6-ch52-completions" data-part="PART XVII — ADVANCED PCIe">
+<h2><span class="num">52</span> Completion Rules — How Answers Come Back</h2>
+
+<div class="callout spec"><div class="callout-title">📘 Specification baseline</div>
+<p><b>DOCUMENT:</b> PCI Express Base Specification — Completion rules, Completion Timeout mechanism, Read Completion Boundary (RCB), Device Control / Device Control 2 registers. <b>STATUS:</b> normative. <b>VERSION NOTES:</b> Configuration Request Retry Status (CRS) was renamed Request Retry Status (RRS) in later revisions, which also allow it for some non-configuration cases <span class="tag version">version</span>; 10-bit tags are optional from 4.0, and 14-bit tags appear with FLIT mode in 6.0 <span class="tag version">version</span>.</p></div>
+
+<h3>52.1 Why this chapter exists</h3>
+<p>Every time an NVMe controller fetches a Submission Queue Entry (SQE), a PRP list, or the data of a write command, it issues a Memory Read (MRd) and waits for a Completion with Data (CplD). Every time the CPU reads a controller register, the controller must answer with a CplD. If completions are split, late, mis-tagged or carry an error status, the NVMe layer sees stalls, timeouts or controller fatal status — and the root cause is invisible unless you can read completion headers. This chapter teaches you to read them.</p>
+<ul class="objectives">
+<li>Decode Completer ID, Requester ID, Tag, Completion Status, Byte Count and Lower Address.</li>
+<li>Explain the Read Completion Boundary and predict how a read will be split.</li>
+<li>Explain Completion Timeout ranges and what happens when one fires.</li>
+<li>Distinguish UR, CA, CRS/RRS and Successful Completion and attribute each to a layer.</li>
+<li>Recognise Unexpected Completions and tag aliasing in a trace.</li>
+</ul>
+<p><b>Prerequisites:</b> <a href="#p6-ch51-ordering">Chapter 51 (ordering)</a>, TLP header basics, <a class="gl" href="#g-mrrs">MRRS</a> and <a class="gl" href="#g-mps">MPS</a>.</p>
+
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy — the library request desk</div>
+<p>You hand the librarian a request slip with a ticket number (the Tag) and your name (the Requester ID). The librarian may bring the books back in several trips, but always with your ticket number and always in page order. If the book does not exist, you get a slip saying “no such book” (Unsupported Request). If the librarian is broken, you get “I can’t do this” (Completer Abort). If the library is still opening, you get “come back later” (Retry Status). If nobody comes back at all, after a while you give up (Completion Timeout).</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>In PCIe the requester must have pre-reserved buffer space for the answer — there is no “I’ll wait at the desk” without room for the books. And “giving up” (timeout) is a hardware mechanism with programmable ranges, not patience.</p></div>
+
+<h3>52.2 Completion header fields</h3>
+<div class="table-wrap"><table class="bitfield"><thead><tr><th>DW</th><th>Bits 31:24</th><th>Bits 23:16</th><th>Bits 15:8</th><th>Bits 7:0</th></tr></thead><tbody>
+<tr><td>0</td><td colspan="4">Fmt / Type (Cpl or CplD), TC, Attr, TD, EP, Length (non-FLIT layout)</td></tr>
+<tr><td>1</td><td colspan="2">Completer ID (Bus/Device/Function)</td><td>Completion Status (3 bits), BCM (1 bit), Byte Count[11:8]</td><td>Byte Count[7:0]</td></tr>
+<tr><td>2</td><td colspan="2">Requester ID</td><td>Tag[7:0] (extended tag bits elsewhere when 10-bit tags in use)</td><td>R, Lower Address[6:0]</td></tr>
+</tbody></table></div>
+<p><span class="tag verified">verified</span> for the classic (non-FLIT) 3-DW completion header. In FLIT mode the header layout differs <span class="tag version">version</span> — use the 6.x specification for exact bit positions.</p>
+<div class="table-wrap"><table><thead><tr><th>Field</th><th>Owner / creator</th><th>Purpose</th><th>Debug use</th></tr></thead><tbody>
+<tr><td>Requester ID + Tag</td><td>Copied from the request by the completer</td><td>Lets the requester match the answer to its outstanding request</td><td>Mismatch ⇒ Unexpected Completion at the requester</td></tr>
+<tr><td>Completer ID</td><td>Completer</td><td>Identifies who answered</td><td>Shows which function/bridge generated a UR/CA</td></tr>
+<tr><td>Completion Status</td><td>Completer</td><td>000b SC, 001b UR, 010b CRS/RRS, 100b CA</td><td>Error localisation</td></tr>
+<tr><td>Byte Count</td><td>Completer</td><td>Bytes remaining to satisfy the request, <em>including</em> this completion (4096 encoded as 0)</td><td>Detect missing or extra split completions</td></tr>
+<tr><td>Lower Address</td><td>Completer</td><td>Low 7 bits of the starting byte address of this completion’s data</td><td>Verify RCB splitting</td></tr>
+<tr><td>EP (poisoned)</td><td>Completer or forwarding element</td><td>Data is known bad</td><td>Poisoned TLP error at the receiver (AER)</td></tr>
+</tbody></table></div>
+
+<h3>52.3 Splitting: Read Completion Boundary (RCB)</h3>
+<p>A completer may return a read in several CplD TLPs. Each must not exceed the Max Payload Size of the path, and split points (other than the first and last) must fall on naturally aligned RCB boundaries. Root Complexes have an RCB of 64 or 128 bytes (reported in the Link Control register’s RCB bit for the root port); endpoints mirror the setting. <span class="tag verified">verified</span></p>
+<div class="formula">N_cpl ≥ ⌈ (A_start mod RCB + L) / min(MPS, chosen chunk) ⌉ &nbsp;&nbsp;(lower bound; completer may split at any RCB multiple)</div>
+<ul class="vars"><li><b>N_cpl</b> — number of completion TLPs</li><li><b>A_start</b> — starting byte address of the read</li><li><b>RCB</b> — Read Completion Boundary (64 or 128 B)</li><li><b>L</b> — requested length in bytes (≤ MRRS)</li><li><b>MPS</b> — Max Payload Size programmed on the path</li></ul>
+
+<h4>Worked example</h4>
+<p>The SSD reads a 512-byte PRP list at host address 0x1_2340_0FC0 with MRRS = 512 and MPS = 256, RCB = 64. The Root Complex may answer: CplD #1 covers 0FC0–0FFF (64 bytes, ends at a 64-byte boundary, Byte Count 512, Lower Address 40h), CplD #2 covers 1000–10FF (256 bytes, Byte Count 448, Lower Address 00h), CplD #3 covers 1100–11BF (192 bytes, Byte Count 192, Lower Address 00h). <span class="tag synthetic">synthetic</span> Another legal answer uses more, smaller completions — the choice is implementation-dependent <span class="tag impl">impl</span>; the constraints (address order, RCB-aligned splits, ≤ MPS, Byte Count arithmetic) are not.</p>
+
+<h3>52.4 Completion Timeout</h3>
+<p>The requester runs a timer per outstanding non-posted request. If no completion (or not all completions) arrives in time, it logs a Completion Timeout — an uncorrectable error, by default non-fatal — and frees the tag. Device Control 2 lets software choose a range; Device Capabilities 2 reports which ranges are supported (Ranges A–D) and whether timeout disable is supported. The default range is 50 µs to 50 ms. <span class="tag verified">verified</span></p>
+<div class="callout impl"><div class="callout-title">🏭 Implementation-dependent</div><p>What the NVMe controller does after a Completion Timeout on an SQE fetch or on write-data fetch is <em>not</em> defined by PCIe. Many controllers set CSTS.CFS (Controller Fatal Status); some retry; some complete the affected command with an internal error status. Your controller’s datasheet decides.</p></div>
+
+<h3>52.5 Error statuses by layer</h3>
+<div class="table-wrap"><table><thead><tr><th>Status</th><th>Typical cause</th><th>Layer</th><th>NVMe consequence</th></tr></thead><tbody>
+<tr><td>UR — Unsupported Request</td><td>Address outside any BAR; IOMMU blocks DMA (some Root Complexes return UR); function in D3hot; Bus Master Enable clear</td><td>Transaction / platform</td><td>SQE or data fetch fails; controller may go fatal</td></tr>
+<tr><td>CA — Completer Abort</td><td>Completer violated its own programming model or internal error</td><td>Completer internal</td><td>Same</td></tr>
+<tr><td>CRS / RRS</td><td>Device not ready to answer configuration requests after reset</td><td>Config / init</td><td>Enumeration delay; with CRS Software Visibility the read of Vendor ID returns 0001h</td></tr>
+<tr><td>Poisoned (EP=1)</td><td>Uncorrectable memory error in host DRAM on a DMA read</td><td>Data integrity</td><td>Controller should not write poisoned data to media; behaviour impl-dependent</td></tr>
+<tr><td>Unexpected Completion</td><td>Completion with no matching outstanding request (late after timeout, wrong tag, wrong RID)</td><td>Transaction</td><td>Logged as AER uncorrectable (often advisory non-fatal)</td></tr>
+</tbody></table></div>
+
+<h3>52.6 Traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: completion latency grows under host memory pressure</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Tag</th><th>Len/BC</th><th>Latency</th></tr></thead><tbody>
+<tr><td>1</td><td>0.00</td><td>↑</td><td>MRd 512 B</td><td>0x21</td><td>128 DW</td><td>—</td></tr>
+<tr><td>2</td><td>0.92</td><td>↓</td><td>CplD</td><td>0x21</td><td>BC 512</td><td>0.92 µs</td></tr>
+<tr><td>3</td><td>1.10</td><td>↓</td><td>CplD</td><td>0x21</td><td>BC 256</td><td>—</td></tr>
+<tr class="bad"><td>4</td><td>40.0</td><td>↑</td><td>MRd 512 B</td><td>0x22</td><td>128 DW</td><td>—</td></tr>
+<tr class="bad"><td>5</td><td>47.8</td><td>↓</td><td>CplD</td><td>0x22</td><td>BC 512</td><td>7.8 µs</td></tr>
+</tbody></table></div></div>
+<p>Nothing is an error here; the latency is just ten times higher. Possible reasons: remote NUMA memory, IOMMU page-table walk (IOTLB miss), Root Complex congestion. The PCIe trace only shows the symptom. <span class="tag derived">derived</span></p>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: IOMMU blocks data fetch for an NVMe write</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Tag</th><th>Status</th><th>Note</th></tr></thead><tbody>
+<tr><td>1</td><td>0.0</td><td>↓</td><td>MWr doorbell</td><td>—</td><td>—</td><td>SQ2 tail</td></tr>
+<tr><td>2</td><td>0.6</td><td>↑</td><td>MRd SQE</td><td>0x40</td><td>—</td><td></td></tr>
+<tr><td>3</td><td>1.0</td><td>↓</td><td>CplD</td><td>0x40</td><td>SC</td><td>Write command, PRP1 = unmapped IOVA</td></tr>
+<tr class="first-bad"><td>4</td><td>1.4</td><td>↑</td><td>MRd PRP1</td><td>0x41</td><td>—</td><td>Fetch write data</td></tr>
+<tr class="bad"><td>5</td><td>1.9</td><td>↓</td><td>Cpl (no data)</td><td>0x41</td><td>UR</td><td>Blocked by IOMMU (platform-specific choice of status)</td></tr>
+<tr class="bad"><td>6</td><td>3.0</td><td>↑</td><td>MWr CQE</td><td>—</td><td>—</td><td>NVMe status: data transfer error (impl-dependent)</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: completion after timeout</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>t</th><th>Dir</th><th>TLP</th><th>Tag</th><th>Note</th></tr></thead><tbody>
+<tr><td>1</td><td>0</td><td>↓</td><td>MRd CSTS</td><td>0x05</td><td>CPU reads register</td></tr>
+<tr class="bad"><td>2</td><td>55 ms</td><td>—</td><td>—</td><td>—</td><td>Root port logs Completion Timeout (range default)</td></tr>
+<tr class="bad"><td>3</td><td>61 ms</td><td>↑</td><td>CplD</td><td>0x05</td><td>Late completion ⇒ Unexpected Completion</td></tr>
+</tbody></table></div></div>
+<p>Was the SSD slow, or was the timeout range too short? Compare the programmed range in DevCtl2 of the root port with the device’s documented worst-case register-read latency; check whether the controller was in a firmware activation or reset window. <span class="tag derived">derived</span></p>
+
+<h3>52.7 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code>sudo lspci -vvv -s 0000:3b:00.0 | grep -E 'DevCap2|DevCtl2|CmpltTO|MaxPayload|MaxReadReq|RCB'
+# AER counters exposed by the kernel (read-only files)
+cat /sys/bus/pci/devices/0000:3b:00.0/aer_dev_nonfatal
+cat /sys/bus/pci/devices/0000:3b:00.0/aer_dev_fatal
+journalctl -k | grep -i -E 'AER|Completion Timeout|Unsupported Request'</code></pre>
+<p>Illustrative, abbreviated <code>lspci</code> lines will show fields such as <code>CmpltTO</code> ranges and <code>MaxPayload</code>/<code>MaxReadReq</code>. They prove configuration; they do not prove what happened on the wire.</p>
+
+<h3>52.8 Common mistakes and failure patterns</h3>
+<div class="table-wrap"><table><thead><tr><th>Symptom</th><th>Possible causes</th><th>Evidence</th><th>First / second check</th><th>Likely conclusion</th></tr></thead><tbody>
+<tr><td>NVMe controller fatal (CSTS.CFS=1) under IOMMU strict mode only</td><td>Unmapped DMA address</td><td>UR completions to MRd</td><td>IOMMU fault log (<code>dmesg</code>) / PRP addresses in SQE</td><td>Driver mapping bug or use-after-unmap</td></tr>
+<tr><td>Completion Timeout logged at root port</td><td>Device hung; timeout range too short; link down mid-transaction</td><td>AER uncorrectable status</td><td>Link state / LTSSM at the time / DevCtl2 range</td><td>Depends; check Surprise Down</td></tr>
+<tr><td>Unexpected Completion</td><td>Late answer after timeout; tag reuse bug</td><td>Cpl tag with no outstanding MRd</td><td>Look for earlier timeout / tag field width (8 vs 10 bit)</td><td>Usually secondary to a timeout</td></tr>
+<tr><td>Malformed TLP on completion</td><td>Payload exceeds MPS; RCB violation</td><td>AER Malformed TLP + header log</td><td>MPS consistency along path / Lower Address</td><td>Configuration mismatch or completer bug</td></tr>
+<tr><td>Enumeration slow after reset</td><td>CRS/RRS retries</td><td>Repeated CRS on CfgRd</td><td>Reset-to-config timing / firmware boot time</td><td>Device not ready (expected up to spec limits)</td></tr>
+</tbody></table></div>
+
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>When an NVMe controller dies, look backward in the trace for the last <em>non-successful completion</em> it received. A single UR on a PRP fetch explains a controller fatal far more often than a firmware bug does. And always check Byte Count arithmetic: a completer that miscounts produces data that looks “correct but shifted”.</p></div>
+
+<div class="lab"><div class="lab-head">🧪 Lab 52.1 — Predict the completion split <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> compute legal completion sequences. <b>Setup:</b> RCB = 64 B, MPS = 128 B. <b>Steps:</b> for reads of (a) 256 B at 0x...000, (b) 200 B at 0x...0F0, (c) 4096 B at 0x...F80 with MRRS = 4096, list one legal sequence with Byte Count and Lower Address per completion. <b>Questions:</b> what is the minimum number of completions for (c)?</p>
+<details class="answer"><summary>Solution</summary><p>(a) Two completions of 128 B: first BC 256 / LA 00h, second BC 128 / LA 80h (low 7 bits of 0x…080). (b) 0F0–0FF (16 B, BC 200, LA 70h), 100–17F (128 B, BC 184, LA 00h), 180–1B7 (56 B, BC 56, LA 00h). (c) F80–FFF (128 B, BC 0 meaning 4096, LA 00h because 0xF80 has its low 7 bits clear), then 31 further 128-byte completions; minimum 32 completions because each is capped at MPS = 128 B. Lower Address is always the low 7 bits of that completion’s starting byte address.</p></details>
+<p><b>Extension:</b> repeat with RCB = 128 and explain why Root Complexes report RCB.</p></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Who generates the Completion Status field?</p><details class="answer"><summary>Answer</summary><p>The completer (the function that serviced the request), or an intermediate element that terminated the request (e.g. a bridge returning UR).</p></details></li>
+<li><p>What does Byte Count 0 mean in a CplD?</p><details class="answer"><summary>Answer</summary><p>4096 bytes remaining (the 12-bit field encodes 4096 as 0).</p></details></li>
+<li><p>Is a Completion Timeout correctable?</p><details class="answer"><summary>Answer</summary><p>No, it is an uncorrectable error (default severity non-fatal, programmable in AER).</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> Which TLPs require completions? <details class="answer"><summary>Model answer</summary>Non-posted: memory reads, I/O and config requests, AtomicOps.</details></li>
+<li><span class="lvl">Intermediate</span> Why may a 4 KiB read return as many TLPs? <details class="answer"><summary>Model answer</summary>Each completion is capped by MPS and splits are allowed at RCB boundaries; the completer chooses.</details></li>
+<li><span class="lvl">Advanced</span> How would you detect tag aliasing with 10-bit tags enabled on only one side? <details class="answer"><summary>Model answer</summary>Check Device Control 2 10-bit Tag Requester Enable and the completer’s 10-bit Tag Completer Supported; look for completions whose upper tag bits differ from the request; correlate with Unexpected Completion logs.</details></li>
+<li><span class="lvl">Senior</span> The controller sets CFS after a UR. Is the controller wrong? <details class="answer"><summary>Model answer</summary>Not necessarily; PCIe does not dictate NVMe recovery. Determine why the host returned UR (IOMMU, BME cleared by error recovery, bad PRP). The NVMe behaviour is implementation-dependent; the root cause is upstream.</details></li>
+</ol></div>
+<div class="callout remember"><div class="callout-title">📌 Summary</div><p>Completions carry Requester ID + Tag for matching, Completion Status for error attribution, Byte Count and Lower Address for split reassembly. Splits respect MPS and RCB and stay in address order. Timeouts are requester-side, programmable, and their NVMe-level consequence is implementation-dependent.</p></div>
+<p><b>Next:</b> <a href="#p6-ch53-flow-control">Chapter 53 — Flow Control and Credits</a>.</p>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can decode a completion header and verify Byte Count / Lower Address across a split.</li>
+<li>I can map UR, CA, CRS/RRS, EP to likely causes.</li>
+<li>I can explain the Completion Timeout mechanism and its configuration registers.</li>
+<li>I can trace a controller fatal back to an upstream completion error.</li>
+</ul></div>
+</section>
+
+<section class="chapter" id="p6-ch53-flow-control" data-part="PART XVII — ADVANCED PCIe">
+<h2><span class="num">53</span> Flow Control and Credits</h2>
+<div class="callout spec"><div class="callout-title">📘 Specification baseline</div>
+<p><b>DOCUMENT:</b> PCI Express Base Specification — Flow Control (Transaction Layer), Data Link Layer InitFC/UpdateFC DLLPs. <b>STATUS:</b> normative. <b>VERSION NOTES:</b> Scaled Flow Control (larger credit fields with a scale factor) was introduced to support higher bandwidth-delay products <span class="tag version">version</span>; FLIT mode in 6.0 adds shared credit pools alongside dedicated credits <span class="tag version">version</span>. The counter rules below are for the classic (non-FLIT, unscaled) case.</p></div>
+
+<h3>53.1 Why this chapter exists</h3>
+<p>PCIe never drops a TLP because a buffer is full. Instead, the receiver advertises how much buffer space it has, in <b>credits</b>, and the transmitter is forbidden to send a TLP unless enough credits are available. When credits run dry, the link goes quiet even though both sides are healthy. Most “mysteriously low NVMe throughput” investigations that end at the PCIe layer end here.</p>
+<ul class="objectives">
+<li>List the six credit types and what each counts.</li>
+<li>Explain InitFC1/InitFC2 and UpdateFC DLLPs.</li>
+<li>Apply the credit gating rule and compute credit-limited throughput.</li>
+<li>Recognise credit starvation in a trace and distinguish it from a slow device.</li>
+</ul>
+<p><b>Prerequisites:</b> <a href="#p6-ch51-ordering">ordering classes</a>, DLLPs (<a class="gl" href="#g-dllp">DLLP</a>, <a class="gl" href="#g-fc">FC</a>), <a class="gl" href="#g-ack">Ack</a>/<a class="gl" href="#g-nak">Nak</a>.</p>
+
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy — parking tickets</div><p>The school car park gives the library six kinds of parking tickets: big-truck tickets and small-car tickets, for three different car parks (deliveries, requests, answers). The library may only send a vehicle if it holds a ticket for that car park. When the school empties a space, it mails a ticket back (UpdateFC). If the school is slow to mail tickets back, the library’s trucks wait at the gate even though the road is empty.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>Tickets are not individual objects; they are running counters that wrap around. The receiver does not “mail back tickets”; it periodically advertises the total it has ever freed, and the sender computes the difference. And a sender may be told “infinite credits” (advertised as 0), meaning no tickets are needed at all for that type.</p></div>
+
+<h3>53.2 Credit types</h3>
+<div class="table-wrap"><table><thead><tr><th>Type</th><th>Counts</th><th>Unit</th><th>Consumed by</th></tr></thead><tbody>
+<tr><td>PH</td><td>Posted Request headers</td><td>1 per TLP</td><td>MWr, Msg</td></tr>
+<tr><td>PD</td><td>Posted Request data</td><td>1 credit = 16 bytes (4 DW)</td><td>MWr payload, MsgD payload</td></tr>
+<tr><td>NPH</td><td>Non-Posted Request headers</td><td>1 per TLP</td><td>MRd, CfgRd/Wr, IORd/Wr, AtomicOps</td></tr>
+<tr><td>NPD</td><td>Non-Posted data</td><td>16 bytes</td><td>CfgWr, IOWr, AtomicOp payloads</td></tr>
+<tr><td>CplH</td><td>Completion headers</td><td>1 per TLP</td><td>Cpl, CplD</td></tr>
+<tr><td>CplD</td><td>Completion data</td><td>16 bytes</td><td>CplD payload</td></tr>
+</tbody></table></div>
+<p><span class="tag verified">verified</span> Credits are kept per Virtual Channel. Header credit fields are 8 bits and data credit fields 12 bits in unscaled flow control; an advertised value of 0 means infinite. Endpoints are generally required to advertise infinite completion credits for requests they issue, since a requester must reserve space for completions before issuing a read <span class="tag uncertain">uncertain</span> — confirm the exact rule and its exceptions in the revision you use.</p>
+
+<h3>53.3 Initialisation and update</h3>
+<figure class="diagram"><svg viewBox="0 0 800 330" role="img" aria-label="Flow control initialisation and update between transmitter and receiver">
+<rect class="box" x="30" y="30" width="200" height="270" rx="8"/><text class="lbl" x="130" y="55" text-anchor="middle">Transmitter (SSD)</text>
+<text class="lbl small" x="130" y="90" text-anchor="middle">CREDIT_LIMIT (from DLLPs)</text><text class="lbl small" x="130" y="115" text-anchor="middle">CREDITS_CONSUMED</text><text class="lbl small" x="130" y="140" text-anchor="middle">gate: may I send?</text>
+<rect class="box" x="570" y="30" width="200" height="270" rx="8"/><text class="lbl" x="670" y="55" text-anchor="middle">Receiver (Root Port)</text>
+<text class="lbl small" x="670" y="90" text-anchor="middle">CREDITS_ALLOCATED</text><text class="lbl small" x="670" y="115" text-anchor="middle">CREDITS_RECEIVED</text><text class="lbl small" x="670" y="140" text-anchor="middle">buffer (P / NP / Cpl)</text>
+<path class="ln" d="M570 175 L230 175" marker-end="url(#arrow)"/><text class="lbl small" x="400" y="168" text-anchor="middle">InitFC1 / InitFC2 (P, NP, Cpl) at DL init</text>
+<path class="ln" d="M230 215 L570 215" marker-end="url(#arrow)"/><text class="lbl small" x="400" y="208" text-anchor="middle">TLPs consume credits</text>
+<path class="ln" d="M570 255 L230 255" marker-end="url(#arrow)"/><text class="lbl small" x="400" y="248" text-anchor="middle">UpdateFC (when buffers drain)</text>
+<text class="lbl small" x="400" y="300" text-anchor="middle">Each direction runs this independently</text>
+</svg><figcaption>Figure 53.1 — Credit-based flow control. Counter names follow the specification’s conceptual model; real implementations may differ internally. <span class="tag conceptual">conceptual</span></figcaption></figure>
+<p>During Data Link Layer initialisation (link reaches DL_Active), each side sends InitFC1 then InitFC2 DLLPs for P, NP and Cpl, per VC0 (other VCs when enabled). After that, the receiver sends UpdateFC DLLPs as it frees buffer space. <span class="tag verified">verified</span></p>
+<div class="formula">Send allowed ⇔ (CREDIT_LIMIT − (CREDITS_CONSUMED + CUMULATIVE_CREDITS_REQUIRED)) mod 2<sup>FieldSize</sup> ≤ 2<sup>FieldSize</sup> / 2</div>
+<ul class="vars"><li><b>CREDIT_LIMIT</b> — most recent value advertised by the receiver (from InitFC/UpdateFC)</li><li><b>CREDITS_CONSUMED</b> — credits consumed by TLPs sent since init (modular)</li><li><b>CUMULATIVE_CREDITS_REQUIRED</b> — credits this TLP needs (1 header, ⌈payload/16⌉ data)</li><li><b>FieldSize</b> — 8 for headers, 12 for data (unscaled)</li></ul>
+<p><span class="tag verified">verified</span> (form of the gating rule from the specification’s flow-control model; confirm FieldSize when Scaled Flow Control is enabled).</p>
+
+<h3>53.4 Credit-limited throughput</h3>
+<div class="formula">BW_max ≈ (Credits_D × 16 B) / RTT_FC</div>
+<ul class="vars"><li><b>BW_max</b> — sustainable payload bandwidth for one credit type</li><li><b>Credits_D</b> — data credits advertised (buffer size / 16)</li><li><b>RTT_FC</b> — round-trip time from sending a TLP until the UpdateFC that returns its credits is processed (wire, receiver processing, UpdateFC scheduling)</li></ul>
+<h4>Worked example</h4>
+<p>A Gen4 x4 link carries ≈ 7.9 GB/s raw after 128b/130b encoding (16 GT/s × 4 lanes × 128/130 ÷ 8). <span class="tag derived">derived</span> Suppose a switch port advertises 128 PD credits (2 KiB) and the credit loop RTT is 600 ns. BW_max ≈ 2048 B / 600 ns ≈ 3.4 GB/s. The NVMe SSD streaming reads (posted writes upstream) would be capped well below link speed. <span class="tag synthetic">synthetic</span> numbers chosen for teaching. Doubling the buffer or halving the RTT doubles the ceiling. This is why Scaled Flow Control and larger receive buffers appear as speeds rise.</p>
+
+<h3>53.5 Hardware view</h3>
+<div class="callout hw"><div class="callout-title">🔧 Hardware</div><p>Credit buffers are SRAM inside the Transaction Layer of each port. Switches have a set per port per VC. Root ports often advertise generous posted credits because host writes from devices are the bulk direction. The SSD itself must reserve completion buffer space for every MRd it has outstanding; this, together with the number of tags, bounds how much write data it can prefetch from host memory. <span class="tag impl">impl</span></p></div>
+
+<h3>53.6 Traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: credits flow back steadily (upstream posted)</div><div class="table-wrap"><table>
+<thead><tr><th>t (ns)</th><th>Dir</th><th>Packet</th><th>Detail</th></tr></thead><tbody>
+<tr><td>0</td><td>↑</td><td>MWr 256 B</td><td>consumes 1 PH, 16 PD</td></tr>
+<tr><td>35</td><td>↑</td><td>MWr 256 B</td><td>consumes 1 PH, 16 PD</td></tr>
+<tr><td>210</td><td>↓</td><td>UpdateFC-P</td><td>HdrFC/DataFC advance by 2/32</td></tr>
+<tr><td>245</td><td>↑</td><td>MWr 256 B</td><td>…</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: posted credit starvation at a switch</div><div class="table-wrap"><table>
+<thead><tr><th>t (ns)</th><th>Dir</th><th>Packet</th><th>Detail</th></tr></thead><tbody>
+<tr><td>0–900</td><td>↑</td><td>MWr ×8</td><td>credits now exhausted (limit reached)</td></tr>
+<tr class="first-bad"><td>900–2 400</td><td>↑</td><td>(idle / SKP only)</td><td>Transmitter gated; no TLPs despite data ready</td></tr>
+<tr class="bad"><td>2 400</td><td>↓</td><td>UpdateFC-P</td><td>late update — switch egress congested toward root</td></tr>
+<tr><td>2 450</td><td>↑</td><td>MWr ×8</td><td>burst resumes</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: Flow Control Protocol Error</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>Packet</th><th>Detail</th></tr></thead><tbody>
+<tr><td>0</td><td>↓</td><td>InitFC1-P</td><td>PH=32, PD=256</td></tr>
+<tr class="first-bad"><td>5 µs</td><td>↑</td><td>MWr 512 B</td><td>sent although only 16 PD credits remained (transmitter counter bug)</td></tr>
+<tr class="bad"><td>5.1 µs</td><td>—</td><td>Receiver Overflow</td><td>AER uncorrectable (Receiver Overflow, default fatal)</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: gaps between TLPs</div><div class="table-wrap"><table>
+<thead><tr><th>t (ns)</th><th>Dir</th><th>Packet</th><th>Detail</th></tr></thead><tbody>
+<tr><td>0</td><td>↑</td><td>MWr 256 B</td><td>credits available (limit far ahead)</td></tr>
+<tr><td>0–1 500</td><td>↑</td><td>idle</td><td>no gating — device simply had nothing to send (NAND read latency)</td></tr>
+</tbody></table></div></div>
+<p>Gaps alone do not prove starvation. You must reconstruct the credit counters from InitFC/UpdateFC and TLP sizes: if the counter shows ample credit during the gap, the device was idle, not blocked. <span class="tag derived">derived</span></p>
+
+<h3>53.7 Linux view and its limits</h3>
+<pre class="code" data-kind="read-only inspection"><code># Link speed/width and MPS are visible; credit state is NOT exposed by standard Linux tools
+sudo lspci -vvv -s 0000:3b:00.0 | grep -E 'LnkSta:|MaxPayload'
+# Measure the symptom instead
+sudo fio --name=seqread --filename=/dev/nvme0n1 --rw=read --bs=128k --iodepth=64 \
+     --ioengine=io_uring --direct=1 --runtime=30 --time_based --readonly</code></pre>
+<div class="callout warn"><div class="callout-title">⚠️ Safety</div><p>The fio command above uses <code>--readonly</code> and reads only. Never run write workloads against a device that holds data you care about.</p></div>
+<p>Credit counters are internal to ports. Some switches expose vendor-specific debug counters <span class="tag impl">impl</span>; otherwise a protocol analyzer that decodes DLLPs is the only direct evidence.</p>
+
+<h3>53.8 Failure patterns</h3>
+<div class="table-wrap"><table><thead><tr><th>Symptom</th><th>Causes</th><th>Evidence</th><th>Disambiguating experiment</th><th>Confidence</th></tr></thead><tbody>
+<tr><td>Sequential read throughput plateaus below link rate</td><td>Upstream posted credit starvation; MPS too small; host memory bandwidth</td><td>Gaps gated by credit limit</td><td>Move SSD to root port directly (bypass switch)</td><td>Medium</td></tr>
+<tr><td>Writes slow, reads fine</td><td>SSD runs out of tags / completion buffer for data fetch; MRRS small</td><td>Few outstanding MRd</td><td>Increase MRRS (lab system), compare</td><td>Medium</td></tr>
+<tr><td>Receiver Overflow AER</td><td>Transmitter ignored credits</td><td>Credit math in trace</td><td>Reproduce with analyzer, compute counters</td><td>High if math confirms</td></tr>
+<tr><td>Flow Control Protocol Error</td><td>Illegal advertisement (e.g. exceeds max) or missing InitFC</td><td>DLLP decode at link-up</td><td>Capture link training to DL_Active</td><td>High</td></tr>
+<tr><td>Link hangs with outstanding reads</td><td>NP credits never returned (deadlock in a bridge)</td><td>NP gated, P still flowing</td><td>Check ordering rule P-passes-NP compliance</td><td>Medium</td></tr>
+</tbody></table></div>
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>Bandwidth-delay product is the single most useful mental model in PCIe performance. Credits, tags, MRRS and NVMe queue depth are all the same idea at different layers: “how much can be in flight before I must wait for an acknowledgement?” If any one of them is smaller than bandwidth × latency, it becomes the bottleneck.</p></div>
+<div class="lab"><div class="lab-head">🧪 Lab 53.1 — Credit counter simulation <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> simulate the gating rule. <b>Setup:</b> Python 3.</p>
+<pre class="code" data-kind="simulation"><code>FIELD = 12                      # data credit field width (unscaled)
+MOD = 1 &lt;&lt; FIELD
+limit, consumed = 256, 0         # InitFC advertised 256 PD credits (4 KiB)
+def can_send(payload):
+    need = -(-payload // 16)     # ceil(payload/16)
+    return ((limit - (consumed + need)) % MOD) &lt;= MOD // 2
+sent = 0
+while can_send(256):
+    consumed = (consumed + 16) % MOD
+    sent += 1
+print("TLPs sent before gating:", sent)   # expect 16
+limit = (limit + 64) % MOD                 # UpdateFC returns 64 credits
+print("after update can send:", can_send(256))</code></pre>
+<p><b>Questions:</b> why does modular arithmetic handle wrap-around? What happens if the receiver advertises 0? <b>Extension:</b> add RTT and compute throughput.</p>
+<details class="answer"><summary>Solution</summary><p>Counters wrap; comparing the modular difference against half the range distinguishes “ahead” from “behind”. An advertised 0 means infinite — the real implementation skips gating for that type; this toy code would mis-handle it, which is exactly the bug class to watch for.</p></details></div>
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>How many PD credits does a 256-byte MWr consume?</p><details class="answer"><summary>Answer</summary><p>16 (256 / 16) plus 1 PH credit.</p></details></li>
+<li><p>Which DLLPs carry credit information?</p><details class="answer"><summary>Answer</summary><p>InitFC1, InitFC2 (initialisation) and UpdateFC (runtime), each per class (P, NP, Cpl) and per VC.</p></details></li>
+<li><p>What does an advertised credit value of 0 mean?</p><details class="answer"><summary>Answer</summary><p>Infinite credits for that type.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Intermediate</span> Why does PCIe use credits instead of retransmitting on overflow? <details class="answer"><summary>Model answer</summary>Credits guarantee the receiver always has space, so the Data Link Layer replay mechanism only handles bit errors, not congestion; this keeps latency deterministic and avoids loss.</details></li>
+<li><span class="lvl">Senior</span> Throughput is 60% of link rate behind a switch but 95% direct. Walk me through it. <details class="answer"><summary>Model answer</summary>Compare posted credits advertised by the switch upstream port vs root port, measure UpdateFC latency, check MPS on all hops, check switch egress contention from other devices, compute bandwidth-delay product.</details></li>
+</ol></div>
+<div class="callout remember"><div class="callout-title">📌 Summary</div><p>Six credit types, per VC, initialised by InitFC and replenished by UpdateFC; a TLP may only be sent if its header and data credits are available. Credit-limited bandwidth ≈ buffer / round-trip time. Gaps in a trace mean starvation only if counter reconstruction says so.</p></div>
+<p><b>Next:</b> <a href="#p6-ch54-equalization">Chapter 54 — Equalization</a>.</p>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can list credit types and units, and compute consumption for any TLP.</li>
+<li>I can reconstruct credit counters from a DLLP trace.</li>
+<li>I can compute a credit-limited bandwidth ceiling and explain how to raise it.</li>
+<li>I can distinguish starvation from idleness with evidence.</li>
+</ul></div>
+</section>

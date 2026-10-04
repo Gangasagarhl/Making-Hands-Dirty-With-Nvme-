@@ -1,0 +1,339 @@
+<section class="part" id="p5-part-xiv"><div class="part-num">PART XIV</div><h1>Interrupts</h1><p class="part-intro">An NVMe controller can complete millions of commands per second across dozens of queues. Telling the host about those completions — quickly, to the right CPU, without drowning it — is the job of the interrupt architecture. This part follows the evolution from shared level-triggered wires (INTx) to Message Signalled Interrupts (MSI) to MSI-X, and then dissects MSI-X down to the bytes of its table and pending-bit array, the masking rules, the queue-to-vector mapping NVMe uses, and NVMe's interrupt coalescing feature. You will finish able to recognise an interrupt on a PCIe trace, explain why one is missing, and tune interrupt behaviour for latency or throughput.</p></section>
+
+<section class="chapter" id="p5-ch42-interrupts" data-part="PART XIV — INTERRUPTS">
+<h2><span class="num">42</span> Interrupt Architecture: INTx, MSI and MSI-X</h2>
+
+<h3>42.1 Why this chapter exists</h3>
+<p>Every completed NVMe command must eventually reach software. Software can <em>poll</em> the CQ (burning CPU) or be <em>interrupted</em>. PCIe offers three interrupt mechanisms inherited from PCI history, each with very different scalability. NVMe allows all three — the NVMe over PCIe transport supports pin-based (INTx), single and multiple MSI, and MSI-X — but real high-performance systems use MSI-X almost exclusively. Understanding why requires knowing what each mechanism physically is.</p>
+
+<h3>42.2 Learning objectives</h3>
+<ul class="objectives">
+<li>Describe INTx virtual wires, MSI and MSI-X and their PCIe representation (Assert/Deassert messages vs memory writes).</li>
+<li>Explain why MSI-X suits NVMe's per-queue, per-CPU model.</li>
+<li>Explain NVMe INTMS/INTMC and why they do not apply to MSI-X.</li>
+<li>Identify interrupt TLPs in a trace.</li>
+</ul>
+
+<h3>42.3 Prerequisites</h3>
+<p>Chapter 39's stage 15 (<a href="#p5-ch39-e2e-read">MSI-X in the end-to-end read</a>); PCIe message TLPs and configuration space capabilities from earlier parts.</p>
+
+<h3>42.4 Story and analogy</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>INTx is a single <b>shared doorbell button</b> for a whole apartment block: when it rings, the caretaker has to knock on every door to find who pressed it, and the bell keeps ringing until that person lets go. MSI is giving each flat a <b>postcard</b> with the caretaker's address printed on it — the flat drops the postcard in the post when it needs attention, and the postcard says which flat it is. MSI-X is giving each flat <b>a whole book of differently addressed postcards</b> — one for the plumber, one for the electrician, one for the caretaker — and a switch for each postcard to say "don't send this one right now".</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>INTx in PCIe is not a wire at all: it is emulated with Assert_INTx/Deassert_INTx message TLPs that the switch/root port aggregate into a virtual level. And MSI "postcards" are memory writes travelling the same posted path as data — which is precisely why they order correctly behind earlier data writes, something no physical wire could guarantee.</p></div>
+
+<h3>42.5 The three mechanisms</h3>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>INTx (legacy, pin-based)</th><th>MSI</th><th>MSI-X</th></tr></thead>
+<tbody>
+<tr><td>Representation on PCIe</td><td>Assert_INTx / Deassert_INTx messages (INTA–INTD), level semantics</td><td>MWr of 1 DW (data) to programmed address</td><td>MWr of 1 DW to per-vector address</td></tr>
+<tr><td>Capability</td><td>Interrupt Pin / Line in config header; Command reg bit 10 Interrupt Disable; Status reg bit 3 Interrupt Status</td><td>MSI capability (ID 05h)</td><td>MSI-X capability (ID 11h) + table + PBA in a BAR</td></tr>
+<tr><td>Vectors per function</td><td>1 (shared)</td><td>1, 2, 4, 8, 16, 32 (power of two, contiguous data values)</td><td>Up to 2048, independent</td></tr>
+<tr><td>Address per vector</td><td>n/a</td><td>One address for all vectors; vectors differ in low data bits</td><td>Independent address + data per vector</td></tr>
+<tr><td>Per-vector masking</td><td>Interrupt Disable bit only</td><td>Optional (if Per-Vector Masking Capable)</td><td>Always (Vector Control bit 0) + Function Mask</td></tr>
+<tr><td>Sharing / need to poll sources</td><td>Yes — ISR must check every possible source</td><td>No for single-source vectors</td><td>No</td></tr>
+<tr><td>Ordering with data writes</td><td>None — message path and data differ in semantics; driver must read device to flush</td><td>Ordered (posted write)</td><td>Ordered (posted write)</td></tr>
+<tr><td>CPU affinity</td><td>Single target</td><td>Limited (one address)</td><td>Per vector</td></tr>
+</tbody></table></div>
+<div class="callout spec"><div class="callout-title">📘 Spec</div><p><span class="tag verified">verified</span> The NVMe over PCIe transport defines Interrupt Mask Set (INTMS, offset 0Ch) and Interrupt Mask Clear (INTMC, offset 10h) registers that let host software mask/unmask interrupt vectors when using pin-based or MSI interrupts; host software is not to use them when MSI-X is configured — MSI-X masking is done in the MSI-X table. NVMe also defines how pin-based interrupts aggregate across CQs. For exact normative wording, consult the transport specification.</p></div>
+
+<h3>42.6 Why NVMe strongly benefits from MSI-X</h3>
+<ul>
+<li><b>One vector per CQ:</b> Linux creates one I/O queue pair per CPU (or per CPU group) and one vector per CQ, each with affinity to that CPU. The completion is handled on the CPU that submitted the I/O — cache-hot, lock-free.</li>
+<li><b>No source polling:</b> the vector itself identifies the CQ; the ISR scans only one CQ.</li>
+<li><b>Scale:</b> NVMe allows up to 65,535 I/O queues; MSI caps at 32 vectors, MSI-X at 2048. Controllers commonly expose 32–256 vectors (<span class="tag impl">impl</span>).</li>
+<li><b>Independent masking:</b> a vector can be masked (e.g. while its CPU goes offline) without affecting others.</li>
+<li><b>Ordering:</b> the interrupt MWr follows the CQE MWr on the same posted path; when the interrupt arrives the CQE is in memory — no "flushing read" required (INTx needs one).</li>
+</ul>
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>When an NVMe drive gets fewer vectors than queues (e.g. MSI-X table size 9 on a 64-CPU host), Linux reduces the number of I/O queues to match vectors, and several CPUs share each queue — you'll see it in <code>/sys/block/nvme0n1/mq/*/cpu_list</code>. A "slow drive on big servers" complaint can be a vector-count limitation, not a media problem. Virtualised drives (SR-IOV VFs) are especially prone.</p></div>
+
+<h3>42.7 How each looks in a trace</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — the same completion signalled three ways</div><div class="table-wrap"><table>
+<thead><tr><th>Mechanism</th><th>TLPs (upstream unless noted)</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>INTx</td><td>MWr CQE → Msg Assert_INTA … (host ISR reads CSTS/INTMS via MRd ↓/CplD ↑) … host writes INTMS ↓ … Msg Deassert_INTA</td><td>Level semantics; extra MMIO reads; shared line</td></tr>
+<tr><td>MSI (single)</td><td>MWr CQE → MWr 1 DW to MSI address, data = base data</td><td>One vector for all CQs: ISR must scan all CQs</td></tr>
+<tr><td>MSI-X</td><td>MWr CQE → MWr 1 DW to vector n address, data n</td><td>Directly identifies CQ</td></tr>
+</tbody></table></div></div>
+
+<h3>42.8 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code>sudo lspci -vvv -s 02:00.0 | grep -A3 -E "MSI:|MSI-X:"   # capability, Enable+/-, Count
+grep -E "nvme" /proc/interrupts                           # per-vector counts per CPU
+cat /proc/irq/&lt;N&gt;/effective_affinity_list                 # where vector N lands
+ls /sys/bus/pci/devices/0000:02:00.0/msi_irqs/            # Linux IRQ numbers of vectors</code></pre>
+<p><b>Can prove:</b> which mechanism is enabled, how many vectors are allocated, how many interrupts were delivered per vector/CPU. <b>Cannot prove:</b> whether a specific interrupt message was sent but lost, or why a vector is quiet (no completions vs masked vs remapping fault).</p>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>How is INTx carried on a PCIe link?</p><details class="answer"><summary>Answer</summary><p>As Assert_INTx/Deassert_INTx message TLPs emulating a level-sensitive wire.</p></details></li>
+<li><p>Max vectors for MSI and MSI-X?</p><details class="answer"><summary>Answer</summary><p>32 and 2048.</p></details></li>
+<li><p>Why does INTx need a flushing read?</p><details class="answer"><summary>Answer</summary><p>The interrupt message isn't ordered relative to data the way MSI writes are guaranteed to be by the driver's assumption model; reading a device register forces earlier posted writes to complete before the response.</p></details></li>
+<li><p>When should host software use INTMS/INTMC?</p><details class="answer"><summary>Answer</summary><p>Only with pin-based or MSI interrupts — not MSI-X.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> What is MSI? <details class="answer"><summary>Model answer</summary><p>An interrupt sent as a memory write of a data value to a special address, decoded by the platform as an interrupt.</p></details></li>
+<li><span class="lvl">Intermediate</span> Why does NVMe prefer MSI-X? <details class="answer"><summary>Model answer</summary><p>Per-CQ vectors with independent address/data/mask allow per-CPU completion handling at scale.</p></details></li>
+<li><span class="lvl">Advanced</span> A server with 128 CPUs shows 16 NVMe queues. Why? <details class="answer"><summary>Model answer</summary><p>Vector count or controller's Number of Queues (Feature 07h) limit; Linux maps several CPUs per queue.</p></details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can explain INTx, MSI, MSI-X and their trace appearance.</li>
+<li>I can explain five reasons NVMe benefits from MSI-X.</li>
+<li>I know when INTMS/INTMC apply.</li>
+</ul></div>
+<p><b>Next:</b> <a href="#p5-ch43-msix">Chapter 43</a> — MSI-X down to the bytes.</p>
+</section>
+
+<section class="chapter" id="p5-ch43-msix" data-part="PART XIV — INTERRUPTS">
+<h2><span class="num">43</span> MSI-X in Depth (Deep-Dive Module: MSI and MSI-X)</h2>
+
+<h3>43.1 Why this chapter exists</h3>
+<p>"The interrupt didn't fire" is one of the most common NVMe bring-up and virtualisation complaints. Diagnosing it requires knowing exactly where MSI-X state lives (config space capability, a table in a BAR, a pending-bit array in a BAR), which bits gate delivery, how masking produces pending bits rather than lost interrupts, how NVMe binds CQs to vectors, and how coalescing deliberately delays interrupts.</p>
+
+<h3>43.2 Learning objectives</h3>
+<ul class="objectives">
+<li><b>Beginner:</b> name the three pieces of MSI-X (capability, table, PBA) and what a vector is.</li>
+<li><b>Intermediate:</b> decode Message Control, Table Offset/BIR, PBA Offset/BIR and a 16-byte table entry.</li>
+<li><b>Advanced:</b> explain masking semantics (Function Mask, per-vector mask, pending bits) and NVMe interrupt coalescing (Feature 08h) and Interrupt Vector Configuration (Feature 09h).</li>
+<li><b>Senior:</b> diagnose lost/late interrupts across device, platform (interrupt remapping) and virtualisation layers.</li>
+<li><b>Trace-analysis:</b> identify MSI-X MWrs and table-programming MWrs; map them to CQs.</li>
+<li><b>Debugging:</b> apply five failure patterns.</li>
+<li><b>Validation:</b> design tests for masking/pending behaviour.</li>
+</ul>
+
+<h3>43.3 Kid story and analogy boundary</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>The SSD has a <b>phone book</b> (MSI-X table) kept in its own drawer. Each page (entry) has a phone number (Message Address), a short secret word to say (Message Data), and a little "do not call" sticker (mask bit). When a mailbox (CQ) has a new letter, the SSD looks up that mailbox's page and calls the number, saying the secret word. If the page has the "do not call" sticker, the SSD writes a tick on a <b>sticky-note board</b> (PBA) instead, and calls as soon as the sticker is removed. There's also a big "nobody calls anybody" switch for the whole phone book (Function Mask).</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Analogy boundary</div><p><b>Represents:</b> table entry fields, mask, pending. <b>Hides:</b> that the "call" is a posted memory write subject to PCIe ordering and flow control; that the platform decides what the "phone number" means (APIC address, interrupt remapping handle); that the host programs the phone book with MMIO writes. <b>Misleading when:</b> you think the tick on the board is a counter — it's one bit per vector, so multiple masked events collapse into one pending interrupt.</p></div>
+
+<h3>43.4 Vocabulary</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Related to</th><th>Common confusion</th></tr></thead>
+<tbody>
+<tr><td>Vector</td><td>One interrupt "line"</td><td>Index n into the MSI-X table; one (address, data, mask) tuple</td><td>Linux IRQ number (different!)</td><td>Vector index ≠ Linux IRQ number ≠ CPU vector number</td></tr>
+<tr><td>MSI-X Table</td><td>Phone book</td><td>Array of 16-byte entries in memory space of a BAR, at Table Offset</td><td>BIR</td><td>It's in a BAR, not config space</td></tr>
+<tr><td>PBA</td><td>Sticky notes</td><td>Pending Bit Array: 1 bit per vector, in QWORDs, in a BAR</td><td>Mask</td><td>Read-only to software; writes are undefined-behaviour territory</td></tr>
+<tr><td>BIR</td><td>Which drawer</td><td>BAR Indicator Register: bits 2:0 of Table/PBA Offset register select BAR 0–5</td><td>BAR</td><td>Table and PBA may be in different BARs</td></tr>
+<tr><td>Function Mask</td><td>Master mute</td><td>Message Control bit 14; masks all vectors</td><td>Per-vector mask</td><td>Setting it doesn't change per-vector bits</td></tr>
+<tr><td>MSI-X Enable</td><td>Turn system on</td><td>Message Control bit 15</td><td>INTx/MSI disable</td><td>When set, INTx and MSI must not be used</td></tr>
+<tr><td>Table Size</td><td>Pages in book</td><td>Message Control bits 10:0, encoded N−1</td><td>Vectors</td><td>Value 0x1F means 32 vectors</td></tr>
+<tr><td>Interrupt coalescing</td><td>Waiting to batch calls</td><td>NVMe Feature 08h: aggregation threshold + time</td><td>Feature 09h</td><td>Not a PCIe feature</td></tr>
+<tr><td>Interrupt remapping</td><td>Switchboard</td><td>IOMMU function translating MSI writes to validated interrupts</td><td>IOMMU</td><td>Faults appear in IOMMU logs, not AER</td></tr>
+</tbody></table></div>
+
+<h3>43.5 Architecture: where MSI-X state lives</h3>
+<figure class="diagram"><svg viewBox="0 0 820 400" role="img" aria-label="MSI-X capability in configuration space pointing to the table and pending bit array located in BAR memory">
+<rect class="box" x="20" y="20" width="300" height="200" rx="8"/>
+<text class="lbl" x="170" y="44" text-anchor="middle">Config space: MSI-X capability</text>
+<rect class="box alt" x="40" y="60" width="260" height="34"/><text class="lbl small" x="50" y="82">+0 Cap ID 11h | Next ptr | Message Control</text>
+<rect class="box alt" x="40" y="100" width="260" height="34"/><text class="lbl small" x="50" y="122">+4 Table Offset [31:3] | Table BIR [2:0]</text>
+<rect class="box alt" x="40" y="140" width="260" height="34"/><text class="lbl small" x="50" y="162">+8 PBA Offset [31:3] | PBA BIR [2:0]</text>
+<text class="lbl small" x="40" y="200">MC: [15] Enable [14] Func Mask [10:0] Size−1</text>
+<rect class="box" x="400" y="20" width="400" height="360" rx="8"/>
+<text class="lbl" x="600" y="44" text-anchor="middle">BAR n memory (e.g. BAR0 of NVMe ctrl)</text>
+<rect class="box accent" x="420" y="60" width="360" height="30"/><text class="lbl small" x="430" y="80">0000h–0FFFh controller registers (CAP, CC, CSTS…)</text>
+<rect class="box accent" x="420" y="96" width="360" height="30"/><text class="lbl small" x="430" y="116">1000h… doorbells</text>
+<rect class="box alt" x="420" y="140" width="360" height="150"/>
+<text class="lbl small" x="430" y="160">MSI-X Table @ Table Offset (16 B / entry)</text>
+<text class="lbl small" x="430" y="184">entry 0: Addr Lo | Addr Hi | Data | VecCtrl</text>
+<text class="lbl small" x="430" y="206">entry 1: Addr Lo | Addr Hi | Data | VecCtrl</text>
+<text class="lbl small" x="430" y="228">…</text>
+<text class="lbl small" x="430" y="250">entry N−1</text>
+<text class="lbl small" x="430" y="274">VecCtrl bit 0 = Mask</text>
+<rect class="box alt" x="420" y="304" width="360" height="60"/>
+<text class="lbl small" x="430" y="326">PBA @ PBA Offset: bit n = pending for vector n</text>
+<text class="lbl small" x="430" y="348">(QWORD granularity, read-only)</text>
+<path class="ln" d="M300 117 H415 V150" marker-end="url(#arrow)"/>
+<path class="ln" d="M300 157 H380 V320 H415" marker-end="url(#arrow)"/>
+</svg><figcaption>Figure 43.1 — MSI-X: the capability (config space) points with Offset+BIR to the table and PBA inside a memory BAR. Exact placement inside the BAR is implementation-dependent; many NVMe controllers place them in BAR0 after the doorbells, others in a separate BAR.</figcaption></figure>
+
+<h4>43.5.1 MSI-X capability structure</h4>
+<div class="table-wrap"><table class="bitfield">
+<thead><tr><th>Offset</th><th>31 … 16</th><th>15 … 8</th><th>7 … 0</th></tr></thead>
+<tbody>
+<tr><td>+00h</td><td>Message Control (bit 15 MSI-X Enable, bit 14 Function Mask, bits 10:0 Table Size N−1)</td><td>Next Capability Pointer</td><td>Capability ID = 11h</td></tr>
+<tr><td>+04h</td><td colspan="3">Table Offset (bits 31:3, QWORD aligned) | Table BIR (bits 2:0)</td></tr>
+<tr><td>+08h</td><td colspan="3">PBA Offset (bits 31:3, QWORD aligned) | PBA BIR (bits 2:0)</td></tr>
+</tbody></table></div>
+
+<h4>43.5.2 MSI-X table entry (16 bytes)</h4>
+<div class="table-wrap"><table class="bitfield">
+<thead><tr><th>Entry offset</th><th>Field</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>+0h</td><td>Message Address (lower 32 bits)</td><td>Bits 1:0 zero (DWORD aligned)</td></tr>
+<tr><td>+4h</td><td>Message Upper Address</td><td>0 → 3DW MWr header; non-zero → 4DW</td></tr>
+<tr><td>+8h</td><td>Message Data</td><td>Payload of the interrupt MWr</td></tr>
+<tr><td>+Ch</td><td>Vector Control</td><td>Bit 0 = Mask Bit (1 after reset); other bits reserved (newer revisions define additional bits — <span class="tag version">version</span>)</td></tr>
+</tbody></table></div>
+<p>Entry n lives at <code>BAR[TableBIR] + TableOffset + 16·n</code>; pending bit n at <code>BAR[PBABIR] + PBAOffset + (n/64)·8</code>, bit <code>n % 64</code>.</p>
+
+<h4>43.5.3 Inputs, outputs, actors, state</h4>
+<div class="table-wrap"><table>
+<thead><tr><th>Element</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td>Inputs</td><td>Interrupt events from the controller (CQ has new entries, coalescing condition met); host MMIO writes programming the table; config writes to Message Control</td></tr>
+<tr><td>Outputs</td><td>Upstream MWr (1 DW) to the Message Address; PBA bits</td></tr>
+<tr><td>Actors</td><td>NVMe driver, PCI core (allocates vectors), platform interrupt controller/IOMMU interrupt remapping, controller interrupt logic</td></tr>
+<tr><td>State</td><td>Enable, Function Mask, per-vector Mask, Pending bits, NVMe coalescing counters/timers per vector</td></tr>
+<tr><td>Memory/registers</td><td>Capability (config), Table and PBA (BAR), NVMe Features 08h/09h, CQ's IV/IEN from Create I/O CQ</td></tr>
+<tr><td>Dependencies</td><td>Bus Master Enable (Command register bit 2) must be set — MSI-X writes are memory writes issued by the function; Memory Space Enable for table access; INTx disabled when MSI-X enabled</td></tr>
+</tbody></table></div>
+
+<h3>43.6 Mechanism step by step</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Who acts</th><th>What changes</th><th>Where</th><th>Evidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>PCI core (Linux)</td><td>Reads MSI-X cap; Table Size, BIRs, offsets</td><td>Config space</td><td>lspci "MSI-X: Enable- Count=N"</td></tr>
+<tr><td>2</td><td>PCI core</td><td>Sets Function Mask + Enable (masked while programming)</td><td>Message Control</td><td>Config write (CfgWr0 TLP)</td></tr>
+<tr><td>3</td><td>PCI core / IRQ domain</td><td>Allocates Linux IRQs, writes address/data per entry</td><td>MSI-X table in BAR</td><td>Downstream MWr to table region</td></tr>
+<tr><td>4</td><td>PCI core</td><td>Clears per-vector masks for requested vectors; clears Function Mask</td><td>Table + Message Control</td><td>MWr + CfgWr</td></tr>
+<tr><td>5</td><td>NVMe driver</td><td>Admin CQ uses vector 0 (by NVMe convention admin CQ interrupts on vector 0); Create I/O CQ with IV=n, IEN=1</td><td>Controller queue state</td><td>Admin SQE CDW11</td></tr>
+<tr><td>6</td><td>Controller</td><td>CQE posted to CQ bound to vector n</td><td>Host memory</td><td>MWr CQE</td></tr>
+<tr><td>7</td><td>Controller</td><td>Evaluates coalescing for vector n (threshold/time, unless CD set for that vector)</td><td>Internal</td><td>Timing gaps</td></tr>
+<tr><td>8</td><td>Controller</td><td>If Enable=1 and Function Mask=0 and Mask(n)=0: send MWr(addr n, data n). Else set Pending(n)</td><td>Link / PBA</td><td>MWr to Message Address, or PBA bit</td></tr>
+<tr><td>9</td><td>Platform</td><td>Interrupt remapping validates source ID and translates; APIC delivers to CPU</td><td>Host</td><td>/proc/interrupts; remapping fault logs</td></tr>
+<tr><td>10</td><td>Host software</td><td>Later unmasks vector n</td><td>Table</td><td>MWr to Vector Control</td></tr>
+<tr><td>11</td><td>Controller</td><td>If Pending(n) set when unmasked: sends message, clears pending</td><td>Link / PBA</td><td>MWr shortly after unmask MWr</td></tr>
+</tbody></table></div>
+<div class="callout spec"><div class="callout-title">📘 Spec discipline</div><p><span class="tag verified">verified</span> Normative (PCIe Base): capability layout, table entry layout, mask bit reset value of 1, pending-bit behaviour (a masked vector's message is held pending and sent when unmasked if still pending), Table Size encoding, max 2048. <span class="tag verified">verified</span> Normative (NVMe): Create I/O CQ carries IV and IEN; Feature 08h Interrupt Coalescing; Feature 09h Interrupt Vector Configuration with Coalescing Disable. <span class="tag impl">impl</span>: number of vectors, table placement in BAR, message address/data format (platform), whether the controller re-evaluates an interrupt condition or only latches pending. <span class="tag conceptual">informative</span>: The NVMe spec does not mandate one vector per CQ; several CQs may share a vector.</p></div>
+
+<h3>43.7 Queue-to-vector mapping</h3>
+<pre class="diagram">CPU0 ── SQ1/CQ1 ── IV=1 ── table[1] → addr/data targeting CPU0
+CPU1 ── SQ2/CQ2 ── IV=2 ── table[2] → … CPU1
+ …
+CPUn ── SQn+1/CQn+1 ── IV=n+1 ── table[n+1] → … CPUn
+Admin SQ0/CQ0 ─────── IV=0 ── table[0] (often shared with I/O queue 1 in Linux — impl)
+Poll queues (IEN=0) ── no vector</pre>
+<p>Linux's nvme driver uses managed IRQ affinity: vectors are spread across CPUs at allocation; when a CPU goes offline, its managed vector is shut down after its queue drains (<span class="tag impl">impl</span>, kernel-version dependent).</p>
+
+<h3>43.8 Interrupt coalescing (NVMe Feature 08h)</h3>
+<div class="table-wrap"><table class="bitfield">
+<thead><tr><th>CDW11 bits</th><th>Field</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>15:08</td><td>Aggregation Time (TIME)</td><td>Maximum delay in 100 µs increments; 0 = no delay-based coalescing</td></tr>
+<tr><td>07:00</td><td>Aggregation Threshold (THR)</td><td>Minimum number of CQEs to aggregate per vector, zero-based (0 → 1 entry)</td></tr>
+</tbody></table></div>
+<p>The controller sends an interrupt when either the threshold of completions accumulates or the aggregation time elapses since the first unsignalled completion (spec describes the intent; exact timing <span class="tag impl">impl</span>). The setting applies to all I/O-queue vectors; Feature 09h (Interrupt Vector Configuration) CDW11 bits 15:0 select a vector and bit 16 Coalescing Disable (CD) exempts it. The admin CQ vector is not coalesced.</p>
+<div class="formula">interrupts/s ≈ min(IOPS_per_vector / (THR+1),  …) bounded below by 1 / (TIME × 100 µs) when traffic is light</div>
+<ul class="vars"><li><b>THR</b> — zero-based aggregation threshold</li><li><b>TIME</b> — aggregation time in 100 µs units</li><li><b>IOPS_per_vector</b> — completions per second on CQs mapped to this vector</li></ul>
+<div class="callout warn"><div class="callout-title">⚠️ Latency trade-off</div><p>With TIME = 1 (100 µs) and QD1 workloads, a coalescing controller can add up to ~100 µs to every I/O — doubling the latency of a fast read. Linux does not enable NVMe coalescing by default. Tune only with measurement. <code>nvme get-feature /dev/nvme0 -f 8 -H</code> is read-only; <code>set-feature</code> changes device behaviour (caution).</p></div>
+
+<h3>43.9 Trace view</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: table programming and interrupts</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>TLP</th><th>Address / detail</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>init</td><td>↓</td><td>CfgWr0</td><td>MSI-X MC = C000h | size</td><td>Enable + Function Mask</td></tr>
+<tr><td>init</td><td>↓</td><td>MWr 1 DW ×3</td><td>BAR0+2000h/2004h/2008h</td><td>Entry 0 addr lo/hi/data (table at 2000h, impl)</td></tr>
+<tr><td>init</td><td>↓</td><td>MWr</td><td>BAR0+200Ch = 0</td><td>Unmask entry 0</td></tr>
+<tr><td>init</td><td>↓</td><td>CfgWr0</td><td>MC = 8000h | size</td><td>Function Mask cleared</td></tr>
+<tr><td>run</td><td>↑</td><td>MWr 4 DW</td><td>CQ1 slot</td><td>CQE</td></tr>
+<tr><td>run</td><td>↑</td><td>MWr 1 DW</td><td>FEE0_1000 data 0x41</td><td>Vector 1 interrupt</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: coalescing delay</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↑</td><td>MWr CQE #1 (CQ2)</td><td>completion</td></tr>
+<tr class="first-bad"><td>0 → 200</td><td>—</td><td>no MSI-X on vector 2 visible</td><td>Feature 08h TIME=2, THR=7: waiting for 8 CQEs or 200 µs</td></tr>
+<tr><td>200</td><td>↑</td><td>MWr FEE0_2000</td><td>interrupt after timer — latency +200 µs, by design</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: vector masked, PBA set</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>TLP / read</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↑</td><td>MWr CQE (CQ5)</td><td>completion</td></tr>
+<tr class="first-bad"><td>0 → 30 s</td><td>—</td><td>no MWr to vector 5 address in captured interval</td><td>—</td></tr>
+<tr class="bad"><td>debug</td><td>↓↑</td><td>MRd BAR0+2050h..205Ch / CplD: VecCtrl = 1</td><td>Vector 5 masked</td></tr>
+<tr class="bad"><td>debug</td><td>↓↑</td><td>MRd PBA / CplD: bit 5 = 1</td><td>Device has a pending message — device behaved correctly; host left vector masked (e.g. CPU hotplug race, driver bug, VM migration)</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: MSI-X sent but no ISR</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>TLP</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↑</td><td>MWr CQE</td><td>—</td></tr>
+<tr class="first-bad"><td>0.05 µs</td><td>↑</td><td>MWr FEE0_3000 data 0x51</td><td>Message on the link — but /proc/interrupts doesn't increment</td></tr>
+</tbody></table></div></div>
+<p><b>Reasoning:</b> link evidence says the device sent it; host evidence says software didn't run. Candidates: interrupt remapping rejected it (stale entry after VM migration/affinity change — check IOMMU fault log), address/data stale (host reprogrammed the table but the device used a cached copy — device bug), the capture point is upstream of a switch that dropped it (unlikely). This is a cross-layer gap between "PCIe delivered" and "CPU received".</p>
+
+<h3>43.10 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code>sudo lspci -vvv -s 02:00.0 | grep -A2 "MSI-X"
+#  Capabilities: [b0] MSI-X: Enable+ Count=33 Masked-       (illustrative)
+#        Vector table: BAR=0 offset=00002000
+#        PBA: BAR=0 offset=00003000
+grep nvme /proc/interrupts | head
+sudo nvme get-feature /dev/nvme0 -f 0x08 -H   # interrupt coalescing (read-only)
+sudo nvme get-feature /dev/nvme0 -f 0x09 -c 1 -H  # vector 1 configuration (read-only)
+# Reading table/PBA memory directly requires mapping the BAR (e.g. /sys/.../resource0)
+# - read-only inspection only; writing would corrupt interrupt state.</code></pre>
+<div class="callout warn"><div class="callout-title">⚠️ Safety</div><p>Never write MSI-X table entries or Message Control by hand (setpci or resource mmap) on a live system: you can mask the interrupt of the boot disk and hang the machine. Treat all of these as read-only inspection.</p></div>
+
+<h3>43.11 Five failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Possible causes</th><th>Evidence</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Likely conclusion / confidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>I/O timeouts; Linux reports completion found in timeout handler (polled)</td><td>Masked vector; MSI-X disabled; remapping fault</td><td>CQE present, IRQ count static</td><td>lspci Enable/Masked</td><td>Table Vector Control, PBA</td><td>Switch to poll queue for that CPU — if fixed, interrupt path</td><td>Host-side interrupt path; high</td></tr>
+<tr><td>2</td><td>High QD1 latency (~+100 µs)</td><td>Coalescing enabled</td><td>Gap CQE→MSI-X</td><td>Get Feature 08h</td><td>Feature 09h CD per vector</td><td>Disable coalescing on test drive</td><td>Configuration; high</td></tr>
+<tr><td>3</td><td>All completions on one CPU</td><td>Single vector (MSI fallback, vector shortage)</td><td>/proc/interrupts one line</td><td>lspci MSI-X Count</td><td>dmesg for allocation failures</td><td>Boot with more vectors / fewer CPUs</td><td>Platform/vector shortage; medium-high</td></tr>
+<tr><td>4</td><td>Interrupts stop after CPU hotplug or VM migration</td><td>Stale remapping, vector not restored</td><td>Sudden stop at event time</td><td>IOMMU fault log</td><td>Table contents vs expected</td><td>Re-bind driver</td><td>Platform/hypervisor; medium</td></tr>
+<tr><td>5</td><td>Spurious/duplicate interrupts, empty CQ on ISR</td><td>Shared vectors; device sends before CQE visible (ordering bug, RO misuse)</td><td>ISR finds no phase-valid entry</td><td>Check RO attr on CQE MWr</td><td>Count spurious ratio</td><td>Disable RO in Device Control</td><td>Device or bridge ordering; medium</td></tr>
+</tbody></table></div>
+
+<h3>43.12 Labs</h3>
+<div class="lab"><div class="lab-head">🧪 Lab 43.1 (beginner) — Map vectors to queues and CPUs <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> derive the queue/vector/CPU map. <b>Prerequisites:</b> Linux, NVMe drive. <b>Setup/Procedure:</b> run the commands in §43.10; list nvme lines in /proc/interrupts; read effective_affinity_list for each; read <code>/sys/block/nvme0n1/mq/*/cpu_list</code>. <b>Observations:</b> number of vectors, queues, CPUs per queue. <b>Questions:</b> is vector count = I/O queues + 1? Which vector serves the admin queue? <b>Expected reasoning:</b> Linux names vectors nvme0q0, nvme0q1…</p>
+<details class="answer"><summary>Solution</summary><p>Typically nvme0q0 is admin (vector 0), nvme0q1..qN are I/O; poll queues have no vector. Mismatch indicates vector limits or poll/read queue configuration (<code>nvme.poll_queues</code>, <code>nvme.write_queues</code>).</p></details>
+<p><b>Extension:</b> run fio pinned to one CPU and confirm only that vector increments.</p>
+</div>
+<div class="lab"><div class="lab-head">🧪 Lab 43.2 (intermediate) — Decode an MSI-X capability dump <span class="safety safe">SAFE</span></div>
+<p><b>Setup (synthetic):</b> capability bytes at 0xB0: <code>11 C0 20 80 | 00 20 00 00 | 00 30 00 00</code>. <b>Procedure:</b> decode.</p>
+<details class="answer"><summary>Solution</summary><p>Cap ID 11h; next pointer C0h; Message Control (little-endian bytes 20 80) = 0x8020 → Enable=1, Function Mask=0, Table Size field 0x020 → 33 vectors. Table Offset/BIR = 0x0000_2000 → BIR 0, offset 2000h. PBA = 0x0000_3000 → BIR 0, offset 3000h. Entry 5 at BAR0+2050h; pending bit 5 in QWORD at BAR0+3000h.</p></details>
+</div>
+<div class="lab"><div class="lab-head">🧪 Lab 43.3 (advanced) — Coalescing model <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> simulate interrupt rate and added latency vs THR/TIME. </p>
+<pre class="code" data-kind="simulation"><code>import random
+def simulate(iops, thr0, time_units, dur_s=1.0):
+    thr = thr0 + 1; tmax = time_units * 100e-6
+    t = 0.0; pending = []; irqs = 0; added = []
+    while t &lt; dur_s:
+        t += random.expovariate(iops); pending.append(t)
+        if len(pending) &gt;= thr or (tmax and t - pending[0] &gt;= tmax):
+            irqs += 1; added += [t - p for p in pending]; pending = []
+    return irqs, sum(added)/max(1, len(added))
+for thr0, tu in [(0,0),(3,1),(7,2),(15,4)]:
+    print(thr0, tu, simulate(200_000, thr0, tu))</code></pre>
+<p><b>Questions:</b> how does added latency scale with THR at high IOPS vs low IOPS?</p>
+<details class="answer"><summary>Solution</summary><p>At high IOPS the threshold triggers first: added latency ≈ (THR)/2 inter-arrival times (small). At low IOPS the timer dominates: added latency approaches TIME×100 µs. (This simple model only checks the timer on arrivals — a real controller has an independent timer; extend accordingly.)</p></details>
+<p><b>Extension:</b> add an independent timer event.</p>
+</div>
+<div class="lab"><div class="lab-head">🧪 Lab 43.4 (senior forensic) — The silent vector <span class="safety safe">SAFE</span></div>
+<p><b>Given (synthetic):</b> timeouts on QID 7 only; /proc/interrupts for nvme0q7 stopped incrementing at 10:02:13; at 10:02:12 the kernel log shows CPU 6 offline then online; trace shows CQEs on CQ7 and no MWr to vector 7 address; PBA bit 7 = 1; Vector Control 7 = 1. <b>Questions:</b> What happened? Device or host? What fix?</p>
+<details class="answer"><summary>Solution</summary><p>The vector was masked during CPU offline (managed IRQ shutdown) and never unmasked when the CPU returned — host-side bug/race (high confidence: PBA proves the device latched the interrupt correctly). Fix: kernel update/patch for the affinity/hotplug path; workaround: avoid hotplug, reset controller.</p></details>
+</div>
+
+<h3>43.13 Interview questions</h3>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> What is an MSI-X vector? <details class="answer"><summary>Model answer</summary><p>An entry in the MSI-X table: address, data and mask; the device sends an MWr of the data to the address.</p></details></li>
+<li><span class="lvl">Beginner</span> Where is the MSI-X table? <details class="answer"><summary>Model answer</summary><p>In a memory BAR, located by Table BIR and Offset from the capability.</p></details></li>
+<li><span class="lvl">Beginner</span> What does the PBA do? <details class="answer"><summary>Model answer</summary><p>Records pending interrupts for masked vectors.</p></details></li>
+<li><span class="lvl">Beginner</span> How does an NVMe CQ choose its vector? <details class="answer"><summary>Model answer</summary><p>IV field in Create I/O CQ CDW11, with IEN=1.</p></details></li>
+<li><span class="lvl">Beginner</span> Max MSI-X vectors? <details class="answer"><summary>Model answer</summary><p>2048.</p></details></li>
+<li><span class="lvl">Intermediate</span> Decode Message Control 0xC01F. <details class="answer"><summary>Model answer</summary><p>Enable=1, Function Mask=1, 32 vectors.</p></details></li>
+<li><span class="lvl">Intermediate</span> What does Feature 08h do? <details class="answer"><summary>Model answer</summary><p>Configures interrupt aggregation threshold and time for I/O vectors.</p></details></li>
+<li><span class="lvl">Intermediate</span> Why must Bus Master Enable be set for MSI-X? <details class="answer"><summary>Model answer</summary><p>Interrupt messages are memory writes the function initiates as a bus master.</p></details></li>
+<li><span class="lvl">Intermediate</span> What's the reset value of a vector's mask bit? <details class="answer"><summary>Model answer</summary><p>1 (masked).</p></details></li>
+<li><span class="lvl">Intermediate</span> Can several CQs share a vector? <details class="answer"><summary>Model answer</summary><p>Yes; the ISR must then scan all those CQs.</p></details></li>
+<li><span class="lvl">Advanced</span> Why does the CQE become visible before the ISR runs? <details class="answer"><summary>Model answer</summary><p>Both are posted writes from the same requester; the interrupt cannot pass the CQE under default ordering.</p></details></li>
+<li><span class="lvl">Advanced</span> What happens to multiple events while a vector is masked? <details class="answer"><summary>Model answer</summary><p>They collapse into one pending bit; one message on unmask.</p></details></li>
+<li><span class="lvl">Advanced</span> How does interrupt remapping change the meaning of Message Address/Data? <details class="answer"><summary>Model answer</summary><p>Address/data become a handle into the IOMMU's remapping table, validated against the source ID.</p></details></li>
+<li><span class="lvl">Advanced</span> How would you test pending-bit behaviour? <details class="answer"><summary>Model answer</summary><p>Mask vector, generate completions, read PBA (expect set), unmask, expect exactly one message and PBA clear.</p></details></li>
+<li><span class="lvl">Advanced</span> What is Coalescing Disable? <details class="answer"><summary>Model answer</summary><p>Feature 09h bit 16 per vector, exempting it from Feature 08h.</p></details></li>
+<li><span class="lvl">Senior</span> A VM sees periodic 30 s timeouts after live migration. Approach? <details class="answer"><summary>Model answer</summary><p>Check posted-interrupt/remapping state, table restore, PBA; correlate timestamp with migration; test with polling.</p></details></li>
+<li><span class="lvl">Senior</span> Design interrupt strategy for 2 M IOPS at low CPU. <details class="answer"><summary>Model answer</summary><p>Per-CPU queues, MSI-X affinity, moderate coalescing for throughput queues, CD on latency queues, poll queues for hipri, NAPI-like hybrid polling.</p></details></li>
+<li><span class="lvl">Senior</span> Prove whether a missing interrupt is device or host. <details class="answer"><summary>Model answer</summary><p>Analyzer at device link: MWr seen → host; not seen with PBA set → masked; not seen and PBA clear and CQE present → device bug (if coalescing excluded).</p></details></li>
+<li><span class="lvl">Senior</span> Why might vector count limit performance? <details class="answer"><summary>Model answer</summary><p>Fewer queues than CPUs → shared queues, locking, cross-CPU completions, cache misses.</p></details></li>
+<li><span class="lvl">Senior</span> When is polling better than MSI-X? <details class="answer"><summary>Model answer</summary><p>Ultra-low latency, high-IOPS dedicated cores where interrupt overhead dominates; costs CPU.</p></details></li>
+</ol></div>
+<div class="callout remember"><div class="callout-title">📌 Teach-back</div><p><b>Child:</b> phone book with do-not-call stickers and a sticky-note board. <b>Junior:</b> capability → table/PBA in BAR → entry fields → CQ IV mapping. <b>Senior:</b> ordering vs CQE, masking/pending semantics, coalescing trade-offs, remapping and virtualisation failure modes.</p></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>Explain: capability, table, PBA, vector, masking, coalescing.</li>
+<li>Diagram: Figure 43.1 from memory.</li>
+<li>Identify in trace: table programming, interrupt MWr, coalescing gaps.</li>
+<li>Debug: the five failure patterns.</li>
+<li>Distinguish: MSI vs MSI-X vs INTx; PCIe masking vs NVMe INTMS/INTMC; vector vs IRQ number.</li>
+<li>Cite: PCIe Base (MSI-X), NVMe Base (Features 08h/09h), NVMe over PCIe transport (interrupts).</li>
+</ul></div>
+<p><b>Next:</b> <a href="#p5-ch44-nvme-errors">Part XV — Error handling</a>.</p>
+</section>

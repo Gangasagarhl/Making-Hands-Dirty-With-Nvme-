@@ -1,0 +1,587 @@
+<section class="part" id="part-vii">
+<div class="part-num">PART VII</div>
+<h1>PCIe Configuration</h1>
+<p class="part-intro">A PCIe link that has trained to L0 is a road with no addresses on it. Before a single NVMe command can travel, software must <em>discover</em> every device on that road, give every bridge a range of bus numbers, read every device's identity card (its configuration space), learn how big each device's register window is, carve those windows out of the physical address map, and finally switch on memory decoding and bus mastering. This Part walks that journey in three chapters: <a href="#p3-ch17-enumeration">Chapter 17 — Enumeration</a> (the depth-first walk and bus numbering), <a href="#p3-ch18-config-space">Chapter 18 — Configuration Space</a> (decoding headers and capability lists by hand), and <a href="#p3-ch19-bars-mmio">Chapter 19 — BARs and MMIO</a> (sizing, assigning and using the doorway through which the NVMe driver reaches the controller's registers). By the end of the Part you will be able to read an <code>lspci -vvv</code> listing or a raw hex dump and say exactly what firmware and the OS did to the device — and what they forgot to do.</p>
+</section>
+
+<section class="chapter" id="p3-ch17-enumeration" data-part="PART VII — PCIe CONFIGURATION">
+<h2><span class="num">17</span> PCIe Enumeration</h2>
+
+<div class="callout spec"><div class="callout-title">📘 Specification baseline</div>
+<p><b>DOCUMENT:</b> PCI Express Base Specification (PCI-SIG), configuration and enumeration model inherited from the PCI Local Bus Specification and PCI-to-PCI Bridge Architecture Specification. <b>REVISION:</b> concepts here are stable from PCIe 1.0 through 6.x/7.0 <span class="tag version">version</span>; Flit-mode and 14-bit tag details do not change the enumeration algorithm. <b>STATUS:</b> current. <b>OLDER VERSIONS THAT MAY DIFFER:</b> conventional PCI had no Extended Configuration Space (only 256 bytes per function); PCIe added the 4 KiB space reachable through the Enhanced Configuration Access Mechanism (ECAM). <b>SOURCE:</b> PCI-SIG specifications (membership required for the normative text); Linux <code>drivers/pci/probe.c</code> as an openly readable implementation. Section numbers are intentionally not quoted.</p></div>
+
+<h3 id="p3-17-why">17.1 Why this chapter exists</h3>
+<p>Every NVMe bring-up failure that ends in "the drive is not detected" is, at its root, an enumeration story. Either the link never reached L0, or a configuration read returned all-ones, or the bridge above the device did not forward the right bus numbers, or the Base Address Register (BAR) could not be placed, or the OS refused the device's resources. If you cannot narrate enumeration step by step, you will guess at these failures instead of localizing them. This chapter gives you that narration — from power-on to the moment the NVMe driver's <code>probe()</code> function runs — and teaches you to find the first step that went wrong.</p>
+
+<h3 id="p3-17-objectives">17.2 Learning objectives</h3>
+<ul class="objectives">
+<li><b>Beginner:</b> explain what a Bus/Device/Function (<a class="gl" href="#g-bdf">BDF</a>) number is and why software must discover devices rather than having them pre-listed.</li>
+<li><b>Intermediate:</b> perform a depth-first enumeration by hand on a topology with a switch, assigning Primary, Secondary and Subordinate bus numbers correctly.</li>
+<li><b>Advanced:</b> explain Type 0 vs Type 1 configuration requests, how a bridge decides to forward, convert, or reject them, and how Configuration Request Retry Status (CRS) interacts with slow-to-initialize devices.</li>
+<li><b>Senior:</b> reason about resource reallocation, hot-plug bus-number padding, ACPI and firmware hand-off, and why the OS may re-enumerate differently from firmware.</li>
+<li><b>Trace analysis:</b> recognise the signature of an enumeration scan in a protocol capture (bursts of CfgRd0/CfgRd1 at offset 00h, Unsupported Request completions for empty slots) and spot the first anomaly.</li>
+<li><b>Debugging:</b> map "device missing" symptoms to a layer: physical link, configuration routing, resource assignment, or driver binding.</li>
+<li><b>Validation:</b> design tests for enumeration robustness (cold boot, warm reset, hot-plug, CRS behaviour, slow firmware readiness).</li>
+</ul>
+
+<h3 id="p3-17-prereq">17.3 Prerequisites</h3>
+<p>You should already understand the PCIe layer model and the Transaction Layer Packet (<a class="gl" href="#g-tlp">TLP</a>) — in particular that configuration requests (CfgRd0, CfgRd1, CfgWr0, CfgWr1) are non-posted and complete with a Cpl or CplD (<a class="gl" href="#g-cpl">Cpl</a>/<a class="gl" href="#g-cpld">CplD</a>). You should know that the Link Training and Status State Machine (<a class="gl" href="#g-ltssm">LTSSM</a>) must reach L0 before any TLP flows. If those are shaky, revisit the PCIe fundamentals Part first. Inside this Part, the next stops are <a href="#p3-ch18-config-space">Chapter 18</a> and <a href="#p3-ch19-bars-mmio">Chapter 19</a>.</p>
+
+<h3 id="p3-17-story">17.4 Story: the new apartment building</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div>
+<p>Imagine a postman who arrives at a brand-new town where nobody has house numbers yet. He starts at the post office (the Root Complex). He walks down the first street and knocks on every door: "Is anyone home?" If nobody answers, he moves on. If someone answers, he asks, "Who are you, and are you a <em>gate</em> to another street?" When he finds a gate, he walks through it, names the new street "Street 1", and keeps going deeper before returning. Each gate gets a little sign: "Streets 1 through 1 are behind me." When he has visited every street, he goes back and asks each household, "How big is your mailbox?" and then gives each one a real address in the town map. Only then can letters (memory reads and writes) be delivered.</p></div>
+<div class="callout analogy"><div class="callout-title">🌍 Real-world analogy</div>
+<p>A network administrator plugging in a new building of routers: she walks the cabling, assigns subnets to each router port (bus numbers to bridges), records which subnet range sits behind each router (Secondary..Subordinate), then hands out IP addresses to devices (BAR assignment). Routing then works by range checks — exactly how PCIe bridges forward configuration and memory requests.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div>
+<p>(1) Doors in PCIe do not answer with "nobody home" politely: a configuration read to an absent function is completed with Unsupported Request status by the bridge or Root Port, and the CPU typically sees <code>FFFFh</code>/<code>FFFFFFFFh</code> — the "all-ones" response. (2) The postman can find a house that says "come back later" (CRS) — a real device may still be booting its firmware. (3) House numbers (bus numbers) are assigned by the postman, but <em>device</em> numbers on a PCIe link are fixed by topology: a device directly below a Root Port or switch Downstream Port is device 0 (unless ARI is in use). (4) Addresses for mailboxes (BARs) are not chosen by the household — the household only states the <em>size</em> and alignment, and software picks the address.</p></div>
+
+<h3 id="p3-17-beginner">17.5 Beginner view: what enumeration is</h3>
+<p><b>Enumeration</b> is the process by which system software (platform firmware first, then usually the OS again) discovers every PCI Express function in the hierarchy, gives every bridge its bus-number range, sizes and assigns every BAR, and enables the functions it wants to use. It exists because PCIe, like PCI before it, is <em>self-describing</em>: the motherboard does not contain a list of what is plugged in. A slot could hold an NVMe SSD today and a network card tomorrow, and a switch could fan out to 24 drives in a storage enclosure. Software therefore discovers the topology at run time by issuing configuration reads and observing who answers.</p>
+
+<h4 id="p3-17-bdf">17.5.1 Bus / Device / Function (BDF)</h4>
+<p>Every function is addressed in configuration space by a 16-bit <b>Routing ID</b> (called Requester ID when the function initiates a request, Completer ID when it completes one) <span class="tag verified">verified</span>:</p>
+<div class="table-wrap"><table class="bitfield">
+<thead><tr><th>Bits 15:8</th><th>Bits 7:3</th><th>Bits 2:0</th></tr></thead>
+<tbody><tr><td>Bus number (0–255)</td><td>Device number (0–31)</td><td>Function number (0–7)</td></tr></tbody>
+</table></div>
+<p>Linux prints it as <code>DDDD:BB:DD.F</code>, for example <code>0000:01:00.0</code>: PCI <b>segment</b> (domain) 0000, bus 01, device 00, function 0. Segments let a large server have more than 256 buses by giving each Root Complex (or each ECAM region) its own 256-bus space; the segment number is <em>not</em> carried in the TLP — it is a host-side concept. <span class="tag verified">verified</span></p>
+<ul>
+<li><b>Bus number</b> — assigned by software during enumeration. Not burned into hardware. Bus 0 is the Root Complex's internal bus in the common case.</li>
+<li><b>Device number</b> — on a point-to-point PCIe link, the device below a Root Port or switch Downstream Port is device 0. The Downstream Port only forwards Type 0 configuration requests that target device 0 on its secondary bus (unless ARI forwarding is enabled). Devices other than 0 appear on a Root Complex's internal bus (integrated endpoints and Root Ports themselves) and on the internal virtual bus of a switch (one device number per Downstream Port).</li>
+<li><b>Function number</b> — a single physical device can expose up to 8 functions (e.g. a multi-port NIC). Function 0 must exist; software checks the multi-function bit (Header Type bit 7) of function 0 before probing functions 1–7.</li>
+</ul>
+<div class="callout advanced"><div class="callout-title">🚀 Advanced: ARI</div>
+<p>Alternative Routing-ID Interpretation (ARI, an extended capability, ID 000Eh) reinterprets the 8 bits of Device+Function as one 8-bit function number for devices directly below an ARI-capable Downstream Port. This allows up to 256 functions — needed for Single Root I/O Virtualization (<a class="gl" href="#g-sriov">SR-IOV</a>) devices that expose many Virtual Functions. With ARI, "device number" stops being meaningful for that device. <span class="tag verified">verified</span></p></div>
+
+<h3 id="p3-17-engineering">17.6 Engineering view: the full walk from power-on</h3>
+<p>The master journey requested for this chapter is: <b>Firmware → Root Complex → Link → device detection → BDF → configuration space → BAR sizing → BAR assignment → Command register → bus mastering → driver</b>. Here is that journey as a timeline with the evidence each step leaves behind.</p>
+
+<figure class="diagram"><svg viewBox="0 0 820 300" role="img" aria-label="Timeline of PCIe enumeration from power on to NVMe driver probe">
+<rect class="box" x="10" y="20" width="150" height="56" rx="6"/>
+<text class="lbl" x="85" y="44" text-anchor="middle">1. Power-on /</text>
+<text class="lbl" x="85" y="62" text-anchor="middle">PERST# released</text>
+<rect class="box" x="175" y="20" width="150" height="56" rx="6"/>
+<text class="lbl" x="250" y="44" text-anchor="middle">2. LTSSM: Detect →</text>
+<text class="lbl" x="250" y="62" text-anchor="middle">Polling → Cfg → L0</text>
+<rect class="box" x="340" y="20" width="150" height="56" rx="6"/>
+<text class="lbl" x="415" y="44" text-anchor="middle">3. Readiness wait</text>
+<text class="lbl" x="415" y="62" text-anchor="middle">(≥100 ms, CRS)</text>
+<rect class="box accent" x="505" y="20" width="150" height="56" rx="6"/>
+<text class="lbl" x="580" y="44" text-anchor="middle">4. Firmware scan:</text>
+<text class="lbl" x="580" y="62" text-anchor="middle">CfgRd VID per BDF</text>
+<rect class="box accent" x="670" y="20" width="140" height="56" rx="6"/>
+<text class="lbl" x="740" y="44" text-anchor="middle">5. Bus numbers</text>
+<text class="lbl" x="740" y="62" text-anchor="middle">pri/sec/sub</text>
+<line class="ln" x1="160" y1="48" x2="173" y2="48" marker-end="url(#arrow)"/>
+<line class="ln" x1="325" y1="48" x2="338" y2="48" marker-end="url(#arrow)"/>
+<line class="ln" x1="490" y1="48" x2="503" y2="48" marker-end="url(#arrow)"/>
+<line class="ln" x1="655" y1="48" x2="668" y2="48" marker-end="url(#arrow)"/>
+<path class="ln" d="M740 76 L740 110 L85 110 L85 128" marker-end="url(#arrow)"/>
+<rect class="box accent" x="10" y="130" width="150" height="56" rx="6"/>
+<text class="lbl" x="85" y="154" text-anchor="middle">6. BAR sizing</text>
+<text class="lbl" x="85" y="172" text-anchor="middle">(write 1s, read)</text>
+<rect class="box accent" x="175" y="130" width="150" height="56" rx="6"/>
+<text class="lbl" x="250" y="154" text-anchor="middle">7. BAR + bridge</text>
+<text class="lbl" x="250" y="172" text-anchor="middle">window assignment</text>
+<rect class="box" x="340" y="130" width="150" height="56" rx="6"/>
+<text class="lbl" x="415" y="154" text-anchor="middle">8. Boot driver /</text>
+<text class="lbl" x="415" y="172" text-anchor="middle">UEFI NVMe (opt.)</text>
+<rect class="box" x="505" y="130" width="150" height="56" rx="6"/>
+<text class="lbl" x="580" y="154" text-anchor="middle">9. OS hand-off:</text>
+<text class="lbl" x="580" y="172" text-anchor="middle">ACPI MCFG, _CRS</text>
+<rect class="box alt" x="670" y="130" width="140" height="56" rx="6"/>
+<text class="lbl" x="740" y="154" text-anchor="middle">10. OS scan</text>
+<text class="lbl" x="740" y="172" text-anchor="middle">(keep or realloc)</text>
+<line class="ln" x1="160" y1="158" x2="173" y2="158" marker-end="url(#arrow)"/>
+<line class="ln" x1="325" y1="158" x2="338" y2="158" marker-end="url(#arrow)"/>
+<line class="ln" x1="490" y1="158" x2="503" y2="158" marker-end="url(#arrow)"/>
+<line class="ln" x1="655" y1="158" x2="668" y2="158" marker-end="url(#arrow)"/>
+<path class="ln" d="M740 186 L740 220 L85 220 L85 236" marker-end="url(#arrow)"/>
+<rect class="box alt" x="10" y="238" width="150" height="50" rx="6"/>
+<text class="lbl" x="85" y="260" text-anchor="middle">11. Match class</text>
+<text class="lbl" x="85" y="277" text-anchor="middle">010802h → nvme</text>
+<rect class="box alt" x="175" y="238" width="150" height="50" rx="6"/>
+<text class="lbl" x="250" y="260" text-anchor="middle">12. Command.MSE=1</text>
+<text class="lbl" x="250" y="277" text-anchor="middle">Command.BME=1</text>
+<rect class="box alt" x="340" y="238" width="150" height="50" rx="6"/>
+<text class="lbl" x="415" y="260" text-anchor="middle">13. DMA mask,</text>
+<text class="lbl" x="415" y="277" text-anchor="middle">ioremap BAR0</text>
+<rect class="box alt" x="505" y="238" width="150" height="50" rx="6"/>
+<text class="lbl" x="580" y="260" text-anchor="middle">14. MSI-X vectors</text>
+<text class="lbl" x="580" y="277" text-anchor="middle">allocated</text>
+<rect class="box accent" x="670" y="238" width="140" height="50" rx="6"/>
+<text class="lbl" x="740" y="260" text-anchor="middle">15. NVMe init:</text>
+<text class="lbl" x="740" y="277" text-anchor="middle">read CAP, CC.EN</text>
+<line class="ln" x1="160" y1="263" x2="173" y2="263" marker-end="url(#arrow)"/>
+<line class="ln" x1="325" y1="263" x2="338" y2="263" marker-end="url(#arrow)"/>
+<line class="ln" x1="490" y1="263" x2="503" y2="263" marker-end="url(#arrow)"/>
+<line class="ln" x1="655" y1="263" x2="668" y2="263" marker-end="url(#arrow)"/>
+</svg><figcaption>Figure 17.1 — The enumeration timeline. Row 1 is physical and link bring-up plus discovery; row 2 is resource assignment and hand-off; row 3 is the OS driver taking ownership. The order of steps 12–14 inside the driver is implementation-dependent.</figcaption></figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Step</th><th>Who acts</th><th>What changes</th><th>Evidence you can collect</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Power stable, reference clock running, PERST# (fundamental reset) de-asserted</td><td>Platform / board logic</td><td>Device begins internal initialization</td><td>Oscilloscope on PERST#, REFCLK; board power-sequencing logs <span class="tag impl">impl</span></td></tr>
+<tr><td>2</td><td>Link training</td><td>LTSSM in Root Port and device</td><td>Link reaches L0 at some width and speed (initially 2.5 GT/s, then may retrain higher)</td><td>Protocol analyzer link-training view; Root Port Link Status (Data Link Layer Link Active, current speed/width)</td></tr>
+<tr><td>3</td><td>Readiness wait</td><td>Firmware</td><td>Nothing on the wire; software waits before the first configuration request. The PCIe Base Specification requires software to allow time (commonly cited as 100 ms after reset exit, and for ports above 5 GT/s, 100 ms after link training completes) before sending configuration requests <span class="tag verified">verified</span>; devices may then still answer CRS</td><td>Timestamps in firmware debug logs; analyzer gap between L0 and first CfgRd</td></tr>
+<tr><td>4</td><td>Discovery scan</td><td>Firmware (UEFI PCI bus driver, or coreboot, etc.)</td><td>No state change in device — reads only (Vendor ID at offset 00h)</td><td>Bursts of CfgRd0/CfgRd1 to offset 00h; UR completions for absent functions</td></tr>
+<tr><td>5</td><td>Bus number assignment</td><td>Firmware</td><td>CfgWr to each bridge's Primary/Secondary/Subordinate registers (offset 18h–1Ah of the Type 1 header)</td><td>CfgWr to offset 18h; after this, CfgRd1 starts reaching deeper buses</td></tr>
+<tr><td>6</td><td>BAR sizing</td><td>Firmware</td><td>Temporary all-ones writes to BARs, then restore</td><td>CfgWr <code>FFFFFFFFh</code> to offsets 10h–24h, CfgRd of the same</td></tr>
+<tr><td>7</td><td>BAR and bridge window assignment</td><td>Firmware</td><td>BARs get addresses; bridges get Memory Base/Limit and Prefetchable Base/Limit windows covering their children</td><td>CfgWr to BARs and to bridge offsets 20h–2Ch</td></tr>
+<tr><td>8</td><td>Boot-time driver (optional)</td><td>UEFI NVMe driver if booting from the SSD</td><td>Command register MSE/BME set; the NVMe controller is initialised and later reset or left for the OS <span class="tag impl">impl</span></td><td>MMIO writes to BAR0 (CC, AQA…); NVMe admin commands during boot</td></tr>
+<tr><td>9</td><td>OS hand-off</td><td>Firmware → OS</td><td>ACPI tables describe ECAM (MCFG table) and host-bridge resource windows (<code>_CRS</code>)</td><td>Linux <code>dmesg</code>: lines about MMCONFIG/ECAM and host bridge windows</td></tr>
+<tr><td>10</td><td>OS scan</td><td>Linux PCI core (<code>pci_scan_root_bus_bridge</code> and friends)</td><td>Usually keeps firmware assignments; may reassign if they are invalid or if asked (<code>pci=realloc</code>) <span class="tag impl">impl</span></td><td><code>dmesg</code>: "BAR n: assigned" or "can't assign" messages; <code>lspci -tv</code></td></tr>
+<tr><td>11</td><td>Driver matching</td><td>Linux driver core</td><td>Class code 010802h (mass storage / Non-Volatile Memory controller / NVM Express) matches the <code>nvme</code> driver's class table</td><td><code>lspci -k</code> "Kernel driver in use: nvme"</td></tr>
+<tr><td>12</td><td>Enable decoding and bus mastering</td><td>NVMe driver via <code>pci_enable_device_mem()</code> and <code>pci_set_master()</code></td><td>Command register: Memory Space Enable (bit 1) and Bus Master Enable (bit 2) set</td><td><code>lspci -vvv</code> "Control: … Mem+ BusMaster+"</td></tr>
+<tr><td>13</td><td>DMA mask and BAR mapping</td><td>NVMe driver</td><td>DMA addressing capability declared (typically 64-bit); BAR0 mapped into kernel virtual space</td><td>Driver code; <code>/proc/iomem</code> shows the region claimed as "nvme"</td></tr>
+<tr><td>14</td><td>Interrupt vectors</td><td>NVMe driver</td><td>MSI-X Enable set, table entries programmed</td><td><code>lspci -vvv</code> "MSI-X: Enable+"; <code>/proc/interrupts</code> entries named nvme0q0, nvme0q1…</td></tr>
+<tr><td>15</td><td>NVMe controller initialization</td><td>NVMe driver</td><td>CAP read, CC.EN cycle, admin queue set up (see <a href="#p3-ch24-registers">Chapter 24</a>)</td><td>MMIO TLPs to BAR0 offsets 00h, 14h, 1Ch, 24h–37h</td></tr>
+</tbody></table></div>
+
+<h3 id="p3-17-hardware">17.7 Hardware view: who answers a configuration request</h3>
+<p>A configuration request is born in the Root Complex. The CPU never issues "a config TLP" directly; it performs a load or store to the ECAM window (or, on legacy x86, to I/O ports <code>CF8h</code>/<code>CFCh</code>), and the Root Complex converts that access into a configuration TLP <span class="tag verified">verified</span>. The Root Complex's ECAM decoder takes the address apart:</p>
+<div class="formula">ECAM address = ECAM_base + (Bus &lt;&lt; 20) + (Device &lt;&lt; 15) + (Function &lt;&lt; 12) + Register</div>
+<ul class="vars">
+<li><b>ECAM_base</b> — physical base of the configuration window, reported to the OS in the ACPI MCFG table (per segment and bus range).</li>
+<li><b>Bus</b> — 8 bits (0–255). Each bus takes 1 MiB of window.</li>
+<li><b>Device</b> — 5 bits (0–31). Each device takes 32 KiB.</li>
+<li><b>Function</b> — 3 bits (0–7). Each function takes 4 KiB.</li>
+<li><b>Register</b> — 12-bit byte offset (0–FFFh) into the function's 4 KiB configuration space.</li>
+</ul>
+<p>A full 256-bus segment therefore needs a 256 MiB window. Firmware may describe a smaller bus range to save address space. <span class="tag derived">derived</span></p>
+
+<pre class="code" data-kind="executable"><code>#!/usr/bin/env python3
+"""ECAM and legacy CF8h address calculators (pure arithmetic, no hardware access)."""
+
+def ecam_addr(base, bus, dev, fn, reg):
+    assert 0 &lt;= bus &lt; 256 and 0 &lt;= dev &lt; 32 and 0 &lt;= fn &lt; 8 and 0 &lt;= reg &lt; 4096
+    return base + (bus &lt;&lt; 20) + (dev &lt;&lt; 15) + (fn &lt;&lt; 12) + reg
+
+def cf8_value(bus, dev, fn, reg):
+    # Legacy mechanism reaches only the first 256 bytes, dword aligned.
+    assert reg &lt; 256 and reg % 4 == 0
+    return (1 &lt;&lt; 31) | (bus &lt;&lt; 16) | (dev &lt;&lt; 11) | (fn &lt;&lt; 8) | (reg &amp; 0xFC)
+
+def bdf_from_rid(rid):
+    return (rid &gt;&gt; 8) &amp; 0xFF, (rid &gt;&gt; 3) &amp; 0x1F, rid &amp; 0x7
+
+ECAM_BASE = 0xE000_0000          # synthetic: real base comes from the ACPI MCFG table
+for bdf, reg in [((0x01, 0, 0), 0x000), ((0x01, 0, 0), 0x100), ((0x04, 0, 0), 0x034)]:
+    b, d, f = bdf
+    print(f"{b:02x}:{d:02x}.{f} reg {reg:03x}h -&gt; ECAM {ecam_addr(ECAM_BASE, b, d, f, reg):#010x}")
+print(f"CF8h value for 01:00.0 reg 10h = {cf8_value(1, 0, 0, 0x10):#010x}")
+rid = (0x04 &lt;&lt; 8) | (0 &lt;&lt; 3) | 0
+print(f"Requester ID {rid:#06x} -&gt; bus {bdf_from_rid(rid)[0]:02x} dev {bdf_from_rid(rid)[1]:02x} fn {bdf_from_rid(rid)[2]}")
+print(f"ECAM window for 256 buses = {256 * 32 * 8 * 4096 // (1 &lt;&lt; 20)} MiB")</code></pre>
+<p>Output when run (pure arithmetic; the ECAM base is synthetic):</p>
+<pre class="code" data-kind="executable"><code>01:00.0 reg 000h -&gt; ECAM 0xe0100000
+01:00.0 reg 100h -&gt; ECAM 0xe0100100
+04:00.0 reg 034h -&gt; ECAM 0xe0400034
+CF8h value for 01:00.0 reg 10h = 0x80010010
+Requester ID 0x0400 -&gt; bus 04 dev 00 fn 0
+ECAM window for 256 buses = 256 MiB</code></pre>
+
+<h4 id="p3-17-type01">17.7.1 Type 0 vs Type 1 configuration requests</h4>
+<p>The Root Complex chooses a TLP type by comparing the target bus with the topology:</p>
+<ul>
+<li><b>CfgRd0 / CfgWr0 (Type 0)</b> — targets a function on the bus <em>directly below</em> the port issuing it. The receiving function consumes it.</li>
+<li><b>CfgRd1 / CfgWr1 (Type 1)</b> — targets a function on a bus further down. Each bridge (Root Port, switch port) compares the target bus with its own registers:
+<ul>
+<li>target bus == <b>Secondary Bus Number</b> → convert to Type 0 and send it down the link;</li>
+<li>Secondary &lt; target bus ≤ <b>Subordinate Bus Number</b> → forward downstream unchanged as Type 1;</li>
+<li>otherwise → not for this bridge (it is not claimed by this branch).</li></ul></li>
+</ul>
+<p>This range check is why bus numbering must be contiguous and depth-first: every bridge must "own" exactly the range of bus numbers beneath it. <span class="tag verified">verified</span></p>
+
+<div class="callout hw"><div class="callout-title">🔧 Hardware: what a switch looks like to software</div>
+<p>A PCIe switch is not one device to software. It appears as a <b>tree of PCI-to-PCI bridges</b>: one Upstream Port (a Type 1 function on the bus below the Root Port) and an internal virtual bus with one Type 1 function per Downstream Port. A 1-upstream/3-downstream switch therefore consumes <em>two</em> levels of bus numbers before its endpoints: one for the internal bus, then one per Downstream Port. Engineers who forget the internal bus mis-predict BDFs every time.</p></div>
+
+<h3 id="p3-17-algorithm">17.8 The depth-first enumeration algorithm</h3>
+<pre class="code" data-kind="pseudocode"><code>next_bus = 0
+
+scan_bus(bus):
+    highest = bus
+    for dev in 0..31:
+        if read_cfg16(bus, dev, 0, 0x00) == 0xFFFF: continue       # no function 0 → no device
+        nfuncs = 8 if (read_cfg8(bus, dev, 0, 0x0E) &amp; 0x80) else 1   # multi-function bit
+        for fn in 0..nfuncs-1:
+            vid = read_cfg16(bus, dev, fn, 0x00)
+            if vid == 0xFFFF: continue
+            if vid == 0x0001: retry later                           # CRS software visibility (see 17.9)
+            hdr = read_cfg8(bus, dev, fn, 0x0E) &amp; 0x7F
+            if hdr == 0x01:                                          # Type 1: a bridge
+                next_bus += 1
+                write_cfg8(bus, dev, fn, 0x18, bus)                  # Primary
+                write_cfg8(bus, dev, fn, 0x19, next_bus)             # Secondary
+                write_cfg8(bus, dev, fn, 0x1A, 0xFF)                 # Subordinate: temporarily "everything"
+                sub = scan_bus(next_bus)                             # recurse first (depth-first)
+                write_cfg8(bus, dev, fn, 0x1A, sub)                  # shrink to the real range
+                highest = max(highest, sub)
+            else:
+                record endpoint; size its BARs later
+    return highest
+
+scan_bus(0)</code></pre>
+<p>Two details matter in real firmware <span class="tag impl">impl</span>: (1) hot-plug capable Downstream Ports often get <em>extra</em> bus numbers reserved ("bus padding") so a switch inserted later can be numbered without renumbering the whole tree; (2) Linux normally reads the bus numbers firmware programmed and only assigns new ones if they are missing or broken. Linux performs its own scan using the same principles (<code>pci_scan_child_bus</code>, <code>pci_scan_bridge</code>).</p>
+
+<h4 id="p3-17-walk">17.8.1 Worked walk with bus numbering</h4>
+<p>The following executable simulation applies the algorithm to a synthetic topology: a Root Complex with an integrated host bridge, Root Port A (an NVMe SSD directly attached) and Root Port B (a 3-port switch with two NVMe SSDs and one empty slot).</p>
+<pre class="code" data-kind="simulation"><code>#!/usr/bin/env python3
+"""Depth-first PCIe bus-numbering simulation (SYNTHETIC topology, no hardware access)."""
+
+# Each node: ("bridge", name, [children]) or ("ep", name)
+# Children of a bridge sit on the bridge's SECONDARY bus; device numbers are list positions.
+TOPOLOGY = [  # devices on bus 0 (root complex internal bus)
+    ("ep", "Host bridge"),                                   # 00:00.0
+    ("bridge", "Root Port A", [("ep", "NVMe SSD #1")]),       # 00:01.0
+    ("bridge", "Root Port B", [                               # 00:02.0
+        ("bridge", "Switch Upstream Port", [
+            ("bridge", "Switch Downstream Port 0", [("ep", "NVMe SSD #2")]),
+            ("bridge", "Switch Downstream Port 1", [("ep", "NVMe SSD #3")]),
+            ("bridge", "Switch Downstream Port 2", []),      # empty slot
+        ]),
+    ]),
+]
+
+next_bus = 0
+rows = []
+
+def scan_bus(bus, devices, depth):
+    """Scan one bus; recurse into bridges depth-first. Returns highest bus number used."""
+    global next_bus
+    highest = bus
+    for dev, node in enumerate(devices):
+        bdf = f"{bus:02x}:{dev:02x}.0"
+        if node[0] == "ep":
+            rows.append((depth, bdf, node[1], "type 0", ""))
+            continue
+        _, name, children = node
+        next_bus += 1
+        secondary = next_bus
+        # Real firmware temporarily programs subordinate = 0xFF so Type 1 config
+        # requests for any deeper bus are forwarded while scanning below.
+        idx = len(rows)
+        rows.append([depth, bdf, name, "type 1", None])
+        sub = scan_bus(secondary, children, depth + 1)
+        rows[idx][4] = f"pri={bus:02x} sec={secondary:02x} sub={sub:02x}"
+        highest = max(highest, sub)
+    return highest
+
+scan_bus(0, TOPOLOGY, 0)
+print(f"{'BDF':8} {'header':7} {'bus registers':24} device")
+for depth, bdf, name, hdr, regs in rows:
+    print(f"{bdf:8} {hdr:7} {regs:24} {'  ' * depth}{name}")</code></pre>
+<p>Output:</p>
+<pre class="code" data-kind="simulation"><code>BDF      header  bus registers            device
+00:00.0  type 0                           Host bridge
+00:01.0  type 1  pri=00 sec=01 sub=01     Root Port A
+01:00.0  type 0                             NVMe SSD #1
+00:02.0  type 1  pri=00 sec=02 sub=06     Root Port B
+02:00.0  type 1  pri=02 sec=03 sub=06       Switch Upstream Port
+03:00.0  type 1  pri=03 sec=04 sub=04         Switch Downstream Port 0
+04:00.0  type 0                                 NVMe SSD #2
+03:01.0  type 1  pri=03 sec=05 sub=05         Switch Downstream Port 1
+05:00.0  type 0                                 NVMe SSD #3
+03:02.0  type 1  pri=03 sec=06 sub=06         Switch Downstream Port 2</code></pre>
+
+<figure class="diagram"><svg viewBox="0 0 820 520" role="img" aria-label="Depth-first bus numbering of a PCIe hierarchy with a switch">
+<rect class="box" x="20" y="10" width="780" height="40" rx="6"/>
+<text class="lbl" x="410" y="35" text-anchor="middle">Root Complex (CPU side) — ECAM decoder turns loads/stores into CfgRd/CfgWr TLPs</text>
+<line class="ln" x1="40" y1="72" x2="780" y2="72"/>
+<text class="lbl small" x="44" y="66">Bus 0 (internal)</text>
+<rect class="box" x="40" y="90" width="160" height="50" rx="6"/>
+<text class="lbl" x="120" y="111" text-anchor="middle">00:00.0 Host bridge</text>
+<text class="lbl small" x="120" y="129" text-anchor="middle">Type 0</text>
+<rect class="box accent" x="260" y="90" width="190" height="50" rx="6"/>
+<text class="lbl" x="355" y="111" text-anchor="middle">00:01.0 Root Port A</text>
+<text class="lbl small" x="355" y="129" text-anchor="middle">pri 0 · sec 1 · sub 1</text>
+<rect class="box accent" x="520" y="90" width="230" height="50" rx="6"/>
+<text class="lbl" x="635" y="111" text-anchor="middle">00:02.0 Root Port B</text>
+<text class="lbl small" x="635" y="129" text-anchor="middle">pri 0 · sec 2 · sub 6</text>
+<line class="ln" x1="120" y1="72" x2="120" y2="90"/>
+<line class="ln" x1="355" y1="72" x2="355" y2="90"/>
+<line class="ln" x1="635" y1="72" x2="635" y2="90"/>
+<line class="ln" x1="355" y1="140" x2="355" y2="188" marker-end="url(#arrow)"/>
+<text class="lbl small" x="362" y="168">Link → Bus 1</text>
+<rect class="box" x="260" y="190" width="190" height="50" rx="6"/>
+<text class="lbl" x="355" y="211" text-anchor="middle">01:00.0 NVMe SSD #1</text>
+<text class="lbl small" x="355" y="229" text-anchor="middle">Type 0 · class 010802h</text>
+<line class="ln" x1="635" y1="140" x2="635" y2="188" marker-end="url(#arrow)"/>
+<text class="lbl small" x="642" y="168">Link → Bus 2</text>
+<rect class="box accent" x="520" y="190" width="230" height="50" rx="6"/>
+<text class="lbl" x="635" y="211" text-anchor="middle">02:00.0 Switch Upstream Port</text>
+<text class="lbl small" x="635" y="229" text-anchor="middle">pri 2 · sec 3 · sub 6</text>
+<line class="ln" x1="300" y1="272" x2="790" y2="272"/>
+<text class="lbl small" x="300" y="266">Bus 3 (virtual bus inside the switch)</text>
+<line class="ln" x1="635" y1="240" x2="635" y2="272"/>
+<rect class="box accent" x="300" y="290" width="150" height="50" rx="6"/>
+<text class="lbl" x="375" y="311" text-anchor="middle">03:00.0 DSP 0</text>
+<text class="lbl small" x="375" y="329" text-anchor="middle">pri 3 · sec 4 · sub 4</text>
+<rect class="box accent" x="470" y="290" width="150" height="50" rx="6"/>
+<text class="lbl" x="545" y="311" text-anchor="middle">03:01.0 DSP 1</text>
+<text class="lbl small" x="545" y="329" text-anchor="middle">pri 3 · sec 5 · sub 5</text>
+<rect class="box accent" x="640" y="290" width="150" height="50" rx="6"/>
+<text class="lbl" x="715" y="311" text-anchor="middle">03:02.0 DSP 2</text>
+<text class="lbl small" x="715" y="329" text-anchor="middle">pri 3 · sec 6 · sub 6</text>
+<line class="ln" x1="375" y1="272" x2="375" y2="290"/>
+<line class="ln" x1="545" y1="272" x2="545" y2="290"/>
+<line class="ln" x1="715" y1="272" x2="715" y2="290"/>
+<line class="ln" x1="375" y1="340" x2="375" y2="398" marker-end="url(#arrow)"/>
+<text class="lbl small" x="381" y="374">Bus 4</text>
+<line class="ln" x1="545" y1="340" x2="545" y2="398" marker-end="url(#arrow)"/>
+<text class="lbl small" x="551" y="374">Bus 5</text>
+<line class="ln" x1="715" y1="340" x2="715" y2="398" marker-end="url(#arrow)"/>
+<text class="lbl small" x="721" y="374">Bus 6</text>
+<rect class="box" x="300" y="400" width="150" height="50" rx="6"/>
+<text class="lbl" x="375" y="421" text-anchor="middle">04:00.0 NVMe SSD #2</text>
+<text class="lbl small" x="375" y="439" text-anchor="middle">Type 0</text>
+<rect class="box" x="470" y="400" width="150" height="50" rx="6"/>
+<text class="lbl" x="545" y="421" text-anchor="middle">05:00.0 NVMe SSD #3</text>
+<text class="lbl small" x="545" y="439" text-anchor="middle">Type 0</text>
+<rect class="box alt" x="640" y="400" width="150" height="50" rx="6"/>
+<text class="lbl" x="715" y="421" text-anchor="middle">empty slot</text>
+<text class="lbl small" x="715" y="439" text-anchor="middle">CfgRd0 → UR → FFFFh</text>
+<circle class="box alt" cx="30" cy="115" r="11"/><text class="lbl small" x="30" y="119" text-anchor="middle">1</text>
+<circle class="box alt" cx="250" cy="115" r="11"/><text class="lbl small" x="250" y="119" text-anchor="middle">2</text>
+<circle class="box alt" cx="250" cy="215" r="11"/><text class="lbl small" x="250" y="219" text-anchor="middle">3</text>
+<circle class="box alt" cx="508" cy="115" r="11"/><text class="lbl small" x="508" y="119" text-anchor="middle">4</text>
+<circle class="box alt" cx="508" cy="215" r="11"/><text class="lbl small" x="508" y="219" text-anchor="middle">5</text>
+<circle class="box alt" cx="288" cy="315" r="11"/><text class="lbl small" x="288" y="319" text-anchor="middle">6</text>
+<circle class="box alt" cx="288" cy="425" r="11"/><text class="lbl small" x="288" y="429" text-anchor="middle">7</text>
+<circle class="box alt" cx="460" cy="315" r="11"/><text class="lbl small" x="460" y="319" text-anchor="middle">8</text>
+<circle class="box alt" cx="460" cy="425" r="11"/><text class="lbl small" x="460" y="429" text-anchor="middle">9</text>
+<circle class="box alt" cx="630" cy="315" r="11"/><text class="lbl small" x="630" y="319" text-anchor="middle">10</text>
+<text class="lbl small" x="20" y="482">Circled numbers = depth-first visit order. The Secondary bus number is assigned on the way DOWN (subordinate</text>
+<text class="lbl small" x="20" y="500">temporarily FFh); the real Subordinate number is written on the way back UP, once the deepest bus is known.</text>
+</svg><figcaption>Figure 17.2 — Depth-first bus numbering for the synthetic topology simulated above. Root Port B's range (2–6) covers the switch's internal bus (3) and the three Downstream Port buses (4, 5, 6).</figcaption></figure>
+
+<div class="callout remember"><div class="callout-title">📌 Remember</div>
+<p>Primary = the bus the bridge sits on. Secondary = the bus immediately below it. Subordinate = the highest-numbered bus anywhere below it. A Type 1 request is forwarded if Secondary ≤ target ≤ Subordinate, and converted to Type 0 at the bridge whose Secondary equals the target.</p></div>
+
+<h3 id="p3-17-crs">17.9 Readiness, CRS and the "device not ready yet" problem</h3>
+<p>An NVMe SSD contains a controller running firmware. After reset, that firmware may need time before it can answer configuration requests. PCIe provides <b>Configuration Request Retry Status (CRS)</b>: the device may complete a configuration request with CRS status, meaning "try again" <span class="tag verified">verified</span>. What software sees depends on the Root Port's <b>CRS Software Visibility</b> enable (in the Root Control register of the PCI Express Capability):</p>
+<ul>
+<li><b>Visibility disabled</b> — the Root Complex re-issues the request itself (hardware retry); the CPU load may simply stall until the device answers or a platform timeout occurs <span class="tag impl">impl</span>.</li>
+<li><b>Visibility enabled</b> — for a read that includes the Vendor ID register, the Root Complex returns the special value <code>0001h</code> in the Vendor ID field so software can poll without blocking <span class="tag verified">verified</span>. Linux uses this when available and waits up to a bounded time (on the order of a minute in current kernels) for the device to become ready <span class="tag impl">impl</span>.</li>
+</ul>
+<p>Newer PCIe revisions add <b>Readiness Notifications</b> (Device Readiness Status and Function Readiness Status messages) and a Readiness Time Reporting capability so software need not guess <span class="tag version">version</span>. Support is optional; capability discovery applies.</p>
+<div class="callout notsaid"><div class="callout-title">📭 What the spec does not say</div>
+<p>The PCIe specification does not say how long a particular NVMe SSD's firmware takes to become ready, nor how long a given BIOS waits before giving up. A drive that is "missing only on cold boot" is frequently a readiness-timing interaction between a slow device and an impatient firmware — the evidence is the timestamp of the first CfgRd relative to link-up, and whether CRS completions were returned.</p></div>
+
+<h3 id="p3-17-protocol">17.10 Protocol view: what travels on the link</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Transaction</th><th>Direction</th><th>Posted?</th><th>Completion</th><th>Meaning during enumeration</th></tr></thead>
+<tbody>
+<tr><td>CfgRd0</td><td>Downstream (RC → device)</td><td>Non-posted</td><td>CplD (success) / Cpl with UR or CRS</td><td>Read a register of a function on the bus directly below</td></tr>
+<tr><td>CfgRd1</td><td>Downstream</td><td>Non-posted</td><td>Same</td><td>Read a register of a function further down; converted to Type 0 at the right bridge</td></tr>
+<tr><td>CfgWr0 / CfgWr1</td><td>Downstream</td><td>Non-posted (unlike memory writes)</td><td>Cpl (no data)</td><td>Program bus numbers, BARs, Command register</td></tr>
+<tr><td>Cpl with UR</td><td>Upstream</td><td>—</td><td>—</td><td>No function at that BDF (generated by the bridge/port above the empty slot or by a device lacking that function)</td></tr>
+<tr><td>Cpl with CRS</td><td>Upstream</td><td>—</td><td>—</td><td>Function exists but not ready yet</td></tr>
+</tbody></table></div>
+<p>Configuration writes are non-posted: the writer waits for a completion. This is a deliberate safety property — software knows a BAR or bus-number write has taken effect before it issues the next request <span class="tag verified">verified</span>. A completion's <b>Completer ID</b> is captured by the device from the configuration requests it receives; this is how an endpoint learns its own bus/device number <span class="tag verified">verified</span>, which it then uses as Requester ID in its own memory reads (DMA).</p>
+
+<h3 id="p3-17-trace">17.11 Trace view: enumeration on the wire</h3>
+<p>The traces below are <b>synthetic</b>: invented to teach recognition of patterns, formatted as a generic table rather than any vendor's screen. Columns: relative time, direction (↓ downstream toward device, ↑ upstream), TLP type, requester/target, register, data, notes.</p>
+
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 17.A — normal: discovery of 01:00.0 below Root Port A</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Target BDF</th><th>Reg</th><th>Data</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0.00</td><td>↓</td><td>CfgRd0</td><td>01:00.0</td><td>000h</td><td>—</td><td>Root Port A forwards (target bus == its secondary, 1)</td></tr>
+<tr><td>0.85</td><td>↑</td><td>CplD SC</td><td>—</td><td>—</td><td>0010_1B36h</td><td>Device 0010h, Vendor 1B36h (synthetic choice; see Ch 18)</td></tr>
+<tr><td>1.40</td><td>↓</td><td>CfgRd0</td><td>01:00.0</td><td>00Ch</td><td>—</td><td>Header Type byte at 0Eh</td></tr>
+<tr><td>2.20</td><td>↑</td><td>CplD SC</td><td>—</td><td>—</td><td>0000_0000h</td><td>Header type 00h, single function → skip fn 1–7</td></tr>
+<tr><td>2.90</td><td>↓</td><td>CfgRd0</td><td>01:00.0</td><td>008h</td><td>—</td><td>Revision + Class Code</td></tr>
+<tr><td>3.70</td><td>↑</td><td>CplD SC</td><td>—</td><td>—</td><td>0108_0202h</td><td>Class 010802h = NVMe; rev 02h</td></tr>
+<tr><td>4.30</td><td>↓</td><td>CfgRd0</td><td>01:01.0</td><td>000h</td><td>—</td><td>Older/defensive firmware probing device 1 on a point-to-point link</td></tr>
+<tr><td>4.90</td><td>↑</td><td>Cpl UR</td><td>—</td><td>—</td><td>—</td><td>Root Port only passes device 0 → UR; CPU sees FFFFFFFFh</td></tr>
+</tbody></table></div></div>
+
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 17.B — slow: device answers CRS for 180 ms after link-up</div><div class="table-wrap"><table>
+<thead><tr><th>t (ms)</th><th>Dir</th><th>TLP</th><th>Target</th><th>Reg</th><th>Status/Data</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>—</td><td>(link reaches L0)</td><td>—</td><td>—</td><td>—</td><td>DL_Active on Root Port</td></tr>
+<tr><td>100.2</td><td>↓</td><td>CfgRd0</td><td>01:00.0</td><td>000h</td><td>—</td><td>First config read after the readiness wait</td></tr>
+<tr><td>100.2</td><td>↑</td><td>Cpl CRS</td><td>—</td><td>—</td><td>CRS</td><td>Device firmware not ready; software sees 0001h (visibility on)</td></tr>
+<tr><td>110.3</td><td>↓↑</td><td>CfgRd0 / Cpl CRS</td><td>01:00.0</td><td>000h</td><td>CRS</td><td>Polling continues (repeated pattern elided)</td></tr>
+<tr><td>280.5</td><td>↓</td><td>CfgRd0</td><td>01:00.0</td><td>000h</td><td>—</td><td></td></tr>
+<tr><td>280.5</td><td>↑</td><td>CplD SC</td><td>—</td><td>—</td><td>0010_1B36h</td><td>Ready: normal enumeration proceeds</td></tr>
+</tbody></table></div></div>
+
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 17.C — failed: bridge bus range wrong, device behind switch invisible</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Target</th><th>Reg</th><th>Data</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0.0</td><td>↓</td><td>CfgWr0</td><td>00:02.0</td><td>018h</td><td>00_FF_02_00h</td><td>Root Port B: pri 0, sec 2, sub FFh (temporary)</td></tr>
+<tr><td>1.1</td><td>↑</td><td>Cpl SC</td><td>—</td><td>—</td><td>—</td><td></td></tr>
+<tr><td>2.0</td><td>↓</td><td>CfgWr1→0</td><td>02:00.0</td><td>018h</td><td>00_03_03_02h</td><td>Switch USP: sub written as 03h <b>before</b> scanning below (bug)</td></tr>
+<tr class="first-bad"><td>3.4</td><td>↓</td><td>CfgRd1</td><td>04:00.0</td><td>000h</td><td>—</td><td>Target bus 4 is outside USP range 3..3 → not forwarded below the switch</td></tr>
+<tr class="bad"><td>4.0</td><td>↑</td><td>Cpl UR</td><td>—</td><td>—</td><td>—</td><td>Software concludes "no device on bus 4" — SSD #2 disappears</td></tr>
+<tr class="bad"><td>5.2</td><td>↑</td><td>Cpl UR</td><td>—</td><td>—</td><td>—</td><td>Same for bus 5 — SSD #3 disappears</td></tr>
+</tbody></table></div></div>
+
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 17.D — ambiguous: all-ones from a device that was present a second ago</div><div class="table-wrap"><table>
+<thead><tr><th>t (s)</th><th>Dir</th><th>TLP / event</th><th>Target</th><th>Reg</th><th>Data</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>12.000</td><td>↓↑</td><td>CfgRd0 / CplD</td><td>01:00.0</td><td>000h</td><td>0010_1B36h</td><td>Healthy</td></tr>
+<tr class="first-bad"><td>12.430</td><td>—</td><td>Link leaves L0 → Recovery → Detect</td><td>—</td><td>—</td><td>—</td><td>Surprise link down? Or an intentional reset by software?</td></tr>
+<tr class="bad"><td>12.431</td><td>↓</td><td>CfgRd0</td><td>01:00.0</td><td>000h</td><td>—</td><td>Root Port cannot send: link down</td></tr>
+<tr class="bad"><td>12.431</td><td>↑ (internal)</td><td>RC synthesizes failure</td><td>—</td><td>—</td><td>FFFF_FFFFh</td><td>Software sees all-ones — identical to "no device"</td></tr>
+</tbody></table></div>
+<p>Why ambiguous: all-ones can mean "empty slot", "device removed", "link down", "device in reset", or (for a memory read) a real register value of all-ones. Disambiguate with the Root Port's Link Status (Data Link Layer Link Active), its AER status (Surprise Down), hot-plug Slot Status (Presence Detect), and the timeline of any reset software issued.</p></div>
+
+<h3 id="p3-17-linux">17.12 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code># Tree view: shows bridges and which BDFs hang below each Root Port / switch port
+lspci -tv
+
+# One device in detail: header, BARs ("Region"), capabilities, bus numbers on bridges
+sudo lspci -vvv -s 01:00.0
+sudo lspci -vvv -s 00:01.0        # bridge: look for "Bus: primary=00, secondary=01, subordinate=01"
+
+# Kernel's enumeration narrative
+sudo dmesg | grep -iE 'pci |pci_bus|ecam|mmconfig|bar [0-9]|bridge window'
+sudo journalctl -k -b | grep -i nvme
+
+# sysfs view of the same objects
+ls /sys/bus/pci/devices/
+cat /sys/bus/pci/devices/0000:01:00.0/{vendor,device,class}
+cat /sys/bus/pci/devices/0000:01:00.0/resource       # start end flags per BAR
+cat /proc/iomem | grep -i -A2 nvme</code></pre>
+<div class="callout warn"><div class="callout-title">⚠️ Safety</div>
+<p>Everything above is read-only. Commands such as <code>echo 1 &gt; /sys/bus/pci/rescan</code>, <code>echo 1 &gt; /sys/bus/pci/devices/…/remove</code>, or <code>setpci</code> with a <code>=value</code> suffix <b>change hardware state</b>. Removing the device that holds your root filesystem will crash the system. Only do those in a VM or on a dedicated test machine (CAUTION LAB). Reading beyond the first 64 bytes of configuration space via sysfs requires root.</p></div>
+<p>Illustrative, abbreviated <code>lspci -tv</code> shape for the synthetic topology (not captured from real hardware):</p>
+<pre class="code" data-kind="read-only inspection"><code>-[0000:00]-+-00.0  Host bridge
+           +-01.0-[01]----00.0  Non-Volatile memory controller
+           \-02.0-[02-06]----00.0-[03-06]--+-00.0-[04]----00.0  Non-Volatile memory controller
+                                           +-01.0-[05]----00.0  Non-Volatile memory controller
+                                           \-02.0-[06]--</code></pre>
+<p>The <code>[02-06]</code> notation is exactly Secondary–Subordinate. Reading the tree: Root Port 00:02.0 owns buses 2–6; the switch Upstream Port at 02:00.0 owns 3–6; its three Downstream Ports own 4, 5 and 6.</p>
+
+<h3 id="p3-17-code">17.13 Code: how the Linux NVMe driver takes over after enumeration</h3>
+<p>Simplified from the shape of <code>drivers/nvme/host/pci.c</code> (names abbreviated; error handling removed; this is <b>pseudocode</b>, not compilable kernel code):</p>
+<pre class="code" data-kind="pseudocode"><code>nvme_probe(pdev):
+    dev = alloc(...)
+    pci_enable_device_mem(pdev)          # Command.MSE = 1 (memory decode on)
+    pci_set_master(pdev)                 # Command.BME = 1 (device may now DMA)
+    dma_set_mask_and_coherent(&amp;pdev-&gt;dev, DMA_BIT_MASK(64))
+    pci_request_mem_regions(pdev, "nvme")   # claim BAR0 in /proc/iomem
+    bar = ioremap(pci_resource_start(pdev, 0), size)   # kernel virtual mapping of BAR0
+    cap = readq(bar + 0x00)              # NVMe CAP register (Chapter 24)
+    pci_alloc_irq_vectors(pdev, 1, N, PCI_IRQ_ALL_TYPES)  # MSI-X preferred
+    ... controller reset/enable, Identify, I/O queues ...</code></pre>
+<p>Notice the strict order: you cannot read CAP before MSE=1 (the device would not decode the address and the read returns all-ones or faults), and the device cannot fetch commands before BME=1 (its memory reads would be blocked by its own Command register). <span class="tag derived">derived</span></p>
+
+<h3 id="p3-17-worked">17.14 Worked example: predicting BDFs before you boot</h3>
+<p><b>Problem.</b> A server has one Root Port at 00:03.0 with a 1-upstream/4-downstream switch. Downstream Ports 0 and 2 have NVMe SSDs; ports 1 and 3 are empty. Firmware reserves no hot-plug padding. Bus numbers already used: 00 only. Predict every BDF and every bridge's (pri, sec, sub).</p>
+<p><b>Solution.</b> Root Port 00:03.0 gets sec = 1. Switch USP is 01:00.0 with sec = 2 (internal bus). DSPs are 02:00.0, 02:01.0, 02:02.0, 02:03.0. Depth-first: DSP0 sec = 3 → SSD at 03:00.0, sub = 3. DSP1 sec = 4, empty, sub = 4. DSP2 sec = 5 → SSD at 05:00.0, sub = 5. DSP3 sec = 6, sub = 6. USP sub = 6, Root Port sub = 6. Note that empty DSPs still consume a bus number — they are bridges and have a secondary bus whether or not anything is plugged in. <span class="tag derived">derived</span></p>
+<p><b>Twist.</b> If firmware gives each hot-plug DSP 8 extra buses of padding, the second SSD moves from bus 05 to a much higher bus number. This is why <em>BDFs are not stable identifiers</em> across firmware settings — use serial numbers, NGUID/EUI-64, or physical slot numbers in automation.</p>
+
+<h3 id="p3-17-mistakes">17.15 Common mistakes</h3>
+<ul>
+<li>Assuming the device number on a PCIe link can be anything but 0 (without ARI).</li>
+<li>Forgetting the switch internal bus when predicting BDFs.</li>
+<li>Treating <code>FFFFFFFFh</code> as data. On PCIe, all-ones from a config read is almost always "no response".</li>
+<li>Using BDF as a persistent drive identifier in test scripts.</li>
+<li>Believing enumeration happens once. It can happen at boot, after hot-plug, after <code>rescan</code>, after a Secondary Bus Reset, and in VMs again inside the guest.</li>
+<li>Issuing configuration requests immediately after a reset (no readiness wait) and interpreting failures as a dead device.</li>
+</ul>
+
+<h3 id="p3-17-debug">17.16 Debugging connection: five failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Likely conclusion (confidence)</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>SSD absent from <code>lspci</code>; Root Port present</td><td>Link never trained; device not powered; PERST# held; device in CRS forever</td><td>Root Port Link Status: DLLLA bit, negotiated width</td><td>Root Port Slot Status presence detect (if slot implemented)</td><td>Move the drive to a known-good slot; analyzer on link: is there any training?</td><td>No L0 → physical/link problem, not enumeration (high)</td></tr>
+<tr><td>2</td><td>SSD appears only after warm reboot, not cold boot</td><td>Device readiness slower than firmware's wait</td><td>Firmware log timestamps; CRS handling setting</td><td>Device vendor's documented ready time <span class="tag impl">impl</span></td><td>Add delay in firmware setup (if available) or test with OS-level rescan after boot</td><td>Readiness race (medium-high)</td></tr>
+<tr><td>3</td><td>Drives behind a switch missing, switch itself visible</td><td>Bad Subordinate value; switch DSP link down; switch firmware/EEPROM config</td><td><code>lspci -vvv</code> on USP/DSPs: bus numbers</td><td>DSP Link Status</td><td>Read config space of DSPs; if DSP link is up but endpoint missing, check bus ranges</td><td>Routing range error vs downstream link failure (medium)</td></tr>
+<tr><td>4</td><td>Device enumerated but driver not bound; <code>dmesg</code>: "BAR 0: no space" / "can't assign"</td><td>Bridge window too small; firmware did not reserve MMIO for hot-plug; 64-bit window missing</td><td><code>/proc/iomem</code>, bridge "Memory behind bridge" lines</td><td>Firmware "Above 4G decoding" setting <span class="tag impl">impl</span></td><td>Boot with <code>pci=realloc</code> (test system) and compare</td><td>Resource-assignment failure (high)</td></tr>
+<tr><td>5</td><td>BDF of SSD changes between boots</td><td>Hot-plug bus padding, firmware version change, different slot population</td><td><code>lspci -tv</code> diffs</td><td>Firmware settings diffs</td><td>Repeat boot with identical population and settings</td><td>Expected behaviour; fix the automation, not the system (high)</td></tr>
+</tbody></table></div>
+
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div>
+<p>When a device is "missing", resist starting in the driver. Ask, in order: <b>Did the link train?</b> (Root Port Link Status / analyzer) → <b>Did a config read reach the device?</b> (trace or Root Port AER UR counts) → <b>Did it answer with data, UR, or CRS?</b> → <b>Did resource assignment succeed?</b> (<code>dmesg</code>) → <b>Did a driver match?</b> (<code>lspci -k</code>). Each question has cheap, decisive evidence. Debugging by layer is ten times faster than debugging by intuition.</p></div>
+
+<div class="callout impl"><div class="callout-title">🏭 Implementation-dependent</div>
+<p>Exact firmware scan order (some scan all functions of all devices; some stop early), bus padding policy, the readiness timeout, whether firmware leaves the NVMe controller enabled when handing off to the OS, and whether the OS reassigns resources are all implementation-dependent. Linux's behaviour also varies with kernel version and command-line options.</p></div>
+
+<h3 id="p3-17-zero">17.17 Zero-hallucination ledger</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Category</th><th>Items</th></tr></thead>
+<tbody>
+<tr><td><span class="tag verified">verified</span></td><td>BDF field widths; ECAM address composition and 4 KiB per function; Type 0/Type 1 forwarding by Secondary/Subordinate; configuration writes are non-posted; UR for absent functions; CRS and the 0001h Vendor ID visibility mechanism; class code 010802h for NVM Express.</td></tr>
+<tr><td><span class="tag derived">derived</span></td><td>BDF predictions in 17.14; 256 MiB per full ECAM segment; ordering constraints in the driver.</td></tr>
+<tr><td><span class="tag impl">impl</span></td><td>Firmware wait times, bus padding, scan order, OS reassignment policy, CRS polling timeout.</td></tr>
+<tr><td><span class="tag version">version</span></td><td>Readiness Notifications and Readiness Time Reporting (newer PCIe revisions); Flit-mode does not change enumeration logic but changes TLP encoding.</td></tr>
+<tr><td>Check in the spec</td><td>Exact readiness timing rules for your link speed; CRS rules for non-Vendor-ID reads; ARI forwarding rules.</td></tr>
+<tr><td>Never assume</td><td>That a BDF is stable; that all-ones means "absent"; that firmware and OS assign identical resources.</td></tr>
+</tbody></table></div>
+
+<h3 id="p3-17-lab">17.18 Labs</h3>
+<div class="lab"><div class="lab-head">🧪 Lab 17.1 — Read your machine's PCIe tree <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> map every Root Port, switch and NVMe endpoint on a real or virtual machine, and reconstruct each bridge's (pri, sec, sub).</p>
+<p><b>Prerequisites:</b> Linux with <code>pciutils</code>; root for full output.</p>
+<p><b>Setup:</b> any Linux machine or VM. In QEMU, you can create an emulated NVMe device with <code>-drive file=nvm.img,if=none,id=nvm -device nvme,serial=lab17,drive=nvm</code>, optionally behind <code>-device pcie-root-port,id=rp1</code> with <code>bus=rp1</code> on the NVMe device (Q35 machine type).</p>
+<p><b>Procedure:</b> (1) Run <code>lspci -tv</code>. (2) For each bridge, run <code>sudo lspci -vvv -s &lt;bdf&gt;</code> and record the "Bus: primary=, secondary=, subordinate=" line. (3) Draw the tree with bus numbers. (4) Locate every device with class "Non-Volatile memory controller".</p>
+<p><b>Observations:</b> every endpoint's bus number must fall inside exactly one chain of nested bridge ranges.</p>
+<p><b>Questions:</b> Which bridges have empty secondary buses? Are any ranges padded (sub &gt; sec although nothing is below)?</p>
+<details class="answer"><summary>Solution / expected reasoning</summary><p>Each bridge's range [sec, sub] must contain the ranges of all bridges below it. Padding appears as sub &gt; sec with nothing below — usually on hot-plug capable ports (look for "HotPlug+" in the slot capabilities of that port). Empty Root Ports still have a secondary bus. In QEMU with a single root port you should see the NVMe device at <code>01:00.0</code> or similar depending on how many ports precede it.</p></details>
+<p><b>Extension:</b> write a script that parses <code>lspci -vvv</code> and validates the nesting automatically.</p></div>
+
+<div class="lab"><div class="lab-head">🧪 Lab 17.2 — Simulate depth-first numbering <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> modify the simulation in 17.8.1 to add hot-plug padding of N buses to every Downstream Port that is marked hot-plug capable.</p>
+<p><b>Procedure:</b> add a flag to bridge nodes; after recursing, set <code>sub = max(sub, secondary + N)</code> and bump <code>next_bus</code> accordingly. Rerun and compare BDFs.</p>
+<p><b>Questions:</b> Which endpoints change BDF? Does the Root Port's range grow?</p>
+<details class="answer"><summary>Solution</summary><p>Padding a port shifts the bus numbers of everything enumerated <em>after</em> it, not before it. The enclosing bridges' Subordinate values grow to include the padding. In the sample topology, padding DSP 0 by 4 moves SSD #3 from bus 05 to bus 09 and the Root Port's range from 2–6 to 2–10.</p></details>
+<p><b>Extension:</b> model a hot-plug event: insert a switch below a padded port and verify it can be numbered without touching other ranges.</p></div>
+
+<div class="lab"><div class="lab-head">🧪 Lab 17.3 — Remove and rescan a non-boot NVMe device in a VM <span class="safety caution">CAUTION</span></div>
+<p><b>Objective:</b> observe enumeration messages live.</p>
+<p><b>Setup:</b> a VM whose root disk is <em>not</em> the NVMe device under test.</p>
+<p><b>Procedure:</b> (1) <code>sudo dmesg -w</code> in one terminal. (2) <code>echo 1 | sudo tee /sys/bus/pci/devices/0000:01:00.0/remove</code>. (3) <code>echo 1 | sudo tee /sys/bus/pci/rescan</code>. (4) Compare the messages to the timeline in 17.6.</p>
+<p><b>Observations:</b> you should see the PCI core report the device, its BAR assignment and the NVMe driver binding again.</p>
+<details class="answer"><summary>Solution / expected reasoning</summary><p>Remove detaches the driver and deletes the PCI device object; rescan re-reads configuration space below every bridge. The re-found device normally keeps its BDF because bus numbers on the bridge are unchanged. If BAR assignment messages appear, compare addresses with the earlier <code>/proc/iomem</code> — they may differ.</p></details>
+<p><b>Extension:</b> repeat with the NVMe namespace mounted and observe what the block layer and file system report (do this only in a disposable VM).</p></div>
+
+<div class="lab"><div class="lab-head">🧪 Lab 17.4 — Senior forensic lab: the missing drives <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> given synthetic trace 17.C plus this <code>lspci</code> fact — "switch USP 02:00.0: Bus: primary=02, secondary=03, subordinate=03" — produce a root-cause statement with evidence and confidence.</p>
+<details class="answer"><summary>Model answer</summary><p>Root cause: the switch Upstream Port's Subordinate Bus Number was programmed to 03h before the scan below it completed, so Type 1 requests for buses 4 and 5 were not forwarded and returned UR. Evidence: CfgWr at offset 18h with sub=03h (trace row 2.0), first UR on target bus 4 (row 3.4), lspci range 03–03. Confidence: high for the mechanism; whether the bug is in firmware code or a switch configuration EEPROM override is unknown without firmware source. Fix verification: after correction, USP range should read 03–06.</p></details></div>
+
+<h3 id="p3-17-exercise">17.19 Exercises</h3>
+<div class="callout exercise"><div class="callout-title">🎯 Exercise</div>
+<ol>
+<li>Compute the ECAM address of register 104h of function 05:00.3 with ECAM base C000_0000h.</li>
+<li>A Root Port has sec=08h, sub=0Ch. For a CfgRd1 to bus 0Bh, what does it do? For bus 08h? For bus 0Dh?</li>
+<li>Decode Requester ID 3A11h into bus, device and function.</li>
+</ol>
+<details class="answer"><summary>Answers</summary><p>(1) C000_0000h + (05h&lt;&lt;20) + (0&lt;&lt;15) + (3&lt;&lt;12) + 104h = C050_3104h. (2) Bus 0Bh: forward as Type 1. Bus 08h: convert to Type 0. Bus 0Dh: not claimed — not forwarded downstream. (3) 3A11h = 0011_1010_0001_0001b: bus 3Ah, device 00010b = 2, function 001b = 1 → 3A:02.1.</p></details></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Why does a Root Port normally only forward Type 0 configuration requests for device 0?</p><details class="answer"><summary>Answer</summary><p>Because a PCIe link is point-to-point: only one device sits on the secondary bus of a Root Port or Downstream Port, and it is device 0. (ARI changes the interpretation of the device/function bits.)</p></details></li>
+<li><p>What value does software typically see when reading a configuration register of a non-existent function?</p><details class="answer"><summary>Answer</summary><p>All ones (FFFFh for a 16-bit read, FFFFFFFFh for 32-bit), because the request completes with Unsupported Request and the Root Complex returns all-ones to the CPU.</p></details></li>
+<li><p>Why is Subordinate written as FFh during the descent?</p><details class="answer"><summary>Answer</summary><p>So that the bridge forwards Type 1 requests for any deeper bus that will be numbered during the recursion; the final value is written once the deepest bus number is known.</p></details></li>
+<li><p>What does a Vendor ID read of 0001h mean when CRS Software Visibility is enabled?</p><details class="answer"><summary>Answer</summary><p>The device answered with Configuration Request Retry Status — present but not ready. Software should retry later.</p></details></li>
+<li><p>Which two Command register bits must the NVMe driver set before it can talk to the controller and before the controller can fetch commands?</p><details class="answer"><summary>Answer</summary><p>Memory Space Enable (bit 1) for MMIO register access, and Bus Master Enable (bit 2) so the device may issue memory requests (DMA).</p></details></li>
+</ol></div>
+
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> What is a BDF and who assigns each part? <details class="answer"><summary>Model answer</summary><p>Bus (8 bits, assigned by software during enumeration), Device (5 bits, determined by topology — 0 on a PCIe link), Function (3 bits, fixed by the device design). Together they form the Routing ID used in configuration requests and as Requester ID in TLPs the device sends.</p></details></li>
+<li><span class="lvl">Beginner</span> Why does PCIe need enumeration at all? <details class="answer"><summary>Model answer</summary><p>Because the hierarchy is not known at design time; devices are self-describing and software must discover them, assign bus numbers and addresses, and enable them.</p></details></li>
+<li><span class="lvl">Intermediate</span> Explain the forwarding decision a bridge makes for a Type 1 configuration request. <details class="answer"><summary>Model answer</summary><p>If the target bus equals Secondary, convert to Type 0 and send downstream; if it is greater than Secondary and at most Subordinate, forward unchanged; otherwise do not claim it.</p></details></li>
+<li><span class="lvl">Intermediate</span> How many bus numbers does a 1×4 switch consume below its Root Port, with no padding and nothing plugged in? <details class="answer"><summary>Model answer</summary><p>Six: the Root Port's secondary bus (on which the Upstream Port sits), the switch's internal virtual bus (on which the four Downstream Ports sit), and one secondary bus per Downstream Port (four). Empty Downstream Ports still consume their secondary bus number.</p></details></li>
+<li><span class="lvl">Advanced</span> Why might an NVMe SSD be missing only after cold boot? <details class="answer"><summary>Model answer</summary><p>Device readiness after power-on is slower than after warm reset (firmware load from NAND/NOR, self-tests); if platform firmware scans before readiness and does not honour CRS long enough, the device is missed. Evidence: timing of first CfgRd, CRS completions, firmware logs.</p></details></li>
+<li><span class="lvl">Senior</span> Your automation identifies drives by BDF and breaks after a BIOS update. What do you change and why? <details class="answer"><summary>Model answer</summary><p>Switch to stable identifiers (controller serial number, namespace NGUID/EUI-64/UUID, physical slot via Slot Capabilities/ACPI). BDFs depend on enumeration order and padding policy and are not stable across firmware versions or population changes.</p></details></li>
+</ol></div>
+
+<div class="callout interview"><div class="callout-title">🧠 Teach-back</div>
+<p><b>To a child:</b> "The computer walks through every hallway knocking on doors, writes a number on each hallway, and then tells every room where its mailbox is." <b>To a junior engineer:</b> explain BDF, Type 0/1, and why bus numbering is depth-first. <b>To a senior engineer:</b> explain how CRS, padding and OS reallocation create time- and configuration-dependent enumeration results, and how you would prove which one caused a missing device.</p></div>
+
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can compute an ECAM address and decode a Requester ID without notes.</li>
+<li>I can number buses depth-first for any topology including switches and empty ports.</li>
+<li>I can identify an enumeration scan, UR responses and CRS in a trace.</li>
+<li>I can list the steps between link-up and NVMe driver probe and name the evidence for each.</li>
+<li>I can explain why "missing device" debugging starts at the link and walks up.</li>
+<li>I can name which statements come from the PCIe specification and which are firmware/OS policy.</li>
+</ul></div>
+
+<h3 id="p3-17-summary">17.20 Summary, further reading and next</h3>
+<p>Enumeration is a depth-first walk that assigns bus numbers to bridges and discovers functions using non-posted configuration reads. BDF = software-assigned bus + topology-determined device + design-determined function. Bridges route Type 1 requests by Secondary/Subordinate ranges. Readiness (CRS) and resource assignment are the two most common sources of "device missing" problems after the link itself. The NVMe driver can only begin once Memory Space and Bus Master are enabled and BAR0 is mapped.</p>
+<p><b>Further reading:</b> PCI Express Base Specification (PCI-SIG) chapters on configuration space and the configuration transaction model; Linux kernel documentation <code>Documentation/PCI/</code> (especially the PCI driver guide) and source <code>drivers/pci/probe.c</code>; ACPI specification (MCFG table, <code>_CRS</code>). <b>Next:</b> <a href="#p3-ch18-config-space">Chapter 18 — Configuration Space</a>, where we decode each register the scan just read.</p>
+</section>

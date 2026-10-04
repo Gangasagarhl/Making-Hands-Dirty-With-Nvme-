@@ -1,0 +1,419 @@
+<section class="chapter" id="p5-ch40-e2e-write" data-part="PART XIII — END-TO-END NVMe OVER PCIe">
+<h2><span class="num">40</span> End-to-End NVMe Write</h2>
+
+<h3>40.1 Why this chapter exists</h3>
+<p>A Write looks like a Read with the arrows flipped, and that intuition is half right and half dangerous. The control path (SQE, doorbell, fetch, CQE, MSI-X, head doorbell) is identical. The data path is not: for a Write the device must <em>pull</em> the data from host memory with non-posted MRd requests, each of which needs tags, Non-Posted credits, CplD responses and completion-timeout supervision. Writes therefore exercise the host's memory-read path far harder than reads do, they expose MRRS and RCB behaviour, and they bring in the volatile write cache, FUA (Force Unit Access) and Flush semantics — the source of most "I lost data after power loss" investigations.</p>
+
+<h3>40.2 Learning objectives</h3>
+<ul class="objectives">
+<li>List the stages of a 4 KiB NVMe Write (opcode 01h) and mark which cross the link and in which direction.</li>
+<li>Compute the number of MRd requests and CplD completions for a given size, MRRS and RCB.</li>
+<li>Explain when the controller is allowed to post the CQE (before NAND program, with volatile write cache) and how FUA/Flush change that.</li>
+<li>Recognise in a synthetic trace the data-fetch phase, tag usage and completion splitting.</li>
+<li>Diagnose write-specific failures: completion timeout on data fetch, poisoned data, IOMMU read fault, write fault status, power-loss data loss.</li>
+</ul>
+
+<h3>40.3 Prerequisites</h3>
+<p><a href="#p5-ch39-e2e-read">Chapter 39</a> (end-to-end read) — this chapter only details the differences; PCIe completions, tags and flow control from the PCIe part of the book.</p>
+
+<h3>40.4 Story and analogy</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>This time you want the warehouse to <b>store</b> your drawing. You put the request card in the tray and ring the bell, just like before. But the worker can't take your drawing through the bell either: they must reach into your house <b>again</b> and ask "please hand me pieces 1, 2, 3 and 4 of the drawing", and you (your house's front door, the root complex) hand each piece back. When the worker has all the pieces safely in the warehouse's <b>front desk tray</b> (write cache), they can already give you a receipt — even if they haven't walked to the shelf yet.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>The "front desk tray" (volatile write cache) loses its contents if power fails unless the drive has power-loss protection capacitors; the receipt (CQE) does <em>not</em> promise the drawing is on the shelf (NAND) unless you asked with FUA or later sent a Flush. Also, the worker's requests for pieces are numbered with <em>tags</em>, can be outstanding concurrently and can be answered out of order across different tags.</p></div>
+
+<h3>40.5 The differences at a glance</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Aspect</th><th>Read (02h)</th><th>Write (01h)</th></tr></thead>
+<tbody>
+<tr><td>Data direction on the link</td><td>Device → host, posted MWr</td><td>Host → device, CplD in response to device MRd</td></tr>
+<tr><td>Who initiates data movement</td><td>Device (writes)</td><td>Device (reads)</td></tr>
+<tr><td>Limits on TLP size</td><td>MPS per MWr</td><td>MRRS per MRd; completions limited by MPS (completer's) and split at RCB</td></tr>
+<tr><td>Outstanding resource</td><td>Posted credits only</td><td>Tags + NP credits on device; completion buffer space; completion timeout</td></tr>
+<tr><td>Media timing vs CQE</td><td>CQE after data has been read from media</td><td>CQE may be posted once data is in controller buffer (VWC), before program</td></tr>
+<tr><td>Typical error statuses</td><td>Unrecovered Read Error (SCT 2h / SC 81h)</td><td>Write Fault (SCT 2h / SC 80h), Namespace Write Protected (generic 20h), capacity exceeded</td></tr>
+<tr><td>PCIe failure exposure</td><td>Upstream posted path</td><td>Host memory read path (CTO, poisoned CplD, UR from IOMMU)</td></tr>
+</tbody></table></div>
+
+<h3>40.6 The master table: a 4 KiB write in 24 steps</h3>
+<p>Same parameters as Chapter 39 (QID 3, BAR0 <code>0xF7A0_0000</code>, data IOVA <code>0x1_4000_0000</code>, ReqID 0x0200), MRRS = 512 bytes, RCB = 64 bytes, root complex returns completions up to 256 bytes (MPS of the link). All values <span class="tag synthetic">synthetic</span>.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Who acts</th><th>Action</th><th>What changes</th><th>Where</th><th>PCIe on the wire</th><th>Evidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Application</td><td>pwrite / io_uring write, O_DIRECT</td><td>Syscall</td><td>CPU</td><td>none</td><td>strace</td></tr>
+<tr><td>2</td><td>Block layer</td><td>bio/request with REQ_OP_WRITE (± REQ_FUA)</td><td>Request tag</td><td>Kernel</td><td>none</td><td>blktrace Q/G/D (RWBS = "W" or "WFS")</td></tr>
+<tr><td>3</td><td>DMA API/IOMMU</td><td>Map buffer for DMA_TO_DEVICE (device-read permission)</td><td>IOMMU PTE (read-only for device)</td><td>IOMMU tables</td><td>none</td><td>IOMMU tracepoints</td></tr>
+<tr><td>4</td><td>Driver</td><td>Builds SQE: opcode 01h, CID, NSID, PRP1, SLBA, NLB, FUA bit (CDW12 bit 30) if requested</td><td>SQ slot</td><td>Host DRAM</td><td>none</td><td>nvme_setup_cmd</td></tr>
+<tr><td>5</td><td>Driver</td><td>wmb; tail++</td><td>Private tail</td><td>Driver</td><td>none</td><td>—</td></tr>
+<tr><td>6</td><td>RC</td><td>Doorbell MWr host→device</td><td>Posted credit</td><td>Link ↓</td><td><b>MWr</b> 1 DW @BAR0+1018h</td><td>Analyzer</td></tr>
+<tr><td>7</td><td>Controller</td><td>Detects new tail</td><td>Internal tail</td><td>Controller</td><td>Ack DLLP</td><td>—</td></tr>
+<tr><td>8</td><td>Controller</td><td>SQE fetch device→host</td><td>Tag 0x11 outstanding</td><td>Link ↑</td><td><b>MRd</b> 16 DW (non-posted)</td><td>Analyzer</td></tr>
+<tr><td>9</td><td>RC</td><td>Returns SQE</td><td>Tag 0x11 retired</td><td>Link ↓</td><td><b>CplD</b> 64 B</td><td>Analyzer</td></tr>
+<tr><td>10</td><td>Controller</td><td>Validates (NSID, LBA range, write-protect, capacity); allocates write buffer</td><td>Buffer reserved</td><td>Controller SRAM/DRAM</td><td>none</td><td>—</td></tr>
+<tr><td>11</td><td>Controller DMA</td><td>Data fetch request 1 (bytes 0–511)</td><td>Tag 0x12 outstanding</td><td>Link ↑</td><td><b>MRd</b> 128 DW @0x1_4000_0000</td><td>Analyzer</td></tr>
+<tr><td>12</td><td>Controller DMA</td><td>Data fetch requests 2–8 (512 B each)</td><td>Tags 0x13–0x19 outstanding (8 total)</td><td>Link ↑</td><td><b>MRd ×7</b> back-to-back</td><td>Analyzer: pipelined requests</td></tr>
+<tr><td>13</td><td>IOMMU/RC</td><td>Translate + read DRAM for each request</td><td>—</td><td>Host</td><td>none</td><td>IOMMU fault log if denied</td></tr>
+<tr><td>14</td><td>RC</td><td>Completions for request 1</td><td>Partial byte counts</td><td>Link ↓</td><td><b>CplD ×2</b> (256 B each; BC=512 then 256)</td><td>Analyzer: same tag, decreasing Byte Count</td></tr>
+<tr><td>15</td><td>RC</td><td>Completions for requests 2–8</td><td>All tags retired</td><td>Link ↓</td><td><b>CplD ×14</b> (may interleave between tags)</td><td>Analyzer</td></tr>
+<tr><td>16</td><td>Controller</td><td>Reassembles 4 KiB; end-to-end protection check (if PI)</td><td>Data in write buffer</td><td>Controller</td><td>none</td><td>—</td></tr>
+<tr><td>17</td><td>Controller</td><td>Decides completion point: VWC enabled &amp; no FUA → complete now; FUA → after media program</td><td>Write cache state</td><td>Controller</td><td>none</td><td>Identify Controller VWC; Get Features 06h (Volatile Write Cache)</td></tr>
+<tr><td>18</td><td>Controller</td><td>CQE write device→host</td><td>CQ slot</td><td>Link ↑</td><td><b>MWr</b> 4 DW</td><td>Analyzer</td></tr>
+<tr><td>19</td><td>Controller</td><td>MSI-X</td><td>—</td><td>Link ↑</td><td><b>MWr</b> 1 DW to message address</td><td>Analyzer, /proc/interrupts</td></tr>
+<tr><td>20</td><td>Driver ISR</td><td>Phase check, CID lookup, status</td><td>Request complete</td><td>Host DRAM</td><td>none</td><td>nvme_complete_rq</td></tr>
+<tr><td>21</td><td>Driver</td><td>CQ head doorbell host→device</td><td>Controller frees CQ slot</td><td>Link ↓</td><td><b>MWr</b> 1 DW @BAR0+101Ch</td><td>Analyzer</td></tr>
+<tr><td>22</td><td>Block layer</td><td>Unmap, complete, wake app</td><td>—</td><td>Kernel</td><td>none</td><td>blktrace C</td></tr>
+<tr><td>23</td><td>FTL/NAND (later, asynchronous)</td><td>Program the page(s) (tPROG hundreds of µs to ms)</td><td>NAND state, L2P map</td><td>Device</td><td>none</td><td>Only indirectly (later latencies, SMART data units written)</td></tr>
+<tr><td>24</td><td>Host (optional)</td><td>Flush (opcode 00h) to make cached data durable</td><td>Cache drained</td><td>Device</td><td>SQE/CQE as usual, no data</td><td>blktrace "F" / "FN"</td></tr>
+</tbody></table></div>
+
+<div class="formula">N_MRd = ceil(bytes / MRRS) ;   N_CplD ≥ Σ ceil(request_bytes / min(MPS_completer, ...)), split at RCB boundaries</div>
+<ul class="vars"><li><b>MRRS</b> — Max_Read_Request_Size in the requester's Device Control (128–4096 B)</li><li><b>MPS_completer</b> — the completer cannot send a CplD payload larger than the link's MPS</li><li><b>RCB</b> — Read Completion Boundary (64 or 128 B); a completer splitting a read must split at RCB-aligned addresses</li></ul>
+<div class="callout hw"><div class="callout-title">🔧 Hardware</div><p>The number of tags a controller can keep outstanding, multiplied by MRRS, bounds the bytes in flight on the read path. With 8-bit tags (256) and MRRS 512 that's 128 KiB in flight — enough for Gen4 x4 at ~1–2 µs round trip. Gen5/Gen6 links and longer latencies (switches, retimers) push designs toward 10-bit tags (1024) — <span class="tag version">version</span>: 10-bit tag requester/completer support is optional from PCIe 4.0 and must be enabled in Device Control 2. Write bandwidth that tops out well below link rate, with a trace showing the device stalls waiting for tags, is a classic signature.</p></div>
+
+<h3>40.7 Sequence diagram</h3>
+<figure class="diagram"><svg viewBox="0 0 820 720" role="img" aria-label="Sequence diagram of an NVMe write showing the device reading the data from host memory with MRd and receiving CplD">
+<rect class="box" x="20" y="10" width="150" height="34" rx="6"/><text class="lbl" x="95" y="32" text-anchor="middle">Driver / CPU</text>
+<rect class="box alt" x="230" y="10" width="170" height="34" rx="6"/><text class="lbl" x="315" y="32" text-anchor="middle">Host DRAM + RC</text>
+<rect class="box accent" x="470" y="10" width="170" height="34" rx="6"/><text class="lbl" x="555" y="32" text-anchor="middle">NVMe controller</text>
+<rect class="box" x="690" y="10" width="110" height="34" rx="6"/><text class="lbl" x="745" y="32" text-anchor="middle">NAND</text>
+<path class="ln" d="M95 44 V705"/><path class="ln" d="M315 44 V705"/><path class="ln" d="M555 44 V705"/><path class="ln" d="M745 44 V705"/>
+<path class="ln" d="M95 80 H310" marker-end="url(#arrow)"/><text class="lbl small" x="105" y="74">① store SQE opcode 01h</text>
+<path class="ln" d="M95 120 H550" marker-end="url(#arrow)"/><text class="lbl small" x="105" y="114">② MWr SQ tail doorbell (posted ↓)</text>
+<path class="ln" d="M555 160 H320" marker-end="url(#arrow)"/><text class="lbl small" x="330" y="154">③ MRd SQE tag 11h (↑ NP)</text>
+<path class="ln" d="M315 200 H550" marker-end="url(#arrow)"/><text class="lbl small" x="330" y="194">④ CplD SQE (↓)</text>
+<path class="ln" d="M555 245 H320" marker-end="url(#arrow)"/><text class="lbl small" x="330" y="239">⑤ MRd data 512 B tag 12h (↑ NP)</text>
+<path class="ln" d="M555 265 H320" marker-end="url(#arrow)"/>
+<path class="ln" d="M555 285 H320" marker-end="url(#arrow)"/><text class="lbl small" x="330" y="305">… MRd tags 13h–19h</text>
+<path class="ln" d="M315 335 H550" marker-end="url(#arrow)"/><text class="lbl small" x="330" y="329">⑥ CplD tag 12h 256 B, BC=512 (↓)</text>
+<path class="ln" d="M315 355 H550" marker-end="url(#arrow)"/>
+<path class="ln" d="M315 375 H550" marker-end="url(#arrow)"/><text class="lbl small" x="330" y="395">… 16 CplD total</text>
+<rect class="box alt" x="545" y="410" width="20" height="40"/><text class="lbl small" x="580" y="434">buffer (VWC)</text>
+<path class="ln" d="M555 480 H320" marker-end="url(#arrow)"/><text class="lbl small" x="330" y="474">⑦ MWr CQE (↑)</text>
+<path class="ln" d="M555 520 H320" marker-end="url(#arrow)"/><text class="lbl small" x="330" y="514">⑧ MWr MSI-X (↑)</text>
+<path class="ln" d="M95 580 H550" marker-end="url(#arrow)"/><text class="lbl small" x="105" y="574">⑨ MWr CQ head doorbell (↓)</text>
+<path class="ln" d="M555 620 H740" marker-end="url(#arrow)"/><text class="lbl small" x="565" y="614">⑩ program (later)</text>
+<rect class="box alt" x="735" y="630" width="20" height="60"/><text class="lbl small" x="610" y="670">tPROG</text>
+</svg><figcaption>Figure 40.1 — Sequence of a 4 KiB NVMe Write with volatile write cache enabled. Note the data now arrives in CplD packets answering device MRd requests, and the CQE may precede the NAND program.</figcaption></figure>
+
+<h3>40.8 Stage notes — the five views for the write-specific stages</h3>
+<h4>Data fetch (MRd) — device → host</h4>
+<p><b>Analogy:</b> "please pass me piece 3 of the drawing". <b>Technical:</b> the controller walks PRP1/PRP2 (or the PRP list it fetched) and issues reads no larger than MRRS that do not cross 4 KiB boundaries. <b>Hardware:</b> each request occupies a tag and reserves completion buffer space at the device (a requester must not issue a non-posted request unless it can accept all completions — completion credits are typically advertised as infinite by endpoints, so the requester self-limits). <b>Protocol:</b> MRd, 4DW header if above 4 GiB, Length in DW, First/Last BE all ones for aligned transfers. <b>Trace:</b> a train of upstream MRds with incrementing addresses and distinct tags.</p>
+<h4>Data delivery (CplD) — host → device</h4>
+<p><b>Analogy:</b> pieces handed through the door. <b>Technical:</b> the completer returns one or more CplDs per request; Byte Count indicates remaining bytes including this completion; Lower Address gives the starting byte address low bits. <b>Hardware:</b> completions for the <em>same</em> request arrive in address order; completions for <em>different</em> tags may interleave. <b>Protocol:</b> CplD with Status SC; EP=1 marks poisoned data. <b>Trace:</b> pairs (or groups) of CplD with the same tag and decreasing Byte Count: 512, 256 for a 512-byte request split into two 256-byte completions.</p>
+<h4>Completion point</h4>
+<p><b>Technical:</b> If the Volatile Write Cache is present and enabled (Feature 06h) and FUA=0, the controller may post the CQE as soon as the data is in its buffer. With FUA=1 (CDW12 bit 30) it must not complete until data is in non-volatile media. Drives with power-loss protection may report VWC not present because their buffer is effectively non-volatile (<span class="tag impl">impl</span>). <b>Trace:</b> the gap between the last CplD and the CQE MWr is short (µs) for cached writes and long (hundreds of µs or more) for FUA writes.</p>
+
+<h3>40.9 Synthetic traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal 4 KiB write, MRRS 512, VWC on</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Address / IDs</th><th>Len</th><th>Tag</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0.00</td><td>↓</td><td>MWr</td><td>F7A0_1018</td><td>1 DW =0x0044</td><td>—</td><td>Doorbell SQ3</td></tr>
+<tr><td>0.61</td><td>↑</td><td>MRd</td><td>1_2340_10C0</td><td>16 DW</td><td>0x11</td><td>Fetch SQE slot 0x43</td></tr>
+<tr><td>1.45</td><td>↓</td><td>CplD</td><td>→0200</td><td>16 DW, BC 64</td><td>0x11</td><td>SQE: opcode 01h, CID 0x0043</td></tr>
+<tr><td>2.10</td><td>↑</td><td>MRd</td><td>1_4000_0000</td><td>128 DW</td><td>0x12</td><td>Data 0–511</td></tr>
+<tr><td>2.12–2.24</td><td>↑</td><td>MRd ×7</td><td>…0200 … 0E00</td><td>128 DW each</td><td>0x13–0x19</td><td>Data 512–4095</td></tr>
+<tr><td>3.02</td><td>↓</td><td>CplD</td><td>LA=00</td><td>64 DW, BC 512</td><td>0x12</td><td>First half of req 0x12</td></tr>
+<tr><td>3.06</td><td>↓</td><td>CplD</td><td>LA=00</td><td>64 DW, BC 256</td><td>0x12</td><td>Second half — tag 0x12 done</td></tr>
+<tr><td>3.10–3.60</td><td>↓</td><td>CplD ×14</td><td>…</td><td>64 DW</td><td>0x13–0x19</td><td>Remaining data</td></tr>
+<tr><td>5.20</td><td>↑</td><td>MWr</td><td>1_2350_0430</td><td>4 DW</td><td>—</td><td>CQE CID 0x0043, SF=0, P=1</td></tr>
+<tr><td>5.24</td><td>↑</td><td>MWr</td><td>FEE0_2000</td><td>1 DW</td><td>—</td><td>MSI-X</td></tr>
+<tr><td>8.40</td><td>↓</td><td>MWr</td><td>F7A0_101C</td><td>1 DW =0x0044</td><td>—</td><td>CQ3 head doorbell</td></tr>
+</tbody></table></div></div>
+<p>Note "LA=00" for both completions: Lower Address carries only address bits 6:0, and the second completion begins at 0x1_4000_0100 whose low 7 bits are 0. This is a common decode trap.</p>
+
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow write: tag starvation (throughput, not latency, problem)</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Detail</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0–1.5</td><td>↕</td><td>…</td><td>many SQEs fetched</td><td>Deep queue workload (QD 64, 128 KiB writes)</td></tr>
+<tr><td>2.0–2.4</td><td>↑</td><td>MRd ×32</td><td>tags 0x00–0x1F, 4 KiB each (MRRS 4096)</td><td>Device uses only 32 tags (impl limit)</td></tr>
+<tr class="first-bad"><td>2.4–6.8</td><td>—</td><td>—</td><td>no new MRd until completions return</td><td>All tags busy; round trip 4.4 µs through two switch levels</td></tr>
+<tr class="bad"><td>…</td><td>↓</td><td>CplD stream</td><td>link utilisation ≈ 30% in the downstream direction</td><td>Bandwidth-delay product not covered: 32 × 4 KiB / 4.4 µs ≈ 30 GB/s theoretical, but completions return in RCB-sized pieces with RC throttling (impl)</td></tr>
+</tbody></table></div></div>
+<p><b>Reasoning:</b> no errors; the link is under-utilised while the device waits. First check: Device Control 2 10-bit tag enable, MRRS, topology depth. This is a performance root cause visible only by looking at gaps and tag counts.</p>
+
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed write: IOMMU denies data read</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Detail</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0–1.5</td><td>↕</td><td>…</td><td>doorbell, SQE fetch normal</td><td>—</td></tr>
+<tr><td>2.1</td><td>↑</td><td>MRd</td><td>addr 1_4000_0000 tag 0x12</td><td>Data read</td></tr>
+<tr class="first-bad"><td>2.9</td><td>↓</td><td>Cpl (no data)</td><td>tag 0x12, Status = UR</td><td>Root complex reports the request unsupported — typical when IOMMU translation fails (<span class="tag impl">impl</span>; some platforms use CA or drop)</td></tr>
+<tr class="bad"><td>3.5</td><td>↑</td><td>MWr</td><td>CQE SCT 0 / SC 04h (Data Transfer Error) — or 06h Internal Error</td><td>Controller converts the PCIe failure into an NVMe status (<span class="tag impl">impl</span>)</td></tr>
+<tr class="bad"><td>host</td><td>—</td><td>log</td><td>IOMMU fault: device 02:00.0 read addr 0x140000000 not present (illustrative)</td><td>Root cause candidate: buffer unmapped too early, or wrong PRP</td></tr>
+</tbody></table></div></div>
+
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: CQE arrives before all CplDs?</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Detail</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>2.1–2.2</td><td>↑</td><td>MRd ×8</td><td>tags 0x12–0x19</td><td>Data fetch</td></tr>
+<tr><td>3.0–3.4</td><td>↓</td><td>CplD ×12</td><td>tags 0x12–0x17 complete</td><td>—</td></tr>
+<tr class="first-bad"><td>3.5</td><td>↑</td><td>MWr</td><td>CQE for CID 0x0043</td><td>CQE before CplDs for tags 0x18/0x19 visible</td></tr>
+<tr><td>3.6</td><td>↓</td><td>CplD ×4</td><td>tags 0x18, 0x19</td><td>remaining data</td></tr>
+</tbody></table></div></div>
+<p><b>Reasoning:</b> upstream and downstream are independent directions: ordering rules do not relate an upstream MWr to downstream CplDs. Is it a bug? Only if tags 0x18/0x19 belong to <em>this</em> command (completing a write before having its data would be a serious firmware bug). They might belong to another command whose fetch was interleaved. Ambiguity resolved by mapping tags → command (requires device-internal logs or careful address correlation to PRPs). Also check the analyzer timestamp alignment between the two directions (probe skew).</p>
+
+<h3>40.10 Flush, FUA and durability</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Host intent</th><th>NVMe mechanism</th><th>Linux mechanism</th><th>When CQE means "durable"</th></tr></thead>
+<tbody>
+<tr><td>Ordinary write</td><td>Write, FUA=0</td><td>REQ_OP_WRITE</td><td>Only if VWC absent or disabled</td></tr>
+<tr><td>Durable single write</td><td>Write, FUA=1</td><td>REQ_FUA (if device advertises FUA support — Linux checks VWC/ONCS)</td><td>Yes, for that write</td></tr>
+<tr><td>Barrier for prior writes</td><td>Flush (00h)</td><td>REQ_PREFLUSH / fsync</td><td>Yes, for all writes completed before the Flush was submitted</td></tr>
+<tr><td>Disable cache</td><td>Set Features 06h WCE=0</td><td><code>nvme set-feature -f 6 -v 0</code> (changes device state — caution)</td><td>Every write</td></tr>
+</tbody></table></div>
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>On the PCIe link, a FUA write and a normal write look identical except for one bit inside the SQE payload of the CplD and the timing gap before the CQE. If you're investigating data loss after power failure, decode the SQE CDW12 bit 30 in captured CplDs and check whether Flush commands (opcode 00h on an I/O queue) were present before the power event. The absence of Flushes (in a complete capture) is strong evidence of a host/filesystem durability problem rather than an SSD bug.</p></div>
+
+<h3>40.11 Common mistakes</h3>
+<ul>
+<li>Expecting MWr from host to device for write data. The host never pushes I/O data (except into a CMB/PMR when used as a data buffer).</li>
+<li>Treating each CplD as one request — multiple completions per request are normal.</li>
+<li>Misreading Byte Count as "bytes in this TLP" — it is bytes remaining, including this one.</li>
+<li>Assuming the CQE means data is on NAND.</li>
+<li>Mapping the buffer DMA_FROM_DEVICE for a write (IOMMU permission fault).</li>
+<li>Unmapping/reusing the buffer before the CQE (use-after-free DMA: device reads changed data).</li>
+</ul>
+
+<h3>40.12 Lab</h3>
+<div class="lab"><div class="lab-head">🧪 Lab 40.1 — Count TLPs for writes of varying size <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> build intuition for MRRS/RCB effects without hardware. <b>Setup:</b> paper or a Python REPL. <b>Procedure:</b> for transfer sizes 512 B, 4 KiB, 16 KiB, 128 KiB and MRRS ∈ {128, 512, 4096}, completer max payload 256, RCB 64, compute MRd and minimum CplD counts. <b>Observations:</b> fill a table. <b>Questions:</b> which parameter dominates request count? which dominates completion count?</p>
+<pre class="code" data-kind="executable"><code>import math
+def counts(size, mrrs, cpl_max=256):
+    n_mrd = math.ceil(size / mrrs)
+    n_cpl = sum(math.ceil(min(mrrs, size - i*mrrs) / cpl_max) for i in range(n_mrd))
+    return n_mrd, n_cpl
+for size in (512, 4096, 16384, 131072):
+    for mrrs in (128, 512, 4096):
+        print(size, mrrs, counts(size, mrrs))</code></pre>
+<details class="answer"><summary>Solution</summary><p>MRRS dominates request count (e.g. 128 KiB: 1024 / 256 / 32 requests). The completer's max payload dominates completion count (128 KiB: 512 completions at 256 B regardless of MRRS ≥ 256; at MRRS 128 it's 1024 completions). Larger MRRS reduces tag and NP credit pressure, at the cost of potentially larger latency for other devices (fairness).</p></details>
+<p><b>Extension:</b> add RCB-split modelling for an unaligned start address (e.g. 0x...0020).</p>
+</div>
+<div class="lab"><div class="lab-head">🧪 Lab 40.2 — Observe write cache and FUA in software <span class="safety caution">CAUTION</span></div>
+<p><b>Objective:</b> observe latency difference between cached writes and FUA/flush writes. <b>Setup:</b> a <em>scratch</em> NVMe namespace with no valuable data. <b>Procedure:</b> <code>nvme id-ctrl /dev/nvme0 | grep -i vwc</code>; <code>nvme get-feature /dev/nvme0 -f 6</code>; run fio 4 KiB randwrite QD1 with and without <code>--fsync=1</code>; compare clat. <b>Observations:</b> latency with fsync significantly higher on drives without PLP. <b>Questions:</b> why can a drive with PLP show almost no difference?</p>
+<div class="callout warn"><div class="callout-title">⚠️ Safety</div><p>Write workloads destroy data on the target. Use only a dedicated test device or namespace. Do not change Feature 06h on a production system.</p></div>
+<details class="answer"><summary>Solution</summary><p>With PLP, the controller can treat its buffer as non-volatile and complete Flush/FUA quickly (or reports VWC not present). Without PLP, Flush forces NAND programming of cached data, adding hundreds of µs to ms.</p></details>
+</div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Which TLP type carries write data across the link for an NVMe Write with host-memory buffers?</p><details class="answer"><summary>Answer</summary><p>CplD (host → device), answering the controller's MRd requests.</p></details></li>
+<li><p>A 2 KiB MRd is answered by CplDs with Byte Count 2048, 1792, 1536… what is the payload of each?</p><details class="answer"><summary>Answer</summary><p>256 bytes each (difference between successive Byte Counts).</p></details></li>
+<li><p>Which SQE bit requests FUA on a Write?</p><details class="answer"><summary>Answer</summary><p>CDW12 bit 30.</p></details></li>
+<li><p>What PCIe error does the controller log if the host never answers a data MRd?</p><details class="answer"><summary>Answer</summary><p>Completion Timeout (uncorrectable, default non-fatal) in its AER Uncorrectable Error Status.</p></details></li>
+<li><p>What does MRRS limit?</p><details class="answer"><summary>Answer</summary><p>The maximum size of a single memory read request issued by that function.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> How does write data get from host to SSD? <details class="answer"><summary>Model answer</summary><p>The SSD reads it: MRd requests to the PRP addresses, the root complex answers with CplD packets carrying the data.</p></details></li>
+<li><span class="lvl">Intermediate</span> Why might writes be slower than reads at the same queue depth on a deep PCIe topology? <details class="answer"><summary>Model answer</summary><p>Non-posted reads need round trips; with limited tags/MRRS the device can't cover the bandwidth-delay product. Reads use posted writes, which stream without waiting.</p></details></li>
+<li><span class="lvl">Advanced</span> Explain how a write CQE can be correct while the data is lost after a power cut. <details class="answer"><summary>Model answer</summary><p>VWC enabled, FUA=0, no Flush: CQE posted when data reached volatile buffer. Durability requires Flush or FUA, or PLP hardware.</p></details></li>
+<li><span class="lvl">Senior</span> You see a poisoned CplD on a write data fetch. Who is at fault and what do you capture next? <details class="answer"><summary>Model answer</summary><p>Data was poisoned at or before the completer — host memory (uncorrectable ECC) or RC internal error. Capture machine-check/EDAC logs, root port AER, physical address; the SSD should fail the command (not write poisoned data) — check its status code.</p></details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can draw the write sequence and point out every non-posted request.</li>
+<li>I can compute MRd/CplD counts from MRRS, MPS and RCB.</li>
+<li>I can decode Byte Count and Lower Address in a completion series.</li>
+<li>I can explain VWC, FUA and Flush and their effect on the CQE timing.</li>
+<li>I can diagnose IOMMU-denied data fetch and tag starvation from traces.</li>
+</ul></div>
+<p><b>Summary:</b> writes share the control path with reads but invert the data path into device-initiated non-posted reads, making them sensitive to tags, MRRS, round-trip latency and host memory errors; the CQE timing depends on cache policy. <b>Next:</b> <a href="#p5-ch41-correlation">Chapter 41</a> — systematic correlation of NVMe commands with TLPs.</p>
+</section>
+
+<section class="chapter" id="p5-ch41-correlation" data-part="PART XIII — END-TO-END NVMe OVER PCIe">
+<h2><span class="num">41</span> Command-to-TLP Correlation</h2>
+
+<h3>41.1 Why this chapter exists</h3>
+<p>A protocol analyzer capture of a busy SSD contains millions of TLPs from dozens of queues and hundreds of in-flight commands. Nothing in a TLP header says "this belongs to NVMe command CID 0x0042 on queue 3". Correlation is an act of <em>reasoning</em>: you link a doorbell to a queue by address, a queue slot to an SQE fetch by address, an SQE to its data by PRP addresses, data to a CQE by CID and queue, and a CQE to an interrupt by vector. This chapter teaches that reasoning formally, and introduces the investigative rules — complete event model, timeline reconstruction, first-abnormal-event, negative evidence — used in every forensic lab of the remaining parts.</p>
+
+<h3>41.2 Learning objectives</h3>
+<ul class="objectives">
+<li>Distinguish crisply: NVMe command, PCIe TLP, NVMe CQE, PCIe Completion TLP.</li>
+<li>Build an address map (BAR0 doorbells, SQ/CQ rings, PRP lists, data buffers, MSI-X addresses) from initialization traffic.</li>
+<li>Correlate each NVMe event to TLP type, direction, requester/completer, address region and tag.</li>
+<li>Represent events using the complete event model and reconstruct expected vs observed timelines.</li>
+<li>Apply the first-abnormal-event and negative-evidence rules.</li>
+</ul>
+
+<h3>41.3 The four things that are NOT interchangeable</h3>
+<div class="callout remember"><div class="callout-title">📌 Remember</div><p>"Completion" means two unrelated things in this stack. A <b>PCIe Completion</b> (Cpl/CplD) answers a <em>PCIe non-posted request</em> within microseconds and lives only on the link. An <b>NVMe Completion Queue Entry</b> answers an <em>NVMe command</em>, may take milliseconds, and is carried to host memory <em>inside a PCIe Memory Write</em> — never inside a PCIe Completion.</p></div>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>NVMe Command</th><th>PCIe TLP</th><th>NVMe CQE</th><th>PCIe Completion TLP</th></tr></thead>
+<tbody>
+<tr><td>Layer</td><td>NVMe (command set / queue)</td><td>PCIe transaction layer</td><td>NVMe (queue)</td><td>PCIe transaction layer</td></tr>
+<tr><td>Size/format</td><td>64-byte SQE</td><td>3/4 DW header (+ prefixes) + 0–1024 DW payload (+ ECRC)</td><td>16-byte entry</td><td>3 DW header + optional data</td></tr>
+<tr><td>Identifier</td><td>CID (16 bit) + SQID</td><td>Requester ID + Tag (for non-posted)</td><td>CID + SQID (DW2/DW3)</td><td>Requester ID + Tag of the request it answers; Completer ID</td></tr>
+<tr><td>Lives in</td><td>Host memory SQ (or CMB)</td><td>On the wire</td><td>Host memory CQ</td><td>On the wire</td></tr>
+<tr><td>Transported by</td><td>CplD (answering the device's MRd), or MWr into CMB</td><td>—</td><td>MWr (device → host)</td><td>—</td></tr>
+<tr><td>Status</td><td>—</td><td>— (requests have none)</td><td>SCT/SC, DNR, More, CRD</td><td>SC, UR, CRS, CA</td></tr>
+<tr><td>Time scale</td><td>µs to seconds lifetime</td><td>ns on wire</td><td>written once</td><td>µs after request</td></tr>
+<tr><td>Failure detection</td><td>Driver timeout (e.g. 30 s)</td><td>LCRC/ECRC, Malformed, etc.</td><td>Status ≠ 0</td><td>Completion Timeout (50 µs–50 ms default range), status ≠ SC</td></tr>
+</tbody></table></div>
+<figure class="diagram"><svg viewBox="0 0 820 330" role="img" aria-label="Diagram showing the NVMe command carried by a PCIe completion, the NVMe CQE carried by a PCIe memory write, and their nesting">
+<rect class="box" x="20" y="20" width="370" height="130" rx="8"/>
+<text class="lbl" x="205" y="44" text-anchor="middle">PCIe Completion TLP (CplD) ↓</text>
+<rect class="box alt" x="40" y="58" width="110" height="74" rx="4"/><text class="lbl small" x="95" y="90" text-anchor="middle">Cpl header</text><text class="lbl small" x="95" y="108" text-anchor="middle">ReqID+Tag</text>
+<rect class="box accent" x="160" y="58" width="210" height="74" rx="4"/><text class="lbl small" x="265" y="90" text-anchor="middle">payload = NVMe Command</text><text class="lbl small" x="265" y="108" text-anchor="middle">(64 B SQE, CID, opcode)</text>
+<rect class="box" x="430" y="20" width="370" height="130" rx="8"/>
+<text class="lbl" x="615" y="44" text-anchor="middle">PCIe Memory Write TLP (MWr) ↑</text>
+<rect class="box alt" x="450" y="58" width="110" height="74" rx="4"/><text class="lbl small" x="505" y="90" text-anchor="middle">MWr header</text><text class="lbl small" x="505" y="108" text-anchor="middle">addr = CQ slot</text>
+<rect class="box accent" x="570" y="58" width="210" height="74" rx="4"/><text class="lbl small" x="675" y="90" text-anchor="middle">payload = NVMe CQE</text><text class="lbl small" x="675" y="108" text-anchor="middle">(16 B, CID, status, P)</text>
+<rect class="box" x="20" y="180" width="370" height="130" rx="8"/>
+<text class="lbl" x="205" y="204" text-anchor="middle">PCIe Memory Read TLP (MRd) ↑</text>
+<text class="lbl small" x="205" y="236" text-anchor="middle">header only: addr = SQ slot, ReqID, Tag</text>
+<text class="lbl small" x="205" y="260" text-anchor="middle">"give me 64 bytes" — the request</text>
+<text class="lbl small" x="205" y="284" text-anchor="middle">answered by the CplD above</text>
+<rect class="box" x="430" y="180" width="370" height="130" rx="8"/>
+<text class="lbl" x="615" y="204" text-anchor="middle">PCIe MWr (MSI-X) ↑</text>
+<text class="lbl small" x="615" y="236" text-anchor="middle">addr = MSI-X Message Address</text>
+<text class="lbl small" x="615" y="260" text-anchor="middle">payload = Message Data (1 DW)</text>
+<text class="lbl small" x="615" y="284" text-anchor="middle">no NVMe content at all</text>
+<path class="ln" d="M205 180 L205 152" marker-end="url(#arrow)"/>
+<path class="ln" d="M615 152 L615 178" marker-end="url(#arrow)"/>
+</svg><figcaption>Figure 41.1 — Nesting: NVMe structures ride <em>inside</em> PCIe payloads. The NVMe command arrives in a PCIe Completion; the NVMe completion leaves in a PCIe Memory Write.</figcaption></figure>
+
+<h3>41.4 The correlation chain</h3>
+<pre class="diagram">NVMe command (SQID, CID)
+   ↕  queue location        SQ base + slot×64  (from Create I/O SQ PRP1 + slot index)
+   ↕  controller access     MRd by device (ReqID = device BDF) to that address
+   ↕  PCIe requester/completer  requester = device, completer = RC
+   ↕  tag                   Tag in MRd = Tag in CplD (+ ReqID)
+   ↕  data addresses        PRP1/PRP2/PRP list from the SQE payload → MWr (read) / MRd (write)
+   ↕  completion            CQE MWr to CQ base + slot×16, payload CID + SQID
+   ↕  interrupt             CQ's IV → MSI-X table entry → MWr to Message Address</pre>
+<p>Each link of the chain is learned from <em>earlier</em> traffic. You cannot correlate a mid-run capture unless you can reconstruct the setup: BAR0 address (from config space or lspci), CAP.DSTRD (from a CAP register read or the driver), queue base addresses (from Create I/O SQ/CQ admin commands — their PRP1 field), and MSI-X table contents (from host MMIO writes to the table, or by reading the BAR region).</p>
+
+<h3>41.5 Correlation table: NVMe event → TLP</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>NVMe event</th><th>TLP type</th><th>Direction</th><th>Requester → Completer</th><th>Address region</th><th>Tag relevance</th><th>Key correlation field</th></tr></thead>
+<tbody>
+<tr><td>Controller register read (CAP, CSTS)</td><td>MRd + CplD</td><td>↓ then ↑</td><td>RC → device</td><td>BAR0 00h–FFFh</td><td>RC tag</td><td>Offset in BAR0</td></tr>
+<tr><td>Controller register write (CC, AQA, ASQ, ACQ)</td><td>MWr</td><td>↓</td><td>RC → device</td><td>BAR0 14h, 24h, 28h, 30h</td><td>none (posted)</td><td>Offset, payload</td></tr>
+<tr><td>SQ tail doorbell</td><td>MWr 1 DW</td><td>↓</td><td>RC → device</td><td>BAR0 1000h + 2y·stride</td><td>none</td><td>Offset → QID; payload → tail</td></tr>
+<tr><td>CQ head doorbell</td><td>MWr 1 DW</td><td>↓</td><td>RC → device</td><td>BAR0 1000h + (2y+1)·stride</td><td>none</td><td>Offset → QID; payload → head</td></tr>
+<tr><td>SQE fetch</td><td>MRd</td><td>↑</td><td>device → RC</td><td>SQ ring</td><td>device tag</td><td>(addr − SQbase)/64 = slot</td></tr>
+<tr><td>SQE delivery</td><td>CplD</td><td>↓</td><td>RC → device</td><td>— (completions are ID-routed)</td><td>matches MRd</td><td>Payload bytes 2–3 = CID</td></tr>
+<tr><td>PRP list / SGL fetch</td><td>MRd + CplD</td><td>↑ / ↓</td><td>device → RC</td><td>Address = PRP2 or SGL segment</td><td>device tag</td><td>Address equals SQE PRP2</td></tr>
+<tr><td>Read data delivery</td><td>MWr (≤ MPS each)</td><td>↑</td><td>device → RC</td><td>Data buffers</td><td>none</td><td>Address ∈ PRP pages of the SQE</td></tr>
+<tr><td>Write data fetch</td><td>MRd + CplD</td><td>↑ / ↓</td><td>device → RC</td><td>Data buffers</td><td>device tag</td><td>Address ∈ PRP pages</td></tr>
+<tr><td>CQE post</td><td>MWr 4 DW</td><td>↑</td><td>device → RC</td><td>CQ ring</td><td>none</td><td>Payload DW3 CID, DW2 SQID</td></tr>
+<tr><td>Interrupt</td><td>MWr 1 DW</td><td>↑</td><td>device → RC</td><td>MSI-X Message Address</td><td>none</td><td>Address/data → vector → CQ</td></tr>
+<tr><td>Asynchronous event</td><td>CQE MWr on admin CQ (+ MSI-X vector 0)</td><td>↑</td><td>device → RC</td><td>Admin CQ</td><td>none</td><td>CID of the outstanding AER command</td></tr>
+<tr><td>HMB access</td><td>MRd/CplD, MWr</td><td>↑ / ↓</td><td>device → RC</td><td>HMB descriptor regions</td><td>device tag</td><td>Address in HMB list (Set Features 0Dh)</td></tr>
+<tr><td>MSI-X table programming</td><td>MWr</td><td>↓</td><td>RC → device</td><td>BAR (Table BIR) + Table Offset + 16·n</td><td>none</td><td>Entry index n</td></tr>
+<tr><td>Error message</td><td>Msg ERR_COR/NONFATAL/FATAL</td><td>↑</td><td>device → root port</td><td>Routed to root complex</td><td>—</td><td>Requester ID = reporting function</td></tr>
+</tbody></table></div>
+
+<h3>41.6 Complete event model</h3>
+<p>Analyzer rows, kernel log lines, tracepoints and NVMe log entries all have different shapes. To reason across them, normalise every observation into one record type:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Field</th><th>Meaning</th><th>Example (SQE fetch)</th></tr></thead>
+<tbody>
+<tr><td>EVENT_ID</td><td>Unique number in your timeline</td><td>E017</td></tr>
+<tr><td>TIMESTAMP</td><td>Source-local time + clock domain</td><td>analyzer 0.62 µs (domain A)</td></tr>
+<tr><td>SOURCE</td><td>Who emitted it</td><td>NVMe ctrl 02:00.0</td></tr>
+<tr><td>DESTINATION</td><td>Who receives it</td><td>Root complex</td></tr>
+<tr><td>LAYER</td><td>App / block / driver / NVMe / TL / DLL / PHY / media</td><td>PCIe TL</td></tr>
+<tr><td>PROTOCOL</td><td>PCIe, NVMe, Linux</td><td>PCIe</td></tr>
+<tr><td>TYPE</td><td>MRd, CQE, AER msg, timeout…</td><td>MRd</td></tr>
+<tr><td>DIRECTION</td><td>Up/down/internal</td><td>Upstream</td></tr>
+<tr><td>ADDRESS</td><td>Address or register</td><td>0x1_2340_1080</td></tr>
+<tr><td>TAG/CID</td><td>PCIe tag or NVMe CID</td><td>tag 0x11</td></tr>
+<tr><td>PAYLOAD</td><td>Summary of data</td><td>— (16 DW requested)</td></tr>
+<tr><td>STATUS</td><td>Completion status / NVMe status</td><td>n/a</td></tr>
+<tr><td>EXPECTED_NEXT</td><td>What should follow</td><td>CplD tag 0x11 within ~2 µs</td></tr>
+<tr><td>ACTUAL_NEXT</td><td>What did follow</td><td>CplD tag 0x11 at 1.48 µs</td></tr>
+<tr><td>CORRELATION_ID</td><td>Ties events of one command</td><td>Q3:CID0042</td></tr>
+<tr><td>EVIDENCE</td><td>Where it came from</td><td>Analyzer capture file, link 2 downstream port</td></tr>
+<tr><td>CONFIDENCE</td><td>High/medium/low + why</td><td>High: address = SQ3 slot 0x42</td></tr>
+</tbody></table></div>
+<div class="callout debug"><div class="callout-title">🐞 Debugging</div><p>The EXPECTED_NEXT / ACTUAL_NEXT pair is the engine of diagnosis: every event creates an expectation, and the first event whose ACTUAL_NEXT differs from EXPECTED_NEXT is your first deviation. CONFIDENCE forces honesty — a correlation by address alone is weaker than by address + CID + timing.</p></div>
+
+<h3>41.7 Timeline reconstruction</h3>
+<p>Build every investigation as two aligned columns:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Phase</th><th>Expected timeline (normal read)</th><th>Observed timeline (example incident)</th></tr></thead>
+<tbody>
+<tr><td>T0 system state</td><td>CSTS.RDY=1, link L0 Gen4 x4, queues created, MSI-X enabled</td><td>Same, but LnkSta shows Gen4 x2 (degraded width)</td></tr>
+<tr><td>T1 first event</td><td>App submits I/O</td><td>Same</td></tr>
+<tr><td>T2 request</td><td>SQE written, doorbell MWr</td><td>Doorbell visible</td></tr>
+<tr><td>T3 transport</td><td>MRd/CplD for SQE within ~2 µs</td><td>MRd visible; CplD after 1 replay (Nak seen)</td></tr>
+<tr><td>T4 device action</td><td>Media read 60–100 µs</td><td>95 µs</td></tr>
+<tr><td>T5 response</td><td>Data MWr ×16</td><td>Data MWr ×16, 3 replays</td></tr>
+<tr><td>T6 completion</td><td>CQE MWr, status 0</td><td>CQE status 0</td></tr>
+<tr><td>T7 software notification</td><td>MSI-X, ISR, head doorbell</td><td>Same; total latency +4 µs</td></tr>
+</tbody></table></div>
+<p>The comparison shows the NVMe layer is healthy; the link is not (degraded width, replays). The user-visible symptom ("slightly slow I/O") is far from the cause ("lane fault → width downgrade + bit errors").</p>
+<div class="callout trace"><div class="callout-title">🔍 Clock domains</div><p>Kernel timestamps, analyzer timestamps and device-internal logs run on different clocks. Align them with an anchor event visible in two domains (e.g. a doorbell MWr that also appears as an MMIO write in a hypervisor trace, or a distinctive admin command). Never compare raw timestamps across domains without an anchor and an error bar.</p></div>
+
+<h3>41.8 The first-abnormal-event rule</h3>
+<p>The first <em>visible</em> failure is not necessarily the root cause. Work backward: <b>SYMPTOM → FIRST DEVIATION → PRECEDING CAUSE</b>.</p>
+<pre class="diagram">SYMPTOM          : "nvme0: I/O 66 QID 3 timeout" at t = 30 s (illustrative)
+      ↑ backward
+FIRST DEVIATION  : SQE fetch MRd (t = 0.7 µs) has no visible CplD
+      ↑ backward
+PRECEDING CAUSE? : at t = −2 s the IOMMU domain was switched (VFIO rebind),
+                   SQ3 IOVA no longer mapped  → RC returns UR / drops request</pre>
+<p>The timeout is a symptom 30 seconds later; the first deviation is 0.7 µs after the doorbell; the cause predates the command entirely. An engineer who stops at the timeout will "fix" it by raising <code>io_timeout</code>.</p>
+
+<h3>41.9 The negative-evidence rule</h3>
+<p>Absence of an event is evidence only if (1) the event was expected and (2) the capture was complete enough to observe it. Never write "the device did not send the CQE". Write "<em>no MWr to the CQ3 region is visible in the captured interval</em>", then qualify with coverage: was the analyzer on the right link segment? Was the buffer full or filtered? Were both directions captured? Was the trigger window long enough? Was the CQ actually in host memory?</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Claim</th><th>Acceptable only if…</th></tr></thead>
+<tbody>
+<tr><td>"No doorbell was rung"</td><td>Downstream direction captured, no filter on MWr, BAR0 address known, capture began before submission</td></tr>
+<tr><td>"The device never fetched the command"</td><td>Upstream MRd captured unfiltered for the whole interval, SQ base known, CMB not used for SQ</td></tr>
+<tr><td>"No interrupt was sent"</td><td>Upstream MWr to MSI address range captured, vector address known, no interrupt remapping change</td></tr>
+<tr><td>"No error occurred"</td><td>AER enabled and unmasked for that error, reporting enabled up to the root port, logs read before being cleared</td></tr>
+</tbody></table></div>
+
+<h3>41.10 Correlation worked example</h3>
+<p>Given (synthetic) these three upstream packets in a mixed trace with SQ1 base 0x1_0000_0000, SQ2 base 0x1_0001_0000, CQ1 base 0x1_0010_0000, CQ2 base 0x1_0011_0000 (1024-entry queues):</p>
+<pre class="code" data-kind="simulation"><code>A: MRd  addr 0x1_0001_0FC0  len 32 DW tag 0x05
+B: MWr  addr 0x1_0011_00A0  len 4 DW  payload DW2=0x0002_0040 DW3=0x0001_7A3F
+C: MWr  addr 0xFEE0_1000    len 1 DW  payload 0x0000_0042</code></pre>
+<p><b>A:</b> address − SQ2 base = 0xFC0 = slot 63; length 32 DW = 128 bytes → fetching SQ2 slots 63 and 64 (two SQEs in one request). <b>B:</b> address − CQ2 base = 0xA0 → CQ2 slot 10. DW2 = 0x0002_0040 → SQID 2, SQHD 0x40 (64); DW3 = 0x0001_7A3F → CID 0x7A3F, bit 16 Phase = 1, status bits 31:17 = 0 → success. The SQHD of 64 is consistent with slot 63 having been consumed. <b>C:</b> an MSI-X write; to know which CQ it signals, consult the MSI-X table: if entry 2 has address 0xFEE0_1000 and data 0x42, it's vector 2, which CQ2 was created with. Note that several vectors may share an address and differ only in data.</p>
+
+<h3>41.11 Common mistakes</h3>
+<ul>
+<li>Matching completions to requests by tag only (ignoring Requester ID) on topologies with several requesters.</li>
+<li>Assuming one SQE per fetch MRd.</li>
+<li>Correlating CQEs to commands by order instead of CID.</li>
+<li>Comparing timestamps across clock domains without anchors.</li>
+<li>Declaring absence without coverage.</li>
+<li>Assuming tags are unique for all time — they are reused as soon as the request completes.</li>
+</ul>
+
+<h3>41.12 Lab</h3>
+<div class="lab"><div class="lab-head">🧪 Lab 41.1 — Build the address map from initialization traffic <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> from a (synthetic) initialization trace, derive all addresses needed for correlation. <b>Setup:</b> given these downstream MWrs to BAR0 (base 0xF7A0_0000) and admin commands:</p>
+<pre class="code" data-kind="simulation"><code>MWr F7A0_0024 = 0x001F_001F      (AQA)
+MWr F7A0_0028 = 0x2_0000_0000    (ASQ, 2 DW)
+MWr F7A0_0030 = 0x2_0001_0000    (ACQ, 2 DW)
+MWr F7A0_0014 = 0x0046_0001      (CC)
+Admin SQE: opcode 05h, PRP1 0x2_0100_0000, CDW10 0x03FF_0001, CDW11 0x0001_0003
+Admin SQE: opcode 01h, PRP1 0x2_0200_0000, CDW10 0x03FF_0001, CDW11 0x0001_0001</code></pre>
+<p><b>Procedure:</b> decode admin queue sizes, admin queue bases, CC fields, I/O CQ1 and SQ1 parameters (size, base, vector, contiguity, associated CQ).</p>
+<details class="answer"><summary>Solution</summary><p>AQA: ASQS = 0x1F → 32 entries, ACQS = 0x1F → 32 entries. ASQ base 0x2_0000_0000, ACQ base 0x2_0001_0000. CC = 0x0046_0001: EN=1, CSS (bits 6:4)=0 (NVM), MPS (10:7)=0 → 4 KiB pages, AMS=0, SHN=0, IOSQES (19:16)=6 → 64 B, IOCQES (23:20)=4 → 16 B. Create I/O CQ (05h): CDW10 QID=1, QSIZE=0x3FF → 1024 entries; CDW11 PC=1 (contiguous), IEN=1 (bit 1), IV (31:16)=1; base 0x2_0100_0000. Create I/O SQ (01h): QID 1, 1024 entries, CDW11 PC=1, QPRIO=0, CQID (31:16)=1; base 0x2_0200_0000. Doorbells: SQ1 tail 1008h, CQ1 head 100Ch (DSTRD 0 assumed — read CAP to confirm).</p></details>
+<p><b>Extension:</b> add MSI-X table programming MWrs and derive vector→address/data.</p>
+</div>
+<div class="lab"><div class="lab-head">🧪 Lab 41.2 — Fill the event model for a failing command <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> practise EXPECTED_NEXT/ACTUAL_NEXT. <b>Setup:</b> use the "failed read: completion timeout on SQE fetch" trace in <a href="#p5-ch39-e2e-read">§39.13</a>. <b>Procedure:</b> write one event-model record per row; fill EXPECTED_NEXT; mark the first mismatch; write CONFIDENCE with justification. <b>Questions:</b> what is the earliest event with a mismatch? what is missing from the evidence?</p>
+<details class="answer"><summary>Solution</summary><p>The MRd (tag 0x11) has EXPECTED_NEXT "CplD tag 0x11 within µs"; ACTUAL_NEXT "none visible; AER CTO ≈ 50 ms" — the first deviation. Missing: IOMMU fault log, root port AER registers, capture coverage on the RC side; confidence medium.</p></details>
+</div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Which carries an NVMe CQE: a PCIe Completion or a PCIe Memory Write?</p><details class="answer"><summary>Answer</summary><p>A PCIe Memory Write (posted, device → host).</p></details></li>
+<li><p>An MRd of 32 DW to an SQ ring — how many SQEs?</p><details class="answer"><summary>Answer</summary><p>Two (128 bytes / 64).</p></details></li>
+<li><p>Which field links a CplD to its MRd?</p><details class="answer"><summary>Answer</summary><p>Requester ID + Tag (Completer ID identifies the responder).</p></details></li>
+<li><p>Phrase correctly: the analyzer shows no CQE.</p><details class="answer"><summary>Answer</summary><p>"No MWr to the CQ region is visible in the captured interval" — plus a statement of capture coverage.</p></details></li>
+<li><p>What admin command reveals an I/O CQ's base address and vector?</p><details class="answer"><summary>Answer</summary><p>Create I/O Completion Queue (05h): PRP1 = base, CDW11 IV = vector.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> What's the difference between an NVMe completion and a PCIe completion? <details class="answer"><summary>Model answer</summary><p>NVMe CQE: 16-byte record reporting an NVMe command's outcome, written into host memory via MWr. PCIe Cpl/CplD: transaction-layer response to a non-posted request, matched by ReqID+Tag.</p></details></li>
+<li><span class="lvl">Intermediate</span> How do you find which NVMe queue a doorbell write targets? <details class="answer"><summary>Model answer</summary><p>(offset − 1000h)/(4 &lt;&lt; DSTRD) = index; even index → SQ (index/2), odd → CQ ((index−1)/2).</p></details></li>
+<li><span class="lvl">Advanced</span> Why can't you correlate a capture started mid-run, and how do you recover? <details class="answer"><summary>Model answer</summary><p>Queue bases, vectors and BAR addresses were set up earlier. Recover from host side (driver debugfs/tracepoints, lspci, reading MSI-X table), or by inferring ring regions from repeating MRd/MWr address patterns, with lower confidence.</p></details></li>
+<li><span class="lvl">Senior</span> Explain the first-abnormal-event and negative-evidence rules with an example. <details class="answer"><summary>Model answer</summary><p>As in §41.8–41.9: timeout symptom → missing CplD deviation → IOMMU remap cause; absence claims need coverage.</p></details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can explain the four-way distinction (command / TLP / CQE / Completion TLP) and draw the nesting.</li>
+<li>I can derive an address map from an initialization trace.</li>
+<li>I can tag every TLP in a mixed trace with queue, slot, CID and role.</li>
+<li>I can fill complete event-model records and identify the first deviation.</li>
+<li>I always phrase absence claims with coverage.</li>
+</ul></div>
+<p><b>Next:</b> <a href="#p5-ch42-interrupts">Part XIV</a> — how that final MWr becomes an interrupt.</p>
+</section>

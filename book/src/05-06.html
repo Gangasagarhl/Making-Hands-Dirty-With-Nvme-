@@ -1,0 +1,317 @@
+<section class="part" id="p5-part-xvi"><div class="part-num">PART XVI</div><h1>Power and Reset</h1><p class="part-intro">Resets and power transitions are where state goes to die — and where many of the hardest bugs live. An NVMe SSD has state at several levels: NVMe controller registers and queues, the NVM subsystem shared by controllers, the PCIe function's configuration space, the link's training state, and the physical power rails. Each reset type and each power state wipes a different subset of that state, takes a different amount of time, and leaves different evidence. This part teaches you, for every reset and every power transition, exactly what is lost, what survives, what the host must rebuild, and how to recognise each one in a trace or a log.</p></section>
+
+<section class="chapter" id="p5-ch48-nvme-reset" data-part="PART XVI — POWER AND RESET">
+<h2><span class="num">48</span> NVMe Reset (Deep-Dive Module: Reset, NVMe Side)</h2>
+
+<h3>48.1 Why this chapter exists</h3>
+<p>When an NVMe command times out, Linux's escalation ends in a controller reset. When firmware is updated, activation may need a reset. When the system shuts down, the controller must be told so that it can flush its caches and mark itself clean — otherwise the next boot may see an "unsafe shutdown" and spend time rebuilding mapping tables. Each of these is a different NVMe mechanism: <b>Controller Reset</b> (CC.EN 1→0), <b>NVM Subsystem Reset</b> (NSSR), and <b>Shutdown</b> (CC.SHN / CSTS.SHST). Confusing them causes lost data, hung reboots and "drive disappeared" incidents.</p>
+
+<h3>48.2 Learning objectives</h3>
+<ul class="objectives">
+<li><b>Beginner:</b> state what CC.EN, CSTS.RDY, CC.SHN, CSTS.SHST and NSSR do.</li>
+<li><b>Intermediate:</b> list the state destroyed and preserved by a controller reset; write the re-initialisation sequence.</li>
+<li><b>Advanced:</b> explain outstanding command handling, CAP.TO timing, NSSR scope and its PCIe side effects; distinguish normal vs abrupt shutdown.</li>
+<li><b>Senior:</b> design a robust reset/recovery ladder and reason about lost commands.</li>
+<li><b>Trace-analysis:</b> recognise reset and re-init sequences on the link.</li>
+<li><b>Debugging/validation:</b> five failure patterns; validate reset correctness.</li>
+</ul>
+
+<h3>48.3 Story and analogy</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>A <b>controller reset</b> is the warehouse manager blowing a whistle: every worker drops what they're holding, all the trays except the main office tray are thrown away, and work starts again only when the manager says "ready". <b>Shutdown</b> is closing time: workers finish putting things on shelves, lock up, and hang a sign "closed properly". <b>NVM subsystem reset</b> is turning off the power to the whole warehouse complex, including the other managers' buildings next door.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>Dropped work isn't reported: commands outstanding at a controller reset simply never get CQEs — the host has to know to treat them as aborted. And "closed properly" (SHST complete) does not by itself mean power is off; the host decides what happens next (power off, D3, keep running).</p></div>
+
+<h3>48.4 Registers involved</h3>
+<div class="table-wrap"><table class="bitfield">
+<thead><tr><th>Register (offset)</th><th>Field</th><th>Bits</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>CAP (00h)</td><td>TO</td><td>31:24</td><td>Worst-case time for RDY to change after EN changes, in 500 ms units</td></tr>
+<tr><td>CAP (00h)</td><td>NSSRS</td><td>36</td><td>NVM Subsystem Reset supported</td></tr>
+<tr><td>CC (14h)</td><td>EN</td><td>0</td><td>Enable; 1→0 = controller reset</td></tr>
+<tr><td>CC (14h)</td><td>SHN</td><td>15:14</td><td>Shutdown Notification: 00 none, 01 normal, 10 abrupt</td></tr>
+<tr><td>CSTS (1Ch)</td><td>RDY</td><td>0</td><td>Ready</td></tr>
+<tr><td>CSTS (1Ch)</td><td>CFS</td><td>1</td><td>Controller Fatal Status</td></tr>
+<tr><td>CSTS (1Ch)</td><td>SHST</td><td>3:2</td><td>Shutdown Status: 00 normal operation, 01 shutdown processing occurring, 10 shutdown processing complete</td></tr>
+<tr><td>CSTS (1Ch)</td><td>NSSRO</td><td>4</td><td>NVM Subsystem Reset Occurred (RW1C)</td></tr>
+<tr><td>CSTS (1Ch)</td><td>PP</td><td>5</td><td>Processing Paused</td></tr>
+<tr><td>NSSR (20h)</td><td>NSSRC</td><td>31:0</td><td>Write 4E564D65h ("NVMe") to initiate NVM Subsystem Reset</td></tr>
+<tr><td>AQA/ASQ/ACQ (24h/28h/30h)</td><td>—</td><td>—</td><td>Admin queue attributes/bases — preserved across controller reset</td></tr>
+</tbody></table></div>
+
+<h3>48.5 Controller Reset (CC.EN 1 → 0)</h3>
+<p><b>Effects</b> (<span class="tag verified">verified</span> in substance; consult Base spec "Controller Reset" for normative text):</p>
+<ul>
+<li>The controller stops processing commands; all I/O SQs and CQs are deleted; outstanding commands are not completed (the host treats them as aborted).</li>
+<li>Controller registers return to their reset values <em>except</em> the admin queue registers (AQA, ASQ, ACQ), which are retained; CSTS.RDY goes to 0 within CAP.TO.</li>
+<li>Internal controller state (Set Features values that are not saved, Asynchronous Event state, etc.) resets; persistent namespace data is unaffected; writes already completed remain subject to cache rules (a reset is not a power loss, but a host should Flush before a deliberate reset if durability matters).</li>
+<li>The PCIe function, its configuration space, BARs, MSI-X configuration and the link are <em>not</em> reset by CC.EN alone.</li>
+</ul>
+<p><b>Re-initialisation sequence:</b></p>
+<pre class="code" data-kind="pseudocode"><code>// Controller reset + re-init (host side)
+cc = mmio_read32(CC); cc &amp;= ~CC_EN; mmio_write32(CC, cc);   // MWr to BAR0+14h
+wait_until(mmio_read32(CSTS) &amp; RDY == 0, CAP.TO * 500 ms);   // MRd/CplD polling
+// all I/O queues are gone; outstanding CIDs -&gt; fail/requeue in software
+mmio_write32(AQA, (acqs-1) &lt;&lt; 16 | (asqs-1));               // optional: retained, but reprogram
+mmio_write64(ASQ, asq_iova); mmio_write64(ACQ, acq_iova);
+mmio_write32(CC, CSS | MPS | AMS | IOSQES(6) | IOCQES(4) | EN);
+wait_until(mmio_read32(CSTS) &amp; RDY == 1, CAP.TO * 500 ms);
+if (CSTS &amp; CFS) escalate();                                    // PCIe-level reset
+identify_controller();                                         // re-validate (FW may have changed)
+set_features(NUM_QUEUES 07h);                                  // re-negotiate
+for each queue: create_io_cq(qid, iv), create_io_sq(qid, cqid); // CQs first, then SQs
+submit_async_event_requests(AERL+1 or fewer);
+restore_features();   // e.g. APST (0Ch), coalescing (08h), VWC (06h), HMB (0Dh) if used
+resubmit_or_fail(outstanding_requests);</code></pre>
+<div class="callout warn"><div class="callout-title">⚠️ Host Memory Buffer</div><p>If the controller uses an HMB (Feature 0Dh), the host must keep the HMB memory intact and mapped until the controller is reset or the HMB disabled; after a controller reset the host re-enables it. Freeing HMB memory while the device may still access it is a classic use-after-free DMA hazard (<span class="tag derived">derived</span>).</p></div>
+
+<h3>48.6 Outstanding commands — the lost-command problem</h3>
+<p>At the moment of reset, a command can be in any of these states; the host cannot generally tell which:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>State at reset</th><th>Has data moved?</th><th>Media effect</th><th>Host treatment</th></tr></thead>
+<tbody>
+<tr><td>In SQ, not fetched</td><td>No</td><td>None</td><td>Resubmit safe</td></tr>
+<tr><td>Fetched, not started</td><td>No</td><td>None</td><td>Resubmit safe</td></tr>
+<tr><td>Read in progress</td><td>Partially into host buffer</td><td>None</td><td>Resubmit (buffer contents undefined until success)</td></tr>
+<tr><td>Write in progress</td><td>Partially fetched</td><td>May be partially written (atomicity rules — AWUN/AWUPF — define what's guaranteed)</td><td>Resubmit; upper layers must tolerate torn writes beyond atomic size</td></tr>
+<tr><td>Completed, CQE posted but not consumed</td><td>Yes</td><td>Done</td><td>CQE is lost with CQ deletion; host may resubmit — idempotent for read/write, not for e.g. some admin commands</td></tr>
+</tbody></table></div>
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>The dangerous cases are non-idempotent commands (Firmware Commit, Format, Sanitize, Namespace Management, reservation commands) and writes whose completion was lost. Robust hosts poll the CQ one last time before resetting (Linux's timeout handler does check for a completed CQE), and upper layers must use FUA/Flush and journalling, not assumptions about which writes landed.</p></div>
+
+<h3>48.7 NVM Subsystem Reset (NSSR)</h3>
+<p>If CAP.NSSRS = 1, writing 4E564D65h to NSSR (20h) resets the whole NVM subsystem — every controller in it, on every port. After it, CSTS.NSSRO = 1 tells hosts it happened. Because the subsystem includes the PCIe port logic on many designs, the PCIe link may go down and retrain (<span class="tag impl">impl</span>) — the root port may log Surprise Down unless masked, and Linux must handle the device as if it had been reset at the PCIe level (re-restore config space). Linux exposes it as <code>nvme subsystem-reset</code>.</p>
+<div class="callout warn"><div class="callout-title">⚠️ Safety</div><p><code>nvme reset</code> and <code>nvme subsystem-reset</code> interrupt all I/O on the device; on a boot or root device this can crash or hang the system. Use only on dedicated test devices.</p></div>
+
+<h3>48.8 Shutdown</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Type</th><th>CC.SHN</th><th>Controller does</th><th>Host waits for</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td>Normal</td><td>01b</td><td>Completes/flushes internal work, saves metadata, marks clean</td><td>CSTS.SHST = 10b (time guided by RTD3E in Identify Controller and host timeout; Linux <code>nvme_core.shutdown_timeout</code>)</td><td>Power off, reboot, suspend-to-power-off</td></tr>
+<tr><td>Abrupt</td><td>10b</td><td>Minimal processing to reach a safe state quickly</td><td>CSTS.SHST = 10b</td><td>Imminent power loss; time-critical</td></tr>
+</tbody></table></div>
+<p>Recommended order (normal shutdown): stop new I/O → wait for or abort outstanding commands → delete I/O SQs, then I/O CQs → set CC.SHN = 01b → poll SHST until 10b → (optionally) clear EN, transition to D3hot/D3cold or power off. To restart after shutdown, the host performs a controller reset/enable sequence. Newer specification revisions also define NVM-subsystem-level shutdown — <span class="tag version">version</span>.</p>
+<div class="callout trace"><div class="callout-title">🔍 Evidence</div><p>SMART/Health log "Unsafe Shutdowns" counter increments when the controller lost power without a completed shutdown. A rising unsafe-shutdown count with no known power failures implicates the host's shutdown path (timeouts too short, platform cuts power early).</p></div>
+
+<h3>48.9 Trace view</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal controller reset and re-init (host-initiated)</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>TLP</th><th>Detail</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↓</td><td>MWr</td><td>BAR0+14h = CC with EN=0</td><td>Controller reset</td></tr>
+<tr><td>+1 µs…</td><td>↓↑</td><td>MRd/CplD (repeated)</td><td>BAR0+1Ch → RDY=1, …, RDY=0</td><td>Host polling</td></tr>
+<tr><td>+12 ms</td><td>↓↑</td><td>MRd/CplD</td><td>CSTS = 0x0</td><td>RDY=0 reached</td></tr>
+<tr><td>+12 ms</td><td>↓</td><td>MWr ×3</td><td>AQA, ASQ, ACQ</td><td>Admin queues</td></tr>
+<tr><td>+12 ms</td><td>↓</td><td>MWr</td><td>CC = 0x0046_0001</td><td>Enable</td></tr>
+<tr><td>+400 ms</td><td>↓↑</td><td>MRd/CplD</td><td>CSTS = 0x1</td><td>Ready</td></tr>
+<tr><td>+400 ms</td><td>↓↑↓</td><td>doorbell / MRd / CplD</td><td>admin SQE opcode 06h</td><td>Identify</td></tr>
+<tr><td>…</td><td>↓↑</td><td>…</td><td>opcodes 09h (07h feature), 05h ×N, 01h ×N, 0Ch</td><td>Queues re-created, AERs armed</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: RDY takes nearly CAP.TO</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>CC.EN=1</td><td>—</td></tr>
+<tr class="first-bad"><td>0 → 14.8 s</td><td>CSTS.RDY=0 on every poll</td><td>CAP.TO = 0x1E (15 s); controller rebuilding mapping table after unsafe shutdown (impl) — slow but legal</td></tr>
+<tr><td>14.8 s</td><td>RDY=1</td><td>Check SMART unsafe shutdowns count</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: CFS after enable</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>CC.EN=1</td><td>—</td></tr>
+<tr class="first-bad"><td>2 s</td><td>CSTS = 0x3 (RDY=1, CFS=1)</td><td>Controller became ready then fatal (firmware assert during init)</td></tr>
+<tr class="bad"><td>2 s+</td><td>admin Identify never completes</td><td>Consequence</td></tr>
+<tr class="bad"><td>host</td><td>escalation: FLR / SBR</td><td>Next rung of ladder</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: writes after shutdown</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>CC.SHN=01b</td><td>Normal shutdown</td></tr>
+<tr><td>80 ms</td><td>CSTS.SHST=10b</td><td>Complete</td></tr>
+<tr class="first-bad"><td>85 ms</td><td>↓ MWr SQ1 tail doorbell</td><td>Host submitted I/O after shutdown — is it a driver bug, or a new enable sequence omitted from the capture filter?</td></tr>
+</tbody></table></div></div>
+
+<h3>48.10 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code>sudo nvme show-regs /dev/nvme0 -H | grep -E -A3 "^cap|^cc|^csts"   # decode CAP.TO, CC, CSTS (read-only)
+sudo nvme id-ctrl /dev/nvme0 | grep -E "rtd3e|rtd3r|aerl|elpe"
+sudo nvme smart-log /dev/nvme0 | grep -i unsafe
+cat /sys/module/nvme_core/parameters/shutdown_timeout
+cat /sys/module/nvme_core/parameters/io_timeout
+sudo journalctl -k | grep -E "nvme.*(reset|timeout|shutdown)"</code></pre>
+<p><b>Can prove:</b> current register state, configured timeouts, unsafe-shutdown history, host-logged resets. <b>Cannot prove:</b> which commands were in flight at reset, whether the device completed internal work before a reset.</p>
+
+<h3>48.11 Five failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Causes</th><th>First check</th><th>Second check</th><th>Experiment</th><th>Conclusion / confidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Reset loops in dmesg</td><td>CFS after every enable; timeouts on first I/O</td><td>CSTS after enable</td><td>FW version</td><td>Cold power cycle (test)</td><td>Firmware; medium</td></tr>
+<tr><td>2</td><td>Unsafe shutdowns climb</td><td>Host power-off before SHST; shutdown_timeout too short</td><td>SMART counter vs reboots</td><td>Shutdown path logs</td><td>Increase timeout</td><td>Host; high</td></tr>
+<tr><td>3</td><td>Boot delay ~15 s</td><td>Long RDY after unsafe shutdown</td><td>CAP.TO, time to RDY</td><td>Unsafe count</td><td>Clean shutdown then boot</td><td>Device recovery after host issue; high</td></tr>
+<tr><td>4</td><td>Device vanishes after nvme subsystem-reset</td><td>Link down, no hotplug handling</td><td>Root port link status</td><td>Surprise Down in AER</td><td>Rescan on test system</td><td>Expected NSSR side effect; high</td></tr>
+<tr><td>5</td><td>Data loss after reset recovery</td><td>Lost CQE for write; no flush; non-idempotent command</td><td>Command in flight list</td><td>Upper-layer journal</td><td>Fault-inject reset during writes</td><td>Host recovery logic; medium</td></tr>
+</tbody></table></div>
+
+<h3>48.12 Lab — Reset lab</h3>
+<div class="lab"><div class="lab-head">🧪 Lab 48.1 — Reset lab: which state must be rebuilt? <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> from a synthetic event log covering normal init, reset, teardown, re-init and a lost command, determine what the host must rebuild and which command was lost. <b>Setup (synthetic log):</b></p>
+<pre class="code" data-kind="simulation"><code>t=0.000  CC.EN=1, RDY=1; Identify; Set Features 07h -&gt; 4 SQ / 4 CQ granted
+t=0.010  Create I/O CQ 1..4 (IV 1..4); Create I/O SQ 1..4; 4x AER armed
+t=0.020  Set Features 08h (THR=3, TIME=1); Set Features 0Ch APST enabled
+t=5.000  SQ2: Write CID 0x0101 LBA 0x1000 NLB 7   (doorbell seen)
+t=5.000  SQ2: Write CID 0x0102 LBA 0x2000 NLB 7   (doorbell seen)
+t=5.001  CQ2: CQE CID 0x0101 status 0             (MWr seen; host has NOT processed CQ2 yet)
+t=5.002  host: CC.EN=0  (timeout recovery on another queue)
+t=5.015  CSTS.RDY=0
+t=5.020  CC.EN=1 ... RDY=1
+t=5.400  Identify; Set Features 07h; Create CQ1..4; Create SQ1..4; AER armed
+t=5.410  (no Set Features 08h / 0Ch issued)</code></pre>
+<p><b>Procedure:</b> list every piece of state destroyed by the reset; mark which the host rebuilt; identify missing rebuild steps; classify CID 0x0101 and 0x0102.</p>
+<p><b>Questions:</b> (1) What did the reset destroy? (2) What did the host forget? (3) What is the status of CIDs 0x0101 and 0x0102? (4) What changes in observed behaviour after the reset?</p>
+<details class="answer"><summary>Solution</summary><p>(1) All I/O SQs/CQs and their contents (including the unprocessed CQE for 0x0101), outstanding commands, queue doorbell state, AER commands, non-saved feature values (Interrupt Coalescing, APST, etc.), async event masks. Admin queue registers were retained; PCIe config/MSI-X were not touched. (2) Coalescing (08h) and APST (0Ch) were not restored — they reverted to defaults. (3) 0x0101: completed by the device, but its CQE was destroyed before the host consumed it → host sees it as outstanding → must resubmit (write is idempotent: same data to same LBA). 0x0102: unknown — may be partially written; must resubmit; durability only after Flush/FUA. (4) Interrupt rate changes (no coalescing → more interrupts, lower latency) and power behaviour changes (no APST → higher idle power): "performance changed after a reset" is a classic symptom of features not restored.</p></details>
+<p><b>Extension:</b> add an HMB and decide when the host may free it.</p></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Which registers survive CC.EN 1→0?</p><details class="answer"><summary>Answer</summary><p>AQA, ASQ, ACQ (admin queue attributes and bases).</p></details></li>
+<li><p>What value initiates NSSR?</p><details class="answer"><summary>Answer</summary><p>4E564D65h ("NVMe") written to offset 20h, if CAP.NSSRS=1.</p></details></li>
+<li><p>Which SHST value means shutdown complete?</p><details class="answer"><summary>Answer</summary><p>10b.</p></details></li>
+<li><p>How long may the host wait for RDY?</p><details class="answer"><summary>Answer</summary><p>CAP.TO × 500 ms.</p></details></li>
+<li><p>Order to create queues after reset?</p><details class="answer"><summary>Answer</summary><p>CQs before the SQs that reference them.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> What does a controller reset do? <details class="answer"><summary>Model answer</summary><p>Stops the controller, deletes I/O queues, drops outstanding commands, resets registers except admin queue registers; host re-enables and rebuilds.</p></details></li>
+<li><span class="lvl">Intermediate</span> Difference between shutdown and reset? <details class="answer"><summary>Model answer</summary><p>Shutdown prepares for power loss (flush, mark clean) and is reported via SHST; reset reinitialises the controller and discards in-flight work.</p></details></li>
+<li><span class="lvl">Advanced</span> Why might NSSR cause a Surprise Down? <details class="answer"><summary>Model answer</summary><p>Subsystem reset can reset PCIe port logic, dropping the link.</p></details></li>
+<li><span class="lvl">Senior</span> Design a recovery ladder. <details class="answer"><summary>Model answer</summary><p>Poll CQ → Abort → controller reset → FLR → hot reset (SBR) → slot power cycle → remove device; with feature restore and command replay rules at each step.</p></details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can write the reset and re-init sequence with timing.</li>
+<li>I can list destroyed vs preserved state.</li>
+<li>I can reason about lost commands and idempotency.</li>
+<li>I can explain normal vs abrupt shutdown and unsafe-shutdown evidence.</li>
+</ul></div>
+<p><b>Next:</b> <a href="#p5-ch49-pcie-reset">Chapter 49 — PCIe resets</a>.</p>
+</section>
+
+<section class="chapter" id="p5-ch49-pcie-reset" data-part="PART XVI — POWER AND RESET">
+<h2><span class="num">49</span> PCIe Reset</h2>
+
+<h3>49.1 Why this chapter exists</h3>
+<p>When an NVMe controller reset is not enough — the controller is fatal, MMIO returns all-ones, or the link is broken — recovery moves down to PCIe-level resets. They are blunter: they reset configuration space (BARs, Command register, MSI-X enable, MPS/MRRS settings), may retrain the link and may take hundreds of milliseconds. Knowing which reset resets what is essential to recover a device without rebooting, and to avoid making things worse.</p>
+
+<h3>49.2 Learning objectives</h3>
+<ul class="objectives">
+<li>Define Conventional Reset (Cold, Warm, Hot) and Function Level Reset, plus Link Disable and Secondary Bus Reset as triggers.</li>
+<li>State what each reset affects (function state, link, sticky bits) and timing rules after reset.</li>
+<li>Explain the relationship between PCIe resets and NVMe controller state.</li>
+<li>Recognise resets in traces (LTSSM transitions, CRS completions, config re-programming).</li>
+</ul>
+
+<h3>49.3 Analogy</h3>
+<div class="callout analogy"><div class="callout-title">🌍 Analogy</div><p>A <b>cold reset</b> is unplugging the whole building. A <b>warm reset</b> is pressing the building's big red reset button with power still on (PERST#). A <b>hot reset</b> is a message sent down the road telling the next building to reset itself. An <b>FLR</b> resets just one office in a building that houses several companies, leaving the road open.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>Hot reset is not addressed to one device: it propagates to everything below the port that issued it. And FLR does not reset the shared link or other functions, but an NVMe subsystem may still be shared with other functions or ports — FLR's scope is the function's controller only.</p></div>
+
+<h3>49.4 Reset types</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Reset</th><th>Category</th><th>Trigger</th><th>Scope</th><th>Link</th><th>Sticky bits</th></tr></thead>
+<tbody>
+<tr><td>Cold reset</td><td>Conventional (Fundamental)</td><td>Main power applied/re-applied</td><td>Whole component</td><td>Retrains from Detect</td><td>Reset (power lost)</td></tr>
+<tr><td>Warm reset</td><td>Conventional (Fundamental)</td><td>PERST# asserted with power on (platform mechanism — <span class="tag impl">impl</span>)</td><td>Whole component</td><td>Retrains from Detect</td><td>Preserved if Vaux maintained (sticky semantics) — <span class="tag impl">impl</span></td></tr>
+<tr><td>Hot reset</td><td>Conventional (in-band)</td><td>TS1/TS2 with Hot Reset bit from upstream port; software sets Secondary Bus Reset (Bridge Control bit 6) on the downstream port</td><td>All components below that port</td><td>Goes through Hot Reset LTSSM state then Detect</td><td>Preserved</td></tr>
+<tr><td>Link down / Link Disable</td><td>Results in reset of downstream components</td><td>Link Control bit 4 (Link Disable) on downstream port, or loss of link</td><td>Below the port</td><td>Disabled → Detect when re-enabled</td><td>Preserved</td></tr>
+<tr><td>Function Level Reset (FLR)</td><td>Function-specific</td><td>Device Control bit 15 (Initiate FLR), if Device Capabilities bit 28 (FLR Capable)</td><td>One function</td><td>Unaffected</td><td>Preserved; link-related and some other registers not reset</td></tr>
+</tbody></table></div>
+<div class="callout spec"><div class="callout-title">📘 Spec — timing rules</div><p><span class="tag verified">verified</span> (substance; see PCIe Base for exact conditions): after a Conventional Reset, software must wait at least 100 ms before sending configuration requests to a device below a port supporting ≤ 5 GT/s; for ports supporting &gt; 5 GT/s, wait 100 ms after link training completes (Data Link Layer Link Active). A device may answer configuration requests with Configuration Request Retry Status (CRS) while initialising, for up to 1 s after reset; software with CRS Software Visibility enabled sees a special value (Vendor ID 0001h) when reading. After FLR, software waits 100 ms before accessing the function (unless Readiness Notifications/Immediate Readiness say otherwise — <span class="tag version">version</span>). After D3hot → D0, a 10 ms recovery time applies.</p></div>
+
+<h3>49.5 Effects on an NVMe device</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>State</th><th>CC.EN reset</th><th>FLR</th><th>Hot reset / SBR</th><th>Warm/Cold</th></tr></thead>
+<tbody>
+<tr><td>NVMe I/O queues, outstanding commands</td><td>Destroyed</td><td>Destroyed</td><td>Destroyed</td><td>Destroyed</td></tr>
+<tr><td>Admin queue registers</td><td>Kept</td><td>Reset</td><td>Reset</td><td>Reset</td></tr>
+<tr><td>Config space (BARs, Command reg, MSI-X enable, MPS/MRRS, ASPM)</td><td>Kept</td><td>Reset (function's)</td><td>Reset</td><td>Reset</td></tr>
+<tr><td>AER sticky status</td><td>Kept</td><td>Kept</td><td>Kept</td><td>Cold: lost; warm: kept if Vaux (impl)</td></tr>
+<tr><td>Link</td><td>Up</td><td>Up</td><td>Retrained</td><td>Retrained</td></tr>
+<tr><td>Other functions on device</td><td>Unaffected</td><td>Unaffected</td><td>Reset</td><td>Reset</td></tr>
+<tr><td>NVMe controller considers it a Controller Level Reset</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+</tbody></table></div>
+<div class="callout debug"><div class="callout-title">🐞 Debugging</div><p>After any PCIe-level reset, the OS must <b>restore config space</b> (BARs, Command register Memory Space + Bus Master enable, MSI-X, MPS/MRRS, ASPM, LTR, L1 substates) before the NVMe driver touches BAR0. If restore is skipped or partial, the first MMIO read of CAP returns all-ones (Memory Space disabled → UR) or the first DMA fails (Bus Master disabled → the device can't issue requests). Many "device dead after reset" bugs are restore bugs, not device bugs.</p></div>
+
+<h3>49.6 Mechanism: secondary bus reset step by step</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Who acts</th><th>What changes</th><th>Where</th><th>Evidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>OS (PCI core)</td><td>Saves device config space; quiesces driver (reset_prepare)</td><td>Memory</td><td>dmesg (driver messages)</td></tr>
+<tr><td>2</td><td>OS</td><td>Masks Surprise Down / link-down reporting where needed (impl)</td><td>Root port</td><td>—</td></tr>
+<tr><td>3</td><td>OS</td><td>Sets Bridge Control SBR = 1 on the downstream port</td><td>Port config space</td><td>CfgWr</td></tr>
+<tr><td>4</td><td>Port</td><td>Sends TS1s with Hot Reset bit; LTSSM → Hot Reset</td><td>Link</td><td>Analyzer: ordered sets with Hot Reset</td></tr>
+<tr><td>5</td><td>Device</td><td>Resets internal state; link goes down</td><td>Device</td><td>LTSSM: Detect</td></tr>
+<tr><td>6</td><td>OS</td><td>Holds SBR ≥ 1 ms (Trst — <span class="tag impl">impl</span>), clears it</td><td>Port</td><td>CfgWr</td></tr>
+<tr><td>7</td><td>Link</td><td>Detect → Polling → Configuration → L0 (and speed change via Recovery for Gen2+)</td><td>Link</td><td>LnkSta Link Training, DLLLA</td></tr>
+<tr><td>8</td><td>OS</td><td>Waits (≥ 100 ms rules), polls Vendor ID handling CRS</td><td>Config</td><td>CfgRd → CRS completions</td></tr>
+<tr><td>9</td><td>OS</td><td>Restores config space</td><td>Device</td><td>CfgWr series</td></tr>
+<tr><td>10</td><td>NVMe driver</td><td>Full controller init (Ch. 48 sequence)</td><td>BAR0</td><td>MMIO, admin commands</td></tr>
+</tbody></table></div>
+
+<h3>49.7 Trace view</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: FLR</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>Packet</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↓</td><td>CfgRd Device Status</td><td>Check Transactions Pending = 0</td></tr>
+<tr><td>+1 µs</td><td>↓</td><td>CfgWr Device Control bit 15 = 1</td><td>Initiate FLR</td></tr>
+<tr><td>0–100 ms</td><td>—</td><td>Link stays L0; only DLLPs (UpdateFC) visible</td><td>Function resetting internally</td></tr>
+<tr><td>100 ms</td><td>↓↑</td><td>CfgRd/CplD Vendor ID</td><td>Function back</td></tr>
+<tr><td>100 ms+</td><td>↓</td><td>CfgWr BARs, Command, MSI-X…</td><td>Restore</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: CRS during re-init</div><div class="table-wrap"><table>
+<thead><tr><th>t after link up</th><th>Packet</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>100 ms</td><td>CfgRd Vendor ID → Cpl status CRS</td><td>Device not ready</td></tr>
+<tr class="first-bad"><td>100–850 ms</td><td>repeated CRS</td><td>Device firmware boot slow (legal up to 1 s)</td></tr>
+<tr><td>850 ms</td><td>CplD Vendor ID valid</td><td>Ready</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: link fails to retrain after hot reset</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>SBR asserted / deasserted</td><td>—</td></tr>
+<tr class="first-bad"><td>+2 ms…</td><td>LTSSM cycles Detect → Polling → Detect</td><td>Receiver detection OK but no training sets — device not responding (internal hang, power, or refclk)</td></tr>
+<tr class="bad"><td>+1 s</td><td>OS: device not ready after reset</td><td>Escalate to slot power cycle (if supported)</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: link up at lower speed after reset</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr class="first-bad"><td>+20 ms</td><td>L0 at Gen1 x4; no speed change attempted</td><td>Is it a target-link-speed setting left at Gen1 by software, failed equalization, or intentional (driver workaround)? Check LnkCtl2 Target Link Speed and equalization status bits.</td></tr>
+</tbody></table></div></div>
+
+<h3>49.8 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code>cat /sys/bus/pci/devices/0000:02:00.0/reset_method      # e.g. "flr bus" (kernel-dependent)
+sudo lspci -vvv -s 02:00.0 | grep -E "FLReset|DevCtl|LnkSta|LnkCtl2"
+sudo lspci -vvv -s 00:01.1 | grep -E "BridgeCtl|LnkSta"
+sudo journalctl -k | grep -E "(reset|link down|link up|not ready)"</code></pre>
+<div class="callout warn"><div class="callout-title">⚠️ Safety</div><p><code>echo 1 &gt; /sys/bus/pci/devices/…/reset</code>, <code>echo 1 &gt; …/remove</code> and <code>setpci</code> writes to Bridge Control/Link Control are disruptive operations. They can take a boot disk away, hang the machine or trigger fatal error handling. Use only on test devices that are not mounted, and preferably via the driver (<code>nvme reset</code>) for controller-level resets.</p></div>
+
+<h3>49.9 Five failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Causes</th><th>First check</th><th>Second check</th><th>Experiment</th><th>Conclusion / confidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>BAR reads all-ones after reset</td><td>Config not restored (MSE=0), device still in reset, CRS ignored</td><td>lspci Control: Mem+ BusMaster+</td><td>Timing after reset</td><td>Re-read after 1 s</td><td>Restore/timing; high</td></tr>
+<tr><td>2</td><td>FLR not available</td><td>Device lacks FLR</td><td>DevCap FLReset</td><td>reset_method</td><td>—</td><td>Use bus reset (affects siblings); high</td></tr>
+<tr><td>3</td><td>Sibling device reset unexpectedly</td><td>SBR used on shared bus</td><td>Topology</td><td>reset_method chosen</td><td>—</td><td>Scope misunderstanding; high</td></tr>
+<tr><td>4</td><td>Fatal AER storm during reset</td><td>Surprise Down not masked</td><td>AER root port</td><td>Timing vs reset</td><td>Mask during reset (kernel does in many paths)</td><td>Expected-event reporting; medium</td></tr>
+<tr><td>5</td><td>Link trains at low speed after reset</td><td>Equalization failure, signal integrity</td><td>LnkSta2 equalization</td><td>Correctable errors</td><td>Retrain (Link Control Retrain Link) on test</td><td>Physical; medium</td></tr>
+</tbody></table></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Which resets are Conventional Resets?</p><details class="answer"><summary>Answer</summary><p>Cold, warm (Fundamental Resets) and hot reset.</p></details></li>
+<li><p>How is FLR initiated?</p><details class="answer"><summary>Answer</summary><p>Device Control bit 15 (Initiate Function Level Reset), if FLR capable.</p></details></li>
+<li><p>Does FLR retrain the link?</p><details class="answer"><summary>Answer</summary><p>No.</p></details></li>
+<li><p>What does CRS mean?</p><details class="answer"><summary>Answer</summary><p>Configuration Request Retry Status — device not ready; retry the config request.</p></details></li>
+<li><p>Does a controller reset (CC.EN) reset MSI-X configuration?</p><details class="answer"><summary>Answer</summary><p>No — PCIe config/MSI-X untouched; only NVMe controller state.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Intermediate</span> Compare FLR and SBR for recovering an NVMe SSD. <details class="answer"><summary>Model answer</summary><p>FLR: function only, link stays up, no effect on siblings; SBR: everything below the port, link retrains, more thorough (resets PCIe logic) but broader impact.</p></details></li>
+<li><span class="lvl">Advanced</span> Why wait 100 ms after reset? <details class="answer"><summary>Model answer</summary><p>Spec-mandated time for device initialisation before config requests; CRS covers longer init up to 1 s.</p></details></li>
+<li><span class="lvl">Senior</span> A device recovers only after a cold power cycle. What does that tell you? <details class="answer"><summary>Model answer</summary><p>State survives warm/hot/FLR: sticky or always-powered logic, firmware stuck in a state not reset by PERST#, or PHY needing full power-on; escalate to vendor with that evidence.</p></details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can fill the reset-effects table from memory.</li>
+<li>I can describe SBR step by step and the post-reset timing rules.</li>
+<li>I can recognise resets and CRS in traces.</li>
+<li>I can choose the right reset rung for a given failure.</li>
+</ul></div>
+<p><b>Next:</b> <a href="#p5-ch50-power">Chapter 50 — power management</a>.</p>
+</section>
