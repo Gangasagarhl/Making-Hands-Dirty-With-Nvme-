@@ -1,0 +1,914 @@
+<p class="lead">NVMe over TCP (NVMe/TCP) carries NVM Express (NVMe) capsules and data over ordinary Transmission Control Protocol / Internet Protocol (TCP/IP) networks. This chapter goes byte by byte through the Protocol Data Units (PDUs) that frame capsules on a TCP stream. It traces the command, data and completion paths for reads and writes, explains header and data digests and Transport Layer Security (TLS) 1.3, and builds a working method for performance analysis and debugging from packet captures.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>NVMe/TCP is the most widely deployable NVMe-oF transport. It needs no special NICs, no lossless Ethernet configuration and no subnet manager, just IP connectivity. That accessibility means you will meet it everywhere: in cloud block storage, in disaggregated flash arrays, in Kubernetes storage, and in your own lab with nothing but two Linux machines or one VM.</p>
+  <p>It is also the transport you can see most clearly. Every capsule, every byte of data and every digest crosses a TCP stream that <code>tcpdump</code> can record and Wireshark can decode. Once you can read an NVMe/TCP capture as fluently as a PCIe trace, you can debug remote storage problems that otherwise look like "the network is slow".</p>
+  <p><a href="ch65.html">Chapter 65</a> gave you the model: capsules, the message-based transport, Fabrics commands. This chapter makes it concrete for one transport.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Explain why NVMe/TCP needs its own framing on top of a TCP byte stream.</li>
+    <li>Decode the 8-byte PDU common header and every PDU type: ICReq, ICResp, H2CTermReq, C2HTermReq, CapsuleCmd, CapsuleResp, H2CData, C2HData, R2T.</li>
+    <li>Walk through connection initialization (TCP handshake → ICReq/ICResp → Connect) and say what each parameter negotiates.</li>
+    <li>Trace the read path (CapsuleCmd → C2HData → CapsuleResp) and the write path (in-capsule, or CapsuleCmd → R2T → H2CData → CapsuleResp).</li>
+    <li>Explain header and data digests (CRC32C), what each protects, and what happens when one fails.</li>
+    <li>Describe how TLS 1.3 secures NVMe/TCP and what it changes in captures.</li>
+    <li>Build a latency and throughput model for NVMe/TCP and identify where the time goes.</li>
+    <li>Find the first abnormal PDU in a capture and assign it to TCP, NVMe/TCP framing or NVMe command processing.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <ul>
+      <li><a href="ch65.html">NVMe-oF Mental Model</a>: capsules, in-capsule data, Connect, message-based model.</li>
+      <li><a href="ch37.html">Scatter Gather Lists</a>: SGL descriptor identifiers.</li>
+      <li><a href="ch29.html">NVMe Command Structure</a>: SQE and CQE layouts.</li>
+      <li><a href="ch32.html">READ</a> and <a href="ch33.html">WRITE</a>: the commands we will carry.</li>
+      <li>Basic TCP: the three-way handshake, sequence numbers, acknowledgements and retransmission. Any networking primer covers these.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Imagine a very long pipe between two houses. You can pour marbles into one end and they come out the other end in exactly the same order. None get lost (if one falls out, the pipe puts it back). But the pipe has no idea where one message ends and the next begins. It is just a stream of marbles.</p>
+    <p>So the two families agree on a rule. Every message starts with eight special marbles that say "this is a letter, and it is 72 marbles long", or "this is a parcel of 4,096 marbles for request number 66". The family at the other end counts marbles and always knows where the next message starts.</p>
+    <p>Sometimes the sender wants to send a huge parcel, but the receiver's shelf is not ready. So the receiver sends a little note back: "Ready for parcel 66, send me marbles 0 to 8,191." That note is called "Ready to Transfer".</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>Think of a freight railway between a factory and a warehouse, with one dedicated track per loading dock. Every wagon has a standard placard on the front: wagon type, how long the placard is, where the cargo starts, and the total wagon length. Order wagons (capsules) carry a work order. Cargo wagons carry goods and say which order and which part of it they belong to. When the warehouse is ready to accept a big inbound shipment, it sends back a "ready to receive" wagon with a dock ticket number. Optional seals (digests) on the placard and the cargo let inspectors detect tampering or damage. A locked, armoured train (TLS) hides everything except the fact that wagons are moving.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What it hides.</strong> TCP does not deliver "wagons". It delivers bytes, and one PDU may be cut across many TCP segments, or many PDUs may share one segment. The receiver must reassemble PDUs from the byte stream using the length in the header. Trains also do not run in reverse on the same track. A TCP connection is full duplex, and PDUs flow both ways at once.</p>
+    <p><strong>Where it misleads.</strong> The railway suggests a "ready to receive" wagon is needed for every delivery. In NVMe/TCP, read data (controller to host) is sent without asking: the host already allocated the buffer when it sent the command. R2T is used only for host-to-controller data that does not travel in-capsule.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>TCP gives NVMe/TCP a reliable, in-order, full-duplex byte stream between a host and a target. NVMe needs to send discrete things over it: a command, a block of data, a completion. So NVMe/TCP defines a small set of message types called PDUs. Every PDU begins with the same 8-byte <span class="g" data-term="pdu">common header</span> that states its type and total length.</p>
+  <p>Each NVMe queue pair, the admin queue and every I/O queue, gets its own TCP connection. When a connection opens, the two sides exchange an <span class="g" data-term="icreq">Initialize Connection Request (ICReq)</span> and <span class="g" data-term="icresp">Initialize Connection Response (ICResp)</span> to agree on options such as digests. Then the host sends the Fabrics Connect command in a CapsuleCmd PDU, and the queue is ready.</p>
+  <p>After that, NVMe I/O follows three paths:</p>
+  <ul>
+    <li><strong>Command path:</strong> the host sends a CapsuleCmd PDU containing the SQE (and small write data, if it fits in-capsule).</li>
+    <li><strong>Data path:</strong> read data comes back in <span class="g" data-term="c2hdata">C2HData</span> (controller-to-host data) PDUs. Write data that did not fit in the capsule goes in <span class="g" data-term="h2cdata">H2CData</span> (host-to-controller data) PDUs, but only after the controller asks for it with an <span class="g" data-term="r2t">R2T (Ready to Transfer)</span> PDU.</li>
+    <li><strong>Completion path:</strong> the controller sends a CapsuleResp PDU containing the CQE.</li>
+  </ul>
+  <p>Two optional features protect and hide the data. A <span class="g" data-term="header-digest">header digest</span> and a <span class="g" data-term="data-digest">data digest</span> add CRC32C checksums. TLS 1.3 encrypts and authenticates the whole stream.</p>
+  <aside class="callout remember">
+    <p>Default port: <strong>4420</strong> for NVMe/TCP I/O controllers, and <strong>8009</strong> for the NVMe/TCP discovery service. Both are IANA-registered for NVMe-oF use. Targets may listen on any port they choose. Discovery tells the host which.</p>
+  </aside>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>Why framing is needed on a byte stream</h3>
+  <p>TCP preserves byte order but not message boundaries. A sender writes a 4,120-byte C2HData PDU. With Generic Segmentation Offload, the NIC may cut it into three 1,448-byte segments on a 1,500-byte MTU network. The receiver's Generic Receive Offload may merge those with the following CapsuleResp into one large buffer. NVMe/TCP must therefore be <em>self-delimiting</em>. Every PDU announces its own total length (PLEN) in a fixed position, so a receiver can always find the next PDU boundary. If a single length field is corrupted and undetected, every later PDU on the connection is misparsed. This is why the header digest exists and why framing errors are fatal to the connection.</p>
+
+  <h3>One TCP connection per queue pair</h3>
+  <p>NVMe/TCP maps each NVMe queue pair to one TCP connection. A host with 16 I/O queues to a controller holds 17 TCP connections: 1 admin + 16 I/O. This preserves NVMe's lock-free, per-CPU queue design. Each host CPU can own one connection, and the target can steer each connection to one of its CPUs (via RSS, Receive Side Scaling, or aRFS, accelerated Receive Flow Steering). The I/O queue count is negotiated through Set Features Number of Queues and Linux's <code>nr_io_queues</code> option. <span class="badge impl">Implementation-dependent</span></p>
+
+  <h3>The PDU common header</h3>
+  <p>Every NVMe/TCP PDU begins with this 8-byte header. Multi-byte fields are little-endian. <span class="badge verified">Verified</span></p>
+  <table class="packet">
+    <caption>NVMe/TCP PDU common header (CH), bytes in wire order</caption>
+    <thead><tr><th class="row-label">Bytes</th><th colspan="8">Byte 0</th><th colspan="8">Byte 1</th><th colspan="8">Byte 2</th><th colspan="8">Byte 3</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">0–3</td><td colspan="8" class="hl">PDU-Type</td><td colspan="8">FLAGS</td><td colspan="8">HLEN</td><td colspan="8">PDO</td></tr>
+      <tr><td class="row-label">4–7</td><td colspan="32" class="hl">PLEN (32-bit, little-endian)</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>Common header fields</caption>
+    <thead><tr><th>Field</th><th>Size</th><th>Owner</th><th>Meaning</th><th>What breaks if wrong</th></tr></thead>
+    <tbody>
+      <tr><td>PDU-Type</td><td>1 byte</td><td>Sender</td><td>Which PDU this is (table below)</td><td>Receiver parses the wrong layout → fatal error</td></tr>
+      <tr><td>FLAGS</td><td>1 byte</td><td>Sender</td><td>Per-type flags: HDGSTF (header digest present), DDGSTF (data digest present), LAST_PDU, SUCCESS…</td><td>Digest presence mismatch → misframing</td></tr>
+      <tr><td>HLEN</td><td>1 byte</td><td>Sender</td><td>Length of CH + PDU-specific header, excluding digests. Fixed per type.</td><td>Wrong HLEN for type → fatal "invalid header field"</td></tr>
+      <tr><td>PDO</td><td>1 byte</td><td>Sender</td><td>PDU Data Offset: where data starts from the PDU's first byte. 0 if no data.</td><td>Data read from wrong offset</td></tr>
+      <tr><td>PLEN</td><td>4 bytes</td><td>Sender</td><td>Total PDU length, including header, digests, padding and data</td><td>Every following PDU on the connection misparsed</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>NVMe/TCP PDU types (values as in the TCP Transport specification and Linux <code>nvme-tcp.h</code>)</caption>
+    <thead><tr><th>PDU-Type</th><th>Name</th><th>Direction</th><th>HLEN</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td>00h</td><td>ICReq</td><td>Host → Controller</td><td>128</td><td>Initialize Connection Request</td></tr>
+      <tr><td>01h</td><td>ICResp</td><td>Controller → Host</td><td>128</td><td>Initialize Connection Response</td></tr>
+      <tr><td>02h</td><td>H2CTermReq</td><td>Host → Controller</td><td>24</td><td>Host terminates the connection due to a fatal transport error</td></tr>
+      <tr><td>03h</td><td>C2HTermReq</td><td>Controller → Host</td><td>24</td><td>Controller terminates the connection due to a fatal transport error</td></tr>
+      <tr><td>04h</td><td>CapsuleCmd</td><td>Host → Controller</td><td>72</td><td>Command capsule (CH + 64-byte SQE), optional in-capsule data</td></tr>
+      <tr><td>05h</td><td>CapsuleResp</td><td>Controller → Host</td><td>24</td><td>Response capsule (CH + 16-byte CQE)</td></tr>
+      <tr><td>06h</td><td>H2CData</td><td>Host → Controller</td><td>24</td><td>Write data sent in response to an R2T</td></tr>
+      <tr><td>07h</td><td>C2HData</td><td>Controller → Host</td><td>24</td><td>Read data</td></tr>
+      <tr><td>09h</td><td>R2T</td><td>Controller → Host</td><td>24</td><td>Ready to Transfer: requests a range of write data</td></tr>
+    </tbody>
+  </table>
+  <p>Value 08h is not used by the base PDU set. Do not invent a meaning for it. If you see it in a capture, check whether it is a newer or vendor-specific extension in the TCP Transport 1.3 specification, or a misparse.</p>
+
+  <h3>Connection initialization: ICReq and ICResp</h3>
+  <p>Immediately after the TCP handshake, before any capsule, the host sends ICReq and the controller answers with ICResp. These are the only PDUs that exist purely at the NVMe/TCP layer. They negotiate how the rest of the connection will be framed.</p>
+  <table>
+    <caption>ICReq and ICResp fields (PDU-specific header, after the 8-byte CH)</caption>
+    <thead><tr><th>PDU</th><th>Bytes</th><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>ICReq</td><td>8–9</td><td>PFV: PDU Format Version</td><td>0 for the current format. A mismatch makes the controller reject the connection.</td></tr>
+      <tr><td>ICReq</td><td>10</td><td>HPDA: Host PDU Data Alignment</td><td>Alignment the host wants for data in C2HData PDUs, in units of 4 bytes, 0's based (0 = no padding)</td></tr>
+      <tr><td>ICReq</td><td>11</td><td>DGST</td><td>Bit 0: header digest enable requested. Bit 1: data digest enable requested.</td></tr>
+      <tr><td>ICReq</td><td>12–15</td><td>MAXR2T</td><td>Maximum outstanding R2Ts per command the host supports, 0's based (0 = one)</td></tr>
+      <tr><td>ICResp</td><td>8–9</td><td>PFV</td><td>Format version the controller uses</td></tr>
+      <tr><td>ICResp</td><td>10</td><td>CPDA: Controller PDU Data Alignment</td><td>Alignment the controller requires for data in H2CData/CapsuleCmd PDUs</td></tr>
+      <tr><td>ICResp</td><td>11</td><td>DGST</td><td>Digests the controller agrees to enable. From now on, both directions use them.</td></tr>
+      <tr><td>ICResp</td><td>12–15</td><td>MAXH2CDATA</td><td>Maximum bytes of data in one H2CData PDU</td></tr>
+    </tbody>
+  </table>
+  <p>The remaining bytes up to 128 are reserved in the base format. TLS-related and later-revision parameters are negotiated by other means (see TLS below). <span class="badge version">Version-dependent</span> Check the ICReq/ICResp figures in TCP Transport 1.3 for any fields added after the base layout.</p>
+  <aside class="callout warn">
+    <p>Digest enablement is negotiated per connection. The admin queue might negotiate digests while I/O queues do not, if the host asks differently. Linux uses the same <code>--hdr-digest</code>/<code>--data-digest</code> choice for all queues of a controller. A capture of one connection proves nothing about the others.</p>
+  </aside>
+
+  <h3>The command path: CapsuleCmd</h3>
+  <p>A CapsuleCmd PDU is CH (8) + SQE (64) = HLEN 72, optionally followed by a header digest, padding to CPDA, in-capsule data and a data digest. The SQE's data pointer is SGL1, which over TCP is one of:</p>
+  <table>
+    <caption>SGL descriptors used in NVMe/TCP command capsules</caption>
+    <thead><tr><th>SGL identifier byte</th><th>Descriptor</th><th>Used for</th><th>Data travels in</th></tr></thead>
+    <tbody>
+      <tr><td>01h (type 0h, subtype 1h)</td><td>Data Block, Offset subtype</td><td>In-capsule data (writes and other host→controller data that fits)</td><td>The same CapsuleCmd PDU</td></tr>
+      <tr><td>5Ah (type 5h, subtype Ah)</td><td>Transport SGL Data Block</td><td>Reads; writes too large for in-capsule</td><td>C2HData (reads) or R2T + H2CData (writes)</td></tr>
+    </tbody>
+  </table>
+  <p>The 5Ah value is what Linux <code>nvme-tcp</code> emits and what the TCP Transport specification describes for transport data blocks. <span class="badge verified">Verified</span> The address field is zero, because the transport, not an address, decides where the bytes land.</p>
+
+  <h3>The read data path: C2HData</h3>
+  <p>For a read, the controller sends one or more C2HData PDUs, then a CapsuleResp. The PDU-specific header carries:</p>
+  <table>
+    <caption>C2HData / H2CData / R2T PDU-specific headers (bytes 8–23)</caption>
+    <thead><tr><th>Bytes</th><th>C2HData</th><th>H2CData</th><th>R2T</th></tr></thead>
+    <tbody>
+      <tr><td>8–9</td><td>CCCID: Command Capsule CID</td><td>CCCID</td><td>CCCID</td></tr>
+      <tr><td>10–11</td><td>reserved</td><td>TTAG: Transfer Tag (copied from R2T)</td><td>TTAG: chosen by the controller</td></tr>
+      <tr><td>12–15</td><td>DATAO: Data Offset into the command's data</td><td>DATAO</td><td>R2TO: R2T Offset</td></tr>
+      <tr><td>16–19</td><td>DATAL: Data Length in this PDU</td><td>DATAL</td><td>R2TL: R2T Length</td></tr>
+      <tr><td>20–23</td><td>reserved</td><td>reserved</td><td>reserved</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li>A large read may arrive in several C2HData PDUs with increasing DATAO. The last one carries the <strong>LAST_PDU</strong> flag.</li>
+    <li>The <strong>SUCCESS</strong> flag on the last C2HData PDU lets the controller say "the command succeeded" and skip the CapsuleResp, saving a PDU. The TCP Transport specification restricts when this optimization may be used (it interacts with SQ flow control and SQHD reporting), and hosts must still handle a CapsuleResp. <span class="badge uncertain">Confirm conditions</span> Read the C2HData PDU section of TCP Transport 1.3 for the exact conditions.</li>
+    <li>The host places data at DATAO within the buffer it associated with that CCCID. Wrong CCCID or out-of-range DATAO is a fatal transport error.</li>
+  </ul>
+
+  <h3>The write data path: in-capsule, or R2T and H2CData</h3>
+  <p>If the write fits in the capsule (≤ IOCCSZ × 16 − 64 bytes, see <a href="ch65.html#engineering">Chapter 65</a>), the data rides in the CapsuleCmd and there is one round trip. Otherwise:</p>
+  <ol>
+    <li>The host sends a CapsuleCmd with a Transport SGL Data Block descriptor (5Ah) and the total length.</li>
+    <li>When the controller has buffer space, it sends an <strong>R2T</strong> naming CCCID, a TTAG it chose, the offset R2TO and length R2TL it wants now.</li>
+    <li>The host answers with one or more <strong>H2CData</strong> PDUs covering exactly [R2TO, R2TO + R2TL), each no larger than MAXH2CDATA, echoing TTAG. The last one for that R2T carries LAST_PDU.</li>
+    <li>The controller may issue further R2Ts for the rest of the data, with at most MAXR2T + 1 outstanding per command.</li>
+    <li>When all data has arrived and the write completes, the controller sends a CapsuleResp.</li>
+  </ol>
+  <aside class="callout insight" data-title="R2T is controller-paced flow control for writes">
+    <p>The controller never receives write data it did not ask for, except in-capsule data whose maximum size it advertised. This protects target memory. A target under memory pressure simply delays R2Ts, and that delay shows up in captures as a gap between CapsuleCmd and R2T. When you see write latency, measure that gap first.</p>
+  </aside>
+
+  <h3>The completion path: CapsuleResp</h3>
+  <p>A CapsuleResp is CH (8) + CQE (16) = HLEN 24. The CQE's CID matches the command's CID. Its Status field is the ordinary NVMe status. A transport-level problem that affects one command but not the connection, such as a data digest error, is reported through NVMe status values for transport errors. A problem that destroys framing is reported with a TermReq PDU and the connection closes.</p>
+
+  <h3>Termination PDUs: H2CTermReq and C2HTermReq</h3>
+  <p>When either side detects a fatal transport error, it sends a TermReq PDU and closes the TCP connection. The PDU carries a <strong>Fatal Error Status (FES)</strong> and Fatal Error Information, plus a copy of the offending PDU header (up to a limit). FES values the specification defines include, by name: Invalid PDU Header Field, PDU Sequence Error, Header Digest Error, Data Transfer Out of Range, Data Transfer Limit Exceeded (R2T limit), and Unsupported Parameter. <span class="badge uncertain">Confirm values</span> Read the numeric FES encodings from the TermReq PDU figures in TCP Transport 1.3. Linux decodes them in <code>drivers/nvme/host/tcp.c</code>.</p>
+  <p>When a connection terminates, its queue pair is gone. If it was the admin queue, the association is gone. The host's error recovery then tears down and reconnects the controller: <code>state</code> goes to <code>resetting</code>, then <code>connecting</code>.</p>
+
+  <h3>Digests: what they protect</h3>
+  <p>TCP has a 16-bit ones'-complement checksum, and Ethernet has a 32-bit FCS. Why add more? The Ethernet FCS protects only one link hop, and is recomputed by every switch and router. The TCP checksum is weak, and is frequently computed by NIC offload hardware that never sees memory corruption, which can occur in host memory, in a NIC, or in a middlebox. NVMe/TCP's optional digests are <strong>CRC32C</strong> (the Castagnoli polynomial, also used by iSCSI). They give end-to-end protection between the NVMe/TCP layers on each side.</p>
+  <ul>
+    <li><strong>Header digest (HDGST)</strong>: 4 bytes immediately after the PDU header, covering CH + PDU-specific header. A mismatch means the framing itself is untrustworthy, so it is fatal to the connection.</li>
+    <li><strong>Data digest (DDGST)</strong>: 4 bytes after the PDU data, covering the data only (not padding). A mismatch means this command's data is bad, but framing is intact, so the command fails and the connection may survive.</li>
+  </ul>
+  <figure>
+<pre class="diagram">
+ C2HData PDU with both digests and CPDA/HPDA padding (not to scale)
+
+ 0        8                      24      28        PDO                 PLEN-4   PLEN
+ +--------+----------------------+-------+---------+-------------------+--------+
+ |   CH   | PSH: CCCID TTAG/rsvd | HDGST | padding |   DATA (DATAL)    | DDGST  |
+ |        | DATAO DATAL rsvd     |CRC32C | to HPDA |                   | CRC32C |
+ +--------+----------------------+-------+---------+-------------------+--------+
+ |&lt;------ HLEN = 24 ----------&gt;|                   |&lt;-- data digest covers --&gt;|
+ |&lt;-- header digest covers ---&gt;|
+</pre>
+    <figcaption>Where digests sit. HLEN never includes the digest. PDO points to the first data byte. PLEN covers everything.</figcaption>
+  </figure>
+  <p>Digests cost CPU unless the NIC offloads them. Modern CPUs compute CRC32C with dedicated instructions (SSE4.2 <code>crc32</code> on x86, CRC extensions on Arm), so the cost is real but small. Some NICs offer NVMe/TCP digest offload. <span class="badge impl">Implementation-dependent</span> Linux disables digests by default.</p>
+
+  <h3>TLS 1.3 for NVMe/TCP</h3>
+  <p>Transport Layer Security (TLS) encrypts and integrity-protects the whole TCP stream. Current NVMe/TCP specifications require TLS 1.3 when TLS is used. NVMe/TCP TLS is based on <strong>pre-shared keys (PSKs)</strong> rather than certificates:</p>
+  <ul>
+    <li><strong>Configured PSK</strong>: an administrator provisions a key on host and target, in an interchange format that nvme-cli can generate (<code>nvme gen-tls-key</code>). From it, both sides derive a <em>retained PSK</em> and a TLS PSK identity that names the host NQN, subsystem NQN and hash.</li>
+    <li><strong>Generated PSK (secure channel concatenation)</strong>: the host first authenticates in-band with DH-HMAC-CHAP (Authentication Send/Receive) on an unencrypted admin queue. The exchange produces a key, and the queues are then reconnected over TLS using a PSK derived from it. <span class="badge version">Version-dependent</span> This was introduced in later TCP transport and Base revisions. Linux support arrived in 2024–2025 kernels.</li>
+  </ul>
+  <p>The discovery log page entry for a port says whether TLS is required, not required or supported, using its Transport Requirements (TREQ) and transport-specific (TSAS) fields. See <a href="ch68.html">Fabric Architecture</a>.</p>
+  <p>On Linux, the kernel does not perform the TLS handshake itself. The <code>tlshd</code> daemon (from <code>ktls-utils</code>) performs the handshake in user space, using PSKs stored in a kernel keyring (<code>.nvme</code>), then hands the session keys to kernel TLS (kTLS) for the data path.</p>
+  <aside class="callout trace">
+    <p>With TLS on, a capture shows a TLS 1.3 handshake (ClientHello with a PSK identity, ServerHello) right after the TCP handshake, and then only "Application Data" records. ICReq, every capsule and every digest are inside the encryption. To debug at the NVMe layer you need either the session keys (exported by the endpoint for a lab capture) or host/target tracing. In production, TLS is the reason "just take a capture" stops being enough. Plan observability before you enable it.</p>
+  </aside>
+  <aside class="callout version">
+    <p>The 2026 NVMe 2.4 set updated the asymmetric key-exchange options in authentication to prepare for post-quantum cryptography. That affects how keys for secure channel concatenation can be derived. The framing in this chapter is unchanged. See <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a> and read algorithm identifiers only from the Base 2.4 specification.</p>
+  </aside>
+
+  <h3>Keep alive over TCP</h3>
+  <p>A TCP connection can stay "up" while the far end is dead, for example a crashed target behind a switch that never sends a reset. NVMe's Keep Alive mechanism (admin command 18h, timeout KATO set in the admin Connect) detects this at the NVMe layer. If the controller sees no Keep Alive (or, with Traffic Based Keep Alive, no commands) within KATO, it tears down the association. If the host's Keep Alive commands are not completed, the host resets and reconnects. Linux sends Keep Alive at a fraction of KATO. <span class="badge impl">Implementation-dependent</span> <a href="ch68.html">Chapter 68</a> covers keep alive and reconnection policy in depth.</p>
+
+  <h3>The central concept on the ladder: the NVMe/TCP PDU</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Every parcel on the marble pipe starts with eight special marbles saying what kind of parcel it is and how long it is.</p></div>
+    <div class="rung" data-rung="B"><p>A PDU is a self-delimiting message on a TCP stream: an 8-byte common header (type, flags, header length, data offset, total length), a type-specific header, optional digests and padding, and optional data.</p></div>
+    <div class="rung" data-rung="C"><p>Host and target NVMe/TCP drivers build PDUs in socket buffers. NICs segment them into TCP/IP packets and may offload checksums and segmentation. On receive, the stack reassembles the byte stream and the driver walks it PDU by PDU, copying data into request buffers (or placing it directly, with DDP offload).</p></div>
+    <div class="rung" data-rung="D"><p>The NVMe over TCP Transport Specification, Revision 1.3 defines PDU types, header layouts, ICReq/ICResp negotiation, digests, R2T rules, termination and TLS use. The Base 2.4 specification defines the capsules carried inside.</p></div>
+    <div class="rung" data-rung="E"><p>Read: CapsuleCmd → C2HData… → CapsuleResp. Write (large): CapsuleCmd → R2T → H2CData… → CapsuleResp. Write (small): CapsuleCmd with in-capsule data → CapsuleResp. Fatal error: TermReq, then FIN/RST.</p></div>
+    <div class="rung" data-rung="F"><p>Wireshark shows "NVMe/TCP" frames with the PDU type, CCCID, DATAO/DATAL and the decoded SQE/CQE. Several PDUs may share one frame, and one PDU may span several frames.</p></div>
+    <div class="rung" data-rung="G"><p>A TermReq names the fatal error and quotes the bad header. A gap before R2T means target buffer pressure. Retransmissions mean network loss. A command with C2HData but no CapsuleResp, followed by a host abort, means the target's completion path. Classify each anomaly by layer before forming a hypothesis.</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for R2T</h3>
+  <table>
+    <caption>R2T: sixteen questions</caption>
+    <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>What is it?</td><td>A controller→host PDU (type 09h) requesting a specific range of a command's write data.</td></tr>
+      <tr><td>Why was it created?</td><td>So the controller can bound the memory it commits to incoming write data.</td></tr>
+      <tr><td>What problem does it solve?</td><td>It stops unsolicited bulk writes from exhausting target buffers, and lets the target pace data by its own readiness.</td></tr>
+      <tr><td>What existed before it?</td><td>iSCSI's R2T (the same idea and name). Over PCIe, the controller pulls write data with Memory Read requests, which is the same pull model.</td></tr>
+      <tr><td>Why is the current design better?</td><td>It is explicit, bounded by MAXR2T, and tagged (TTAG), so the controller can track several outstanding transfers per command.</td></tr>
+      <tr><td>Who creates it?</td><td>The controller (target NVMe/TCP layer).</td></tr>
+      <tr><td>Who consumes it?</td><td>The host NVMe/TCP driver, which answers with H2CData PDUs.</td></tr>
+      <tr><td>Where does it live?</td><td>On the I/O queue's TCP connection, in the controller→host direction.</td></tr>
+      <tr><td>What memory/registers are involved?</td><td>Target receive buffers sized by R2TL. On the host, the write request's data buffer at offset R2TO.</td></tr>
+      <tr><td>What happens before it?</td><td>A CapsuleCmd for a write whose data is not (entirely) in-capsule.</td></tr>
+      <tr><td>What happens after it?</td><td>H2CData PDUs covering exactly the requested range with LAST_PDU on the final one. Possibly more R2Ts. Then the CapsuleResp.</td></tr>
+      <tr><td>What happens if it is wrong?</td><td>R2T beyond the command's length → host fatal error (Data Transfer Out of Range). Too many outstanding → R2T limit exceeded. Wrong CCCID → fatal.</td></tr>
+      <tr><td>What does the protocol analyzer show?</td><td>An "R2T" PDU with CCCID, TTAG, R2TO, R2TL, and the time gap after the CapsuleCmd.</td></tr>
+      <tr><td>What does Linux show?</td><td>Nothing directly by default. <code>nvme_tcp</code> tracepoints or BPF (where available) and host-side latency show the effect. Fatal errors appear in dmesg.</td></tr>
+      <tr><td>What would a validation engineer test?</td><td>Multiple R2Ts per command, MAXR2T limits, R2TL smaller than MAXH2CDATA and larger, out-of-order R2T across commands, R2T with an unknown CCCID.</td></tr>
+      <tr><td>What would a senior engineer suspect when it fails?</td><td>Target buffer exhaustion (long CapsuleCmd→R2T gaps), host bugs in splitting H2CData by MAXH2CDATA, or TTAG mix-ups under concurrency.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>NVMe/TCP needs no special hardware, which is its main selling point. But the hardware you do have shapes its performance far more than the protocol does.</p>
+  <table>
+    <caption>Hardware participants in an NVMe/TCP I/O</caption>
+    <thead><tr><th>Component</th><th>Must / may participate</th><th>What it does for NVMe/TCP</th><th>Observable?</th></tr></thead>
+    <tbody>
+      <tr><td>Host CPU</td><td>Must</td><td>Runs nvme-tcp: builds PDUs, copies data to and from socket buffers, computes digests (unless offloaded), runs the TCP stack</td><td>CPU profiles, softirq time</td></tr>
+      <tr><td>Host NIC</td><td>Must</td><td>DMA of packets, checksum offload, segmentation (TSO/GSO), receive coalescing (GRO/LRO), RSS queue steering, interrupt moderation</td><td><code>ethtool -S</code> counters; PCIe analyzer on the NIC link</td></tr>
+      <tr><td>NIC NVMe/TCP offload (DDP, CRC)</td><td>May</td><td>Places C2HData payloads directly into request buffers and verifies data digests in hardware <span class="badge impl">Implementation-dependent</span></td><td>Driver statistics</td></tr>
+      <tr><td>Kernel TLS offload</td><td>May</td><td>Encrypts/decrypts TLS records in the NIC</td><td><code>ethtool -k</code> feature flags, TLS statistics</td></tr>
+      <tr><td>Switches/routers</td><td>Must</td><td>Forward packets. Buffer depth and ECN marking set loss and latency under congestion.</td><td>Switch counters, mirror ports</td></tr>
+      <tr><td>Target NIC + CPU</td><td>Must</td><td>Receive, parse PDUs, issue R2Ts, run the target controller logic</td><td>Target CPU profiles, nvmet tracing</td></tr>
+      <tr><td>Backing device</td><td>Must (some form)</td><td>Executes the actual media operation, e.g. the Lab SSD over PCIe</td><td>Target-side PCIe trace, iostat</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw">
+    <p><strong>Where the bytes get copied.</strong> Without offload, a 4 KiB read on the host typically goes: NIC DMA → kernel socket buffer → copy into the block request's pages. On the target: backing device DMA into target memory → (possibly) copy into socket buffer → NIC DMA. Each copy costs memory bandwidth and CPU. This is the fundamental performance gap between NVMe/TCP and NVMe/RDMA, where the RNIC moves data directly between registered buffers. <span class="badge impl">Implementation-dependent</span> Zero-copy transmit paths and DDP offloads narrow the gap.</p>
+  </aside>
+  <h3>MTU and segmentation</h3>
+  <p>With a 1,500-byte MTU and TCP timestamps, each segment carries up to 1,448 bytes of payload. A 128 KiB C2HData PDU becomes about 91 segments. With a 9,000-byte (jumbo) MTU it becomes about 15. Fewer segments mean fewer per-packet costs, but jumbo frames must be configured end to end. A single 1,500-byte hop causes fragmentation or, with Path MTU Discovery blocked, black-holed large packets. This is a classic NVMe/TCP failure: small commands work, large I/O hangs.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>NVMe/TCP framing is defined normatively by the <cite class="spec">NVMe over TCP Transport Specification, Revision 1.3</cite>. The capsule contents, Fabrics commands, authentication protocols and status codes come from the <cite class="spec">NVM Express Base Specification, Revision 2.4</cite>. TCP itself is defined by the IETF (RFC 9293), and TLS 1.3 by RFC 8446. NVMe documents reference them rather than redefine them.</p>
+  <aside class="callout verified">
+    <ul>
+      <li>Every PDU starts with an 8-byte common header: PDU-Type, FLAGS, HLEN, PDO, PLEN.</li>
+      <li>PDU types 00h–07h and 09h are ICReq, ICResp, H2CTermReq, C2HTermReq, CapsuleCmd, CapsuleResp, H2CData, C2HData and R2T.</li>
+      <li>ICReq/ICResp are exchanged once per connection before any capsule, and negotiate PFV, data alignment, digests, MAXR2T and MAXH2CDATA.</li>
+      <li>Header and data digests are CRC32C and optional, and are enabled by negotiation.</li>
+      <li>Each NVMe queue pair maps to one TCP connection.</li>
+      <li>Port 4420 is registered for NVMe-oF and port 8009 for NVMe/TCP discovery.</li>
+    </ul>
+  </aside>
+  <aside class="callout derived">
+    <ul>
+      <li>Because HLEN is fixed per PDU type, a receiver can validate it immediately. Any mismatch indicates corruption or a peer bug, never a negotiable difference.</li>
+      <li>Because header digests cover only headers, data corruption with digests disabled goes undetected by NVMe/TCP. Only the TCP checksum, which is often offloaded, stands in the way.</li>
+      <li>Because R2T is the only way large write data is solicited, write throughput per command is bounded by MAXR2T × R2TL per round trip.</li>
+    </ul>
+  </aside>
+  <aside class="callout impl">
+    <ul>
+      <li>Target in-capsule data size, MAXH2CDATA and how many R2Ts a target issues per command.</li>
+      <li>Whether data digests are verified in software or hardware, and whether the C2H SUCCESS optimization is used.</li>
+      <li>Linux options: <code>nr_io_queues</code>, <code>queue_size</code>, <code>hdr_digest</code>, <code>data_digest</code>, <code>tls</code>, <code>keep_alive_tmo</code>, <code>ctrl_loss_tmo</code>, <code>reconnect_delay</code>.</li>
+      <li>CPU steering of connections (RSS, aRFS, XPS) and busy polling.</li>
+    </ul>
+  </aside>
+  <aside class="callout version">
+    <ul>
+      <li>NVMe/TCP was ratified as a Technical Proposal against NVMe-oF 1.1 (2018–2019) and became its own transport specification with the NVMe 2.0 restructuring.</li>
+      <li>TLS support moved from optional/early forms to TLS 1.3 requirements, with configured and generated PSKs, across TCP transport revisions. Secure channel concatenation came later.</li>
+      <li>The 2.4 set (August 2026) revised all transport specifications together. Check the Revision Changes document for TCP 1.3 specifics before claiming a behaviour is new or old.</li>
+    </ul>
+  </aside>
+  <aside class="callout notsaid">
+    <ul>
+      <li>The specification does not require digests. "Digests off" is fully compliant.</li>
+      <li>It does not specify TCP tuning: congestion control algorithm, Nagle (Linux nvme-tcp disables it), buffer sizes, or MTU.</li>
+      <li>It does not define performance targets or how many connections a host should open.</li>
+      <li>Exact FES numeric values, TLS PSK identity format details and any 1.3-specific PDU fields must be read from the TCP Transport 1.3 document. This chapter names them without numbers.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn">
+    <ul>
+      <li>Never assume one TCP segment equals one PDU.</li>
+      <li>Never assume every read ends with a CapsuleResp (the SUCCESS flag may replace it).</li>
+      <li>Never assume digests are on because the admin queue showed them.</li>
+      <li>Never assume a TCP retransmission is an NVMe error. It is a latency event.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <h3>Connection establishment for one I/O queue</h3>
+  <figure>
+    <ol class="seq" data-actors="Host nvme-tcp|Target nvmet-tcp">
+      <li data-from="Host nvme-tcp" data-to="Target nvmet-tcp" data-t="0 µs">TCP SYN → port 4420</li>
+      <li data-from="Target nvmet-tcp" data-to="Host nvme-tcp" class="dashed">SYN-ACK</li>
+      <li data-from="Host nvme-tcp" data-to="Target nvmet-tcp">ACK</li>
+      <li data-from="Host nvme-tcp" data-to="Target nvmet-tcp">ICReq (PFV 0, HPDA, DGST, MAXR2T)</li>
+      <li data-from="Target nvmet-tcp" data-to="Host nvme-tcp" class="dashed">ICResp (CPDA, DGST, MAXH2CDATA)</li>
+      <li data-from="Host nvme-tcp" data-to="Target nvmet-tcp">CapsuleCmd: Connect QID n, CNTLID 1</li>
+      <li data-from="Target nvmet-tcp" data-to="Host nvme-tcp" class="dashed">CapsuleResp: Success</li>
+      <li data-note="Host nvme-tcp|Target nvmet-tcp">I/O queue n ready</li>
+    </ol>
+    <figcaption>One I/O queue's connection. With TLS, a TLS 1.3 handshake sits between the TCP ACK and ICReq. Synthetic example for teaching.</figcaption>
+  </figure>
+  <h3>Small write (in-capsule)</h3>
+  <figure>
+    <ol class="seq" data-actors="Host|Controller">
+      <li data-from="Host" data-to="Controller">CapsuleCmd Write CID 0x0050 + 4 KiB data</li>
+      <li data-note="Controller">write to backing device</li>
+      <li data-from="Controller" data-to="Host" class="dashed">CapsuleResp CID 0x0050 Success</li>
+    </ol>
+    <figcaption>One round trip. Requires data ≤ IOCCSZ × 16 − 64.</figcaption>
+  </figure>
+  <h3>Large write (R2T)</h3>
+  <figure>
+    <ol class="seq" data-actors="Host|Controller">
+      <li data-from="Host" data-to="Controller">CapsuleCmd Write CID 0x0051, SGL 5Ah 64 KiB</li>
+      <li data-note="Controller">allocate buffers</li>
+      <li data-from="Controller" data-to="Host" class="dashed">R2T CCCID 0x0051 TTAG 3 R2TO 0 R2TL 65536</li>
+      <li data-from="Host" data-to="Controller">H2CData TTAG 3 DATAO 0 DATAL 32768</li>
+      <li data-from="Host" data-to="Controller">H2CData TTAG 3 DATAO 32768 DATAL 32768 LAST</li>
+      <li data-note="Controller">write to backing device</li>
+      <li data-from="Controller" data-to="Host" class="dashed">CapsuleResp CID 0x0051 Success</li>
+    </ol>
+    <figcaption>Two round trips. H2CData PDUs are capped at MAXH2CDATA (32 KiB here).</figcaption>
+  </figure>
+  <h3>Large read</h3>
+  <figure>
+    <ol class="seq" data-actors="Host|Controller">
+      <li data-from="Host" data-to="Controller">CapsuleCmd Read CID 0x0052, SGL 5Ah 128 KiB</li>
+      <li data-note="Controller">read from backing device</li>
+      <li data-from="Controller" data-to="Host" class="dashed">C2HData DATAO 0 DATAL 65536</li>
+      <li data-from="Controller" data-to="Host" class="dashed">C2HData DATAO 65536 DATAL 65536 LAST</li>
+      <li data-from="Controller" data-to="Host" class="dashed">CapsuleResp CID 0x0052 Success</li>
+    </ol>
+    <figcaption>Read data is unsolicited. The host committed the buffer when it sent the command.</figcaption>
+  </figure>
+  <h3>Ordering and concurrency</h3>
+  <ul>
+    <li>Within one connection, PDUs arrive in the order sent. Across connections, no order exists. Commands on different queues are independent, exactly as on PCIe.</li>
+    <li>Many commands are interleaved on one connection. C2HData for CID 0x0052 may be followed by C2HData for 0x0053 and then more for 0x0052. The target chooses the interleaving at PDU granularity. A PDU itself is never split by another PDU.</li>
+    <li>Completions may be out of order. CID matching is mandatory.</li>
+    <li>The host may send new CapsuleCmds while H2CData for earlier commands is in flight. Writes do not block the queue.</li>
+  </ul>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Setup as in <a href="ch65.html#trace">Chapter 65</a>: host 192.0.2.10, target 192.0.2.20:4420, namespace 1 backed by the Lab SSD. In these traces, digests are <strong>enabled</strong> (header and data), the MTU is 1,500 and GRO is disabled on the capture host, so frames are wire-sized. Target in-capsule size is 4 KiB. MAXH2CDATA is 32 KiB. Frame lengths include 66 bytes of Ethernet/IP/TCP headers.</p>
+  <h3>Normal: 16 KiB write with R2T</h3>
+  <div class="trace" data-kind="synthetic" data-title="NVMe/TCP 16 KiB write, digests on, MTU 1500">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time (s)</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Length</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>0.000000</td><td>192.0.2.10</td><td>192.0.2.20</td><td>NVMe/TCP</td><td>142</td><td>CapsuleCmd, Write, CID 0x0071, NSID 1, SLBA 0x8000, NLB 31, SGL 5Ah len 16384 [HDGST]</td><td>PDU = 72 + 4 HDGST = 76 bytes</td></tr>
+        <tr class="dir-up"><td>2</td><td>0.000019</td><td>192.0.2.20</td><td>192.0.2.10</td><td>NVMe/TCP</td><td>94</td><td>R2T, CCCID 0x0071, TTAG 0x0005, R2TO 0, R2TL 16384 [HDGST]</td><td>Target ready for all 16 KiB (24 + 4 = 28-byte PDU)</td></tr>
+        <tr class="dir-down"><td>3</td><td>0.000031</td><td>192.0.2.10</td><td>192.0.2.20</td><td>NVMe/TCP</td><td>1514</td><td>H2CData, CCCID 0x0071, TTAG 0x0005, DATAO 0, DATAL 16384, LAST_PDU [HDGST, DDGST]</td><td>First segment of a 16,416-byte PDU</td></tr>
+        <tr class="dir-down"><td>4–13</td><td>0.000032–0.000044</td><td>192.0.2.10</td><td>192.0.2.20</td><td>TCP</td><td>1514 ×10</td><td>[TCP segment of a reassembled PDU]</td><td>Continuation segments, 1,448 payload bytes each</td></tr>
+        <tr class="dir-down"><td>14</td><td>0.000045</td><td>192.0.2.10</td><td>192.0.2.20</td><td>TCP</td><td>554</td><td>[TCP segment of a reassembled PDU]</td><td>Final 488 bytes, ending with the DDGST</td></tr>
+        <tr class="dir-up"><td>15</td><td>0.000046</td><td>192.0.2.20</td><td>192.0.2.10</td><td>TCP</td><td>66</td><td>4420 → 51234 [ACK]</td><td></td></tr>
+        <tr class="dir-up"><td>16</td><td>0.000061</td><td>192.0.2.20</td><td>192.0.2.10</td><td>NVMe/TCP</td><td>94</td><td>CapsuleResp, CID 0x0071, Status Success [HDGST]</td><td>Write complete</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Arithmetic check.</strong> The H2CData PDU is 24 (header) + 4 (HDGST) + 16,384 (data) + 4 (DDGST) = 16,416 bytes, with PDO = 28 (CPDA = 0). 16,416 = 11 × 1,448 + 488, so it occupies 11 full segments (frames 3–13) and one 488-byte tail (frame 14, 554 bytes on the wire). Always check PLEN against segment payloads like this. When a capture is truncated or a segment is missing, it is the only way to tell an incomplete PDU from a short one.</p>
+    <p><strong>Timing.</strong> CapsuleCmd → R2T took 19 µs (target allocated buffers immediately). Data serialization took about 15 µs. Last data byte → CapsuleResp took 15 µs (target wrote to the Lab SSD; a write landing in the SSD's cache is fast). Total 61 µs, all illustrative.</p>
+  </div>
+
+  <h3>Slow: a read delayed by a lost segment (NVMe is innocent)</h3>
+  <div class="trace" data-kind="synthetic" data-title="NVMe/TCP 8 KiB read with TCP retransmission">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time (s)</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Length</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>0.000000</td><td>192.0.2.10</td><td>192.0.2.20</td><td>NVMe/TCP</td><td>142</td><td>CapsuleCmd, Read, CID 0x0090, SLBA 0x20000, NLB 15, SGL 5Ah 8192</td><td></td></tr>
+        <tr class="dir-up"><td>2</td><td>0.000088</td><td>192.0.2.20</td><td>192.0.2.10</td><td>NVMe/TCP</td><td>1514</td><td>C2HData, CCCID 0x0090, DATAO 0, DATAL 8192, LAST_PDU (segment 1/6)</td><td>Target answered in 88 µs: normal</td></tr>
+        <tr class="dir-up"><td>3</td><td>0.000089</td><td>192.0.2.20</td><td>192.0.2.10</td><td>TCP</td><td>1514</td><td>[TCP segment of a reassembled PDU] (3/6)</td><td>Segment 2 never arrived</td></tr>
+        <tr class="dir-down"><td>4</td><td>0.000090</td><td>192.0.2.10</td><td>192.0.2.20</td><td>TCP</td><td>78</td><td>[TCP Dup ACK] SACK</td><td>Host signals a hole</td></tr>
+        <tr class="dir-up"><td>5–7</td><td>0.000090–0.000092</td><td>192.0.2.20</td><td>192.0.2.10</td><td>TCP</td><td>…</td><td>segments 4–6, CapsuleResp in segment 6</td><td>Host cannot deliver: byte stream has a gap</td></tr>
+        <tr class="abnormal"><td>8</td><td>0.000310</td><td>192.0.2.20</td><td>192.0.2.10</td><td>TCP</td><td>1514</td><td>[TCP Fast Retransmission] segment 2</td><td><strong>First abnormal event</strong> is the loss itself (between 2 and 3). This frame repairs it.</td></tr>
+        <tr class="dir-down"><td>9</td><td>0.000312</td><td>192.0.2.10</td><td>192.0.2.20</td><td>TCP</td><td>66</td><td>[ACK]</td><td>Host now delivers C2HData + CapsuleResp to nvme-tcp</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The target produced data in 88 µs, which is normal. The command completed at the host at about 312 µs because of a single lost segment and a 220 µs recovery. TCP's in-order delivery means the CapsuleResp, already received at frame 7, was held behind the gap: <em>head-of-line blocking</em>. Every other command on the same connection was delayed too. On the NVMe side, nothing is wrong. The fix lies in the network (drops, buffer sizing, ECN) or in spreading load over more connections. Correctly, the first abnormal event is "segment 2 missing", inferred from the dup-ACK/SACK at frame 4, and frame 8 is its repair.</p>
+  </div>
+
+  <h3>Abnormal: host sends data outside the R2T window</h3>
+  <div class="trace" data-kind="synthetic" data-title="NVMe/TCP fatal error: H2CData out of range">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time (s)</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Length</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>12.400000</td><td>192.0.2.10</td><td>192.0.2.20</td><td>NVMe/TCP</td><td>142</td><td>CapsuleCmd, Write, CID 0x00A4, SGL 5Ah len 65536</td><td>64 KiB write</td></tr>
+        <tr class="dir-up"><td>2</td><td>12.400021</td><td>192.0.2.20</td><td>192.0.2.10</td><td>NVMe/TCP</td><td>94</td><td>R2T, CCCID 0x00A4, TTAG 0x0009, R2TO 0, R2TL 32768</td><td>Target asks for the <em>first half only</em></td></tr>
+        <tr class="dir-down"><td>3</td><td>12.400030</td><td>192.0.2.10</td><td>192.0.2.20</td><td>NVMe/TCP</td><td>…</td><td>H2CData, TTAG 0x0009, DATAO 0, DATAL 32768, LAST_PDU</td><td>Correct</td></tr>
+        <tr class="abnormal"><td>4</td><td>12.400059</td><td>192.0.2.10</td><td>192.0.2.20</td><td>NVMe/TCP</td><td>…</td><td>H2CData, TTAG 0x0009, DATAO 32768, DATAL 32768, LAST_PDU</td><td><strong>First abnormal event</strong>: data for a range no R2T requested</td></tr>
+        <tr class="dir-up"><td>5</td><td>12.400070</td><td>192.0.2.20</td><td>192.0.2.10</td><td>NVMe/TCP</td><td>122</td><td>C2HTermReq, FES: Data Transfer Out of Range, FEI → DATAO field; header of PDU 4 attached</td><td>Target declares a fatal transport error</td></tr>
+        <tr class="dir-up"><td>6</td><td>12.400072</td><td>192.0.2.20</td><td>192.0.2.10</td><td>TCP</td><td>66</td><td>4420 → 51234 [FIN, ACK]</td><td>I/O queue connection closed</td></tr>
+        <tr class="note"><td colspan="8">Host dmesg (illustrative): queue error, controller reset, reconnect. All commands outstanding on every queue of this controller are failed or requeued.</td></tr>
+        <tr class="dir-down"><td>7</td><td>12.400410</td><td>192.0.2.10</td><td>192.0.2.20</td><td>TCP</td><td>74</td><td>51302 → 4420 [SYN]</td><td>Reconnect begins (admin queue first)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h4>Reasoning</h4>
+  <ol>
+    <li><strong>Lowest working layer.</strong> TCP delivered everything in order. There are no retransmissions and no digest errors (both digests on). The failure is at the NVMe/TCP framing layer.</li>
+    <li><strong>First abnormal event.</strong> Frame 4. The R2T in frame 2 granted [0, 32768), and frame 4 sends [32768, 65536) under the same TTAG without a second R2T. The C2HTermReq in frame 5 is the <em>consequence</em>, and its quoted header points back at frame 4.</li>
+    <li><strong>Hypotheses.</strong> (a) Host driver bug: it treats R2TL as "the rest of the command" and ignores partial grants. (b) The host misread R2TL, for example due to an endianness or field-offset error in a custom initiator. (c) A middlebox rewrote the PDU. This is unlikely with header digests valid.</li>
+    <li><strong>Evidence.</strong> Header digests on frames 2 and 4 are valid, so the bytes are what the endpoints sent, which rules out (c). Repeat with a target that always grants full-length R2Ts. If the problem disappears, the host's partial-R2T handling is the cause.</li>
+    <li><strong>Root cause (in this synthetic case).</strong> A custom user-space initiator ignored R2TL. Fix: send exactly R2TL bytes per R2T and wait for the next R2T. Regression test: a target configured to grant at most 8 KiB per R2T.</li>
+  </ol>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> for the inspection commands. <span class="badge caution">Caution lab</span> for <code>nvme connect</code>/<code>disconnect</code>: these create or remove block devices, and disconnecting a namespace that is mounted or in use can fail I/O. Only connect to targets you own.</p></aside>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># TCP connections that belong to NVMe/TCP (port 4420), with RTT, cwnd and retransmits</span>
+ss -tni '( dport = :4420 or sport = :4420 )'
+
+<span class="cm"># NIC offload state that changes what a capture shows</span>
+ethtool -k eth0 | grep -E 'segmentation|receive-offload|checksum|tls'
+
+<span class="cm"># Digest and TLS settings are visible in the controller's options (kernel-dependent)</span>
+for c in /sys/class/nvme/nvme*; do echo "$c $(cat $c/transport) $(cat $c/address)"; done
+
+<span class="cm"># Capture NVMe/TCP for later decode in Wireshark (needs root, read-only on the data path)</span>
+sudo tcpdump -i eth0 -s 0 -w nvme_tcp.pcap 'tcp port 4420 or tcp port 8009'</code></pre>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code><span class="cm"># Caution: creates a block device. Connect to a lab target with digests on.</span>
+sudo modprobe nvme-tcp
+sudo nvme connect -t tcp -a 192.0.2.20 -s 4420 \
+     -n nqn.2026-10.org.example:lab-ssd \
+     --hdr-digest --data-digest --nr-io-queues=4
+
+<span class="cm"># Caution: remove it again when finished (ensure nothing is mounted).</span>
+sudo nvme disconnect -n nqn.2026-10.org.example:lab-ssd</code></pre>
+  <p>In Wireshark, NVMe/TCP is decoded automatically on port 4420. For other ports, use "Decode As… → NVMe/TCP". Turn on TCP reassembly (it is on by default) so that PDUs spanning segments are decoded. Wireshark's NVMe dissector then shows the SQE/CQE fields inside the capsule.</p>
+  <table>
+    <caption>What Linux evidence proves</caption>
+    <thead><tr><th>Evidence</th><th>Proves</th><th>Does not prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>ss</code> shows retransmits climbing</td><td>Loss or reordering on that connection</td><td>That NVMe latency is caused by it (correlate times)</td></tr>
+      <tr><td>Capture taken on host with TSO/GRO on</td><td>What the stack handed to and received from the NIC</td><td>Wire-level segmentation, which differs</td></tr>
+      <tr><td>dmesg queue/controller reset messages</td><td>The host saw a fatal or timeout event</td><td>Which side was at fault: get the capture</td></tr>
+      <tr><td>Connect succeeds with <code>--data-digest</code></td><td>The target agreed to data digests on these connections</td><td>That data was never corrupted earlier, without them</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>A receiver's hardest job is reassembling PDUs from arbitrary TCP segments and checking digests. The program below builds a C2HData + CapsuleResp stream with both digests, feeds it to a receiver in random-sized chunks, and shows what happens when a data bit or a header bit is corrupted. It is a standard-library-only simulation and runs as written.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="nvme_tcp_stream.py"><code>#!/usr/bin/env python3
+"""nvme_tcp_stream.py - reassemble and check NVMe/TCP PDUs from a byte stream.
+Synthetic teaching tool: builds its own stream, splits it into arbitrary TCP
+segments, then parses it back the way a receiver must."""
+import struct, random
+
+# CRC32C (Castagnoli), reflected polynomial 0x82F63B78, as used by NVMe/TCP digests
+_T = []
+for i in range(256):
+    c = i
+    for _ in range(8):
+        c = (c &gt;&gt; 1) ^ 0x82F63B78 if c &amp; 1 else c &gt;&gt; 1
+    _T.append(c)
+
+def crc32c(data, crc=0):
+    crc ^= 0xFFFFFFFF
+    for b in data:
+        crc = _T[(crc ^ b) &amp; 0xFF] ^ (crc &gt;&gt; 8)
+    return crc ^ 0xFFFFFFFF
+
+assert crc32c(b"123456789") == 0xE3069283        # standard CRC32C check value
+
+NAMES = {0x00: "ICReq", 0x01: "ICResp", 0x02: "H2CTermReq", 0x03: "C2HTermReq",
+         0x04: "CapsuleCmd", 0x05: "CapsuleResp", 0x06: "H2CData", 0x07: "C2HData", 0x09: "R2T"}
+HDGSTF, DDGSTF, LAST_PDU, SUCCESS = 0x01, 0x02, 0x04, 0x08
+
+def pdu(ptype, flags, psh, data=b"", hdgst=False, ddgst=False):
+    """Build one PDU: 8-byte common header + PDU-specific header [+HDGST] [+DATA] [+DDGST]."""
+    hlen = 8 + len(psh)
+    flags |= (HDGSTF if hdgst else 0) | (DDGSTF if ddgst and data else 0)
+    pdo = (hlen + (4 if hdgst else 0)) if data else 0
+    plen = hlen + (4 if hdgst else 0) + len(data) + (4 if ddgst and data else 0)
+    ch = struct.pack("&lt;BBBBI", ptype, flags, hlen, pdo, plen)
+    out = ch + psh
+    if hdgst:
+        out += struct.pack("&lt;I", crc32c(out))
+    out += data
+    if ddgst and data:
+        out += struct.pack("&lt;I", crc32c(data))
+    return out
+
+def c2h_data(cccid, datao, data, last=True, **kw):
+    psh = struct.pack("&lt;HHII4x", cccid, 0, datao, len(data))
+    return pdu(0x07, LAST_PDU if last else 0, psh, data, **kw)
+
+def capsule_resp(cid, status=0, **kw):
+    cqe = struct.pack("&lt;IIHHHH", 0, 0, 0, 1, cid, status &lt;&lt; 1)   # DW0, DW1, SQHD, SQID, CID, P+Status
+    return pdu(0x05, 0, cqe, **kw)
+
+class Receiver:
+    def __init__(self, hdgst, ddgst):
+        self.buf, self.hdgst, self.ddgst = bytearray(), hdgst, ddgst
+
+    def feed(self, segment):
+        self.buf += segment
+        while len(self.buf) &gt;= 8:
+            ptype, flags, hlen, pdo, plen = struct.unpack_from("&lt;BBBBI", self.buf, 0)
+            if len(self.buf) &lt; plen:
+                return                                   # wait for more bytes: PDUs span segments
+            raw, self.buf = bytes(self.buf[:plen]), self.buf[plen:]
+            self.check(ptype, flags, hlen, pdo, plen, raw)
+
+    def check(self, ptype, flags, hlen, pdo, plen, raw):
+        name = NAMES.get(ptype, f"unknown {ptype:02X}h")
+        verdict = "ok"
+        if self.hdgst:
+            (got,) = struct.unpack_from("&lt;I", raw, hlen)
+            if got != crc32c(raw[:hlen]):
+                verdict = "HEADER DIGEST ERROR -&gt; fatal: terminate the connection (host sends H2CTermReq)"
+        if verdict == "ok" and pdo and self.ddgst:
+            data = raw[pdo:plen - 4]
+            (got,) = struct.unpack_from("&lt;I", raw, plen - 4)
+            if got != crc32c(data):
+                verdict = "DATA DIGEST ERROR -&gt; fail this command; framing still intact"
+        info = ""
+        if ptype in (0x06, 0x07):
+            cccid, _, datao, datal = struct.unpack_from("&lt;HHII", raw, 8)
+            info = f"CCCID 0x{cccid:04X} DATAO {datao} DATAL {datal}" + (" LAST_PDU" if flags &amp; LAST_PDU else "")
+        elif ptype == 0x05:
+            cid, sf = struct.unpack_from("&lt;HH", raw, 8 + 12)
+            info = f"CID 0x{cid:04X} status 0x{sf &gt;&gt; 1:04X}"
+        print(f"  {name:&lt;11} hlen={hlen:&lt;3} pdo={pdo:&lt;3} plen={plen:&lt;5} {info}  [{verdict}]")
+
+if __name__ == "__main__":
+    random.seed(7)
+    data = bytes(range(256)) * 16                                     # 4 KiB of read data
+    stream = c2h_data(0x0042, 0, data, hdgst=True, ddgst=True) + capsule_resp(0x0042, hdgst=True, ddgst=True)
+
+    def deliver(stream, title):
+        print(title)
+        rx, pos = Receiver(hdgst=True, ddgst=True), 0
+        while pos &lt; len(stream):                                     # random segment sizes, like TCP
+            n = random.randint(1, 1448)
+            rx.feed(stream[pos:pos + n]); pos += n
+
+    deliver(stream, "Clean stream (digests on), random TCP segmentation:")
+    bad = bytearray(stream); bad[24 + 4 + 1000] ^= 0x10             # flip one bit in the data
+    deliver(bytes(bad), "Same stream with one data bit flipped in transit:")
+    bad = bytearray(stream); bad[12] ^= 0x01                         # flip a bit in DATAO
+    deliver(bytes(bad), "Same stream with one header bit flipped in transit:")
+</code></pre>
+  <p>Output of a run (deterministic, because of the fixed random seed):</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>Clean stream (digests on), random TCP segmentation:
+  C2HData     hlen=24  pdo=28  plen=4128  CCCID 0x0042 DATAO 0 DATAL 4096 LAST_PDU  [ok]
+  CapsuleResp hlen=24  pdo=0   plen=28    CID 0x0042 status 0x0000  [ok]
+Same stream with one data bit flipped in transit:
+  C2HData     hlen=24  pdo=28  plen=4128  CCCID 0x0042 DATAO 0 DATAL 4096 LAST_PDU  [DATA DIGEST ERROR -&gt; fail this command; framing still intact]
+  CapsuleResp hlen=24  pdo=0   plen=28    CID 0x0042 status 0x0000  [ok]
+Same stream with one header bit flipped in transit:
+  C2HData     hlen=24  pdo=28  plen=4128  CCCID 0x0042 DATAO 1 DATAL 4096 LAST_PDU  [HEADER DIGEST ERROR -&gt; fatal: terminate the connection (host sends H2CTermReq)]
+  CapsuleResp hlen=24  pdo=0   plen=28    CID 0x0042 status 0x0000  [ok]</code></pre>
+  <h4>What to notice</h4>
+  <ul>
+    <li>The receiver never assumes segment boundaries. It waits until PLEN bytes are buffered.</li>
+    <li>A flipped data bit is caught by the data digest. The framing is still intact, so the following CapsuleResp parses fine. The host would fail this command with a transport error status and keep the connection.</li>
+    <li>A flipped header bit changes DATAO from 0 to 1. The header digest catches it, and the only safe reaction is to terminate the connection. Without a header digest, the receiver would silently place data one byte off.</li>
+  </ul>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Problem.</strong> On the lab network (25 Gb/s Ethernet, MTU 1,500, TCP timestamps on), what fraction of link bandwidth carries NVMe data for 128 KiB reads with digests on? And what is the minimum time just to serialize one such read onto the wire?</p>
+  <h4>Step 1: bytes per read on the wire</h4>
+  <p>The read produces one C2HData PDU of 24 + 4 (HDGST) + 131,072 + 4 (DDGST) = 131,104 bytes (assuming the target sends it as one PDU), plus a CapsuleResp of 28 bytes. Total NVMe/TCP stream bytes: 131,132.</p>
+  <p>Segments: ⌈131,132 / 1,448⌉ = 91. Per-segment overhead on the wire: 66 bytes of headers + 24 bytes of Ethernet preamble, start delimiter, FCS and inter-frame gap = 90 bytes.</p>
+  <div class="formula">
+    <div class="eq"><var>E</var> = <var>D</var> / (<var>S</var> + <var>N</var> × <var>O</var>)</div>
+    <dl class="vars">
+      <dt>E</dt><dd>efficiency: fraction of wire time carrying NVMe data</dd>
+      <dt>D</dt><dd>NVMe data bytes per command (131,072)</dd>
+      <dt>S</dt><dd>NVMe/TCP stream bytes per command, including PDU headers and digests (131,132)</dd>
+      <dt>N</dt><dd>number of TCP segments (91)</dd>
+      <dt>O</dt><dd>per-segment wire overhead in bytes (90)</dd>
+    </dl>
+  </div>
+  <p>E = 131,072 / (131,132 + 91 × 90) = 131,072 / 139,322 ≈ <strong>94.1%</strong>. With jumbo frames (8,948 bytes of payload per segment, 15 segments): 131,072 / (131,132 + 1,350) ≈ 98.9%. The NVMe/TCP framing itself costs under 0.05%. The per-packet overhead is what matters.</p>
+  <h4>Step 2: serialization time</h4>
+  <p>139,322 bytes × 8 = 1,114,576 bits. At 25 × 10<sup>9</sup> b/s that is ≈ <strong>44.6 µs</strong>. A Lab SSD read of 128 KiB takes tens of µs of NAND time plus about 19 µs of PCIe Gen4 x4 transfer (131,072 B at roughly 7 GB/s). So for large reads on 25 GbE, <em>wire serialization is comparable to media time</em>. That is why 100 GbE and multiple connections matter for throughput.</p>
+  <h4>Step 3: bandwidth ceiling</h4>
+  <p>25 Gb/s × 0.941 ≈ 23.5 Gb/s ≈ 2.94 GB/s of NVMe data, at most, for one port, before any CPU limits. The Lab SSD at Gen4 x4 can deliver around 7 GB/s locally, so one 25 GbE port cannot expose its full sequential bandwidth. <span class="badge derived">Derived</span></p>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <table>
+    <caption>Frequent NVMe/TCP misconceptions</caption>
+    <thead><tr><th>Mistake</th><th>Consequence</th><th>Correct view</th></tr></thead>
+    <tbody>
+      <tr><td>Reading one TCP frame as one PDU</td><td>Misdecoded captures, phantom "short" PDUs</td><td>Reassemble by PLEN. Let the analyzer reassemble, and verify by hand when in doubt.</td></tr>
+      <tr><td>Expecting R2T for reads</td><td>Searching for a PDU that never exists</td><td>Reads are unsolicited C2HData. R2T is only for host→controller data.</td></tr>
+      <tr><td>Treating TCP retransmissions as NVMe errors</td><td>Chasing the target firmware for a network problem</td><td>TCP loss = latency at NVMe. NVMe errors are status codes or TermReqs.</td></tr>
+      <tr><td>Assuming digests are on</td><td>Undetected corruption blamed on media</td><td>Check the ICReq/ICResp DGST bits on every connection</td></tr>
+      <tr><td>Capturing with TSO/GRO on and reading frame sizes as wire sizes</td><td>Wrong conclusions about MTU and segmentation</td><td>Capture on a tap or mirror port, or disable offloads for the test</td></tr>
+      <tr><td>Forgetting head-of-line blocking</td><td>Blaming a slow command on the target when an earlier lost segment delayed it</td><td>Look for retransmissions on the same connection before the slow completion</td></tr>
+      <tr><td>Enabling TLS without an observability plan</td><td>Captures become useless during an incident</td><td>Plan key export for labs, tracing for production</td></tr>
+      <tr><td>Equating 8009 and 4420 roles</td><td>Connecting I/O to the discovery port</td><td>Discovery service usually on 8009 (TCP), I/O controllers usually on 4420</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>NVMe/TCP failure patterns, each with the first evidence to collect:</p>
+  <table>
+    <caption>NVMe/TCP failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>Likely layer</th><th>First check</th><th>Disambiguating experiment</th></tr></thead>
+    <tbody>
+      <tr><td>Small I/O works, large I/O hangs then times out</td><td>Network (MTU black hole)</td><td>Interface MTU on every hop. ICMP "fragmentation needed" being blocked.</td><td><code>ping -M do -s 8972</code> between host and target (jumbo), or 1472 (standard)</td></tr>
+      <tr><td>Periodic controller resets, "keep alive" in logs</td><td>Association / CPU starvation</td><td>Gaps in Keep Alive commands in the capture. Target CPU load.</td><td>Raise KATO in a test. If resets stop, the root cause is latency, not loss.</td></tr>
+      <tr><td>Write latency spikes, reads fine</td><td>Target buffer pressure</td><td>CapsuleCmd → R2T gaps</td><td>Reduce write queue depth. Compare with in-capsule-sized writes.</td></tr>
+      <tr><td>Throughput plateau far below link speed</td><td>CPU (copies, single connection)</td><td>Per-CPU softirq and nvme-tcp CPU usage</td><td>Increase <code>nr_io_queues</code> and parallel jobs. Check RSS spreading.</td></tr>
+      <tr><td>Sporadic data mismatches at the application</td><td>Data path integrity</td><td>Whether data digests are on</td><td>Enable data digests. If digest errors appear, find the corrupting hop (NIC, memory, middlebox).</td></tr>
+      <tr><td>Connection resets with TermReq</td><td>NVMe/TCP framing (peer bug)</td><td>FES and the quoted header in the TermReq</td><td>Reproduce with the same I/O pattern against a reference target (Linux nvmet)</td></tr>
+      <tr><td>Connect hangs with TLS enabled</td><td>TLS handshake</td><td><code>tlshd</code> logs, PSK presence in keyring, PSK identity</td><td>Connect without TLS to a test port. If that works, the problem is key or identity mismatch.</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout debug" data-title="A three-question triage for any NVMe/TCP capture">
+    <ol>
+      <li>Are there TCP anomalies (retransmissions, zero windows, resets) near the problem? If yes, start at the network.</li>
+      <li>Is there a TermReq, or a FIN/RST from one side without a TermReq? If yes, it is a transport or framing error, or a crash. Find the PDU the TermReq quotes.</li>
+      <li>Otherwise, is there a CapsuleResp with non-zero status, or a command with no response before the host's abort? If yes, the problem is at the NVMe layer or in the target's backend.</li>
+    </ol>
+  </aside>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight" data-title="NVMe/TCP performance is mostly CPU and queueing">
+    <p>On modern networks, NVMe/TCP's protocol overhead is trivial. The 24-byte headers are noise next to 1,448-byte segments. What costs time is per-I/O CPU work on both ends (system calls, copies, digests, interrupts, context switches) and queueing: head-of-line blocking within a connection, and contention when several queues share a CPU. Senior engineers profile CPU per I/O and latency per connection before touching network settings.</p>
+  </aside>
+  <aside class="callout insight" data-title="Connection count is a design parameter">
+    <p>More I/O queues mean more TCP connections. That improves parallelism and reduces head-of-line blocking, but costs target memory (buffers per queue entry × depth × queues) and connection-setup time on reconnect. A host with 64 CPUs connecting to 20 targets with 64 queues each holds 1,280+ connections, and reconnect storms after a switch failure become a real operational risk.</p>
+  </aside>
+  <aside class="callout insight" data-title="Turn on digests in every test environment">
+    <p>Production may run without digests for CPU reasons. Test and validation environments should run with them, because they turn silent corruption into a loud, attributable error. The bugs they catch, such as NIC offload defects, memory corruption and middlebox interference, are exactly the ones that otherwise take months to find.</p>
+  </aside>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab: Capture and decode NVMe/TCP on a loopback target</h3>
+  <h4>Objective</h4>
+  <p>Build a throwaway NVMe/TCP target on one Linux machine using the in-kernel <code>nvmet</code> target, connect to it over loopback, capture the traffic, and identify ICReq/ICResp, Connect, Property Get/Set, Identify, a Read with C2HData, and a Write with in-capsule data and with R2T. Then repeat with digests on.</p>
+  <h4>Skills</h4>
+  <ul><li>configfs target setup</li><li>nvme-cli connect/disconnect</li><li>tcpdump and Wireshark NVMe/TCP decoding</li><li>Mapping PDUs to NVMe commands</li></ul>
+  <h4>Safety</h4>
+  <aside class="callout safety">
+    <p><span class="badge caution">Caution lab</span> Requires root and loads kernel modules. Use a <strong>disposable virtual machine</strong>. The namespace is backed by a <em>file</em> created for this lab. Never point <code>device_path</code> at a disk or partition that holds data. Do not run this on a production host. The target listens on 127.0.0.1 only.</p>
+  </aside>
+  <h4>Hardware required</h4>
+  <p>None beyond a Linux VM with 2 vCPUs and 2 GiB RAM.</p>
+  <h4>Software required</h4>
+  <p>Linux kernel with <code>nvmet</code>, <code>nvmet-tcp</code> and <code>nvme-tcp</code> modules (most distribution kernels have them), <code>nvme-cli</code>, <code>tcpdump</code>, Wireshark (on the VM or on another machine to open the pcap).</p>
+  <h4>Input</h4>
+  <p>Subsystem NQN <code>nqn.2026-10.org.example:lab-ssd</code>, a 1 GiB backing file, port 4420 on 127.0.0.1.</p>
+  <h4>Expected output</h4>
+  <p>A pcap in which you can label every NVMe/TCP PDU type except TermReq, plus a table of PDU counts for each experiment.</p>
+  <h4>Background</h4>
+  <p>Linux <code>nvmet</code> is configured through configfs under <code>/sys/kernel/config/nvmet</code>. Subsystems contain namespaces. Ports define transport addresses. Linking a subsystem into a port exposes it. <a href="ch68.html">Chapter 68</a> uses the same target for discovery and multipathing.</p>
+  <h4>Step 1: build the target</h4>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code><span class="cm"># Caution: disposable VM only. Run as root.</span>
+modprobe nvmet nvmet-tcp nvme-tcp
+NQN=nqn.2026-10.org.example:lab-ssd
+CFG=/sys/kernel/config/nvmet
+truncate -s 1G /var/tmp/nvmet-lab.img              <span class="cm"># sparse file, no real disk involved</span>
+
+mkdir $CFG/subsystems/$NQN
+echo 1 &gt; $CFG/subsystems/$NQN/attr_allow_any_host  <span class="cm"># lab only; ch68 replaces this with an allow list</span>
+mkdir $CFG/subsystems/$NQN/namespaces/1
+echo -n /var/tmp/nvmet-lab.img &gt; $CFG/subsystems/$NQN/namespaces/1/device_path
+echo 1 &gt; $CFG/subsystems/$NQN/namespaces/1/enable
+
+mkdir $CFG/ports/1
+echo tcp       &gt; $CFG/ports/1/addr_trtype
+echo ipv4      &gt; $CFG/ports/1/addr_adrfam
+echo 127.0.0.1 &gt; $CFG/ports/1/addr_traddr
+echo 4420      &gt; $CFG/ports/1/addr_trsvcid
+ln -s $CFG/subsystems/$NQN $CFG/ports/1/subsystems/$NQN</code></pre>
+  <h4>Step 2: capture a connect, a read and two writes</h4>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code>tcpdump -i lo -s 0 -w /var/tmp/nvme_tcp_lab.pcap 'tcp port 4420' &amp;
+sleep 1
+nvme connect -t tcp -a 127.0.0.1 -s 4420 -n $NQN --nr-io-queues=1
+nvme list                                          <span class="cm"># note the new /dev/nvmeXnY</span>
+DEV=/dev/nvme1n1                                   <span class="cm"># adjust to what nvme list shows</span>
+dd if=$DEV of=/dev/null bs=4k count=1 iflag=direct              <span class="cm"># one 4 KiB read</span>
+dd if=/dev/urandom of=$DEV bs=4k count=1 oflag=direct           <span class="cm"># small write: in-capsule?</span>
+dd if=/dev/urandom of=$DEV bs=128k count=1 seek=8 oflag=direct  <span class="cm"># large write: R2T</span>
+nvme disconnect -n $NQN
+kill %1</code></pre>
+  <h4>Step 3: decode and repeat with digests</h4>
+  <p>Open the pcap in Wireshark with the display filter <code>nvme-tcp</code>. Label each PDU type, then find the Read and both Writes by opcode. Repeat Step 2 with <code>--hdr-digest --data-digest</code> added to <code>nvme connect</code> and a new pcap file. Finally, tear down the target:</p>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code>rm $CFG/ports/1/subsystems/$NQN
+rmdir $CFG/ports/1
+echo 0 &gt; $CFG/subsystems/$NQN/namespaces/1/enable
+rmdir $CFG/subsystems/$NQN/namespaces/1
+rmdir $CFG/subsystems/$NQN
+rm /var/tmp/nvmet-lab.img</code></pre>
+  <h4>Observation</h4>
+  <p>Record per connection: the ICReq DGST/HPDA/MAXR2T values, the ICResp CPDA/MAXH2CDATA values, the number of connections (admin + I/O), and for each data command the PDU sequence.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>How many TCP connections did <code>--nr-io-queues=1</code> produce, and which carried the Connect with QID 0?</li>
+    <li>Which Property Get/Set commands did the host send, in which order, and which properties (by offset) did they touch?</li>
+    <li>Did the 4 KiB write travel in-capsule? What does that tell you about the target's IOCCSZ?</li>
+    <li>For the 128 KiB write, how many R2Ts and H2CData PDUs did you see, and why?</li>
+    <li>On loopback, why are frames so much larger than 1,514 bytes?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Compute the in-capsule size from <code>nvme id-ctrl $DEV</code> (fields <code>ioccsz</code>, <code>iorcsz</code>) and predict, before capturing, the largest write that will travel in-capsule. Verify it with a write of exactly that size and one of that size plus 512 bytes.</p>
+  <details class="hint"><summary>Hint</summary><p>Search the Wireshark packet list for "Fabrics" to find Connect and Property commands quickly. Loopback's MTU is 65,536, so whole PDUs fit in single frames.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <ol>
+      <li>Two connections: admin (QID 0) and one I/O queue (QID 1). The admin Connect is on the first connection opened. If you see extra short-lived connections, check whether your nvme-cli version probed a discovery controller first.</li>
+      <li>Typically Property Get CAP (00h), Property Get VS (08h), Property Set CC (14h) with EN = 1, then Property Get CSTS (1Ch) until RDY = 1. At disconnect, Property Set CC for shutdown, then Property Get CSTS. Order and repetition are <span class="badge impl">implementation-dependent</span>.</li>
+      <li>On typical <code>nvmet</code> configurations, 4 KiB fits in-capsule. You will see a CapsuleCmd whose PLEN is 72 + 4096 = 4168 and SGL identifier 01h. If not, your target advertises a smaller in-capsule size.</li>
+      <li>Usually one R2T for the full 128 KiB (or several, if the target limits R2TL), and as many H2CData PDUs as needed to respect MAXH2CDATA. Count them and divide 131,072 by the observed DATAL.</li>
+      <li>Loopback has a large MTU and no NIC segmentation, so each PDU is usually one frame.</li>
+    </ol>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>The time between CapsuleCmd and CapsuleResp on loopback is almost all software: two TCP stacks, nvmet, and file I/O on the page cache. It sets a floor for this machine's NVMe/TCP software cost. Real networks add serialization and propagation on top of it, but never subtract from it.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li><code>nvme connect</code> reports that it failed to write to <code>/dev/nvme-fabrics</code>: the <code>nvme-tcp</code> module is not loaded, or the target is not listening. Check <code>ss -ltn</code> for port 4420.</li>
+    <li>No new block device appears: the namespace is not enabled, or the backing path is wrong. Check <code>dmesg</code> for nvmet messages.</li>
+    <li>Wireshark shows plain TCP: you captured on the wrong interface or the port differs. Use Decode As.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Add <code>tc qdisc add dev lo root netem delay 200us loss 0.5%</code> (Caution: affects all loopback traffic in the VM), repeat the read workload with <code>fio</code>, and observe retransmissions and head-of-line blocking in the capture. Remove it with <code>tc qdisc del dev lo root</code>.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Write out, byte by byte, the common header of a CapsuleResp PDU with header digest on and data digest negotiated.</li>
+    <li>A C2HData PDU has HLEN 24, PDO 32, PLEN 4132, and both digest flags set. Is it consistent? If so, what is HPDA?</li>
+    <li>Explain why a data digest error fails one command while a header digest error kills the connection.</li>
+    <li>A host's ICReq sets MAXR2T = 3. What does that permit the controller to do?</li>
+    <li>Design a validation test that proves a target honours MAXH2CDATA.</li>
+    <li>Explain the difference between port 8009 and port 4420 to a new team member.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <ol>
+      <li>Bytes 05 01 18 00 1C 00 00 00: type 05h, FLAGS 01h (HDGSTF only, since a CapsuleResp carries no data and so no DDGST), HLEN 24, PDO 0, PLEN 28 (24 + 4).</li>
+      <li>24 header + 4 HDGST = 28, padded to 32, so PDO = 32 means data aligned to 32 bytes. HPDA is 0's based in 4-byte units: 32 / 4 − 1 = 7. Data = 4132 − 32 − 4 (DDGST) = 4096 bytes. Consistent.</li>
+      <li>A header digest error means fields such as PLEN, DATAO and CCCID cannot be trusted, so the receiver cannot find the next PDU boundary safely. A data digest error leaves framing intact. Only the data of one command is bad.</li>
+      <li>MAXR2T is 0's based, so 3 means up to 4 R2Ts may be outstanding for a single command.</li>
+      <li>Connect with a known MAXH2CDATA from ICResp. Issue large writes and verify (from the capture or target trace) that every H2CData PDU has DATAL ≤ MAXH2CDATA. Then use a custom initiator to send an oversized H2CData and expect a C2HTermReq for a data transfer limit violation.</li>
+      <li>8009 is where the discovery controller usually listens. You fetch the Discovery Log Page there to learn which subsystems exist and where. 4420 is where I/O controllers usually listen. You connect there to read and write namespaces. Both are conventions that discovery entries can override.</li>
+    </ol>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>What is the size of the NVMe/TCP common header?</p>
+      <ul class="options" data-answer="2"><li>4 bytes</li><li>8 bytes</li><li>24 bytes</li><li>72 bytes</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>8 bytes: PDU-Type, FLAGS, HLEN, PDO (one byte each) and PLEN (4 bytes). 24 and 72 are full HLENs for some PDU types.</p></details></li>
+    <li><p>Which PDU carries read data?</p>
+      <ul class="options" data-answer="3"><li>H2CData</li><li>R2T</li><li>C2HData</li><li>CapsuleResp</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Controller-to-host data PDU. H2CData carries write data. R2T requests write data.</p></details></li>
+    <li><p>When is R2T used?</p>
+      <ul class="options" data-answer="1"><li>For host-to-controller data not sent in-capsule</li><li>For every read</li><li>Before every command</li><li>Only on the admin queue</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The controller solicits write data it did not receive in-capsule.</p></details></li>
+    <li><p>A header digest mismatch is detected. What is the correct reaction?</p>
+      <ul class="options" data-answer="4"><li>Ignore it, TCP already checksummed the data</li><li>Fail the command and continue</li><li>Request retransmission with a new R2T</li><li>Treat it as fatal: send a TermReq and close the connection</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Framing fields are untrustworthy, so the stream cannot be parsed safely beyond this point.</p></details></li>
+    <li><p>What does MAXH2CDATA limit?</p>
+      <ul class="options" data-answer="2"><li>The size of in-capsule data</li><li>The data length of a single H2CData PDU</li><li>The number of outstanding R2Ts</li><li>The size of C2HData PDUs</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The controller advertises it in ICResp. In-capsule size comes from IOCCSZ, and outstanding R2Ts from MAXR2T.</p></details></li>
+    <li><p>Which algorithm do NVMe/TCP digests use?</p>
+      <ul class="options" data-answer="3"><li>CRC-16</li><li>Adler-32</li><li>CRC32C</li><li>SHA-256</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>CRC32C (Castagnoli), the same CRC used by iSCSI digests. TLS provides cryptographic integrity if needed.</p></details></li>
+    <li><p>How many TCP connections does a host with 8 I/O queues to one controller use?</p>
+      <ul class="options" data-answer="3"><li>1</li><li>8</li><li>9</li><li>16</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>One per queue pair: 8 I/O + 1 admin.</p></details></li>
+    <li><p>A capture shows a lost segment and a 200 µs fast retransmission before a CapsuleResp. Where is the problem?</p>
+      <ul class="options" data-answer="1"><li>Network/TCP layer: NVMe only sees latency</li><li>Target firmware</li><li>NVMe/TCP framing</li><li>The host's Connect parameters</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>TCP recovered the loss transparently. Head-of-line blocking delayed the response.</p></details></li>
+    <li><p>Open: why can a target drop the CapsuleResp for a successful read, and what must the host still handle?</p>
+      <details class="answer"><summary>Model answer</summary><p>The SUCCESS flag on the last C2HData PDU can signal successful completion, which saves a PDU. The TCP Transport specification limits when this may be used (for example around SQ flow control). The host must still accept a normal CapsuleResp, and must handle errors, which always need a CapsuleResp to carry status.</p></details></li>
+    <li><p>Open: what does TLS change for a debugging engineer, and how would you prepare?</p>
+      <details class="answer"><summary>Model answer</summary><p>All NVMe/TCP PDUs become opaque Application Data. Prepare by enabling session key export in labs (so Wireshark can decrypt), relying on host and target tracing in production, keeping TCP-level visibility (retransmissions and timing are still visible), and logging TLS handshake outcomes from <code>tlshd</code>.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> Why does NVMe/TCP need PDUs when TCP already delivers bytes reliably?</p>
+      <details class="answer"><summary>Model answer</summary><p>TCP is a byte stream with no message boundaries. NVMe needs discrete commands, data blocks and completions. PDUs give each message a type and length so the receiver can find boundaries and parse the content.</p></details></li>
+    <li><p><strong>Beginner:</strong> Walk me through a 4 KiB read over NVMe/TCP.</p>
+      <details class="answer"><summary>Model answer</summary><p>Host sends CapsuleCmd (SQE with Read, SGL Transport Data Block, 4096 bytes). Target reads the data and sends a C2HData PDU (CCCID, DATAO 0, DATAL 4096, LAST_PDU), then a CapsuleResp with the CQE. The host copies the data into the request buffer and completes the request on the CapsuleResp.</p></details></li>
+    <li><p><strong>Intermediate:</strong> What do ICReq and ICResp negotiate?</p>
+      <details class="answer"><summary>Model answer</summary><p>PDU format version, data alignment in each direction (HPDA/CPDA), header and data digest enablement, the host's maximum outstanding R2Ts (MAXR2T) and the controller's maximum H2CData size (MAXH2CDATA). They happen once per connection, before Connect.</p></details></li>
+    <li><p><strong>Intermediate:</strong> How does in-capsule data change write latency?</p>
+      <details class="answer"><summary>Model answer</summary><p>It removes the R2T round trip. Writes that fit in IOCCSZ × 16 − 64 bytes complete in one round trip. Larger writes need CapsuleCmd → R2T → H2CData → CapsuleResp, which adds at least one RTT plus any target buffer-allocation delay.</p></details></li>
+    <li><p><strong>Advanced:</strong> A customer sees periodic 10 ms latency spikes on NVMe/TCP reads. How do you investigate?</p>
+      <details class="answer"><summary>Model answer</summary><p>Capture at both ends and correlate. Check for TCP retransmissions (an RTO-scale gap suggests tail loss with no dup-ACKs), zero-window events (receiver stalls), and target-side backend latency (target trace or iostat). Check CPU scheduling: softirq starvation and interrupt coalescing. Check network: switch buffer drops and microbursts. Separate per-connection effects (head-of-line) from per-target ones by checking whether all queues spike together.</p></details></li>
+    <li><p><strong>Advanced:</strong> Compare NVMe/TCP digests with TLS.</p>
+      <details class="answer"><summary>Model answer</summary><p>Digests are CRC32C: they detect accidental corruption but not deliberate tampering, and provide no confidentiality. TLS 1.3 provides confidentiality and cryptographic integrity and authenticates peers via PSKs. With TLS, digests are largely redundant for integrity, though the specification governs whether both may be negotiated. TLS also hides the PDUs from passive capture.</p></details></li>
+    <li><p><strong>Senior:</strong> How would you design an NVMe/TCP target for predictable write latency under load?</p>
+      <details class="answer"><summary>Model answer</summary><p>Advertise an in-capsule size matched to the dominant small-write size. Pre-allocate per-queue buffer pools so R2T issuance never waits on allocation. Bound per-connection outstanding R2T bytes, steer each connection to a dedicated CPU, use zero-copy or DDP where available, apply admission control so backend saturation surfaces as queueing rather than R2T starvation, and instrument CapsuleCmd→R2T and R2T→data-complete latencies.</p></details></li>
+    <li><p><strong>Senior:</strong> When would you choose NVMe/TCP over NVMe/RDMA?</p>
+      <details class="answer"><summary>Model answer</summary><p>When reach and operational simplicity matter: routed IP networks, mixed NICs, cloud and VM environments, no lossless Ethernet. Also when CPU headroom exists, and when tooling and team skills favour TCP. RDMA is the choice when the lowest latency and CPU efficiency justify the network engineering and RNIC requirements.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain why the marbles need a "label" at the start of every parcel.</li>
+    <li><strong>To a junior engineer:</strong> explain R2T and why reads do not need it.</li>
+    <li><strong>To a senior engineer:</strong> argue for or against enabling data digests in production for a specific workload.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "The pipe gives you marbles one after another, but it does not tell you where one parcel stops. The label says how many marbles belong to this parcel, so you know when the next one starts."</p>
+    <p><strong>Junior:</strong> "For a write too big for the command capsule, the target says 'I have room now, send bytes X to Y' with an R2T, and the host sends exactly those bytes in H2CData PDUs. For a read, the host already set aside room for the data when it sent the command, so the target just sends C2HData without asking."</p>
+    <p><strong>Senior:</strong> "For a database on a routed network crossing middleboxes and NICs with aggressive offloads, enable data digests: CRC32C costs a few percent of CPU with hardware instructions, and it turns silent corruption into attributable errors. For a single-hop, TLS-protected deployment where TLS already supplies integrity, digests add little."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <ul>
+    <li>NVMe/TCP frames capsules and data into self-delimiting PDUs, each starting with an 8-byte common header, on one TCP connection per queue pair.</li>
+    <li>ICReq/ICResp negotiate format version, alignment, digests, MAXR2T and MAXH2CDATA before Connect.</li>
+    <li>Read: CapsuleCmd → C2HData… → CapsuleResp. Write: in-capsule (one round trip) or CapsuleCmd → R2T → H2CData… → CapsuleResp.</li>
+    <li>Header digest errors are fatal to the connection, and data digest errors fail one command. TermReq PDUs report fatal errors.</li>
+    <li>TLS 1.3 with PSKs secures NVMe/TCP and hides PDUs from captures.</li>
+    <li>Performance is dominated by CPU cost, copies, segmentation and head-of-line blocking, not by PDU overhead.</li>
+  </ul>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>decode any NVMe/TCP common header from hex</li>
+      <li>list all PDU types with direction and purpose</li>
+      <li>draw the read, small-write and large-write sequences</li>
+      <li>explain what each digest covers and the consequence of each failing</li>
+      <li>reassemble a PDU from TCP segments by PLEN</li>
+      <li>classify a capture anomaly as TCP, NVMe/TCP framing or NVMe status</li>
+      <li>set up, capture and tear down a loopback nvmet target safely</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVMe over TCP Transport Specification, Revision 1.3</cite>: PDU formats, ICReq/ICResp, R2T rules, digests, TermReq, TLS</li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Fabrics commands, authentication</cite></li>
+    <li>IETF RFC 9293 (TCP), RFC 8446 (TLS 1.3)</li>
+    <li>Linux: <code>drivers/nvme/host/tcp.c</code>, <code>drivers/nvme/target/tcp.c</code>, <code>include/linux/nvme-tcp.h</code> (useful reference, not normative). <code>ktls-utils</code> (tlshd) documentation.</li>
+    <li>Wireshark NVMe/TCP dissector documentation.</li>
+  </ul>
+  <p>Deep dive: <a href="dd50.html">NVMe/TCP module</a>. Related: <a href="performance.html">Performance Engineering</a>.</p>
+  <p><strong>Next:</strong> <a href="ch67.html">NVMe/RDMA</a>, where the network adapter itself moves the data into host memory.</p>
+</section>

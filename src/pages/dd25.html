@@ -1,0 +1,753 @@
+<p class="lead"><a href="ch26.html">Chapter 26</a> built the Admin queue from three registers and walked through the first Identify. This module studies the Admin queue <em>in service</em>: how events reach the host, how long commands block it, how queue creation and deletion fail, how wrap and phase go wrong, and how to reason about an Admin timeout when every packet looks fine.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p>After bring-up, the Admin queue carries everything that is not data: health monitoring, error reporting, namespace management, firmware updates, formats, sanitize, feature changes and queue creation. It is small (32 entries on the Lab SSD), it is shared by every tool on the host that talks to the controller, and on many controllers it is processed largely one command at a time. It is also where the controller's only "voice" lives — the Asynchronous Event Request — and where host bugs in wrap and phase handling are least often exercised, because the Admin queue wraps rarely.</p>
+  <p>This module goes beyond the bootstrap: an event-driven trace from notice to re-arm; a long-running command that delays monitoring; a queue-creation failure that the driver ignored; an Admin timeout that could be a host phase bug or a dropped DMA write. The labs decode event completions, build Get Log Page commands that respect transfer limits, and simulate the Admin queue with outstanding events, serial execution and a phase bug.</p>
+  <aside class="callout prereq">
+    <ul>
+      <li><a href="ch26.html">Admin Queue</a> — AQA/ASQ/ACQ, initialisation order, the common SQE, Identify, Get Log Page, features, the bring-up trace. Not repeated here.</li>
+      <li><a href="ch25.html">Queue Architecture</a> and <a href="ch28.html">Doorbells</a> — head/tail, phase tag, wrap.</li>
+      <li><a href="ch30.html">Admin Commands</a> — opcode reference.</li>
+      <li><a href="dd24.html">NVMe Registers</a> — the register side of bring-up and reset.</li>
+    </ul>
+  </aside>
+  <p>Where it goes next: <a href="dd26.html">I/O Queues</a>, <a href="dd41.html">Reset</a>, and back to <a href="dd23.html">Namespaces</a> for the notices that drive rescans.</p>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives by level for the Admin queue in service</caption>
+    <thead><tr><th>Level</th><th>You will be able to…</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Follow an Asynchronous Event Request from submission through completion, log read and re-arm, and decode completion Dword 0.</td></tr>
+      <tr><td>Intermediate</td><td>Build Get Log Page commands (NUMDL/NUMDU, offset, RAE) that respect MDTS; explain the creation and deletion order rules and their error statuses.</td></tr>
+      <tr><td>Advanced</td><td>Explain Admin queue capacity, serial execution of long commands, Commands Supported and Effects, and the Admin wrap/phase failure modes.</td></tr>
+      <tr><td>Senior</td><td>Design Admin timeout and recovery policy that neither resets on slow commands nor waits forever on dead controllers, and arbitrate Admin access between tools.</td></tr>
+      <tr><td>Trace analysis</td><td>Separate Admin traffic from I/O, match CIDs across SQE, CQE and logs, and find the first abnormal Admin event.</td></tr>
+      <tr><td>Debugging</td><td>Apply six Admin failure patterns, from phantom AER "hangs" to lost events and ignored creation errors.</td></tr>
+      <tr><td>Validation</td><td>Test AER limits and delivery, long-command concurrency, invalid creation/deletion parameters, Admin wrap, and Abort behaviour.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>A school office has one small in-tray for notes from parents. Notes go in one at a time and the secretary works through them in order. Some notes are quick ("please send the lunch menu"); one is huge ("please re-paint the gym"), and while she is on the phone about the gym, everything else waits in the tray.</p>
+    <p>The secretary is never allowed to phone a parent first. So clever parents leave a blank, signed card in the tray that says "call me when something happens". When the school has news, she fills in that card and sends it home — and the parent must put a new blank card in the tray straight away, or they will miss the next news. Every blank card waiting in the tray takes up a spot that a real note could have used.</p>
+  </aside>
+  <p>The tray is the Admin Submission Queue; notes are Admin commands; the gym note is a Format NVM or Sanitize; the blank cards are Asynchronous Event Requests; "put a new card in" is re-arming after each event; the limited spots are the 31 usable Admin slots.</p>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <aside class="callout breaks">
+    <ul>
+      <li><strong>Represents.</strong> A small shared queue, mostly serial processing, long jobs blocking short ones, and events delivered only by completing a request the host left waiting.</li>
+      <li><strong>Hides.</strong> The tray has two halves (submission and completion queues) with heads, tails and a phase bit that flips each lap. The secretary may read several notes before acting on any (fetch is not execution), and some controllers do run some Admin commands concurrently.</li>
+      <li><strong>Misleads.</strong> A note that waits a long time is not lost; and a blank card that waits for months is not "stuck". Timeouts must know the difference.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Terms used in this module</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="async-event-request">Asynchronous Event Request</span> (AER)</td><td>Blank "call me" card</td><td>Admin opcode 0Ch with no parameters; completes only when the controller has an event to report</td><td>Limited by AERL; followed by Get Log Page</td><td>Confusing NVMe AER with PCIe Advanced Error Reporting, also "AER"</td></tr>
+      <tr><td><span class="g" data-term="aerl">AERL</span></td><td>How many blank cards are allowed</td><td>Identify Controller: Asynchronous Event Request Limit, 0's based</td><td>Exceeding it: Asynchronous Event Request Limit Exceeded</td><td>Reading it as a count, not 0's based</td></tr>
+      <tr><td>Event DW0</td><td>What the news is</td><td>AER completion Dword 0: event type (bits 2:0), event information (15:8), log page identifier (23:16)</td><td>Tells the host which log to read</td><td>Ignoring the LID and reading the wrong log</td></tr>
+      <tr><td><span class="g" data-term="rae">RAE</span></td><td>"Don't tear up the card yet"</td><td>Retain Asynchronous Event, Get Log Page CDW10 bit 15: if set, reading the log does not clear the event</td><td>Event masked until cleared; multi-part reads</td><td>Leaving RAE set forever — the controller then never reports that event type again</td></tr>
+      <tr><td><span class="g" data-term="get-log-page">Get Log Page</span> sizing</td><td>How much to read</td><td>NUMD (0's based dwords) split NUMDL (CDW10 31:16) / NUMDU (CDW11 15:0); offset in CDW12/13</td><td>Bounded per command by MDTS</td><td>Using a byte count or a 1-based count</td></tr>
+      <tr><td><span class="g" data-term="commands-effects-log">Commands Supported and Effects</span></td><td>"What this note will disturb"</td><td>Log 05h: per opcode, supported, and effects such as capability or namespace change and submission/execution restrictions</td><td>Tells hosts what to rescan and what to serialise</td><td>Assuming every Admin command can run concurrently</td></tr>
+      <tr><td><span class="g" data-term="abort-cmd">Abort</span></td><td>"Cancel that note"</td><td>Admin 08h naming SQID and CID; best effort; limited by ACL</td><td>Itself an Admin command — needs a free slot</td><td>Expecting it to stop a command already executing</td></tr>
+      <tr><td><span class="g" data-term="phase-tag">Phase tag</span> on the Admin CQ</td><td>Which lap the note belongs to</td><td>CQE DW3 bit 16, inverted by the controller each time it wraps the CQ</td><td>Host must flip its expected value on wrap</td><td>Bugs that hide because the Admin CQ wraps rarely</td></tr>
+      <tr><td>Long-running Admin command</td><td>The gym re-paint</td><td>Format NVM, Sanitize (start), Device Self-test, Firmware Commit with activation, large log reads</td><td>May block later Admin commands on serial controllers</td><td>Treating the delay as a hang</td></tr>
+      <tr><td>Invalid Queue Deletion</td><td>Removing the shared tray before its users</td><td>Status for deleting an I/O CQ that still has SQs associated</td><td>Order: delete SQs, then CQ</td><td>Deleting in creation order</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <figure>
+    <pre class="diagram">
+  Host software                              Lab SSD controller
+  -------------                              ------------------
+  kernel driver  --+                         Admin command processor (often serial)
+  nvme-cli       --+--&gt; Admin SQ (32) ----&gt;  fetch (SQ0TDBL 0xFE60_1000)
+  monitoring     --+    0x1_0000_0000          |-- quick: Identify, Get/Set Features, logs
+  orchestration  --+                           |-- long:  Format, Sanitize, Self-test, FW commit
+                                               |-- never (until event): AERs (AERL+1 max)
+                        Admin CQ (32)  &lt;----   post CQE, phase P; MSI-X vector 0
+                        0x1_0000_1000          (0xFEE0_0000, data 0x40)
+  CQ0HDBL 0xFE60_1004 &lt;- host consumes
+  Usable outstanding commands: 31, minus outstanding AERs</pre>
+    <figcaption>Every Admin user on the host funnels into one 32-entry queue pair. Synthetic Lab SSD addresses.</figcaption>
+  </figure>
+  <table>
+    <caption>Admin queue in service by category</caption>
+    <thead><tr><th>Category</th><th>Content</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>Admin SQEs from all host tools via the driver; SQ0 tail doorbell writes; CQ0 head doorbell writes</td></tr>
+      <tr><td>Outputs</td><td>Admin CQEs with status and DW0 results; log and Identify data DMA; MSI-X vector 0</td></tr>
+      <tr><td>Actors</td><td>Kernel driver (owns the queue), user tools via passthrough ioctls, firmware command processor, event sources inside the controller</td></tr>
+      <tr><td>State</td><td>Queue pointers and phase; outstanding CIDs (including AERs); pending events and their masked/retained state; I/O queue table changed by create/delete</td></tr>
+      <tr><td>Memory</td><td>ASQ 0x1_0000_0000 (32 × 64 B), ACQ 0x1_0000_1000 (32 × 16 B); data buffers from 0x2_0000_0000</td></tr>
+      <tr><td>Registers</td><td>AQA/ASQ/ACQ (set at bring-up), SQ0TDBL, CQ0HDBL; MSI-X table entry 0</td></tr>
+      <tr><td>Interfaces</td><td>Admin command set; on Linux, admin passthrough ioctls used by <code>nvme-cli</code></td></tr>
+      <tr><td>Dependencies</td><td>Controller enabled; Bus Master Enable; IOMMU mappings for ASQ, ACQ and every Admin data buffer; interrupt vector 0 routed</td></tr>
+    </tbody>
+  </table>
+  <h3>Who shares the Admin queue</h3>
+  <p>On Linux, every <code>nvme</code> command that a user runs against <code>/dev/nvme0</code> becomes an Admin SQE on the same queue the driver uses for its own work. A monitoring agent polling SMART every second, an orchestration tool creating namespaces and an engineer running a self-test all compete for the same slots and the same (often serial) command processor. The driver's Admin timeout applies to all of them unless a tool passes its own.</p>
+  <aside class="callout insight" data-title="Admin capacity is a budget">
+    <p>32 entries give 31 usable outstanding commands. Subtract the AERs the driver keeps outstanding, and remember that one long command can hold everything behind it. Size monitoring frequency and orchestration concurrency against that budget, not against I/O-queue intuition.</p>
+  </aside>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>The Admin mechanism that matters most in service is the <strong>event loop</strong>: the host keeps AERs outstanding; the controller completes one when an event occurs; the host reads the indicated log, clears the event and re-arms. Lab SSD values (synthetic): AERL = 3 (four AERs allowed), the driver keeps one outstanding; Admin vector 0 at 0xFEE0_0000 with data 0x40.</p>
+  <table>
+    <caption>Event loop, step by step</caption>
+    <thead><tr><th>#</th><th>Who acts</th><th>What changes</th><th>Where</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Host</td><td>Optionally sets Asynchronous Event Configuration (Set Features FID 0Bh) to enable event classes</td><td>Admin queue</td><td>Set Features CQE</td></tr>
+      <tr><td>2</td><td>Host</td><td>Submits AER (0Ch); the controller fetches it and holds it</td><td>Admin SQ</td><td>SQE fetch; no CQE</td></tr>
+      <tr><td>3</td><td>Controller</td><td>Event occurs (temperature above threshold); finds an outstanding AER</td><td>Internal</td><td>None until step 4</td></tr>
+      <tr><td>4</td><td>Controller</td><td>Posts the AER's CQE with DW0 = type/info/LID; masks further events of that type</td><td>Admin CQ</td><td>CQE + MSI-X vector 0</td></tr>
+      <tr><td>5</td><td>Host</td><td>Decodes DW0; submits Get Log Page for the indicated LID with RAE = 0</td><td>Admin SQ</td><td>SQE with LID in CDW10</td></tr>
+      <tr><td>6</td><td>Controller</td><td>Returns the log; clears the event so that type can be reported again</td><td>Data buffer, Admin CQ</td><td>Data MWr + CQE</td></tr>
+      <tr><td>7</td><td>Host</td><td>Submits a new AER; acts on the content (throttle, alert, rescan)</td><td>Admin SQ</td><td>SQE 0Ch</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <ol class="seq" data-actors="Driver|Admin SQ/CQ|Controller|Event source">
+      <li data-from="Driver" data-to="Admin SQ/CQ">AER (0Ch), CID 0x001F</li>
+      <li data-from="Admin SQ/CQ" data-to="Controller">fetched, held</li>
+      <li data-from="Event source" data-to="Controller">temperature over threshold</li>
+      <li data-from="Controller" data-to="Admin SQ/CQ" class="dashed">CQE CID 0x001F, DW0 0x0002_0101</li>
+      <li data-from="Driver" data-to="Admin SQ/CQ">Get Log Page LID 02h, RAE 0</li>
+      <li data-from="Controller" data-to="Driver" class="dashed">512 B SMART / Health log</li>
+      <li data-note="Controller">event cleared; type unmasked</li>
+      <li data-from="Driver" data-to="Admin SQ/CQ">new AER (re-arm)</li>
+    </ol>
+    <figcaption>An event is delivered by completing a request the host left waiting, and is cleared by reading its log.</figcaption>
+  </figure>
+  <h3>Three rules people miss</h3>
+  <ul>
+    <li><strong>No AER, no notice.</strong> If none is outstanding, events are queued or lost (how many the controller retains is implementation-dependent). Every controller reset deletes outstanding AERs; the host must re-arm after every reset. (<a href="dd23.html">Namespaces</a>, senior lab, shows the consequence.)</li>
+    <li><strong>Reading clears; RAE keeps.</strong> With RAE = 0 the log read clears the event and unmasks the type. Tools that read logs with RAE = 0 behind the driver's back can "steal" events: the driver's later read finds nothing pending. Tools should read with RAE = 1 unless they own event handling.</li>
+    <li><strong>Long commands and the queue.</strong> Many controllers process Admin commands in order, so a 40-second Format makes a 1-ms Identify wait 38 seconds. The Commands Supported and Effects log reports per-opcode restrictions (for example "no other command to this namespace" while it runs) and side effects (capability or namespace inventory changes) that tell the host what to rescan afterwards. <span class="badge uncertain">Uncertain</span> Confirm the effects field names and encodings in Base 2.4.</li>
+  </ul>
+  <h3>Creation and deletion order</h3>
+  <p>Create I/O CQ before any SQ that names it; delete every SQ before the CQ they use. Each step is an Admin command with its own status: Create I/O CQ can fail with Invalid Queue Identifier, Invalid Queue Size or Invalid Interrupt Vector; Create I/O SQ with Completion Queue Invalid (the named CQ does not exist), Invalid Queue Identifier or Invalid Queue Size; Delete I/O CQ with Invalid Queue Deletion (SQs still attached). These are Status Code Type 1h (command specific) values. A driver that ignores one failure builds every later step on a missing queue.</p>
+  <h3>Timeouts and Abort</h3>
+  <p>Linux defaults to a 60-second Admin timeout (module parameter <code>admin_timeout</code>) and excludes AERs. On timeout a host may send Abort (08h) naming the SQID and CID — but Abort is itself an Admin command, needs a free slot and may complete with "not aborted"; on serial controllers it may wait behind the very command it targets. The usual escalation is a controller reset, which deletes every queue and every AER; the host then rebuilds and must re-arm events and rescan.</p>
+
+  <h3>The ladder for the central concept: the Admin event loop</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>A school office that may not phone parents: parents leave blank "call me" cards, and must leave a new one each time news arrives.</p></div>
+    <div class="rung" data-rung="B"><p>The host submits AERs; the controller completes one per event with type, information and log ID; the host reads the log and re-arms.</p></div>
+    <div class="rung" data-rung="C"><p>Firmware keeps a pending-event list and mask per type, and holds AER commands without completing them; events are coalesced and masked until their log is read.</p></div>
+    <div class="rung" data-rung="D"><p>Base 2.4 defines the AER command, DW0 format, event types, AERL, RAE, Asynchronous Event Configuration and the log pages; event lists grow by revision.</p></div>
+    <div class="rung" data-rung="E"><p>An AER's CQE is a normal MWr64 to the Admin CQ plus an MSI-X MWr32 to 0xFEE0_0000; the follow-up Get Log Page is a fetch, a data write and another CQE.</p></div>
+    <div class="rung" data-rung="F"><p>In a capture: a CQE whose CID belongs to an old SQE with opcode 0Ch, a Get Log Page with the matching LID within microseconds, then a new 0Ch SQE.</p></div>
+    <div class="rung" data-rung="G"><p>Check that every reset is followed by re-arming, that log reads clear events, that no tool steals events with RAE = 0, and that timeouts exclude AERs.</p></div>
+  </div>
+  <h3>The sixteen questions for the Admin event loop</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>The mechanism by which the controller reports events through outstanding host requests.</dd>
+    <dt>2. Why was it created?</dt><dd>Queues only carry completions of host commands; the controller cannot initiate a message.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Prompt notice of health, errors and configuration changes without polling.</dd>
+    <dt>4. What existed before?</dt><dd>Interrupt status registers that the host had to read and clear (as in AHCI).</dd>
+    <dt>5. Why is it better?</dt><dd>No register polling; the notice carries its log identifier; delivery uses the normal completion path.</dd>
+    <dt>6. Who creates it?</dt><dd>The host submits the AER; the controller fills it with an event.</dd>
+    <dt>7. Who consumes it?</dt><dd>The host driver, which forwards to user space or acts itself.</dd>
+    <dt>8. Where does it live?</dt><dd>The Admin queue pair, controller event state and log pages.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>Admin SQ/CQ, log data buffers, SQ0TDBL/CQ0HDBL, MSI-X vector 0.</dd>
+    <dt>10. What happens before?</dt><dd>Bring-up, Asynchronous Event Configuration, AER submission.</dd>
+    <dt>11. What happens after?</dt><dd>Log read, event clear, re-arm, host action.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Silent loss of notices: stale namespaces, missed temperature or spare warnings, unnoticed firmware activation.</dd>
+    <dt>13. What does the analyzer show?</dt><dd>An old 0Ch SQE, a much later CQE with non-zero DW0, a Get Log Page, a new 0Ch SQE.</dd>
+    <dt>14. What does Linux show?</dt><dd>Kernel messages and udev events for some notices; <code>nvme</code> logs read by tools.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>AERL enforcement, delivery after re-arm, masking until log read, RAE behaviour, events with no AER outstanding, behaviour across reset.</dd>
+    <dt>16. What would a senior engineer suspect?</dt><dd>That nobody re-armed after the last reset, or that a tool cleared the event first.</dd>
+  </dl>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <p>Applicable documents: <cite class="spec">NVM Express Base Specification, Revision 2.4 — Admin Command Set; Asynchronous Event Request command; Get Log Page command; Commands Supported and Effects log page; Create and Delete I/O Submission and Completion Queue commands; Abort command; Asynchronous Event Configuration feature</cite>, and <cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4 — Admin queue and doorbell registers</cite>.</p>
+  <table>
+    <caption>Classifying Admin queue behaviour</caption>
+    <thead><tr><th>Class</th><th>Examples</th></tr></thead>
+    <tbody>
+      <tr><td><span class="badge normative">Normative</span></td><td>AER DW0 fields; AERL limit and its status; masking of an event type until its log is read (unless RAE); Get Log Page field positions; creation/deletion status values; Abort is best effort; phase tag inversion on wrap.</td></tr>
+      <tr><td><span class="badge informative">Informative</span></td><td>Descriptions of typical host event handling and initialisation order.</td></tr>
+      <tr><td><span class="badge optional">Optional</span></td><td>Many event types (telemetry, ANA, predictable latency); Commands Supported and Effects details; Sanitize, Self-test, Namespace Management.</td></tr>
+      <tr><td><span class="badge impl">Implementation-dependent</span></td><td>Whether Admin commands execute serially or concurrently; how many events are retained without an outstanding AER; Abort success; how long Format or Sanitize start takes to complete.</td></tr>
+      <tr><td><span class="badge version">Version-dependent</span></td><td>New event types and log pages per revision; log page offset and index fields; command-specific statuses added in 2.x.</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout verified"><p>Admin opcodes (00h, 01h, 02h, 04h, 05h, 06h, 08h, 09h, 0Ah, 0Ch, 80h), AER DW0 layout, LIDs 01h–05h, NUMDL/NUMDU/offset positions, command-specific statuses Completion Queue Invalid (00h), Invalid Queue Identifier (01h), Invalid Queue Size (02h), Abort Command Limit Exceeded (03h), Asynchronous Event Request Limit Exceeded (05h), Invalid Interrupt Vector (08h), Invalid Log Page (09h), Invalid Queue Deletion (0Ch).</p></aside>
+  <aside class="callout derived"><p>"Outstanding commands ≤ entries − 1" follows from the CQ full condition: a host that allowed more could make the controller unable to post. "Tools that read logs with RAE = 0 can hide events from the driver" follows from the clearing rule.</p></aside>
+  <aside class="callout notsaid">
+    <ul>
+      <li>The specification does not require serial Admin execution, nor promise concurrency.</li>
+      <li>It does not define how long any Admin command may take, or what timeout a host should use.</li>
+      <li>It does not say how many events a controller remembers when no AER is outstanding.</li>
+      <li>Check in the specification: the Commands Supported and Effects field encodings; the event information values for each notice type in Base 2.4; Abort completion DW0 meaning.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn"><p>Never count outstanding AERs as hung commands; never ignore a queue-creation status; never read event logs with RAE = 0 from a tool that does not own event handling; never assume a reset preserved AERs.</p></aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Hardware participation</caption>
+    <thead><tr><th>Category</th><th>Hardware</th></tr></thead>
+    <tbody>
+      <tr><td>Must participate</td><td>Controller front end (doorbells, fetch engine, CQE posting), firmware Admin processor, root complex and memory, MSI-X logic</td></tr>
+      <tr><td>May participate</td><td>IOMMU (translates every Admin DMA: SQE fetch, data, CQE), interrupt remapping, a hypervisor shadowing the Admin queue for a virtual controller</td></tr>
+      <tr><td>Observable</td><td>Doorbell writes, SQE fetch reads, data writes, CQE writes, MSI-X writes</td></tr>
+      <tr><td>Internal, unobservable</td><td>When a fetched command starts executing; pending events and their masks; why a long command is long</td></tr>
+    </tbody>
+  </table>
+  <p>Admin commands often run in firmware on a management processor separate from the I/O fast path. That is why Admin latency is measured in hundreds of microseconds to seconds, why one long command can delay others, and why Admin behaviour differs most between products. Firmware-assisted operations (Format, Sanitize, self-test, firmware activation) also compete with background media management.</p>
+  <aside class="callout hw" data-title="Fetched is not executing">
+    <p>A controller may fetch several Admin SQEs at once (SQHD in later CQEs shows how far it has read) but execute them one by one. In a trace, an early fetch followed by a late CQE does not mean the command was "running" for the whole interval.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>Admin queue transactions (Lab SSD)</caption>
+    <thead><tr><th>Step</th><th>TLP</th><th>Address</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Submit</td><td>MWr32 (host)</td><td>SQ0TDBL 0xFE60_1000</td><td>Posted; value = new tail (0–31)</td></tr>
+      <tr><td>Fetch</td><td>MRd64 (device, Req 0x0100) + CplD</td><td>0x1_0000_0000 + slot × 64</td><td>16 DW per SQE; may fetch several</td></tr>
+      <tr><td>Data in (Identify, log)</td><td>MWr64 (device)</td><td>Buffer from 0x2_0000_0000</td><td>Split at MPS 256 B</td></tr>
+      <tr><td>Data out (Set Features with buffer, firmware download)</td><td>MRd64 + CplD</td><td>Host buffer</td><td>Completions split at RCB 64 B boundaries</td></tr>
+      <tr><td>Complete</td><td>MWr64 (device)</td><td>0x1_0000_1000 + slot × 16</td><td>4 DW; DW2 SQID 0 and SQHD; DW3 status, P, CID</td></tr>
+      <tr><td>Interrupt</td><td>MWr32 (device)</td><td>0xFEE0_0000, data 0x40</td><td>MSI-X vector 0</td></tr>
+      <tr><td>Consume</td><td>MWr32 (host)</td><td>CQ0HDBL 0xFE60_1004</td><td>Posted; value = new head</td></tr>
+    </tbody>
+  </table>
+  <p>Ordering: the CQE write follows the data writes on the same path, and PCIe ordering keeps posted writes in order, so a host that sees a CQE can trust the data before it. The MSI-X write follows the CQE write for the same reason. A dropped posted write — blocked by the IOMMU, for example — produces no error the device can see.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic examples for teaching on the Lab SSD: BAR0 = 0xFE60_0000; Requester ID 0x0100; root complex requests shown as RC; Admin SQ 0x1_0000_0000, Admin CQ 0x1_0000_1000, 32 entries each; MPS 256 B. Times illustrative.</p>
+
+  <h3>Normal: a temperature event from notice to re-arm</h3>
+  <div class="trace" data-kind="synthetic" data-title="AER completes, SMART log read, AER re-armed">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">AER CID 0x001F was submitted in Admin SQ slot 5 at boot, hours earlier. Admin CQ head is at slot 5, phase 1.</td></tr>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0.0</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_0000_1050 Len=4 DW0=0x0002_0101 DW2=0x0000_0006 DW3=0x0001_001F</td><td>CQE in slot 5: CID 0x001F (the AER), success, P = 1; DW0: type 1 (SMART / Health), info 01h (temperature threshold), LID 02h</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.1</td><td>MWr32</td><td>Addr=0xFEE0_0000 Data=0x0000_0040</td><td>MSI-X vector 0</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>4.0</td><td>MWr32</td><td>Addr=0xFE60_1004 Data=0x0000_0006</td><td>CQ0 head = 6</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>6.0</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x0000_0007</td><td>SQ0 tail = 7 (Get Log Page in slot 6)</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>6.5</td><td>MRd64</td><td>Tag=0x04 Addr=0x1_0000_0180 Len=16</td><td>Fetch slot 6</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>7.3</td><td>CplD</td><td>Tag=0x04 ByteCount=64</td><td>SQE: opcode 02h, CID 0x0006, NSID 0xFFFF_FFFF, PRP1 0x2_0000_3000, CDW10 0x007F_0002 (LID 02h, RAE 0, NUMDL 127 → 512 B)</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>48.0</td><td>MWr64 ×2</td><td>Addr=0x2_0000_3000, 0x2_0000_3100 Len=64 each</td><td>512-byte SMART / Health log (critical warning bit 1 set, composite temperature above threshold)</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>48.4</td><td>MWr64</td><td>Addr=0x1_0000_1060 DW2=0x0000_0007 DW3=0x0001_0006</td><td>CQE slot 6: CID 0x0006 success; event cleared</td></tr>
+        <tr class="dir-up"><td>9</td><td>Dev→Host</td><td>48.5</td><td>MWr32</td><td>Addr=0xFEE0_0000 Data=0x0000_0040</td><td>MSI-X vector 0</td></tr>
+        <tr class="dir-down"><td>10</td><td>Host→Dev</td><td>52.0</td><td>MWr32</td><td>Addr=0xFE60_1004 Data=0x0000_0007</td><td>CQ0 head = 7</td></tr>
+        <tr class="dir-down"><td>11</td><td>Host→Dev</td><td>53.0</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x0000_0008</td><td>SQ0 tail = 8: new AER (opcode 0Ch, CID 0x001E) in slot 7</td></tr>
+        <tr class="dir-up"><td>12</td><td>Dev→Host</td><td>53.5</td><td>MRd64</td><td>Tag=0x05 Addr=0x1_0000_01C0 Len=16</td><td>Fetch the AER; no CQE until the next event</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The AER's CQE (row 1) arrives hours after its SQE — normal. DW0 names the log, and the host reads exactly that log with RAE = 0 (row 6), which clears the event. Rows 11–12 re-arm. If row 11 were missing, the next event of any type would be held or lost. Note that SQHD in row 1 is 6: the controller had fetched up to slot 5 long ago and nothing since.</p>
+  </div>
+
+  <h3>Slow: a Format holds the Admin queue</h3>
+  <div class="trace" data-kind="synthetic" data-title="Monitoring Identify waits behind a 40-second Format">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (s)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.000000</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x0000_000B</td><td>Format NVM (80h, NSID 2, CID 0x000A) in slot 10</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.000001</td><td>MRd64</td><td>Addr=0x1_0000_0280 Len=16</td><td>Fetched; firmware starts the format</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>2.000000</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x0000_000C</td><td>Monitoring agent's Identify Controller (CID 0x000B) in slot 11</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>2.000001</td><td>MRd64</td><td>Addr=0x1_0000_02C0 Len=16</td><td>Fetched immediately — but not executed</td></tr>
+        <tr class="note"><td colspan="6">38 seconds of I/O traffic on other queues; no Admin CQEs. The agent's own timeout (30 s) expires at 32.0 s and it logs "controller not responding".</td></tr>
+        <tr class="abnormal"><td>5</td><td>Dev→Host</td><td>40.000</td><td>MWr64</td><td>Addr=0x1_0000_10A0 DW2=0x0000_000C DW3=0x0001_000A</td><td>Format completes (slot 10). The 38 s Identify latency is the first abnormal observation — caused by serial execution, not a fault</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>40.001</td><td>MWr64 ×16 + MWr64</td><td>Identify data to 0x2_0000_4000…; CQE slot 11 DW3=0x0001_000B</td><td>Identify completes 1 ms later</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The controller fetched the Identify (row 4) but executed it only after the Format. The kernel's 60-second Admin timeout was not reached, so nothing reset; the monitoring agent's shorter timeout produced a false alarm. Fixes are host-side: give long commands their own long timeout, pause monitoring during maintenance (or have tools consult Commands Supported and Effects), and set monitoring timeouts against the longest Admin operation the fleet runs. A senior engineer would also ask the vendor whether Identify could be served concurrently.</p>
+  </div>
+
+  <h3>Failed: a queue-creation error the driver ignored</h3>
+  <div class="trace" data-kind="synthetic" data-title="Create I/O CQ rejected; Create I/O SQ then fails">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Bring-up through Identify and Set Features Number of Queues has succeeded. A modified user-space driver sets the interrupt vector from the MSI-X message data table it built.</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>CplD</td><td>SQE fetch, slot 16</td><td>Create I/O CQ (05h), CID 0x0010, PRP1 0x1_2341_0000, CDW10 0x03FF_0001 (QID 1, 1024 entries), CDW11 0x0041_0003 (IV 0x41, IEN 1, PC 1)</td></tr>
+        <tr class="abnormal"><td>2</td><td>Dev→Host</td><td>12.0</td><td>MWr64</td><td>Addr=0x1_0000_1100 DW3=0x8211_0010</td><td>First abnormal event: CQE for CID 0x0010 with SCT 1h, SC 08h (Invalid Interrupt Vector), DNR 1</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>20.0</td><td>CplD</td><td>SQE fetch, slot 17</td><td>Create I/O SQ (01h), CID 0x0011, PRP1 0x1_2340_0000, CDW10 0x03FF_0001, CDW11 0x0001_0001 (CQID 1, PC 1)</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>30.0</td><td>MWr64</td><td>Addr=0x1_0000_1110 DW3=0x8201_0011</td><td>SCT 1h, SC 00h: Completion Queue Invalid — CQ 1 does not exist</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>40.0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0001</td><td>Driver rings SQ1 tail anyway — a write to the doorbell of a queue that does not exist</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>41.0</td><td>MWr64</td><td>Addr=0x1_0000_1120 DW0=0x0001_0000 DW3=0x0001_001F</td><td>Outstanding AER completes: type 0 (error status), info 00h (write to invalid doorbell register), LID 01h — the controller noticed</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The driver confused the MSI-X <em>message data</em> (0x41, what the device writes for vector 1) with the <em>vector index</em> (1). The Lab SSD has 33 vectors (0–32), so 65 is invalid. Row 4 is a consequence, row 5 a consequence of ignoring row 4, row 6 the controller's own report. The three CQEs occupy consecutive Admin CQ slots 16, 17 and 18 (0x1_0000_1100, 0x1110, 0x1120). The fix is one line in the driver, plus the rule that every creation status is checked before the next step: had the driver stopped at row 2, the failure would have been a clear "Invalid Interrupt Vector" message instead of a missing queue and an error event.</p>
+  </div>
+
+  <h3>Ambiguous: an Admin timeout with the CQE on the wire</h3>
+  <div class="trace" data-kind="synthetic" data-title="CQE and MSI-X visible after an Admin CQ wrap, yet the host times out">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (s)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Weeks of uptime; a monitoring agent has issued thousands of Admin commands. The Admin CQ has just wrapped: the previous CQE went to slot 31 with P = 1.</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.000000</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x0000_0015</td><td>Get Log Page (SMART) CID 0x0014 in slot 20</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.000040</td><td>MWr64 ×2</td><td>Addr=0x2_0000_3000…</td><td>Log data</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>0.000041</td><td>MWr64</td><td>Addr=0x1_0000_1000 DW2=0x0000_0015 DW3=0x0000_0014</td><td>CQE in slot 0 with P = 0 (correct for the second lap), success, CID 0x0014</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>0.000042</td><td>MWr32</td><td>Addr=0xFEE0_0000 Data=0x0000_0040</td><td>MSI-X vector 0</td></tr>
+        <tr class="abnormal"><td>5</td><td>(host)</td><td>60.0</td><td>—</td><td>Kernel: Admin command timeout, CID 0x0014, opcode 02h</td><td>First abnormal event: the host did not consume a CQE that the link shows was written</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>60.001</td><td>MWr32</td><td>Addr=0xFE60_0014 Data=0x0046_0060</td><td>Controller reset as recovery</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Why it is ambiguous.</strong> Everything the device can do, it did. The candidates: (a) a host phase bug on the Admin CQ — the host still expects P = 1 in slot 0, so it ignores the new CQE (Admin CQs wrap rarely, so such bugs survive testing); (b) the IOMMU dropped the CQE write (mapping for 0x1_0000_1000 changed or was revoked), so slot 0 still holds the old first-lap CQE; (c) the interrupt was lost or misrouted and the host's timeout path does not poll the CQ before giving up; (d) the CPU read a stale copy of slot 0 (a coherence problem on unusual platforms).</p>
+    <p><strong>Disambiguating evidence.</strong> Dump Admin CQ slot 0 from host memory (debugger, or a driver debug hook) before the reset: new CQE with P = 0 and CID 0x0014 points to (a), (c) or (d); the old CQE points to (b), which an IOMMU fault in the kernel log confirms. Then: a phase bug would usually also produce bursts of "invalid CID" or stale completions at the wrap (the advanced lab shows why) and recur every 32 Admin completions after it; an interrupt problem would show in interrupt counters for vector 0 not incrementing. Confidence before evidence: low; prior favours (b) or (c) on mature drivers, (a) on new ones.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Read-only commands; reading logs is safe, but avoid frequent polling on production systems because every command uses the shared Admin queue.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Event-related controller capabilities: AERL, OAES (which notices), ACL (abort limit)</span>
+sudo nvme id-ctrl /dev/nvme0 | grep -E '^(aerl|oaes|acl|mdts|lpa) '
+
+<span class="cm"># Which events are enabled for notification</span>
+sudo nvme get-feature /dev/nvme0 --feature-id=0x0b -H
+
+<span class="cm"># Commands Supported and Effects: what each opcode affects or restricts</span>
+sudo nvme effects-log /dev/nvme0 -H
+
+<span class="cm"># Error log entries (CID, SQID, status, LBA) — newest first</span>
+sudo nvme error-log /dev/nvme0 --log-entries=16
+
+<span class="cm"># Admin timeout used by the driver, and interrupt counts for the Admin vector</span>
+cat /sys/module/nvme_core/parameters/admin_timeout
+grep nvme0q0 /proc/interrupts
+
+<span class="cm"># Kernel messages about Admin timeouts, queue creation and events</span>
+sudo dmesg | grep -iE 'nvme.*(admin|timeout|queue|async|event)'</code></pre>
+  <table>
+    <caption>What Admin evidence can and cannot prove</caption>
+    <thead><tr><th>Evidence</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>Kernel "Admin timeout" for opcode 0Ch</td><td>A tool or driver bug treating an AER as hung</td><td>Anything about the controller</td></tr>
+      <tr><td>Error log entry with SQID 0 and a CID</td><td>The controller recorded an error for that Admin command</td><td>Which host process sent it</td></tr>
+      <tr><td><code>nvme0q0</code> interrupt count not increasing</td><td>Vector 0 not delivered (or not routed to this CPU)</td><td>Whether the CQE was written</td></tr>
+      <tr><td>Effects log flags for an opcode</td><td>What the controller declares about it</td><td>That every host tool honours it</td></tr>
+      <tr><td>AEN feature value</td><td>Which notices are enabled</td><td>That an AER is outstanding right now</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+  <aside class="callout safety"><p>All four labs are <span class="badge safe">Safe lab</span>: synthetic data and pure software. Reading logs with <code>nvme</code> on your own machine is safe; do not run Format, Sanitize, Firmware Commit or queue creation/deletion commands on a real device for these labs.</p></aside>
+
+  <h3>Beginner lab — Decode asynchronous events</h3>
+  <h4>Objective</h4>
+  <p>Turn AER completion Dword 0 values into event type, information, log page and next host action.</p>
+  <h4>Prerequisites</h4>
+  <p>The mechanism section; <a href="ch26.html">Admin Queue</a> (Asynchronous Event Request).</p>
+  <h4>Setup</h4>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="aer_decode.py"><code>#!/usr/bin/env python3
+"""Decode Asynchronous Event Request completion Dword 0 and say what the host
+must do next. Teaching subset; confirm values in the Base Specification."""
+
+TYPES = {0: "Error status", 1: "SMART / Health status", 2: "Notice",
+         6: "I/O command specific status", 7: "Vendor specific"}
+INFO = {
+    0: {0: "Write to invalid doorbell register", 1: "Invalid doorbell write value",
+        2: "Diagnostic failure", 3: "Persistent internal error",
+        4: "Transient internal error", 5: "Firmware image load error"},
+    1: {0: "NVM subsystem reliability", 1: "Temperature threshold",
+        2: "Spare below threshold"},
+    2: {0: "Namespace Attribute Changed", 1: "Firmware Activation Starting",
+        2: "Telemetry Log Changed", 3: "Asymmetric Namespace Access Change"},
+}
+LOGS = {0x01: "Error Information", 0x02: "SMART / Health Information",
+        0x03: "Firmware Slot Information", 0x04: "Changed Namespace List",
+        0x0C: "Asymmetric Namespace Access"}
+
+def decode(dw0):
+    etype, info, lid = dw0 &amp; 0x7, (dw0 &gt;&gt; 8) &amp; 0xFF, (dw0 &gt;&gt; 16) &amp; 0xFF
+    t = TYPES.get(etype, f"reserved type {etype}")
+    i = INFO.get(etype, {}).get(info, f"info 0x{info:02X}")
+    log = LOGS.get(lid, f"log 0x{lid:02X}")
+    steps = [f"Get Log Page LID {lid:02X}h ({log})"]
+    if etype == 2 and info == 0:
+        steps.append("rescan: Identify the NSIDs in the list")
+    if etype == 2 and info == 1:
+        steps.append("expect CSTS.PP = 1; extend timeouts, do not reset")
+    if etype == 0:
+        steps.append("this is a host or device fault: check the Error Information entries")
+    steps.append("submit a new Asynchronous Event Request")
+    return f"0x{dw0:08X}: {t} / {i} -&gt; " + "; ".join(steps)
+
+if __name__ == "__main__":
+    for dw0 in (0x0002_0101, 0x0004_0002, 0x0001_0100, 0x0003_0102, 0x000C_0302):
+        print(decode(dw0))</code></pre>
+  <h4>Procedure</h4>
+  <ol><li>Decode 0x0002_0101 and 0x0004_0002 by hand: bits 2:0, 15:8, 23:16.</li><li>Run the program. Expected: five lines — temperature threshold (read log 02h), Namespace Attribute Changed (read 04h, rescan), invalid doorbell write value (read 01h), Firmware Activation Starting (read 03h, expect Processing Paused), Asymmetric Namespace Access change (read 0Ch); every line ends with "submit a new Asynchronous Event Request".</li><li>Encode the DW0 for "spare below threshold".</li></ol>
+  <h4>Observations</h4>
+  <p>Note that DW0 always names the log to read.</p>
+  <h4>Questions</h4>
+  <ol><li>What happens to a second temperature event if the host never reads log 02h?</li><li>Why is the last action the same for every event?</li><li>Which event in the list is reporting a host bug?</li></ol>
+  <h4>Expected reasoning</h4>
+  <p>Events of a type are masked until their log is read; delivery needs an outstanding AER.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>0x0002_0101: type 1 (SMART / Health), info 01h (temperature threshold), LID 02h. 0x0004_0002: type 2 (notice), info 00h (Namespace Attribute Changed), LID 04h. Spare below threshold: type 1, info 02h, LID 02h → 0x0002_0201.</p>
+    <p>(1) It is not reported: the type stays masked until the log is read with RAE = 0. (2) Each completion consumes one AER; without a replacement, the controller has fewer (eventually zero) ways to notify. (3) Invalid doorbell write value (0x0001_0100): the host wrote a doorbell value that is out of range — for example a tail beyond the queue size.</p>
+  </details>
+  <h4>Extension</h4>
+  <p>Add the Asynchronous Event Configuration (FID 0Bh) bits to the program so it can say whether each event type is enabled — after checking the bit positions in Base 2.4.</p>
+
+  <h3>Intermediate lab — Build Get Log Page commands within MDTS</h3>
+  <h4>Objective</h4>
+  <p>Encode Get Log Page dwords correctly and split a large log into reads that respect MDTS and RAE.</p>
+  <h4>Prerequisites</h4>
+  <p><a href="ch26.html">Admin Queue</a> (Get Log Page fields); MDTS from <a href="dd21.html">NVMe Controller</a>.</p>
+  <h4>Setup</h4>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="glp.py"><code>#!/usr/bin/env python3
+"""Build Get Log Page (02h) command dwords, splitting a large log into reads
+that respect MDTS. Field positions as in Chapter 26; confirm in the spec."""
+
+def glp(lid, nbytes, offset=0, rae=False, lsp=0, nsid=0xFFFF_FFFF):
+    assert nbytes % 4 == 0 and nbytes &gt; 0, "logs are read in whole dwords"
+    numd = nbytes // 4 - 1                       # 0's based dword count
+    cdw10 = lid | (lsp &lt;&lt; 8) | (int(rae) &lt;&lt; 15) | ((numd &amp; 0xFFFF) &lt;&lt; 16)
+    cdw11 = numd &gt;&gt; 16                           # NUMDU
+    return dict(nsid=nsid, cdw10=cdw10, cdw11=cdw11,
+                cdw12=offset &amp; 0xFFFF_FFFF, cdw13=offset &gt;&gt; 32)
+
+def read_plan(lid, total, mdts=5, mpsmin=4096, rae=True):
+    """Split a log of `total` bytes into commands of at most 2^MDTS * MPSMIN.
+    RAE stays set until the last piece, so the event is cleared only then."""
+    chunk = (1 &lt;&lt; mdts) * mpsmin if mdts else total
+    plan, off = [], 0
+    while off &lt; total:
+        n = min(chunk, total - off)
+        last = off + n &gt;= total
+        plan.append((off, n, glp(lid, n, off, rae=rae and not last)))
+        off += n
+    return plan
+
+if __name__ == "__main__":
+    c = glp(0x02, 512)
+    print("SMART 512 B:  CDW10=0x%08X CDW11=0x%08X" % (c["cdw10"], c["cdw11"]))
+    c = glp(0x01, 16 * 64, rae=True)
+    print("Error log 16 entries, RAE: CDW10=0x%08X" % c["cdw10"])
+    c = glp(0xC0, 400 * 1024)
+    print("Vendor log 400 KiB in one command (needs no MDTS limit): CDW10=0x%08X CDW11=0x%08X"
+          % (c["cdw10"], c["cdw11"]))
+    print("Same log with MDTS=5 (128 KiB per command):")
+    for off, n, c in read_plan(0xC0, 400 * 1024):
+        print("  offset 0x%06X len %6d  CDW10=0x%08X CDW11=0x%08X CDW12=0x%08X"
+              % (off, n, c["cdw10"], c["cdw11"], c["cdw12"]))</code></pre>
+  <h4>Procedure</h4>
+  <ol><li>Predict CDW10 for the 512-byte SMART read, then run. Expected: CDW10 = 0x007F_0002; the 16-entry error log with RAE gives 0x00FF_8001; the 400 KiB single read needs NUMDU = 1 (CDW10 0x8FFF_00C0, CDW11 0x0000_0001); with MDTS = 5 the log becomes four reads at offsets 0, 0x20000, 0x40000 and 0x60000, the last one with RAE clear.</li><li>Explain why the single 400 KiB command would be rejected by the Lab SSD.</li><li>Change the program so a tool that does not own event handling keeps RAE set on every piece.</li></ol>
+  <h4>Observations</h4>
+  <p>Note how NUMD crosses from NUMDL into NUMDU at 256 KiB.</p>
+  <h4>Questions</h4>
+  <ol><li>What is the largest log read in one command on the Lab SSD (MDTS = 5, 4 KiB pages)?</li><li>Why clear RAE only on the last piece?</li><li>What goes wrong if the host computes NUMD as bytes/4 without subtracting one?</li></ol>
+  <h4>Expected reasoning</h4>
+  <p>MDTS bounds every data transfer, logs included; RAE decides when the event is consumed; counts are 0's based.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(1) 2<sup>5</sup> × 4 KiB = 128 KiB. A 400 KiB read exceeds it and fails (Invalid Field in Command is typical), so large logs must be read in pieces with offsets — which requires the log to support offsets (LPA in Identify Controller). (2) If the first piece cleared the event, the log could change before the remaining pieces were read, mixing two versions; keeping the event retained until the end keeps the event and its data consistent. (3) The host asks for 4 bytes more than its buffer; the controller writes past the buffer by one dword — memory corruption, or an IOMMU fault if the buffer ended at a page boundary.</p>
+  </details>
+  <h4>Extension</h4>
+  <p>Add the Index Offset Type / Log Specific Identifier fields for logs that need them, after confirming their positions in Base 2.4.</p>
+
+  <h3>Advanced lab — Simulate the Admin queue in service</h3>
+  <h4>Objective</h4>
+  <p>See capacity, serial execution and a phase bug interact, and learn the signature of each.</p>
+  <h4>Prerequisites</h4>
+  <p>The trace section; phase tag rules from <a href="ch25.html">Queue Architecture</a>.</p>
+  <h4>Setup</h4>
+  <pre class="code" data-kind="simulation" data-lang="python" data-title="adminq_sim.py"><code>#!/usr/bin/env python3
+"""Simulate an Admin queue pair: limited slots shared with outstanding AERs,
+serial command execution, CQ wrap with phase tags, host timeouts.
+A teaching model of one plausible controller, not of any product."""
+
+def simulate(cmds, entries=32, aers=1, flip_phase=True, timeout_ms=60_000, end_ms=None):
+    """cmds: (name, submit_ms, service_ms[, timeout_ms]) in submission order."""
+    cap = entries - 1                      # never more outstanding than CQ slots - 1
+    cq = [(0, None)] * entries             # (phase, cid); memory starts zeroed
+    ctail, cphase, hhead, hphase = 0, 1, 0, 1
+    outstanding = {cid: "AER" for cid in range(aers)}   # AERs never complete here
+    waiting, running, fifo, log = list(cmds), None, [], []
+    started, done, limit = {}, {}, {}
+    end_ms = end_ms or sum(c[2] for c in cmds) + max(c[1] for c in cmds) + timeout_ms + 1000
+    for now in range(end_ms):
+        # host: submit commands whose time has come, if a CID/slot is free
+        while waiting and waiting[0][1] &lt;= now and len(outstanding) &lt; cap:
+            name, t, svc, *tmo = waiting.pop(0)
+            limit[name] = tmo[0] if tmo else timeout_ms
+            cid = min(c for c in range(cap + 1) if c not in outstanding)
+            outstanding[cid] = name
+            started[name] = t
+            fifo.append((cid, name, svc))
+        # controller: executes one admin command at a time, in fetch order
+        if running is None and fifo:
+            cid, name, svc = fifo.pop(0)
+            running = (cid, name, now + svc)
+        if running and running[2] &lt;= now:
+            cid, name, _ = running
+            cq[ctail] = (cphase, cid)      # post CQE (and raise MSI-X vector 0)
+            ctail = (ctail + 1) % entries
+            cphase ^= ctail == 0
+            running = None
+            # host interrupt handler: consume entries whose phase matches
+            budget = entries
+            while cq[hhead][0] == hphase and budget:
+                _, c = cq[hhead]
+                budget -= 1
+                hhead = (hhead + 1) % entries
+                if flip_phase and hhead == 0:
+                    hphase ^= 1
+                who = outstanding.pop(c, None)
+                if who is None:
+                    log.append(f"{now:&gt;6} ms  spurious CQE: CID {c} is not outstanding")
+                elif who == "AER":
+                    log.append(f"{now:&gt;6} ms  AER CID {c} 'completed' by a stale CQE")
+                elif who != name and who not in done:
+                    done[who] = now
+                    log.append(f"{now:&gt;6} ms  WRONG: stale CQE completes {who} (CID {c}) before it ran")
+                else:
+                    done[who] = now
+        for name, t in list(started.items()):
+            if name not in done and now - t == limit[name]:
+                log.append(f"{now:&gt;6} ms  TIMEOUT {name} (submitted at {t} ms)")
+    lat = {n: done[n] - started[n] for n in done}
+    return lat, log
+
+def show(title, cmds, **kw):
+    lat, log = simulate(cmds, **kw)
+    print(f"[{title}]")
+    vals = sorted(lat.values())
+    if vals:
+        print(f"   completed {len(vals)}/{len(cmds)}; latency min {vals[0]} ms, max {vals[-1]} ms")
+    for kind in ("WRONG", "spurious", "AER", "TIMEOUT"):
+        hits = [l for l in log if kind in l]
+        if hits:
+            print(f"   {len(hits)} x {kind}; first: {hits[0].strip()}")
+
+if __name__ == "__main__":
+    burst = [(f"cmd{i}", i, 2) for i in range(40)]          # 40 commands, wraps the CQ
+    show("healthy, 40 commands", burst, aers=1)
+    long_fmt = [("FormatNVM", 0, 40_000, 600_000), ("Identify", 2_000, 1), ("GetLogPage", 3_000, 1)]
+    show("Format holds the queue; tool timeout 30 s", long_fmt, timeout_ms=30_000)
+    show("host never flips its phase", burst, aers=1, flip_phase=False, timeout_ms=5_000)</code></pre>
+  <h4>Procedure</h4>
+  <ol><li>Run it. Expected: healthy run completes 40/40 (the CQ wraps; latency grows to 80 ms because commands arrive faster than they are served); the Format run completes all three, but Identify and Get Log Page time out at the 30 s tool limit (latencies about 37–38 s); the phase-bug run shows 3 WRONG completions, 29 spurious CQEs and 5 timeouts.</li><li>Rerun the phase-bug case with <code>aers=4</code>. What changes?</li><li>Change the Format scenario so the controller executes Admin commands concurrently (hint: let more than one command run at once) and compare.</li></ol>
+  <h4>Observations</h4>
+  <p>Record, for each scenario, what a host log would show and what an analyzer would show.</p>
+  <h4>Questions</h4>
+  <ol><li>Why does the phase bug first produce stale completions rather than silence?</li><li>Why are the WRONG completions the most dangerous output?</li><li>In the Format case, what would an analyzer show that the tool's log does not?</li></ol>
+  <h4>Expected reasoning</h4>
+  <p>After a wrap, a host that does not flip expects the old phase, and every slot still holds an old entry with exactly that phase.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(1) When the host's head returns to slot 0, slots 0–31 still contain first-lap CQEs with P = 1 — which is what the buggy host expects — so it consumes them as new: a burst of stale completions. Once the controller overwrites slots with P = 0, the host ignores them, so later commands time out. (2) A stale CQE whose CID has been reused by a live command completes that command before it ran: the host believes a Set Features or Namespace Attachment succeeded when it did not. No error is logged. (3) The early fetch of the Identify (SQHD advancing) and no CQE for 38 s, with I/O flowing normally on other queues — proof the controller was alive and serial, not hung. With <code>aers=4</code> (step 2) the results barely change: only 27 slots remain for ordinary commands, but this workload never has more than about 20 outstanding, and the CIDs simply start at 4. A burstier workload would show host-side waiting for slots — the capacity cost of AERs. Concurrent execution (step 3) removes the delay, which is why the effects log and vendor documentation matter.</p>
+  </details>
+  <h4>Extension</h4>
+  <p>Add an event source that completes an AER at a chosen time, and a "reset" that clears outstanding AERs; show a notice lost because the host did not re-arm.</p>
+
+  <h3>Senior forensic lab — Drives "missing" on the new server model</h3>
+  <h4>Objective</h4>
+  <p>Find why a storage service fails to start on one server model only, using Admin evidence.</p>
+  <h4>Prerequisites</h4>
+  <p>Creation and deletion rules; <a href="ch27.html">I/O Queues</a>; Number of Queues from <a href="ch26.html">Admin Queue</a>.</p>
+  <h4>Setup (synthetic incident record)</h4>
+  <ul>
+    <li>A storage service uses an in-house user-space driver that creates one I/O queue pair per CPU.</li>
+    <li>On 32-CPU servers it works. On the new 64-CPU model, every Lab SSD is reported "initialisation failed" and left unused.</li>
+    <li>Driver debug log (new model): Set Features Number of Queues requested 0x003F_003F; completion DW0 = 0x001F_001F; queues 1–32 created successfully; Create I/O CQ for QID 33 failed with SCT 1h SC 01h; "rolling back".</li>
+    <li>Rollback log: Delete I/O CQ 1 → SCT 1h SC 0Ch; Delete I/O CQ 2 → SCT 1h SC 0Ch … then "rollback failed, resetting controller".</li>
+    <li>After the reset, the Error Information log shows 33 entries for SQID 0; the service exits.</li>
+  </ul>
+  <h4>Procedure</h4>
+  <ol><li>Decode the Set Features exchange.</li><li>Decode both failure statuses.</li><li>Write the causal chain and the two bugs.</li><li>Propose fixes and a test that would have caught this.</li></ol>
+  <h4>Observations</h4>
+  <p>Note what the controller told the driver before any queue was created.</p>
+  <h4>Questions</h4>
+  <ol><li>How many I/O queues did the driver ask for, and how many did it get?</li><li>What do SC 01h and SC 0Ch mean here?</li><li>Was anything wrong with the drive?</li><li>What is the right behaviour on a 64-CPU host?</li></ol>
+  <h4>Expected reasoning</h4>
+  <p>Number of Queues is a negotiation; allocated values bound creation; deletion order is the reverse of creation.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(1) Requested NSQR = NCQR = 63 (0's based) → 64 each. Allocated NSQA = NCQA = 31 → 32 each. (2) SC 01h, Invalid Queue Identifier: QID 33 is above the allocation. SC 0Ch, Invalid Queue Deletion: the rollback tried to delete CQs while their SQs still existed.</p>
+    <p>Chain: the driver ignored the allocated count (bug 1), so creation failed at QID 33. Its rollback deleted CQs in creation order instead of deleting SQs first (bug 2), so the rollback itself failed and escalated to a reset, and the service gave up. On 32-CPU servers the request never exceeded the allocation, so the bugs never showed. (3) No: the drive answered every command correctly and even reported its limit up front. (4) Create min(CPUs, allocated) queue pairs and map CPUs onto them (several CPUs per queue), as the Linux driver does; roll back by deleting SQs then CQs. Test: a fault-injection or emulated controller (QEMU) configured with fewer queues than host CPUs, plus a creation failure injected mid-way to exercise rollback. Confidence: high — the status codes are unambiguous.</p>
+  </details>
+  <h4>Extension</h4>
+  <p>Design a CPU-to-queue mapping for 64 CPUs on 32 queues that keeps NUMA locality, and state what you would measure to validate it.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+
+  <h3>Pattern 1 — "Hung" Admin commands that are AERs</h3>
+  <dl>
+    <dt>Symptom</dt><dd>A monitoring tool or a custom driver reports one to four Admin commands outstanding for hours and raises alerts or resets.</dd>
+    <dt>Possible causes</dt><dd>AERs counted as normal commands; the tool's timeout logic does not exclude opcode 0Ch.</dd>
+    <dt>Evidence</dt><dd>Opcode of the "hung" CIDs; AERL; number outstanding.</dd>
+    <dt>First check</dt><dd>Are all the "hung" commands opcode 0Ch?</dd>
+    <dt>Second check</dt><dd>Is their number ≤ AERL + 1?</dd>
+    <dt>Disambiguating experiment</dt><dd>Trigger an event (for example lower the temperature threshold on a test drive) and watch one complete.</dd>
+    <dt>Likely conclusion</dt><dd>Tool bug; no controller problem.</dd>
+    <dt>Confidence</dt><dd>High.</dd>
+  </dl>
+
+  <h3>Pattern 2 — Admin latency spikes during maintenance</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Monitoring commands take tens of seconds or time out while I/O is healthy.</dd>
+    <dt>Possible causes</dt><dd>Format, Sanitize, Device Self-test or Firmware Commit running on a controller that serialises Admin commands; very large log reads; many tools sharing the queue.</dd>
+    <dt>Evidence</dt><dd>Admin command history (which opcode started just before); Commands Supported and Effects; analyzer fetches with late CQEs.</dd>
+    <dt>First check</dt><dd>Was a long-running Admin command outstanding at the time?</dd>
+    <dt>Second check</dt><dd>Did I/O latency stay normal?</dd>
+    <dt>Disambiguating experiment</dt><dd>Run the same long command on a test system and time an Identify issued during it.</dd>
+    <dt>Likely conclusion</dt><dd>Serial Admin execution; host timeouts and scheduling must account for it.</dd>
+    <dt>Confidence</dt><dd>High once reproduced.</dd>
+  </dl>
+
+  <h3>Pattern 3 — I/O queue creation fails at bring-up</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Fewer I/O queues than expected, or none; driver falls back or aborts.</dd>
+    <dt>Possible causes</dt><dd>QID above Number of Queues allocation (01h); QSIZE above CAP.MQES or zero (02h); invalid interrupt vector (08h); CQ not created or creation failed (00h); PRP to non-contiguous memory when CAP.CQR = 1.</dd>
+    <dt>Evidence</dt><dd>CQE status of each creation command; Set Features 07h DW0; CAP.MQES and CQR; MSI-X table size.</dd>
+    <dt>First check</dt><dd>Find the first failed creation CQE, not the last.</dd>
+    <dt>Second check</dt><dd>Decode its CDW10/CDW11 against the controller's limits.</dd>
+    <dt>Disambiguating experiment</dt><dd>Re-issue the failing creation in an emulator with the same parameters.</dd>
+    <dt>Likely conclusion</dt><dd>Host parameter error; the status names it.</dd>
+    <dt>Confidence</dt><dd>High.</dd>
+  </dl>
+
+  <h3>Pattern 4 — Shutdown or rollback fails with Invalid Queue Deletion</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Delete I/O CQ fails; the host escalates to a controller reset during shutdown or error recovery.</dd>
+    <dt>Possible causes</dt><dd>CQs deleted before their SQs; an SQ deletion failed and was ignored; bookkeeping lost track of an SQ.</dd>
+    <dt>Evidence</dt><dd>Order of 00h and 04h commands; their statuses.</dd>
+    <dt>First check</dt><dd>Is any SQ that names this CQ still present?</dd>
+    <dt>Second check</dt><dd>Did every Delete I/O SQ succeed?</dd>
+    <dt>Disambiguating experiment</dt><dd>Delete in correct order on an emulator and confirm success.</dd>
+    <dt>Likely conclusion</dt><dd>Host ordering bug.</dd>
+    <dt>Confidence</dt><dd>High.</dd>
+  </dl>
+
+  <h3>Pattern 5 — Events never arrive</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Temperature or spare warnings visible in SMART but never reported; namespaces added but hosts do not see them; firmware activation unnoticed.</dd>
+    <dt>Possible causes</dt><dd>No AER outstanding (not re-armed after reset or after a completion); event class disabled in FID 0Bh; event masked because its log was never read, or read with RAE = 1 forever; another tool read the log with RAE = 0 and cleared the event.</dd>
+    <dt>Evidence</dt><dd>Outstanding Admin commands (AER count); FID 0Bh value; log read history from all tools.</dd>
+    <dt>First check</dt><dd>Is at least one AER outstanding now?</dd>
+    <dt>Second check</dt><dd>Is the event class enabled?</dd>
+    <dt>Disambiguating experiment</dt><dd>Trigger a harmless event on a test drive and watch for the AER completion.</dd>
+    <dt>Likely conclusion</dt><dd>Host event-handling gap, usually re-arming or RAE.</dd>
+    <dt>Confidence</dt><dd>Medium-high.</dd>
+  </dl>
+
+  <h3>Pattern 6 — Admin completions found only by polling</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Admin commands complete only when the timeout handler polls the CQ; logs say the completion was "polled"; Admin operations take exactly the timeout.</dd>
+    <dt>Possible causes</dt><dd>MSI-X vector 0 masked, unrouted or misprogrammed; interrupt remapping fault; CQ created with IEN = 0 for the Admin vector in a custom driver.</dd>
+    <dt>Evidence</dt><dd><code>/proc/interrupts</code> for <code>nvme0q0</code>; MSI-X table entry 0 and mask bits; analyzer shows MWr32 to 0xFEE0_0000.</dd>
+    <dt>First check</dt><dd>Does the interrupt count for vector 0 increase per Admin command?</dd>
+    <dt>Second check</dt><dd>Does the analyzer show the MSI-X write at all?</dd>
+    <dt>Disambiguating experiment</dt><dd>Issue one Identify and compare MSI-X writes on the link with interrupts counted by the host.</dd>
+    <dt>Likely conclusion</dt><dd>Interrupt delivery path, not the controller or the queue.</dd>
+    <dt>Confidence</dt><dd>High once the write is seen on the link but not counted.</dd>
+  </dl>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>How does the controller tell the host about an event?</p><details class="answer"><summary>Model answer</summary><p>By completing an Asynchronous Event Request the host submitted earlier; DW0 gives event type, information and the log page to read.</p></details></li>
+    <li><p>Why must the host submit a new AER after each event?</p><details class="answer"><summary>Model answer</summary><p>Each AER is consumed by one event; without replacements there is nothing to complete for the next event.</p></details></li>
+    <li><p>Which order are I/O queues created and deleted in?</p><details class="answer"><summary>Model answer</summary><p>Create the CQ before its SQs; delete the SQs before the CQ.</p></details></li>
+    <li><p>How many commands can be outstanding on a 32-entry Admin queue?</p><details class="answer"><summary>Model answer</summary><p>At most 31, including any outstanding AERs.</p></details></li>
+    <li><p>What does Get Log Page LID 02h return?</p><details class="answer"><summary>Model answer</summary><p>The SMART / Health Information log (512 bytes).</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>What does RAE do and why does it matter?</p><details class="answer"><summary>Model answer</summary><p>Retain Asynchronous Event: when set, reading the log does not clear the pending event. Used for multi-part reads and by tools that do not own event handling.</p></details></li>
+    <li><p>How do you read a 1 MiB log on a controller with MDTS = 5?</p><details class="answer"><summary>Model answer</summary><p>Eight 128 KiB Get Log Page commands with increasing offsets (if the log supports offsets), RAE set on all but the last.</p></details></li>
+    <li><p>Create I/O SQ fails with Completion Queue Invalid. What do you look for?</p><details class="answer"><summary>Model answer</summary><p>The earlier Create I/O CQ for that CQID: did it fail or was it never sent?</p></details></li>
+    <li><p>Why should Admin timeout logic exclude AERs?</p><details class="answer"><summary>Model answer</summary><p>They are designed to stay outstanding until an event, possibly forever.</p></details></li>
+    <li><p>What is the Commands Supported and Effects log for?</p><details class="answer"><summary>Model answer</summary><p>It lists supported opcodes and their effects and restrictions, so hosts know what to rescan afterwards and what to serialise.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>Why can an Identify wait 38 s?</p><details class="answer"><summary>Model answer</summary><p>On a controller that executes Admin commands serially, it waits behind a long command such as Format; it was fetched but not executed.</p></details></li>
+    <li><p>How does an Admin CQ phase bug manifest?</p><details class="answer"><summary>Model answer</summary><p>At the first wrap, stale completions (spurious or wrong CIDs), then timeouts as new CQEs are ignored; it hides because the Admin CQ wraps rarely.</p></details></li>
+    <li><p>Why is Abort a weak recovery tool on the Admin queue?</p><details class="answer"><summary>Model answer</summary><p>It is best effort, needs a free Admin slot, is limited by ACL, and on a serial controller may wait behind the very command it targets.</p></details></li>
+    <li><p>The link shows a CQE and an MSI-X write, yet the host times out. What do you check?</p><details class="answer"><summary>Model answer</summary><p>Host memory at the CQ slot (did the write land?), IOMMU faults, interrupt counts for vector 0, and the host's phase state.</p></details></li>
+    <li><p>How can a tool steal events from the driver?</p><details class="answer"><summary>Model answer</summary><p>By reading the event's log with RAE = 0 first; the event is cleared and the driver finds nothing.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>Design an Admin timeout policy.</p><details class="answer"><summary>Model answer</summary><p>Per-opcode timeouts (long for Format, Sanitize, self-test, firmware), exclude AERs, poll the CQ before declaring timeout, try Abort where useful, escalate to reset only with evidence, and re-arm events and rescan after any reset.</p></details></li>
+    <li><p>How would you govern Admin access among many tools?</p><details class="answer"><summary>Model answer</summary><p>One owner for event handling; tools read logs with RAE set; rate-limit monitoring; schedule maintenance; budget slots; prefer kernel-exported state over passthrough.</p></details></li>
+    <li><p>What would you validate in a vendor's Admin implementation?</p><details class="answer"><summary>Model answer</summary><p>AERL enforcement and delivery, masking and RAE, events with no AER outstanding, long-command concurrency, creation/deletion statuses, Admin wrap, Abort behaviour, effects log accuracy.</p></details></li>
+    <li><p>A fleet sees creation failures only on one server model. Approach?</p><details class="answer"><summary>Model answer</summary><p>Compare what differs (CPU count, vectors, IOMMU); decode the first failing creation status; check Number of Queues negotiation and rollback order.</p></details></li>
+    <li><p>How do you prove a notice was lost and not never generated?</p><details class="answer"><summary>Model answer</summary><p>Show the state change in logs (for example the Changed Namespace List or SMART) and the absence of an outstanding AER at that time (trace or driver state), or the event cleared by another reader.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>AER DW0 = 0x0002_0101. Which log should the host read?</p><ul class="options" data-answer="2"><li>01h</li><li>02h</li><li>03h</li><li>04h</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>Bits 23:16 = 02h, SMART / Health.</p></details></li>
+    <li><p>Get Log Page for 512 bytes: NUMDL =</p><ul class="options" data-answer="3"><li>512</li><li>128</li><li>127</li><li>511</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>512 / 4 = 128 dwords, 0's based → 127.</p></details></li>
+    <li><p>Delete I/O CQ fails with Invalid Queue Deletion. Why?</p><ul class="options" data-answer="1"><li>An SQ still uses the CQ</li><li>The CQ is full</li><li>The QID exceeds NCQA</li><li>The controller is disabled</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>SQs must be deleted first.</p></details></li>
+    <li><p>DW3 = 0x8211_0010 on Create I/O CQ means:</p><ul class="options" data-answer="4"><li>Invalid Queue Size</li><li>Invalid Queue Identifier</li><li>Completion Queue Invalid</li><li>Invalid Interrupt Vector</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>Status 0x4108: SCT 1h, SC 08h, DNR 1; CID 0x0010.</p></details></li>
+    <li><p>Which Admin commands should timeout logic ignore?</p><ul class="options" data-answer="3"><li>Identify</li><li>Format NVM</li><li>Asynchronous Event Request</li><li>Abort</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>AERs legitimately stay outstanding.</p></details></li>
+    <li><p>Where is the first abnormal event in the failed trace?</p><details class="answer"><summary>Model answer</summary><p>Row 2, the Invalid Interrupt Vector CQE; everything later follows from ignoring it.</p></details></li>
+    <li><p>In the slow trace, why is the Identify fetched at 2 s but completed at 40 s?</p><details class="answer"><summary>Model answer</summary><p>The controller fetched it but executes Admin commands serially, behind the Format.</p></details></li>
+    <li><p>What P value is correct for the first CQE of the Admin CQ's second lap?</p><details class="answer"><summary>Model answer</summary><p>0 — the controller inverts the phase on each wrap; the host must expect 0.</p></details></li>
+    <li><p>After a controller reset, which host action is most often forgotten?</p><details class="answer"><summary>Model answer</summary><p>Re-submitting AERs (and rescanning for changes that happened meanwhile).</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <h3>To a child</h3>
+  <details class="answer"><summary>Model explanation</summary><p>"The SSD's office has a tiny tray for notes. The office can't phone you, so you leave a blank card that it fills in when there's news — and you must leave a new one each time. If someone hands in a huge job, all the small notes wait until it's done."</p></details>
+  <h3>To a junior engineer</h3>
+  <details class="answer"><summary>Model explanation</summary><p>"The Admin queue is shared and small. Events come back as AER completions: decode DW0, read the named log with RAE = 0, re-arm. Long commands can block others. Create CQs before SQs, delete SQs before CQs, check every status. Timeouts exclude AERs, and after any reset re-arm and rescan."</p></details>
+  <h3>To a senior engineer</h3>
+  <details class="answer"><summary>Model explanation</summary><p>"Admin failures are mostly host policy failures: tools that steal events or count AERs as hangs, timeouts that ignore serial execution, ignored creation statuses, and wrap/phase bugs that appear after weeks. Govern access to the queue, make timeouts per opcode, verify event delivery end to end, and treat an Admin timeout with a CQE on the wire as a host-memory or interrupt problem until proven otherwise."</p></details>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain the event loop, Admin capacity, serial execution and the creation/deletion rules;</li>
+      <li>diagram an AER from submission to re-arm and a queue creation sequence with its failure points;</li>
+      <li>identify in traces an event delivery, a long command blocking others, an ignored creation failure and an Admin timeout with a CQE on the wire;</li>
+      <li>debug the six failure patterns;</li>
+      <li>distinguish the Admin queue from I/O queues (<a href="dd26.html">I/O Queues</a>), from registers (<a href="dd24.html">NVMe Registers</a>), from controller resets (<a href="dd41.html">Reset</a>), from doorbell flow (<a href="dd27.html">Doorbells</a>) and from PCIe Advanced Error Reporting (<a href="ch46.html">AER</a>);</li>
+      <li>cite the NVM Express Base Specification, Revision 2.4 (Admin Command Set, Asynchronous Event Request, Get Log Page, Commands Supported and Effects, queue creation and deletion, Abort) by section name.</li>
+    </ul>
+  </aside>
+  <p>Next: <a href="dd26.html">I/O Queues</a> — the queues the Admin queue creates.</p>
+</section>

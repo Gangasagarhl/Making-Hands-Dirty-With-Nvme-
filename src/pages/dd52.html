@@ -1,0 +1,604 @@
+<p class="lead">Chapter 56 showed how Single Root I/O Virtualization (SR-IOV) and NVMe virtualization combine to give each virtual machine (VM) its own NVMe controller. This module studies what happens at the edges of a Virtual Function's (VF's) life: reset, reassignment, interrupt delivery through a hypervisor, fault attribution by Requester ID, and the data a VF leaves behind. That is where SR-IOV deployments fail in production.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p><a href="ch56.html">Chapter 56</a> taught the SR-IOV Extended Capability, VF Routing IDs (RIDs) and BARs, primary and secondary controllers, Virtual Queue (VQ) and Virtual Interrupt (VI) resources and the Virtualization Management command, with a bring-up trace. Here the central concept is the <strong>VF as an isolation and reset boundary</strong>: what a Function Level Reset (FLR) clears and what it leaves, in which order a hypervisor must tear down and hand over a VF, how interrupts and faults are attributed, and how to prove from a trace whether the device or the host is at fault.</p>
+  <aside class="callout prereq">
+    <ul>
+      <li><a href="ch56.html">SR-IOV</a>: everything in it, especially the VF RID formula and the four Virtualization Management actions.</li>
+      <li><a href="ch55.html">Advanced Error Handling</a>: Access Control Services (ACS), IOMMU groups.</li>
+      <li><a href="ch49.html">PCIe Reset</a> and <a href="ch48.html">NVMe Reset</a>: FLR versus controller reset versus NVM Subsystem Reset.</li>
+      <li><a href="ch43.html">MSI-X</a> and <a href="ch20.html">DMA</a>: vector tables, I/O virtual addresses (IOVAs).</li>
+      <li><a href="ch58.html">Namespaces</a>: attachment to controllers.</li>
+    </ul>
+  </aside>
+  <p>Where it goes next: <a href="dd60.html">2026 NVMe 2.4 Updates</a> covers Exported NVM Subsystems and live migration, which rest on the reset and state boundaries studied here; <a href="dd54.html">Validation Engineering</a> turns the failure patterns into a test campaign.</p>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives by level</caption>
+    <thead><tr><th>Level</th><th>You can…</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Say what an FLR of a VF resets and what it does not (namespace data, secondary controller resources).</td></tr>
+      <tr><td>Intermediate</td><td>Write the correct order of operations to take a VF away from one VM and give it to another, and justify each step.</td></tr>
+      <tr><td>Advanced</td><td>Explain how MSI-X from a VF reaches a guest through interrupt remapping, and why the wire can be fast while the guest is slow.</td></tr>
+      <tr><td>Senior</td><td>Decide from evidence whether a DMA fault is a device isolation bug or a host lifecycle bug, and define the acceptance tests that would have caught it.</td></tr>
+      <tr><td>Trace analysis</td><td>Attribute every TLP to a function by RID and by which BAR's doorbell triggered it; separate the configuration, management and guest planes in a capture.</td></tr>
+      <tr><td>Debugging</td><td>Diagnose teardown faults, lost interrupts, data remanence across tenants and resource-assignment rejections.</td></tr>
+      <tr><td>Validation</td><td>Build an FLR-under-load and reassignment test matrix with data-pattern and fault-log oracles.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>A hotel has one big kitchen and many rooms. Each room has its own phone line to the kitchen and its own little cupboard where the kitchen leaves food. When a guest checks out, the hotel must do three things in the right order: hang up the guest's phone line so no more orders come, wait until the kitchen has finished delivering any food already on the way, and only then lock the room. If the hotel locks the room first, a waiter arrives with a tray and finds the door shut, and the tray ends up on the floor.</p>
+    <p>And one more thing: the cupboard. Hanging up the phone does not empty the cupboard. If the hotel forgets to clear it, the next guest opens it and finds the last guest's leftovers.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <aside class="callout breaks">
+    <p><strong>What it represents.</strong> The room's phone line is the VF's register set and doorbells; hanging up is the FLR. Food on the way is DMA already issued by the device. Locking the room is the hypervisor removing the guest's IOMMU mappings. The tray on the floor is an IOMMU fault. The cupboard is the namespace attached to that VF's secondary controller; its contents survive FLR.</p>
+    <p><strong>What it hides.</strong> Two separate parties manage the room: the PCIe side (the VF, reset by FLR) and the NVMe side (the secondary controller, its resources and its namespace attachments, managed through the primary controller). The kitchen is also shared: a reset of the whole kitchen (PF reset, link reset, NVM Subsystem Reset) disturbs every room.</p>
+    <p><strong>Where it misleads.</strong> In a hotel, a waiter who finds a locked door simply goes back. On PCIe, a posted Memory Write that the IOMMU blocks is dropped, logged and never reported to the device as a failure, so the device thinks it delivered. And "waiting for food on the way" is not guaranteed by any single signal: the device's Transactions Pending indication covers its own outstanding non-posted requests, not posted writes already sent.</p>
+  </aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Module vocabulary (terms from Chapter 56 assumed)</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="flr">Function Level Reset (FLR)</span></td><td>Reset one room</td><td>Reset of a single function, started by setting Initiate Function Level Reset in its Device Control register</td><td>For a VF, resets its controller state; leaves other functions alone</td><td>Not a controller reset (CC.EN = 0) and not an NVM Subsystem Reset</td></tr>
+      <tr><td>Transactions Pending</td><td>"Still waiting for answers"</td><td>Device Status bit set while the function has non-posted requests without completions</td><td>Software should see it clear before FLR</td><td>Says nothing about posted writes already sent</td></tr>
+      <tr><td><span class="g" data-term="interrupt-remapping">Interrupt remapping</span></td><td>A switchboard for doorbells</td><td>IOMMU feature translating device MSI/MSI-X writes into interrupts for the right CPU or virtual CPU</td><td>Lets a guest own a VF's vectors safely</td><td>The message on the wire still targets the 0xFEE0_xxxx window</td></tr>
+      <tr><td>Posted interrupt</td><td>A note left at the guest's desk</td><td>Hardware delivery of an interrupt to a virtual CPU without a VM exit, if that vCPU is running</td><td>Fast path of interrupt remapping</td><td>If the vCPU is not running, delivery waits for scheduling</td></tr>
+      <tr><td>MSI-X table emulation</td><td>The receptionist rewrites the phone book</td><td>The hypervisor (for example VFIO) intercepts guest writes to the VF's MSI-X table and programs the real table itself</td><td>The guest never writes physical vector addresses</td><td>A guest's view of its vectors differs from the device's table</td></tr>
+      <tr><td><span class="g" data-term="iommu-domain">IOMMU domain</span></td><td>One guest's map</td><td>A set of IOVA-to-host-physical translations, selected per RID</td><td>VF RID → VM's domain; PF RID → host's domain</td><td>The same IOVA number can be valid in one domain and invalid in another</td></tr>
+      <tr><td>Data remanence</td><td>Leftovers in the cupboard</td><td>Namespace data surviving reset and reassignment</td><td>Cleared by Format NVM, Sanitize, deallocation policies or namespace re-creation</td><td>FLR does not touch media</td></tr>
+      <tr><td>Secondary controller state</td><td>Whether the room's desk is staffed</td><td>Online or Offline, plus assigned VQ/VI counts, managed through the primary controller</td><td>Must be online before the VF's driver enables it</td><td>Survival across VF FLR should be confirmed in Base 2.4</td></tr>
+      <tr><td><span class="g" data-term="rate-limiting">Rate limiting</span> (NVMe 2.4)</td><td>A speed limit per room</td><td>Controller-enforced caps on PCIe bandwidth and IOPS per controller</td><td>Standard answer to noisy neighbours</td><td>Field-level details must be read in Base 2.4</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <figure>
+    <pre class="diagram">
+  Guest VM A (nvme driver)          Guest VM B (nvme driver)          Host (PF nvme driver, mgmt agent)
+     | IOVA domain A                    | IOVA domain B                    | host IOVA domain
+     | vCPUs, posted interrupts         |                                  |
+  ---+---------------- IOMMU: DMA remapping by RID, interrupt remapping ---+------------------------
+                       Root port 00:01.1 (ARI forwarding, ACS)
+                                   | Gen4 x4 link (shared)
+  +--------------------------------+-------------------------------------------------------------+
+  | Lab SSD                                                                                      |
+  |  PF  01:00.0 RID 0x0100 BAR0 0xFE60_0000 -> primary controller CNTLID 1 (Virt. Mgmt 1Ch)    |
+  |  VF1 01:00.1 RID 0x0101 VF BAR0 0x3_8000_0000 -> secondary CNTLID 2 -> NS 5 (VM A)          |
+  |  VF2 01:00.2 RID 0x0102 VF BAR0 0x3_8000_4000 -> secondary CNTLID 3 -> NS 6 (VM B)          |
+  |  per-function: registers, doorbells, MSI-X table/PBA, DMA context tagged with RID           |
+  |  shared: VQ/VI pool, controller CPUs, DRAM, NAND, link, reset domain of the PF               |
+  +----------------------------------------------------------------------------------------------+
+    </pre>
+    <figcaption>Synthetic example for teaching, continuing Chapter 56's topology. VF BAR addresses lie above 4 GiB, so accesses to them use 4-DW headers (MRd64/MWr64).</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture inventory for one VF's life</caption>
+    <thead><tr><th>Aspect</th><th>Content</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>Hypervisor decisions (assign, revoke), host management commands to the primary, guest register writes and doorbells</td></tr>
+      <tr><td>Outputs</td><td>DMA (MRd/MWr with the VF's RID), MSI-X writes, completions to configuration and MMIO reads</td></tr>
+      <tr><td>Actors</td><td>Hypervisor and VFIO, PF driver and management agent, guest driver, IOMMU, device firmware</td></tr>
+      <tr><td>State</td><td>VF Enable/NumVFs (PF); secondary online/offline and VQ/VI (primary); VF controller registers and queues (guest-owned); IOMMU domain and interrupt remapping entries (host); namespace attachment and contents (device)</td></tr>
+      <tr><td>Memory</td><td>Guest RAM for queues and buffers (IOVA domain per VM); host RAM for the PF's queues</td></tr>
+      <tr><td>Registers</td><td>SR-IOV capability (PF); VF Device Control (Initiate FLR) and Device Status (Transactions Pending); VF BAR: CAP, CC, CSTS, AQA/ASQ/ACQ, doorbells from 0x1000, MSI-X table</td></tr>
+      <tr><td>Interfaces</td><td>Configuration space, VF MMIO, primary admin queue, IOMMU tables</td></tr>
+      <tr><td>Dependencies</td><td>ARI forwarding, ACS for isolation, interrupt remapping enabled, platform MMIO reservations, device's correct use of RIDs</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>Revoking VF1 from VM A and giving it to VM C, correctly. Synthetic example for teaching.</p>
+  <table>
+    <caption>Step by step: who acts, what changes, where, and the evidence</caption>
+    <thead><tr><th>#</th><th>Who acts</th><th>What changes</th><th>Where</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Hypervisor</td><td>Pauses VM A (or asks its driver to shut down the controller with CC.SHN)</td><td>Guest</td><td>Guest MWr64 to VF BAR0 + 0x14 (CC); CSTS.SHST polls</td></tr>
+      <tr><td>2</td><td>Hypervisor</td><td>Reads VF1 Device Status until Transactions Pending clears (bounded wait)</td><td>VF configuration space</td><td>CfgRd0 to RID 0x0101</td></tr>
+      <tr><td>3</td><td>Hypervisor</td><td>Sets Initiate FLR in VF1's Device Control</td><td>VF1</td><td>CfgWr0 to RID 0x0101</td></tr>
+      <tr><td>4</td><td>Device</td><td>Resets VF1's function and controller state: registers, queues, outstanding commands, MSI-X configuration</td><td>Device</td><td>No VF1 DMA after this point; CSTS.RDY = 0</td></tr>
+      <tr><td>5</td><td>Hypervisor</td><td>Waits for FLR completion (100 ms is the usual rule for FLR; confirm requirements in the PCI Express Base Specification), then restores VF config state</td><td>Host</td><td>Gap in VF1 traffic; CfgRd succeeding</td></tr>
+      <tr><td>6</td><td>Hypervisor</td><td>Removes VM A's IOMMU mappings and interrupt-remapping entries</td><td>IOMMU</td><td>None on the link; IOMMU tracing</td></tr>
+      <tr><td>7</td><td>Host management</td><td>Erases or re-creates VM A's namespace (Format NVM, Sanitize or delete/create), then detaches it</td><td>Primary admin queue</td><td>PF doorbell MWr32 to 0xFE60_1000; SQE fetch with RID 0x0100</td></tr>
+      <tr><td>8</td><td>Host management</td><td>Optionally rebalances VQ/VI: Offline → Assign → Online for CNTLID 2</td><td>Primary controller</td><td>Virtualization Management (1Ch) SQEs on the PF</td></tr>
+      <tr><td>9</td><td>Host management</td><td>Attaches VM C's namespace to CNTLID 2; sets NVMe 2.4 rate limits if supported</td><td>Primary controller</td><td>Namespace Attachment SQE</td></tr>
+      <tr><td>10</td><td>Hypervisor</td><td>Builds VM C's IOMMU domain and remapping entries; assigns VF1</td><td>IOMMU</td><td>None on the link</td></tr>
+      <tr><td>11</td><td>Guest C driver</td><td>Enables the controller and creates queues</td><td>VF1 BAR</td><td>MWr64 CC.EN = 1; first SQE fetch with RID 0x0101 to VM C's IOVAs</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <ol class="seq" data-actors="Hypervisor|Host mgmt (PF)|VF1 / secondary 2|IOMMU|Guest C">
+      <li data-from="Hypervisor" data-to="VF1 / secondary 2">CC.SHN via guest A, then quiesce</li>
+      <li data-from="Hypervisor" data-to="VF1 / secondary 2">CfgRd: Transactions Pending?</li>
+      <li data-from="VF1 / secondary 2" data-to="Hypervisor" class="dashed">TP = 0</li>
+      <li data-from="Hypervisor" data-to="VF1 / secondary 2" data-t="t0">CfgWr: Initiate FLR</li>
+      <li data-note="VF1 / secondary 2">function + controller state reset</li>
+      <li data-from="Hypervisor" data-to="IOMMU" data-t="t0+100 ms">unmap domain A</li>
+      <li data-from="Host mgmt (PF)" data-to="VF1 / secondary 2">erase NS 5; detach; attach NS 7</li>
+      <li data-from="Hypervisor" data-to="IOMMU">map domain C</li>
+      <li data-from="Guest C" data-to="VF1 / secondary 2">CC.EN = 1, create queues</li>
+      <li data-from="VF1 / secondary 2" data-to="Guest C" class="dashed">DMA with RID 0x0101 (domain C)</li>
+    </ol>
+    <figcaption>Reassignment order: quiesce, reset, then unmap; erase before reattaching. Synthetic, conceptual timing.</figcaption>
+  </figure>
+
+  <h3>The central concept on the ladder: the VF as an isolation and reset boundary</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Each hotel room has its own phone and cupboard. Hanging up the phone stops orders; it does not empty the cupboard. Lock the room only after the last tray has arrived.</p></div>
+    <div class="rung" data-rung="B"><p>A VF is a separate PCIe function with its own RID, registers, queues and vectors. FLR resets that function and its NVMe controller state. Namespace contents, secondary-controller resources and attachments are managed through the PF and survive.</p></div>
+    <div class="rung" data-rung="C"><p>The device keeps per-function register files, doorbell arrays, MSI-X tables and DMA contexts tagged with the RID. The IOMMU picks translation tables by RID. FLR clears the per-function state inside the device; IOMMU state is the host's to change.</p></div>
+    <div class="rung" data-rung="D"><p>The PCI Express Base Specification defines SR-IOV, FLR, Transactions Pending and ACS. NVMe Base 2.4 defines primary and secondary controllers, VQ/VI resources and Virtualization Management, plus 2.4 rate limiting and exported subsystems. What a secondary keeps across VF FLR must be confirmed in Base 2.4's virtualization text.</p></div>
+    <div class="rung" data-rung="E"><p>Configuration requests to the VF's RID start FLR; MMIO to the VF BAR drives the controller; DMA and MSI-X writes leave with the VF's RID; management commands go through the PF's admin queue with RID 0x0100.</p></div>
+    <div class="rung" data-rung="F"><p>In a capture: a CfgWr0 to RID 0x0101, then silence from 0x0101 until a guest enables it again. Any MWr/MRd with RID 0x0101 after the IOMMU unmap is a fault candidate; any guest-pattern DMA with RID 0x0100 is an isolation red flag.</p></div>
+    <div class="rung" data-rung="G"><p>Order the evidence: was there DMA after unmap (host lifecycle bug) or DMA with the wrong RID (device bug)? Was data visible to a new tenant (missing erase)? The answer decides who fixes it.</p></div>
+  </div>
+
+  <h3>The sixteen questions, for the VF reset and isolation boundary</h3>
+  <table>
+    <caption>The VF boundary through the sixteen questions</caption>
+    <thead><tr><th>#</th><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>What is it?</td><td>The set of state that belongs to one VF and can be reset, assigned and isolated independently.</td></tr>
+      <tr><td>2</td><td>Why created?</td><td>To let a VF move between tenants without disturbing other VFs.</td></tr>
+      <tr><td>3</td><td>Problem solved?</td><td>Safe reuse and fault containment in multi-tenant hosts.</td></tr>
+      <tr><td>4</td><td>Before it?</td><td>Whole-device reset (disrupting every user) or hypervisor emulation.</td></tr>
+      <tr><td>5</td><td>Why better?</td><td>Per-tenant reset and isolation at hardware speed.</td></tr>
+      <tr><td>6</td><td>Who creates it?</td><td>The device design, configured by the PF driver and management stack.</td></tr>
+      <tr><td>7</td><td>Who consumes it?</td><td>Hypervisor (reset, reassign), guest driver, IOMMU.</td></tr>
+      <tr><td>8</td><td>Where does it live?</td><td>VF configuration space and BAR, secondary controller state, IOMMU domain, namespace attachment.</td></tr>
+      <tr><td>9</td><td>Memory/registers?</td><td>Device Control/Status of the VF, VF BAR registers and MSI-X table, IOMMU tables, primary controller data structures.</td></tr>
+      <tr><td>10</td><td>Before it?</td><td>VF enabled, secondary online with resources, namespace attached.</td></tr>
+      <tr><td>11</td><td>After it?</td><td>Guest re-initialisation, or reassignment to another tenant.</td></tr>
+      <tr><td>12</td><td>If wrong?</td><td>DMA faults, lost interrupts, data visible to the wrong tenant, other VFs disturbed.</td></tr>
+      <tr><td>13</td><td>Analyzer shows?</td><td>RID per TLP, CfgWr FLR, doorbells per VF BAR, silence after FLR.</td></tr>
+      <tr><td>14</td><td>Linux shows?</td><td>IOMMU faults naming the BDF, reset methods, VFIO events, nvme-cli secondary list.</td></tr>
+      <tr><td>15</td><td>Validation tests?</td><td>FLR under load on every VF; reassignment with data-remanence checks; RID audit of all DMA.</td></tr>
+      <tr><td>16</td><td>Senior suspects?</td><td>Teardown order, missing erase, device RID misuse, reset scope larger than one VF.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <p>Documents: <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Single Root I/O Virtualization and Sharing; Function Level Reset; Access Control Services; Device Control and Device Status registers</cite>; <cite class="spec">NVM Express Base Specification, Revision 2.4 — Virtualization Enhancements; Virtualization Management command; Primary Controller Capabilities and Secondary Controller List; rate limiting; Exported NVM Subsystems</cite>; <cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite> for register and doorbell mapping.</p>
+  <table>
+    <caption>Behaviour classes</caption>
+    <thead><tr><th>Behaviour</th><th>Class</th></tr></thead>
+    <tbody>
+      <tr><td>VFs have their own RIDs and use MSI/MSI-X, not INTx; FLR is per function</td><td><span class="badge normative">Normative</span> (PCIe)</td></tr>
+      <tr><td>Secondary controllers depend on the primary for resources and online state</td><td><span class="badge normative">Normative</span> (NVMe Base 2.4)</td></tr>
+      <tr><td>Software waits after initiating FLR before accessing the function</td><td><span class="badge normative">Normative</span> (PCIe); exact timing rules and readiness mechanisms to be confirmed in the revision you implement</td></tr>
+      <tr><td>Hypervisor teardown order (reset before unmap, erase before reassign)</td><td><span class="badge derived">Derived</span> engineering practice</td></tr>
+      <tr><td>MSI-X table emulation, posted interrupts</td><td><span class="badge impl">Implementation-dependent</span> (hypervisor and platform)</td></tr>
+      <tr><td>Rate limiting, Exported NVM Subsystems, virtualization lockdown controls</td><td><span class="badge version">Version-dependent</span>: NVMe 2.4; <span class="badge optional">Optional</span> features</td></tr>
+      <tr><td>Performance isolation between VFs</td><td><span class="badge impl">Implementation-dependent</span>; not specified</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout notsaid">
+    <ul>
+      <li>Neither specification says a hypervisor must erase a namespace between tenants; that is a product and security policy.</li>
+      <li>The specifications do not define VFIO, posted interrupts or how a hypervisor schedules vCPUs.</li>
+      <li>We have not verified, and do not state, Base 2.4 field layouts for rate limiting or exported-subsystem migration. Read them in Base 2.4 and the Revision Changes document.</li>
+      <li>Whether every secondary-controller property survives a VF FLR must be read in Base 2.4; do not assume from one device's behaviour.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn"><p>Never assume FLR clears media. Never assume Transactions Pending = 0 means no DMA is in flight. Never assume a fault logged against the PF RID was caused by PF software.</p></aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Participation and observability</caption>
+    <thead><tr><th>Category</th><th>Items</th></tr></thead>
+    <tbody>
+      <tr><td>Must participate</td><td>SSD with SR-IOV and NVMe virtualization; root port with ARI forwarding; IOMMU with DMA remapping; interrupt remapping for safe guest vectors.</td></tr>
+      <tr><td>May participate</td><td>PCIe switch with ACS; Address Translation Services (ATS) if the device caches translations; posted-interrupt hardware; NVMe 2.4 rate limiting in the device.</td></tr>
+      <tr><td>Observable</td><td>Every TLP's RID, address and type on the link; configuration writes for FLR; IOMMU fault records; device logs through the PF.</td></tr>
+      <tr><td>Internal, unobservable</td><td>How the device maps VFs to internal queues and NAND; how firmware quiesces a VF during FLR; vCPU scheduling inside the host.</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Where FLR stops at the hardware.</strong> Inside the device, FLR of a VF must abort or complete that function's outstanding work and discard its queue state, without touching other functions' contexts. Firmware commonly implements this by draining the VF's command slots from shared engines. A device that cannot cancel a NAND operation quickly may still emit a late completion write for that VF if its design is wrong; a correct design suppresses DMA for a reset function. Only an analyzer sees the difference. <span class="badge impl">Implementation-dependent</span>.</p>
+  <p><strong>ATS caveat.</strong> If a device uses ATS, it holds cached translations; changing a VF's domain then also requires invalidating the device's translation cache. Most NVMe SSDs do not use ATS today, but check before assuming that an IOMMU unmap is immediately effective. <span class="badge uncertain">Uncertain</span> for any specific product.</p>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>Transactions across the VF boundary</caption>
+    <thead><tr><th>Transaction</th><th>Direction</th><th>Request/response</th><th>Plane</th></tr></thead>
+    <tbody>
+      <tr><td>CfgRd/CfgWr to RID 0x0101 (Device Status, Device Control with Initiate FLR)</td><td>Host → VF</td><td>Non-posted; completion from VF (or from the device on its behalf)</td><td>Configuration</td></tr>
+      <tr><td>MWr64/MRd64 to VF BAR0 0x3_8000_0000 + offset</td><td>Host (guest) → VF</td><td>Writes posted; reads completed with CplD</td><td>Guest</td></tr>
+      <tr><td>MRd/MWr with RID 0x0101 to guest IOVAs (MRd32/MWr32 below 4 GiB, as in the traces here; MRd64/MWr64 above)</td><td>VF → host</td><td>Reads completed by the root complex (or UR on IOMMU fault); writes posted</td><td>Guest data</td></tr>
+      <tr><td>MWr32 to 0xFEE0_xxxx with RID 0x0101</td><td>VF → host</td><td>Posted; remapped by the IOMMU to a guest vector</td><td>Interrupt</td></tr>
+      <tr><td>Admin SQEs on the PF (Virtualization Management 1Ch, Namespace Attachment, Format NVM)</td><td>Host → PF and PF DMA</td><td>NVMe command/CQE</td><td>Management</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Ordering.</strong> PCIe ordering lets a VF's posted writes (data, CQE, MSI-X) pass nothing that came before them in the same direction, so a CQE write is never seen before its data. Configuration writes to start FLR are non-posted; their completion means the write was accepted, not that the reset has finished. <strong>Errors.</strong> A device DMA blocked by the IOMMU becomes an Unsupported Request completion for a read, and a silently dropped, logged write for a posted MWr. Errors that belong to one function (for example a completion timeout on a VF's read) are reported with that function's identity; link errors belong to all functions.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>All traces are synthetic examples for teaching, using Chapter 56's topology: PF RID 0x0100 (BAR0 0xFE60_0000), VF1 RID 0x0101 (VF BAR0 0x3_8000_0000), VF2 RID 0x0102 (VF BAR0 0x3_8000_4000). VM A's queues at IOVA 0x0000_7F00_0000; VM B's at 0x0000_7F00_0000 too, in a different IOVA domain. Guest IOVAs in these traces lie below 4 GiB, so device DMA to them uses 3-DW headers (MRd32/MWr32); VF BAR accesses above 4 GiB use MRd64/MWr64.</p>
+
+  <h3>Normal: VF1 handed from VM A to VM C</h3>
+  <div class="trace" data-kind="synthetic" data-title="Correct teardown and reassignment of VF1">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 ms</td><td>MWr64</td><td>RC Addr=0x3_8000_0014 Data=0x00464001</td><td>Guest A writes CC with SHN = 01b (normal shutdown), EN still 1</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.4 ms</td><td>MWr32 ×3</td><td>RID 0x0101, VM A buffers and CQ</td><td>Last outstanding reads finish</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>2.0 ms</td><td>MRd64 / CplD</td><td>0x3_8000_001C → CSTS = 0x00000009</td><td>SHST = 10b (complete), RDY = 1</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>5.0 ms</td><td>CfgRd0 / CplD</td><td>RID 0x0101 Device Status: Transactions Pending = 0</td><td>No outstanding non-posted requests</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>5.1 ms</td><td>CfgWr0</td><td>RID 0x0101 Device Control: Initiate FLR</td><td>VF1 reset starts</td></tr>
+        <tr class="note"><td colspan="6">No TLP with RID 0x0101 from 5.1 ms onward. Hypervisor waits, then unmaps domain A (not visible on the link).</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>140 ms</td><td>MWr32</td><td>RC Addr=0xFE60_1000 Data=0x0E</td><td>PF admin SQ doorbell: Format NVM of NS 5 (management plane)</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>140.001 ms</td><td>MRd64</td><td>RID 0x0100 Addr=0x1_0000_0340 Len=16</td><td>Primary fetches the SQE from the host's admin SQ</td></tr>
+        <tr class="note"><td colspan="6">Format completes; Namespace Attachment: detach NS 5, attach NS 7 to CNTLID 2 (same PF pattern). Hypervisor maps domain C and assigns VF1.</td></tr>
+        <tr class="dir-down"><td>8</td><td>Host→Dev</td><td>3.2 s</td><td>MWr64</td><td>RC Addr=0x3_8000_0014 Data=0x00460001</td><td>Guest C enables VF1's controller</td></tr>
+        <tr class="dir-up"><td>9</td><td>Dev→Host</td><td>3.3 s</td><td>MRd32</td><td>RID 0x0101 Addr=IOVA 0x0000_6A00_0000 Len=16</td><td>First SQE fetch into VM C's domain</td></tr>
+      </tbody>
+    </table>
+    <p>Reading it: three checks pass. Silence from RID 0x0101 between FLR and re-enable; management on RID 0x0100 only; erase before reattach. The CC value in row 1 sets SHN while keeping CC.EN; Chapter 56's CC = 0x0046_0001 pattern plus SHN.</p>
+  </div>
+
+  <h3>Slow: the wire is fast, the guest is slow</h3>
+  <div class="trace" data-kind="synthetic" data-title="VM A reports 2 ms read latency; VF1 traffic at QD 1">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr64</td><td>Addr=0x3_8000_1008 Data=0x0000002A</td><td>Guest rings VF1 SQ1 tail</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.9</td><td>MRd32</td><td>RID 0x0101 IOVA 0x0000_7F00_0A40 Len=16</td><td>SQE fetch</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>76.0–77.3</td><td>MWr32 ×16</td><td>RID 0x0101 VM A buffer</td><td>4 KiB of data</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>77.5</td><td>MWr32</td><td>RID 0x0101 CQ1 entry</td><td>CQE posted</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>77.6</td><td>MWr32</td><td>RID 0x0101 Addr=0xFEE0_xxxx (remappable format)</td><td>MSI-X from VF1 vector 1</td></tr>
+        <tr class="abnormal"><td>6</td><td>Host→Dev</td><td>2 041.0</td><td>MWr64</td><td>Addr=0x3_8000_100C Data=0x0000002A</td><td><strong>First abnormal event</strong>: the CQ1 head doorbell arrives 1.96 ms after the interrupt</td></tr>
+        <tr class="note"><td colspan="6">Repeats on about 3% of commands; device-side latency (row 1 to row 5) is always about 78 µs.</td></tr>
+      </tbody>
+    </table>
+    <p>Analysis. The device's part ends at row 5. The 1.96 ms gap is between interrupt delivery and the guest's completion processing, which lives in the host: the target vCPU was descheduled, so the posted interrupt waited for scheduling, or the interrupt was remapped to a busy physical CPU. Evidence to collect: host scheduler latency for VM A's vCPUs, interrupt affinity of the VFIO interrupt, CPU over-commit. A vendor escalation for "slow SSD" would be wrong. Fix candidates: pin vCPUs, avoid over-commit on storage VMs, align vector affinity. <span class="badge impl">Implementation-dependent</span>: hypervisor scheduling.</p>
+  </div>
+
+  <h3>Failed: teardown in the wrong order</h3>
+  <div class="trace" data-kind="synthetic" data-title="Hypervisor unmaps VM A's memory before resetting VF1">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">VM A was killed (not shut down) with 12 reads outstanding on VF1. Hypervisor removed domain A's mappings at t = 0.</td></tr>
+        <tr class="abnormal"><td>1</td><td>Dev→Host</td><td>35.2</td><td>MWr32 ×16</td><td>RID 0x0101 Addr=IOVA 0x0000_8800_3000 …</td><td><strong>First abnormal event</strong>: read data written to an IOVA that no longer has a mapping</td></tr>
+        <tr class="note"><td colspan="6">Posted writes: no completion, no error returned to the device. The IOMMU drops them and logs a fault naming 01:00.1 (illustrative, Intel VT-d style: "DMAR: [DMA Write] Request device [01:00.1] fault addr 0x88003000").</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>35.9</td><td>MWr32</td><td>RID 0x0101 CQ1 entry IOVA 0x0000_7F01_0230</td><td>CQE write, also dropped</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>36.0</td><td>MWr32</td><td>RID 0x0101 0xFEE0_xxxx</td><td>MSI-X: interrupt-remapping entry already removed; blocked and logged</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>41.7</td><td>MRd32</td><td>RID 0x0101 IOVA 0x0000_7F00_0B00 Len=16</td><td>Device fetches the next SQE (a write command queued earlier)</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>42.1</td><td>Cpl</td><td>Status=UR, Completer=RC</td><td>Read faulted: Unsupported Request</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>1 900</td><td>CfgWr0</td><td>RID 0x0101 Initiate FLR</td><td>FLR finally issued</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning. Every fault names VF1, all after the unmap and before the FLR. The device behaved correctly for a function that was still enabled; the host's order was wrong. Fault storms like this can also trip host fault-reporting rate limits and hide later, unrelated faults. Fix: quiesce, FLR, then unmap; for killed VMs, FLR first and accept losing in-flight I/O. Regression test: kill a VM under QD 128 load 1 000 times; pass if zero IOMMU faults name the VF and the next tenant's first I/O succeeds.</p>
+  </div>
+
+  <h3>Ambiguous: a fault against the PF's RID</h3>
+  <div class="trace" data-kind="synthetic" data-title="IOMMU fault names 01:00.0 while VM B is busy on VF2">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Host log (illustrative): a DMA read fault for device [01:00.0] at address 0x7F00_2000. VM B's VF2 SQ1 sits at IOVA 0x0000_7F00_0000 in domain B, so 0x7F00_2000 "looks like" VM B's memory.</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr64</td><td>Addr=0x3_8000_5008 Data=0x00000105</td><td>VM B rings VF2's SQ1 tail</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.8</td><td>MRd32</td><td>RID 0x0102 IOVA 0x0000_7F00_4100 Len=16</td><td>Correct: VF2 fetches with its own RID</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>3.1</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x11</td><td>Host management agent rings the PF admin SQ tail</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>3.9</td><td>MRd64</td><td>RID 0x0100 Addr=0x1_0000_0400 Len=16</td><td>Primary fetches an admin SQE: Get Log Page, buffer IOVA 0x0000_7F00_2000 (host domain)</td></tr>
+        <tr class="abnormal"><td>5</td><td>Dev→Host</td><td>9.4</td><td>MWr32</td><td>RID 0x0100 Addr=0x0000_7F00_2000 Len=64 DW</td><td><strong>First abnormal event</strong>: PF writes log data to an IOVA not mapped in the host's domain</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Why it is ambiguous.</strong> From the log alone, two very different stories fit. <em>H1, device isolation bug</em>: VF2's DMA leaves with the PF's RID, so it is translated in the host's domain and faults; this is a security defect. <em>H2, host software bug</em>: the management agent passed a stale or freed buffer address in a PF admin command; the number coincides with VM B's IOVA range because IOVA spaces are per domain and numerically overlap. <strong>Disambiguation</strong> needs the analyzer: tie the faulting TLP to the SQE that requested it. Row 4's fetch is triggered by the PF's admin doorbell (row 3) and its SQE carries the faulting buffer address, so H2 holds; under H1 the faulting write would follow a VF2 doorbell and match a VF2 SQE's PRP. Conclusion here: H2, high confidence with this capture. Without the capture, both remain open and the RID audit test from the validation section is the safe next step.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span>: all commands below only read state. Output formats vary with pciutils, kernel and nvme-cli versions; none is reproduced here.</p></aside>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># VF numbering as the kernel computed it</span>
+cat /sys/bus/pci/devices/0000:01:00.0/sriov_offset /sys/bus/pci/devices/0000:01:00.0/sriov_stride
+cat /sys/bus/pci/devices/0000:01:00.0/sriov_vf_device
+<span class="cm"># FLR support and pending transactions on a VF (DevCap FLReset+, DevSta TransPend)</span>
+sudo lspci -vvv -s 01:00.1 | grep -E 'FLReset|TransPend'
+<span class="cm"># Which reset methods the kernel would use for this VF</span>
+cat /sys/bus/pci/devices/0000:01:00.1/reset_method
+<span class="cm"># Driver and IOMMU group of each function</span>
+for f in /sys/bus/pci/devices/0000:01:00.*; do
+  echo "$f drv=$(basename $(readlink $f/driver 2&gt;/dev/null) 2&gt;/dev/null) grp=$(basename $(readlink $f/iommu_group))"
+done
+<span class="cm"># Interrupt remapping status and IOMMU faults</span>
+journalctl -k | grep -iE 'DMAR|AMD-Vi|IOMMU|remapping' | tail -50
+<span class="cm"># VFIO interrupts on the host (one line per vector in use)</span>
+grep -i vfio /proc/interrupts
+<span class="cm"># NVMe view through the PF: secondary controllers and their state</span>
+sudo nvme list-secondary /dev/nvme0
+sudo nvme list-ctrl /dev/nvme0n1</code></pre>
+  <table>
+    <caption>What each output can and cannot prove</caption>
+    <thead><tr><th>Output</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>sriov_offset, sriov_stride, sriov_vf_device</td><td>The RIDs the kernel will use for VFs</td><td>That the device emits DMA with those RIDs</td></tr>
+      <tr><td>FLReset+ / TransPend</td><td>FLR is supported; non-posted requests are pending right now</td><td>That no posted DMA is in flight</td></tr>
+      <tr><td>reset_method</td><td>What the kernel will do on a reset request</td><td>What the device does internally</td></tr>
+      <tr><td>IOMMU fault lines</td><td>Which RID faulted at which address</td><td>Which command caused it (needs an analyzer or device log)</td></tr>
+      <tr><td>/proc/interrupts vfio lines</td><td>Vectors are allocated and firing</td><td>Guest-side delivery latency</td></tr>
+      <tr><td>list-secondary</td><td>Secondary state and VQ/VI counts</td><td>Which VM owns the VF</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+
+  <h3>Beginner lab: classify state across a VF FLR</h3>
+  <p><strong>Objective.</strong> For each piece of state, decide whether VF FLR clears it, and who owns it. <span class="badge safe">Safe lab</span> (paper).</p>
+  <p><strong>Prerequisites.</strong> <a href="ch56.html">Chapter 56</a>; <a href="ch49.html">PCIe Reset</a>.</p>
+  <p><strong>Setup.</strong> The list: VF1 CC and CSTS; VF1's I/O queues; VF1's MSI-X table; VF Enable in the PF; secondary CNTLID 2 VQ/VI assignment; NS 5 attachment; NS 5 data; VM A's IOMMU domain; interrupt-remapping entries; VF2's queues.</p>
+  <p><strong>Procedure.</strong> Make a table: state · owner (device-VF, device-primary, host) · cleared by VF FLR? · cleared by what otherwise.</p>
+  <p><strong>Observations.</strong> Notice that the host-owned rows are never touched by a device reset.</p>
+  <p><strong>Questions.</strong> Which rows explain the "failed" trace? Which row explains a data leak between tenants?</p>
+  <p><strong>Expected reasoning.</strong> Ownership decides reset scope.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>Cleared by VF FLR: VF1 CC/CSTS, its queues and outstanding commands, its MSI-X configuration. Not cleared: VF Enable (PF), secondary resources and attachment (primary; confirm in Base 2.4), NS 5 data (media), IOMMU domain and remapping entries (host), VF2's queues (another function). The failed trace comes from the host-owned IOMMU domain being changed before the device-owned queues were reset; a tenant data leak comes from NS 5 data surviving everything except an explicit erase.</p>
+  </details>
+  <p><strong>Extension.</strong> Add the rows for a PF controller reset and for NVM Subsystem Reset, and mark which VFs each disturbs.</p>
+
+  <h3>Intermediate lab: check a runbook for ordering bugs</h3>
+  <p><strong>Objective.</strong> Encode lifecycle rules and find the first error in a runbook. <span class="badge safe">Safe lab</span></p>
+  <p><strong>Prerequisites.</strong> The mechanism table above; Python 3.8+.</p>
+  <p><strong>Setup.</strong> The toy model below encodes the rules taught here. Its minimum-resource rule (2 VQ, 1 VI) is a teaching simplification; real minimums come from the device and Base 2.4.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="vf_lifecycle.py"><code>#!/usr/bin/env python3
+"""vf_lifecycle.py - check an SR-IOV + NVMe secondary-controller runbook for ordering bugs.
+Simulation: a toy model of one VF; rules are the ones taught in Chapter 56 and Module 52."""
+
+class VF:
+    def __init__(self):
+        self.vf_enabled = self.online = self.bound = self.dma_mapped = False
+        self.vq = self.vi = 0
+        self.ns_attached = False
+        self.tenant, self.ns_owner = None, None
+
+    def step(self, op, arg=None):
+        err = None
+        if op == "enable_vfs":
+            self.vf_enabled = True
+        elif op == "offline":
+            if self.bound: err = "secondary taken offline while a driver/VM owns the VF"
+            self.online = False
+        elif op in ("assign_vq", "assign_vi"):
+            if self.online: err = "resources assigned to an online secondary (must be offline)"
+            if op == "assign_vq": self.vq += arg
+            else: self.vi += arg
+        elif op == "online":
+            if self.vq &lt; 2 or self.vi &lt; 1: err = f"online with VQ={self.vq} VI={self.vi} (needs admin + 1 I/O queue, 1 vector)"
+            self.online = True
+        elif op == "attach_ns":
+            self.ns_attached = True
+        elif op == "assign_to_vm":
+            if not self.vf_enabled: err = "VF does not exist"
+            elif not self.online: err = "VM gets a VF whose secondary controller is offline"
+            elif self.ns_owner not in (None, arg): err = f"namespace still holds {self.ns_owner}'s data; erase before giving it to {arg}"
+            self.bound, self.dma_mapped, self.tenant = True, True, arg
+            self.ns_owner = arg
+        elif op == "unmap_guest_memory":
+            if self.bound: err = "guest memory unmapped while the VF can still DMA (reset the VF first)"
+            self.dma_mapped = False
+        elif op == "flr":
+            self.bound = False                       # VF function and controller state reset
+        elif op == "erase_ns":
+            self.ns_owner = None
+        elif op == "release_vm":
+            self.tenant = None
+        return err
+
+def run(name, ops):
+    vf, bad = VF(), 0
+    print(f"--- {name}")
+    for n, (op, *arg) in enumerate(ops, 1):
+        err = vf.step(op, *arg)
+        if err:
+            bad += 1
+            print(f"  step {n:2} {op:&lt;20} FIRST ERROR: {err}" if bad == 1 else f"  step {n:2} {op:&lt;20} error: {err}")
+    print("  result:", "clean" if not bad else f"{bad} error(s)")
+
+GOOD = [("enable_vfs",), ("offline",), ("assign_vq", 4), ("assign_vi", 4), ("online",),
+        ("attach_ns",), ("assign_to_vm", "A"), ("flr",), ("unmap_guest_memory",),
+        ("release_vm",), ("erase_ns",), ("assign_to_vm", "B")]
+BAD = [("enable_vfs",), ("assign_vq", 4), ("online",), ("attach_ns",), ("assign_to_vm", "A"),
+       ("unmap_guest_memory",), ("flr",), ("release_vm",), ("assign_to_vm", "B")]
+
+if __name__ == "__main__":
+    run("runbook 1", GOOD)
+    run("runbook 2", BAD)</code></pre>
+  <p><strong>Procedure.</strong> Run it. Then write runbook 3: "kill VM A with I/O outstanding" done correctly.</p>
+  <p><strong>Observations.</strong> Expected output:</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>--- runbook 1
+  result: clean
+--- runbook 2
+  step  3 online               FIRST ERROR: online with VQ=4 VI=0 (needs admin + 1 I/O queue, 1 vector)
+  step  6 unmap_guest_memory   error: guest memory unmapped while the VF can still DMA (reset the VF first)
+  step  9 assign_to_vm         error: namespace still holds A's data; erase before giving it to B
+  result: 3 error(s)</code></pre>
+  <p><strong>Questions.</strong> (a) Why is step 3 the first error, not step 6? (b) Which error would an analyzer show, and which would it never show? (c) What rule does the model lack?</p>
+  <p><strong>Expected reasoning.</strong> The first error is the earliest departure from the rules; later errors may be independent or consequences.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(a) Bringing a secondary online with no interrupt resources is the earliest violation. (b) Step 6 shows on the link as DMA with RID 0x0101 after the unmap and as IOMMU faults; step 9 never shows on the link at all (it is a policy failure visible only in data). (c) Among others: waiting for Transactions Pending before FLR; that a PF reset or driver unbind disturbs every VF; rate-limit configuration. Runbook 3: <code>flr</code>, <code>unmap_guest_memory</code>, <code>release_vm</code>, <code>erase_ns</code>, <code>assign_to_vm C</code>.</p>
+  </details>
+  <p><strong>Extension.</strong> Add a second VF and a <code>pf_reset</code> operation that clears both VFs' bindings.</p>
+
+  <h3>Advanced lab: an emulated SR-IOV NVMe device</h3>
+  <p><strong>Objective.</strong> Bring up secondary controllers on an emulated device and observe FLR and reassignment from inside a VM. <span class="badge caution">Caution lab</span>: run inside a disposable VM; commands create and reset devices.</p>
+  <p><strong>Prerequisites.</strong> <a href="lab-environment.html">Lab Environment</a>; a recent QEMU whose emulated NVMe device supports SR-IOV and virtualization management. Parameter names (for example a maximum-VFs parameter and flexible VQ/VI pool sizes) differ between QEMU versions: read your version's NVMe device documentation <span class="badge uncertain">Uncertain</span>.</p>
+  <p><strong>Setup.</strong> Boot a guest with an emulated NVMe device configured for SR-IOV, an emulated IOMMU if available, and a file-backed namespace.</p>
+  <p><strong>Procedure.</strong> Inside the guest: (1) read <code>nvme primary-ctrl-caps</code> and <code>nvme list-secondary</code>; (2) disable VF autoprobe, create two VFs, then Offline/Assign/Online secondary 2 following Chapter 56's Caution sequence; (3) bind VF1 to the nvme driver, write a known pattern to its namespace; (4) trigger FLR with <code>echo 1 &gt; /sys/bus/pci/devices/&lt;VF&gt;/reset</code>; (5) check controller state and read back the pattern.</p>
+  <p><strong>Observations.</strong> The controller re-initialises after reset; the pattern is still on the namespace; <code>list-secondary</code> still shows resources.</p>
+  <p><strong>Questions.</strong> (a) What does the persistence of the pattern prove? (b) What would you add to make VF1 safe to give to another tenant?</p>
+  <p><strong>Expected reasoning.</strong> Separate controller state from media state.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(a) FLR resets controller state, not stored data (in this emulation; real devices follow the same principle by specification design). (b) An erase step (Format NVM with a secure-erase setting, Sanitize, or namespace delete and re-create) and detach/attach to the new controller, followed by a read-back that returns no prior data. Emulator behaviour is not evidence of a specific SSD's behaviour.</p>
+  </details>
+  <p><strong>Extension.</strong> Attach the emulated device's trace events (if your QEMU build exposes NVMe trace points) and correlate them with the guest's resets.</p>
+
+  <h3>Senior forensic lab: tenant B reads tenant A's data</h3>
+  <p><strong>Objective.</strong> Root-cause a reported cross-tenant data exposure and design the control that prevents it. <span class="badge safe">Safe lab</span> (paper exercise on synthetic evidence).</p>
+  <p><strong>Prerequisites.</strong> All of this module; <a href="ch58.html">Namespaces</a>.</p>
+  <p><strong>Setup: evidence (synthetic).</strong></p>
+  <ul>
+    <li>Tenant B, new on host H7, ran a raw read of its NVMe namespace and found readable database pages carrying tenant A's identifiers.</li>
+    <li>Hypervisor log: VF3 moved from VM A to VM B at 02:14; VF FLR at 02:14:03; IOMMU domain switched at 02:14:04.</li>
+    <li>Management log: NS 9 detached from CNTLID 4, then reattached to CNTLID 4 at 02:14:05. No Format NVM, Sanitize or namespace re-create recorded.</li>
+    <li>Analyzer (installed for another investigation): every DMA during VM B's reads carries RID 0x0103 (VF3) and targets domain B's IOVAs.</li>
+    <li>Identify Namespace for NS 9 shows it is a private namespace (not shared); <code>list-ctrl</code> shows only CNTLID 4 attached.</li>
+  </ul>
+  <p><strong>Procedure.</strong> Classify the evidence; eliminate hypotheses: (H1) device RID or isolation bug; (H2) namespace shared with VM A's controller; (H3) data remanence on reassignment.</p>
+  <p><strong>Questions.</strong> (a) Which evidence eliminates H1? (b) H2? (c) What control fixes H3, and how is it verified?</p>
+  <p><strong>Expected reasoning.</strong> Exposure needs a path; find the one that exists.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(a) All DMA carries VF3's RID into domain B: the device and IOMMU isolated correctly. (b) The namespace is private and attached only to CNTLID 4. (c) H3: the namespace was handed to a new tenant without erasure; FLR and detach/attach do not change media. Control: a mandatory erase (cryptographic erase where supported, or Sanitize/Format NVM, or namespace re-create) in the reassignment workflow, gated by verifying completion status, plus an audit log entry. Verification: a reassignment test writes a unique pattern as tenant 1, reassigns, and asserts tenant 2 reads none of it across 1 000 cycles. Severity: a security incident; report it as such.</p>
+  </details>
+  <p><strong>Extension.</strong> Discuss how NVMe 2.4 exported subsystems and migration change this workflow: state that must move with a tenant versus state that must never move to another tenant.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <table>
+    <caption>SR-IOV failure patterns, part 1: what you see</caption>
+    <thead><tr><th>Pattern</th><th>Symptom</th><th>Possible causes</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>1. Teardown faults</td><td>IOMMU fault burst naming a VF when a VM stops</td><td>Unmap before FLR; killed VM with I/O outstanding</td><td>Faults after unmap, before FLR, all with the VF's RID</td></tr>
+      <tr><td>2. Guest slow, device fast</td><td>Guest latency spikes; device telemetry normal</td><td>vCPU descheduled; interrupt affinity; host over-commit</td><td>Interrupt on time, CQ head doorbell late</td></tr>
+      <tr><td>3. Data visible to a new tenant</td><td>Prior tenant's data readable</td><td>No erase on reassignment; namespace shared by mistake</td><td>Management log lacks erase; attachment list</td></tr>
+      <tr><td>4. Every VF disturbed at once</td><td>All VMs on a device stall or reset together</td><td>PF reset, PF driver unbind or reload, link Recovery, NVM Subsystem Reset</td><td>Host PF driver events; AER/DPC on the root port</td></tr>
+      <tr><td>5. Resource assignment rejected</td><td>Virtualization Management returns an error</td><td>Secondary online; exceeds secondary maximum or pool; granularity</td><td>CQE status on the PF; primary capabilities</td></tr>
+      <tr><td>6. Faults against the PF RID</td><td>IOMMU fault names 01:00.0 during guest I/O</td><td>Device uses PF RID for VF DMA (security bug); or host agent's bad buffer</td><td>Analyzer: which SQE requested the faulting DMA</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>SR-IOV failure patterns, part 2: how you decide</caption>
+    <thead><tr><th>Pattern</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Likely conclusion (confidence)</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Order of unmap and FLR in hypervisor logs</td><td>Fault timestamps vs those events</td><td>Swap the order on a lab host; faults disappear</td><td>Host lifecycle bug (High)</td></tr>
+      <tr><td>2</td><td>Analyzer: MSI-X time vs CQ head doorbell time</td><td>Host scheduler latency for the vCPU</td><td>Pin vCPUs and vector affinity; spikes vanish</td><td>Host scheduling (High)</td></tr>
+      <tr><td>3</td><td>Management log for erase on reassignment</td><td>Namespace attachment and sharing capability</td><td>Reassignment test with unique patterns</td><td>Missing erase policy (High)</td></tr>
+      <tr><td>4</td><td>Host logs for PF driver resets and reloads</td><td>AER/DPC and link state at the root port</td><td>Repeat the PF action on a lab host and watch VFs</td><td>Shared reset scope (High)</td></tr>
+      <tr><td>5</td><td>Secondary state (must be offline)</td><td>Primary Controller Capabilities limits and granularity</td><td>Request a smaller multiple of the granularity</td><td>Configuration error (High)</td></tr>
+      <tr><td>6</td><td>Analyzer correlation of faulting TLP to SQE and doorbell</td><td>Host agent's buffer lifecycle</td><td>Stop the agent; if faults persist with guest I/O, suspect the device</td><td>Depends on evidence (Medium until correlated)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>What does FLR of a VF reset?</p><details class="answer"><summary>Model answer</summary><p>That function's state and its NVMe controller state: registers, queues, outstanding commands, MSI-X configuration. Not other functions, not namespace data.</p></details></li>
+    <li><p>Why does every VF have its own RID?</p><details class="answer"><summary>Model answer</summary><p>So the IOMMU can select the right VM's translation tables and so errors and interrupts are attributed to the right function.</p></details></li>
+    <li><p>Why can't the hypervisor give a guest direct control of the VF's MSI-X table?</p><details class="answer"><summary>Model answer</summary><p>The table holds physical interrupt addresses and data; the hypervisor intercepts guest writes and programs safe, remapped values.</p></details></li>
+    <li><p>Where do namespace management commands for a VF's controller go?</p><details class="answer"><summary>Model answer</summary><p>To the primary controller's admin queue on the PF, by the host's management stack.</p></details></li>
+    <li><p>What does Transactions Pending tell you?</p><details class="answer"><summary>Model answer</summary><p>That the function has non-posted requests awaiting completions; not whether posted writes are in flight.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>Give the order for revoking a VF from a VM.</p><details class="answer"><summary>Model answer</summary><p>Quiesce (shutdown or stop), wait for Transactions Pending to clear, FLR, wait, then unmap IOMMU and remove remapping entries; erase and reattach storage before the next tenant.</p></details></li>
+    <li><p>Why is a blocked posted write more dangerous for debugging than a blocked read?</p><details class="answer"><summary>Model answer</summary><p>A read gets a UR completion the device sees and may report; a posted write is silently dropped and logged only in the host, so the device believes it succeeded.</p></details></li>
+    <li><p>Guest reports 2 ms latency, the device says 80 µs. Who is right?</p><details class="answer"><summary>Model answer</summary><p>Both, measured at different points; the analyzer shows interrupt-to-CQ-head-doorbell time, which is host scheduling.</p></details></li>
+    <li><p>Why must a secondary controller be offline to change its resources?</p><details class="answer"><summary>Model answer</summary><p>Its queues and vectors are in use while online; changing them underneath a running driver would break it, so NVMe requires Offline before Assign.</p></details></li>
+    <li><p>What does a PF driver unbind do to VFs?</p><details class="answer"><summary>Model answer</summary><p>Typically disables SR-IOV, removing every VF, so every guest loses its device: a shared reset scope.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>How do you prove that a fault naming the PF is not VF traffic?</p><details class="answer"><summary>Model answer</summary><p>Correlate the faulting TLP with the doorbell and SQE that caused it in an analyzer capture; matching a PF admin SQE proves host-side origin.</p></details></li>
+    <li><p>Why does ATS complicate VF reassignment?</p><details class="answer"><summary>Model answer</summary><p>The device caches translations; the host must invalidate them, or the device could use stale translations after the domain changes.</p></details></li>
+    <li><p>How would you validate that FLR of VF1 never disturbs VF2?</p><details class="answer"><summary>Model answer</summary><p>Run verified-pattern I/O on VF2 while looping FLR on VF1; pass if VF2 has no errors, no latency outliers beyond a bound, and no resets, over many iterations.</p></details></li>
+    <li><p>What is the difference between VF FLR and a controller reset of the secondary?</p><details class="answer"><summary>Model answer</summary><p>Controller reset (CC.EN 1 → 0) resets NVMe controller state only; FLR resets the whole PCIe function including configuration-visible state and MSI-X, and implies controller reset.</p></details></li>
+    <li><p>How does NVMe 2.4 rate limiting change noisy-neighbour debugging?</p><details class="answer"><summary>Model answer</summary><p>It gives a standard, controller-enforced cap to test against; debugging shifts to verifying configured limits and their enforcement rather than vendor-specific QoS.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>Write acceptance criteria for an SR-IOV NVMe SSD in a multi-tenant cloud.</p><details class="answer"><summary>Model answer</summary><p>RID audit: all VF DMA uses the VF's RID; FLR under load isolates; reassignment with erase leaves no data; resources assign/online correctly at limits; rate limits enforced (if 2.4); error containment per VF; recovery times bounded.</p></details></li>
+    <li><p>Which failures are the device's responsibility and which the platform's?</p><details class="answer"><summary>Model answer</summary><p>Device: correct RIDs, FLR scope, rate enforcement, resource semantics. Platform/host: teardown order, IOMMU and interrupt remapping, erase policy, scheduling. Evidence must name the owner.</p></details></li>
+    <li><p>How would live migration with Exported NVM Subsystems change your test plan?</p><details class="answer"><summary>Model answer</summary><p>Add identity and configuration-template equivalence, runtime-state capture and apply, in-flight I/O correctness across migration, and source cleanup verification, all reading Base 2.4 for definitions.</p></details></li>
+    <li><p>A customer wants to skip erasure for faster VM churn. Your response?</p><details class="answer"><summary>Model answer</summary><p>Not without a different isolation guarantee: cryptographic erase is fast where supported, or per-tenant namespaces re-created; document the risk and require security sign-off otherwise.</p></details></li>
+    <li><p>What evidence do you insist on before escalating "SSD leaks across VMs" to a vendor?</p><details class="answer"><summary>Model answer</summary><p>Analyzer proof of wrong-RID DMA or cross-function data, with attachment lists and erase logs ruling out host policy causes.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>VF FLR clears:</p>
+      <ul class="options" data-answer="2"><li>Namespace data</li><li>The VF's controller registers and queues</li><li>VF Enable in the PF</li><li>The IOMMU domain</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>FLR resets function and controller state only.</p></details></li>
+    <li><p>Correct teardown order:</p>
+      <ul class="options" data-answer="3"><li>Unmap, FLR, quiesce</li><li>FLR, quiesce, unmap</li><li>Quiesce, FLR, unmap</li><li>Unmap only</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Stop new work, reset the function so it stops DMA, then remove translations.</p></details></li>
+    <li><p>A blocked device MWr results in:</p>
+      <ul class="options" data-answer="1"><li>A dropped write and a host-side fault log</li><li>A UR completion to the device</li><li>A Nak DLLP</li><li>A CQE error status</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Posted writes have no completion; the IOMMU drops and logs.</p></details></li>
+    <li><p>Which address header size is used for a write to VF BAR0 at 0x3_8000_0014?</p>
+      <ul class="options" data-answer="2"><li>3 DW (MWr32)</li><li>4 DW (MWr64)</li><li>Either; the TLP decides at random</li><li>None; configuration request</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The address is above 4 GiB, so a 64-bit (4-DW) header is required.</p></details></li>
+    <li><p>An interrupt is on time but the CQ head doorbell is 2 ms late. Most likely:</p>
+      <ul class="options" data-answer="4"><li>NAND read retry</li><li>Link replay</li><li>Wrong MSI-X data</li><li>Host vCPU scheduling</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The device's work ended at the interrupt.</p></details></li>
+    <li><p>Resources can be assigned to a secondary controller only when it is:</p>
+      <ul class="options" data-answer="1"><li>Offline</li><li>Online</li><li>Bound to a VM</li><li>Reset by FLR</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>NVMe requires Offline before Assign.</p></details></li>
+    <li><p>Same IOVA number valid in VM B, faulting for the PF. Why possible?</p>
+      <ul class="options" data-answer="3"><li>IOVA is global</li><li>The PF shares VM B's domain</li><li>IOVA spaces are per domain and overlap numerically</li><li>The IOMMU is disabled</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Each RID's domain has its own address space.</p></details></li>
+    <li><p>Open: why is "FLR resets everything" a dangerous belief in a multi-tenant cloud?</p>
+      <details class="answer"><summary>Model answer</summary><p>It leads to skipping erase on reassignment, exposing the previous tenant's data.</p></details></li>
+    <li><p>Open: name two shared-reset events that disturb every VF.</p>
+      <details class="answer"><summary>Model answer</summary><p>PF driver unbind or PF reset, link Recovery or hot reset, NVM Subsystem Reset, DPC containment at the root port.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <ol>
+    <li><p><strong>To a child:</strong> explain why the hotel waits for the last tray before locking the room, and why it empties the cupboard.</p>
+      <details class="answer"><summary>Model explanation</summary><p>"If we lock the door while a waiter is still walking, the food falls on the floor. And the next guest shouldn't find the last guest's leftovers, so we clean the cupboard every time."</p></details></li>
+    <li><p><strong>To a junior engineer:</strong> walk through VF reassignment, naming the plane (configuration, management, guest, IOMMU) of each step.</p>
+      <details class="answer"><summary>Model explanation</summary><p>"Guest plane: shut down the controller. Configuration plane: check Transactions Pending, FLR the VF. IOMMU: unmap the old domain. Management plane via the PF: erase, detach and attach the namespace, adjust VQ/VI. IOMMU: map the new domain. Guest plane: the new VM enables the controller."</p></details></li>
+    <li><p><strong>To a senior engineer:</strong> argue how you would assign ownership of a DMA fault naming the PF during guest I/O.</p>
+      <details class="answer"><summary>Model explanation</summary><p>"The RID tells us which domain translated it, not who asked. I tie the faulting TLP to its doorbell and SQE in a capture: a PF admin SQE means host software; a VF doorbell and VF SQE with PF RID means a device isolation bug. Until then it is an open security question."</p></details></li>
+  </ol>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain what VF FLR resets and what it leaves, by owner</li>
+      <li>diagram correct VF teardown and reassignment across the four planes</li>
+      <li>identify in a trace: FLR, post-FLR silence, DMA after unmap, interrupt-to-doorbell gaps, PF versus VF origin</li>
+      <li>debug the six patterns on this page</li>
+      <li>distinguish VF FLR from <a href="ch48.html">NVMe controller reset</a> and NVM Subsystem Reset, SR-IOV from <a href="ch55.html">ACS isolation</a>, and VF reassignment from <a href="nvme-2-4.html">NVMe 2.4 exported-subsystem migration</a></li>
+      <li>cite the PCI Express Base Specification (SR-IOV, FLR, ACS) and NVMe Base 2.4 (Virtualization Enhancements, rate limiting)</li>
+    </ul>
+  </aside>
+  <p>Next module: <a href="dd53.html">Performance Engineering</a>.</p>
+</section>

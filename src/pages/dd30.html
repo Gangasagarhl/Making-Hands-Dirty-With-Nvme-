@@ -1,0 +1,637 @@
+<p class="lead">Chapter 32 followed one 4 KiB Read from system call to interrupt, and Chapter 39 tied every layer together. This module pushes the Read to its limits: maximum-size transfers with PRP lists that chain, concurrent reads interleaving on the link, the arithmetic of link-limited throughput, latency tails decomposed stage by stage, and every way a Read can fail or succeed with the wrong data.</p>
+
+<section id="orientation">
+<h2>Orientation</h2>
+<p>A Read is the most frequent command in almost every NVMe trace, and the one whose failures hurt most: a failed Write can be retried from the host's copy, but a Read that returns wrong data, or returns late, goes straight to the application. The happy path is in <a href="ch32.html">Chapter 32</a>. Here we cover the cases that appear in incident reviews: reads at MDTS, reads whose descriptor structures span pages, reads whose data arrives partially, reads that take milliseconds without an error, and reads that are "too fast to be true".</p>
+<aside class="callout prereq">
+<p>You need the Read SQE fields (SLBA, NLB, FUA, LR, PRINFO, DSM hints), the 4 KiB read trace and the latency budget from <a href="ch32.html">Chapter 32 — READ</a>, and the end-to-end correlation method from <a href="ch39.html">Chapter 39 — The Most Important Chapter</a>. PRP rules are in <a href="ch36.html">Chapter 36</a>; MPS and TLP shaping in <a href="dd11.html">Module 11</a>.</p>
+</aside>
+<p>Where it goes next: <a href="dd31.html">Module 31 — WRITE</a> mirrors this module in the other direction; <a href="dd34.html">Module 34 — PRP</a> and <a href="dd36.html">Module 36 — DMA with NVMe</a> deepen the data path; <a href="dd38.html">Module 38 — Trace Correlation</a> generalises the correlation technique.</p>
+</section>
+
+<section id="objectives">
+<h2>Required learning objectives</h2>
+<table>
+<caption>Objectives for this module, by level</caption>
+<thead><tr><th>Level</th><th>You will be able to…</th></tr></thead>
+<tbody>
+<tr><td>Beginner</td><td>Explain why a 128 KiB Read becomes hundreds of TLPs and what each group of TLPs is for.</td></tr>
+<tr><td>Intermediate</td><td>Lay out PRP1, PRP2 and PRP list pages for any buffer offset and size up to MDTS, including a chained list.</td></tr>
+<tr><td>Advanced</td><td>Compute the link-limited read throughput for a given generation, width and MPS, and decompose a latency distribution into stages.</td></tr>
+<tr><td>Senior</td><td>Run a "wrong data" or "slow read" investigation to a defensible conclusion, separating host, platform, link and device causes.</td></tr>
+<tr><td>Trace analysis</td><td>Attribute interleaved data TLPs to their commands by address range and reassemble each Read's payload.</td></tr>
+<tr><td>Debugging</td><td>Diagnose Data Transfer Errors from IOMMU faults, Unrecovered Read Errors, retry-driven tails, ordering-related stale data and throughput shortfalls.</td></tr>
+<tr><td>Validation</td><td>Build a Read test matrix: sizes 1 block to MDTS, PRP offsets, chained lists, FUA/LR, PI, deallocated LBAs, injected uncorrectables, concurrency.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="kid">
+<h2>Kid story</h2>
+<aside class="callout kid" data-title="The library delivery van">
+<p>You ask the library for a big set of books. You give them a card that says where your first shelf is at home and, because the set is big, a second card that is a list of all your other shelves. The library staff gather the books from many storerooms at once, and a van brings them in small boxes, each box labelled with which shelf it goes on. Boxes for your neighbour's order travel in the same van, mixed with yours.</p>
+<p>When the last box for your order is delivered, the driver rings your doorbell to say "your order is complete". Usually that takes a few minutes. Sometimes one book is in a dusty corner and takes ages to find, even though nothing is wrong. Occasionally the shelf list sends the van to an address that doesn't exist, and the delivery stops halfway.</p>
+</aside>
+</section>
+
+<section id="boundary">
+<h2>Analogy boundary</h2>
+<aside class="callout breaks">
+<p><strong>What it represents.</strong> The first card is PRP1; the list card is a PRP list reached through PRP2; storerooms are NAND dies read in parallel; small labelled boxes are MWr TLPs of at most MPS bytes with a target address; the neighbour's boxes are data TLPs of other Reads; the doorbell ring at the end is the CQE followed by the MSI-X interrupt; the dusty corner is read retry; the bad address is a PRP entry the IOMMU does not map.</p>
+<p><strong>What it hides.</strong> The van is not one-way: the device also reads the list card from host memory (MRd and CplD) before it can deliver. Boxes may be delivered in any order within an order; only the doorbell ring is ordered after them, and only under the default ordering rules. The library can also hand you an empty box without visiting any storeroom (deallocated blocks).</p>
+<p><strong>Where it misleads.</strong> A half-finished delivery in the story leaves you knowing which books arrived; in NVMe a failed Read leaves the buffer in an undefined state, and the host must treat all of it as invalid. And a van that "rings first, delivers later" sounds absurd — but with Relaxed Ordering on the wrong TLP, the platform can let the completion overtake the data.</p>
+</aside>
+</section>
+
+<section id="vocabulary">
+<h2>Vocabulary</h2>
+<table>
+<caption>Terms used in this module</caption>
+<thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship to adjacent terms</th><th>Common confusion</th></tr></thead>
+<tbody>
+<tr><td><span class="g" data-term="read-cmd">Read</span></td><td>Bring blocks to the host</td><td>NVM opcode 02h; SLBA, NLB, FUA, LR, PRINFO, DSM hints</td><td>Data flows as device MWr TLPs</td><td>Expecting host MRd for read data</td></tr>
+<tr><td><span class="g" data-term="mdts">MDTS</span></td><td>Biggest single order</td><td>Maximum Data Transfer Size: 2<sup>MDTS</sup> × minimum page size; 128 KiB on the Lab SSD</td><td>Linux caps max_hw_sectors_kb from it</td><td>Thinking it limits NLB in blocks directly</td></tr>
+<tr><td><span class="g" data-term="prp-list">PRP list</span></td><td>The list of shelves</td><td>Page of 8-byte entries reached through PRP2 when a transfer spans more than two pages; last entry chains if more are needed</td><td>PRP1 may have an offset; list entries are page-aligned</td><td>Assuming lists start at page offset 0</td></tr>
+<tr><td><span class="g" data-term="mps">MPS</span></td><td>Biggest box</td><td>Max Payload Size: largest TLP data payload (256 bytes on the reference link)</td><td>Bounds data MWrs; MRRS bounds MRd requests</td><td>Confusing the PCIe MPS with the NVMe memory page size (CC.MPS)</td></tr>
+<tr><td><span class="g" data-term="limited-retry">Limited Retry</span></td><td>"Don't search the dusty corners"</td><td>LR, CDW12 bit 31: fail fast rather than apply lengthy recovery</td><td>Trades latency for error rate</td><td>Setting it without a redundancy layer</td></tr>
+<tr><td>Read retry</td><td>Searching harder</td><td>Device-internal re-reads with different thresholds, soft decoding, parity across dies</td><td>Visible only as latency, or as Unrecovered Read Error when it fails</td><td>Assuming a slow read means an error</td></tr>
+<tr><td>Data Transfer Error</td><td>Delivery stopped</td><td>Generic status 04h: the controller could not move the data</td><td>Often follows an Unsupported Request completion or IOMMU fault</td><td>Blaming the media</td></tr>
+<tr><td><span class="g" data-term="relaxed-ordering">Relaxed Ordering</span></td><td>Boxes may overtake each other</td><td>TLP attribute letting a posted write pass earlier posted writes</td><td>Speeds data delivery; must not apply to the CQE write</td><td>Thinking it is always safe for storage</td></tr>
+<tr><td><span class="g" data-term="iommu">IOMMU</span></td><td>The address checker at the door</td><td>Translates device addresses (IOVAs) and blocks unmapped ones</td><td>Turns host mapping bugs into faults instead of corruption</td><td>Assuming a fault means the device is wrong</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="architecture">
+<h2>Architecture</h2>
+<figure>
+<pre class="diagram">
+ Host                                    Link (Gen4 x4)                              Controller
+ ────                                    ──────────────                              ──────────
+ block layer: bio 128 KiB
+ driver: map pages → IOVAs, build PRP list page(s)
+ SQE (SLBA, NLB, PRP1, PRP2) ─► SQ1
+ MWr32 doorbell ────────────────────────────────────────────────────────────────►  fetch SQE
+                                          ◄── MRd SQE / CplD ──►
+                                          ◄── MRd PRP list (and chained page) ──►    descriptor engine
+                                                                                     FTL lookup → N dies read (tR)
+                                                                                     ECC → retry? → buffer
+ IOMMU translate ◄─ MWr data (≤ 256 B each, no 4 KiB crossing, maybe interleaved) ◄─ DMA engine
+ CQ1 ◄────────────── MWr CQE (after all data, default ordering) ◄────────────────── completion engine
+ CPU ◄────────────── MWr32 MSI-X ◄──────────────────────────────────────────────────
+ driver: unmap, complete bio
+</pre>
+<figcaption>A maximum-size Read through the reference system. Synthetic, conceptual.</figcaption>
+</figure>
+<table>
+<caption>Architecture of a large Read</caption>
+<thead><tr><th>Aspect</th><th>Content</th></tr></thead>
+<tbody>
+<tr><td>Inputs</td><td>Read SQE; PRP1/PRP2 and PRP list pages; namespace format (512-byte LBAs on namespace 1); MDTS.</td></tr>
+<tr><td>Outputs</td><td>Data in host buffers; CQE with status; MSI-X interrupt; possibly Error Information log entries and SMART counter changes.</td></tr>
+<tr><td>Actors</td><td>Block layer, driver, IOMMU, root complex, controller descriptor engine, FTL, NAND dies, ECC engine, DMA engine.</td></tr>
+<tr><td>State</td><td>Outstanding request (SQID, CID); IOMMU mappings for data and list pages; controller per-command transfer progress; die queues.</td></tr>
+<tr><td>Memory</td><td>Data buffers from 0x2_0000_0000; PRP list pages from 0x1_5000_0000; SQ1/CQ1.</td></tr>
+<tr><td>Registers</td><td>SQ1TDBL 0xFE60_1008, CQ1HDBL 0xFE60_100C; Device Control (MPS, MRRS, Relaxed Ordering enable).</td></tr>
+<tr><td>Interfaces</td><td>PCIe MRd/CplD (SQE, lists), MWr (data, CQE, MSI-X); block layer limits.</td></tr>
+<tr><td>Dependencies</td><td>IOMMU mappings valid until completion; MPS agreed along the path; ordering rules preserved between data and CQE.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="mechanism">
+<h2>Mechanism</h2>
+<p>A 128 KiB Read (NLB 255 on 512-byte LBAs) on SQ1, concurrent with a 4 KiB Read on SQ2. Reference lab system; synthetic.</p>
+<ol>
+<li><strong>Map and describe.</strong> <em>Who:</em> driver. <em>What:</em> maps 32 buffer pages (IOVAs 0x2_0010_0000–0x2_0011_F000); PRP1 = first page; 31 entries in a list page at 0x1_5000_0000; PRP2 = list address. <em>Evidence:</em> SQE and list contents.</li>
+<li><strong>Submit.</strong> <em>Who:</em> driver. <em>What:</em> SQE in slot 160, doorbell 161. <em>Evidence:</em> MWr32 to 0xFE60_1008.</li>
+<li><strong>Fetch command and list.</strong> <em>Who:</em> controller. <em>What:</em> MRd for the SQE, then MRd of 248 bytes for the list. <em>Evidence:</em> two MRd/CplD pairs; a controller may fetch the list later or in pieces.</li>
+<li><strong>Read media in parallel.</strong> <em>Who:</em> FTL and dies. <em>What:</em> 32 logical pages spread over several dies read concurrently; ECC corrects each. <em>Evidence:</em> only the gap before data.</li>
+<li><strong>Deliver data.</strong> <em>Who:</em> DMA engine. <em>What:</em> 512 MWr of 256 bytes, in bursts as dies finish; the concurrent Read's TLPs interleave. <em>Evidence:</em> MWr addresses in two disjoint ranges.</li>
+<li><strong>Complete.</strong> <em>Who:</em> controller. <em>What:</em> CQE after the last data TLP; MSI-X. <em>Evidence:</em> MWr to CQ1, MWr32 to 0xFEE0_1000.</li>
+<li><strong>Finish.</strong> <em>Who:</em> driver. <em>What:</em> consume CQE, unmap pages and list, complete the request. <em>Evidence:</em> tracepoints; CQ head doorbell.</li>
+</ol>
+<figure>
+<ol class="seq" data-actors="Driver|Host memory|Link / IOMMU|Controller|NAND">
+<li data-from="Driver" data-to="Host memory">SQE + PRP list (31 entries)</li>
+<li data-from="Driver" data-to="Controller">doorbell SQ1 = 161</li>
+<li data-from="Controller" data-to="Host memory" class="dashed">MRd SQE, MRd list</li>
+<li data-from="Controller" data-to="NAND">read 32 pages on several dies</li>
+<li data-from="NAND" data-to="Controller">pages (after tR + ECC)</li>
+<li data-from="Controller" data-to="Link / IOMMU">512 × MWr 256 B (interleaved with SQ2's read)</li>
+<li data-from="Controller" data-to="Host memory">CQE (after data)</li>
+<li data-from="Controller" data-to="Driver">MSI-X vector 1</li>
+</ol>
+<figcaption>A 128 KiB Read. Synthetic.</figcaption>
+</figure>
+
+<h3>The central concept on the ladder: a Read is a contract that data precedes completion</h3>
+<div class="ladder">
+<div class="rung" data-rung="A"><p>All boxes are delivered before the doorbell rings; if the doorbell says "problem", treat everything as missing.</p></div>
+<div class="rung" data-rung="B"><p>The device writes the data into host buffers, then writes a completion. Success means the whole range arrived; failure means none of it may be trusted.</p></div>
+<div class="rung" data-rung="C"><p>Descriptors (PRP1, PRP2, lists) tell the DMA engine where each page goes; the engine emits MPS-bounded writes in any order, then the CQE, relying on posted-write ordering.</p></div>
+<div class="rung" data-rung="D"><p>NVM Command Set 1.3 defines the Read; Base 2.4 the CQE and generic status; NVMe over PCIe 1.4 the PRP rules; PCIe Base the ordering rules (posted writes do not pass posted writes unless Relaxed Ordering is set).</p></div>
+<div class="rung" data-rung="E"><p>MRd/CplD for SQE and lists, then MWr data, then MWr CQE, then MWr32 MSI-X, all with Requester ID 0x0100.</p></div>
+<div class="rung" data-rung="F"><p>For each Read: data address range = union of PRP pages; count bytes; confirm the CQE follows the last data TLP; check RO attributes.</p></div>
+<div class="rung" data-rung="G"><p>"Wrong data" → was all data written before the CQE (ordering, RO)? to the right addresses (PRP, IOMMU)? from the right LBAs (SQE)? with correct content (PI, media)?</p></div>
+</div>
+</section>
+
+<section id="spec">
+<h2>Specification discipline</h2>
+<p>Sources: <cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3 — Read command; Deallocated or Unwritten Logical Blocks; End-to-end Data Protection</cite>; <cite class="spec">NVM Express Base Specification, Revision 2.4 — Completion Queue Entry; Generic Command Status; Identify Controller (MDTS)</cite>; <cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4 — Physical Region Page entry and list</cite>; <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 family — Transaction Ordering; Relaxed Ordering; Max Payload Size</cite>.</p>
+<table>
+<caption>Classifying Read statements</caption>
+<thead><tr><th>Statement</th><th>Kind</th></tr></thead>
+<tbody>
+<tr><td>PRP1 may have a non-zero offset (dword aligned); list entries are page aligned; the last entry of a list page points to the next list page if more entries are needed.</td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>A data MWr may not exceed MPS or cross a 4 KiB boundary.</td><td><span class="badge normative">Normative</span> (PCIe)</td></tr>
+<tr><td>The CQE is ordered after the data under default PCIe ordering.</td><td><span class="badge derived">Derived</span> from posted-write ordering</td></tr>
+<tr><td>Order of data TLPs within a Read, TLP sizes below MPS, list prefetch, burst pacing.</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+<tr><td>Buffer contents after a failed Read.</td><td>Undefined — <span class="badge normative">Normative</span> in effect: success is the only promise</td></tr>
+<tr><td>Read-retry depth and time; whether LR shortens it and by how much.</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+<tr><td>Deallocated-block read value and DULBE behaviour.</td><td><span class="badge normative">Normative</span> as reported by the namespace; <span class="badge optional">Optional</span> features</td></tr>
+<tr><td>SGL support for I/O, metadata pointer forms.</td><td><span class="badge optional">Optional</span>, <span class="badge version">Version-dependent</span> details</td></tr>
+</tbody>
+</table>
+<aside class="callout notsaid">
+<p>The specifications do not say how long a Read may take, in what order its data TLPs appear, whether a controller prefetches all list pages before transferring, what happens to buffer bytes after an error, or which PCIe completion status a platform returns when its IOMMU blocks a device read (Unsupported Request and Completer Abort are both seen in practice). They also do not say that a Read with FUA = 0 must bypass or use the write cache. This module's DULBE status is named, not numbered <span class="badge uncertain">Check code</span>.</p>
+</aside>
+</section>
+
+<section id="hardware">
+<h2>Hardware view</h2>
+<table>
+<caption>Hardware in a Read</caption>
+<thead><tr><th>Category</th><th>Hardware</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td rowspan="4">Must</td><td>NAND dies and channels</td><td>Array read (tR), data out; parallelism across dies sets large-read throughput.</td></tr>
+<tr><td>ECC engine (LDPC)</td><td>Corrects bit errors; triggers retry on failure.</td></tr>
+<tr><td>DMA engine</td><td>Walks PRP descriptors, emits MWr TLPs.</td></tr>
+<tr><td>Root complex and memory controller</td><td>Accept data writes into DRAM; answer list and SQE reads.</td></tr>
+<tr><td rowspan="2">May</td><td>IOMMU (on in the reference system)</td><td>Translates every data and list address; faults on unmapped ones.</td></tr>
+<tr><td>Controller DRAM/SRAM read cache</td><td>Serves recently written or prefetched data without NAND.</td></tr>
+<tr><td>Observable</td><td colspan="2">Gap from fetch to first data (media), data rate, TLP sizes and attributes, CQE timing, completion statuses on list reads.</td></tr>
+<tr><td>Unobservable</td><td colspan="2">Which dies were read, ECC iterations, retry steps, cache hits — only their timing.</td></tr>
+</tbody>
+</table>
+<aside class="callout hw">
+<p>Link-limited throughput on the reference link (derived): Gen4 is 16 GT/s per lane with 128b/130b encoding, so x4 carries about 7.88 GB/s. Each 256-byte data TLP costs about 280 bytes on the wire (4 bytes framing and sequence, 16-byte header for 64-bit addresses, 4-byte LCRC), so data efficiency is 256/280 ≈ 0.914 and the ceiling is about 7.2 GB/s before DLLP traffic (ACKs, flow-control updates), which takes a few percent more. With MPS 128 the efficiency drops to 128/152 ≈ 0.84.</p>
+</aside>
+</section>
+
+<section id="protocol">
+<h2>Protocol view</h2>
+<table>
+<caption>Transactions of a large Read</caption>
+<thead><tr><th>Step</th><th>TLP</th><th>Posted?</th><th>Bounded by</th><th>Failure modes</th></tr></thead>
+<tbody>
+<tr><td>SQE fetch</td><td>MRd64 + CplD</td><td>No</td><td>MRRS 512, RCB 64</td><td>UR/CA, completion timeout</td></tr>
+<tr><td>PRP list fetch (each list page)</td><td>MRd64 + CplD</td><td>No</td><td>MRRS; list page boundaries</td><td>UR/CA after IOMMU fault → Data Transfer Error</td></tr>
+<tr><td>Data</td><td>MWr64 × n</td><td>Yes</td><td>MPS 256; 4 KiB boundaries</td><td>Silently dropped by IOMMU; poisoned TLP</td></tr>
+<tr><td>CQE</td><td>MWr64</td><td>Yes</td><td>—</td><td>Dropped if CQ unmapped</td></tr>
+<tr><td>Interrupt</td><td>MWr32 (0xFEE0_1000, data 0x41)</td><td>Yes</td><td>—</td><td>Masked vector; remapping fault</td></tr>
+</tbody>
+</table>
+<p>Ordering: data MWrs and the CQE MWr travel in the same direction from the same requester; without Relaxed Ordering, the CQE cannot pass them, so a host that sees the CQE also sees the data. A controller may set Relaxed Ordering on data TLPs (when enabled in Device Control) to let the platform write them faster, but must not set it on the CQE. If it does, or if a platform bug reorders writes, the host may read the buffer before the data lands — the senior lab's scenario.</p>
+<p>Interleaving: concurrent Reads produce data TLPs from the same Requester ID; attribute them by address range (each Read owns its PRP pages), not by position. Tags do not help: posted writes carry tags that the receiver does not use for matching.</p>
+<p>Data errors in mid-transfer: if a list fetch or data write fails, the controller completes the Read with an error status after an unpredictable amount of data has been written. The status, not the data, is authoritative.</p>
+</section>
+
+<section id="trace">
+<h2>Trace view</h2>
+<p>Synthetic examples for teaching on the reference lab system: Gen4 x4, MPS 256, MRRS 512, IOMMU on; SQ1 0x1_2340_0000, CQ1 0x1_2341_0000, SQ2 0x1_2342_0000, CQ2 0x1_2343_0000; namespace 1 with 512-byte LBAs; data buffers from 0x2_0000_0000; PRP lists from 0x1_5000_0000. Doorbells and MSI-X use MWr32; host memory above 4 GiB uses MRd64/MWr64.</p>
+
+<h3>Normal: 128 KiB Read with a concurrent 4 KiB Read</h3>
+<div class="trace" data-kind="synthetic" data-title="Normal: MDTS-sized Read, interleaved data">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_00A1</td><td>SQ1 tail → 161</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.7</td><td>MRd64</td><td>Tag=0x60 Addr=0x1_2340_2800 Len=16 DW</td><td>Fetch slot 160</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.3</td><td>CplD</td><td>ByteCount=64 CDW0=0x0120_0002 NSID=1 PRP1=0x2_0010_0000 PRP2=0x1_5000_0000 CDW10=0x0080_0000 CDW12=0x0000_00FF</td><td>Read CID 0x0120, SLBA 0x80_0000, 256 blocks = 128 KiB</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1.9</td><td>MRd64</td><td>Tag=0x61 Addr=0x1_5000_0000 Len=62 DW</td><td>PRP list: 31 entries = 248 bytes</td></tr>
+<tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2.6</td><td>CplD</td><td>ByteCount=248 Data=0x2_0010_1000, 0x2_0010_2000, … 0x2_0011_F000</td><td>Pages 2–32</td></tr>
+<tr class="dir-down"><td>6</td><td>Host→Dev</td><td>3.0</td><td>MWr32</td><td>Addr=0xFE60_1010 Data=0x0000_0045</td><td>SQ2 tail → 69 (a 4 KiB Read, CID 0x0044, buffer 0x2_0020_0000)</td></tr>
+<tr class="dir-up"><td>7</td><td>Dev→Host</td><td>66.0</td><td>MWr64 ×64</td><td>Addr=0x2_0010_0000 … 0x2_0010_3F00 Len=64 DW each</td><td>First 16 KiB of CID 0x0120 (first dies finished)</td></tr>
+<tr class="dir-up"><td>8</td><td>Dev→Host</td><td>68.4</td><td>MWr64 ×16</td><td>Addr=0x2_0020_0000 … 0x2_0020_0F00</td><td>All of SQ2's 4 KiB Read, interleaved</td></tr>
+<tr class="dir-up"><td>9</td><td>Dev→Host</td><td>69.0</td><td>MWr64</td><td>Addr=0x1_2343_0440 Len=4 DW DW2=0x0002_0045 DW3=0x0001_0044</td><td>SQ2's CQE (vector 1 or its own; omitted)</td></tr>
+<tr class="dir-up"><td>10</td><td>Dev→Host</td><td>69.1</td><td>MWr64 ×448</td><td>Addr=0x2_0010_4000 … 0x2_0011_FF00</td><td>Remaining 112 KiB of CID 0x0120, in bursts</td></tr>
+<tr class="dir-up"><td>11</td><td>Dev→Host</td><td>86.8</td><td>MWr64</td><td>Addr=0x1_2341_0A00 Len=4 DW DW2=0x0001_00A1 DW3=0x0001_0120</td><td>CQE: success, after the last data TLP</td></tr>
+<tr class="dir-up"><td>12</td><td>Dev→Host</td><td>86.9</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x0000_0041</td><td>MSI-X vector 1</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Count: 64 + 448 = 512 data TLPs of 256 bytes = 131,072 bytes, covering exactly PRP1's page plus the 31 list pages. SQ2's Read starts after SQ1's but completes first — completions follow media, not submission. Data for the large Read spans 66.0–86.7 µs ≈ 20.7 µs including interleaved traffic, close to the 18.2 µs line-rate minimum (512 × 280 B / 7.88 GB/s). Attribution of rows 7, 8 and 10 is by address range, not by order.</p>
+</div>
+
+<h3>Slow: a 2.8 ms Read that succeeds</h3>
+<div class="trace" data-kind="synthetic" data-title="Slow: read-retry tail with success status">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_00C9</td><td>SQ1 tail → 201</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.7</td><td>MRd64</td><td>Tag=0x70 Addr=0x1_2340_3200 Len=16 DW</td><td>Fetch slot 200</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.3</td><td>CplD</td><td>CDW0=0x0150_0002 PRP1=0x2_0030_0000 CDW10=0x0123_4560 CDW12=0x0000_0007</td><td>Read CID 0x0150, 4 KiB, LR = 0</td></tr>
+<tr class="abnormal"><td>4</td><td>—</td><td>70 → 2,790</td><td>(none)</td><td>No data for this command; other commands on SQ1 and SQ2 complete normally</td><td>First abnormal event: expected data near 70 µs is absent</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>2,790.4</td><td>MWr64 ×16</td><td>Addr=0x2_0030_0000 … 0x2_0030_0F00</td><td>Data finally arrives</td></tr>
+<tr class="dir-up"><td>6</td><td>Dev→Host</td><td>2,791.2</td><td>MWr64</td><td>Addr=0x1_2341_0C80 Len=4 DW DW3=0x0001_0150</td><td>Success</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> The delay sits entirely between fetch and first data — device side; the host and the link are cleared. A success status with milliseconds of delay fits read retry on a weak page (the LBA was recovered), but also die contention behind an erase, internal garbage collection or thermal throttling. Discriminators: re-read the same LBA immediately (a weak page is likely slow again unless the firmware refreshed it; contention usually is not); check whether other LBAs on the same time window were slow (contention affects many); read the drive's temperature and throttling counters; vendor telemetry may record retry counts. With LR = 1 the same read might have failed fast with an Unrecovered Read Error — useful only when a redundancy layer can rebuild the block.</p>
+</div>
+
+<h3>Failed: Unsupported Request on a chained PRP list page</h3>
+<div class="trace" data-kind="synthetic" data-title="Failed: second PRP list page not mapped in the IOMMU">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_00D1</td><td>SQ1 tail → 209</td></tr>
+<tr class="dir-down"><td>2</td><td>Host→Dev</td><td>1.3</td><td>CplD</td><td>CDW0=0x0130_0002 PRP1=0x2_0040_0000 PRP2=0x1_5000_0FC0 CDW10=0x0200_0000 CDW12=0x0000_00FF</td><td>Read CID 0x0130, 128 KiB; list starts 64 bytes before a page end</td></tr>
+<tr class="dir-up"><td>3</td><td>Dev→Host</td><td>1.9</td><td>MRd64</td><td>Tag=0x71 Addr=0x1_5000_0FC0 Len=16 DW</td><td>8 entries: 7 data pages + chain pointer</td></tr>
+<tr class="dir-down"><td>4</td><td>Host→Dev</td><td>2.6</td><td>CplD</td><td>ByteCount=64 Data=0x2_0040_1000 … 0x2_0040_7000, 0x1_5000_7000</td><td>Last entry chains to list page 0x1_5000_7000</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>67.0</td><td>MWr64 ×128</td><td>Addr=0x2_0040_0000 … 0x2_0040_7F00</td><td>First 32 KiB delivered</td></tr>
+<tr class="dir-up"><td>6</td><td>Dev→Host</td><td>75.2</td><td>MRd64</td><td>Tag=0x72 Addr=0x1_5000_7000 Len=48 DW</td><td>Fetch the second list page (24 entries)</td></tr>
+<tr class="abnormal"><td>7</td><td>Host→Dev</td><td>75.9</td><td>Cpl</td><td>Cpl=RC Req=0x0100 Tag=0x72 Status=UR ByteCount=192</td><td>First abnormal event: Unsupported Request completion (no data)</td></tr>
+<tr class="dir-up"><td>8</td><td>Dev→Host</td><td>76.5</td><td>MWr64</td><td>Addr=0x1_2341_0D00 Len=4 DW DW3=0x0009_0130</td><td>Status word 0x0009: SC 04h Data Transfer Error, SCT 0, DNR 0</td></tr>
+<tr class="note"><td colspan="6">Host log: IOMMU fault from 01:00.0, read, address 0x1_5000_7000, not present. Linux prints status 0x4 for the request.</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> The controller behaved correctly: it followed the chain pointer the host wrote, received UR, stopped, and reported Data Transfer Error. 32 KiB of correct data were written; the host must discard them anyway. The defect is on the host: the list page at 0x1_5000_7000 was not mapped when the device read it. Candidates: the driver allocated a chained page but mapped only the first; an error path unmapped it early; or the chain pointer was miscomputed (pointing at a page the driver never allocated). The IOMMU fault log names the address; the driver's list allocation trace decides among the three. Note the platform returned UR; another platform might return Completer Abort for the same fault.</p>
+</div>
+
+<h3>Ambiguous: an 8 µs Read of zeros</h3>
+<div class="trace" data-kind="synthetic" data-title="Ambiguous: fast Read returning all-zero data">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_00E1</td><td>SQ1 tail → 225</td></tr>
+<tr class="dir-down"><td>2</td><td>Host→Dev</td><td>1.3</td><td>CplD</td><td>CDW0=0x0160_0002 PRP1=0x2_0050_0000 CDW10=0x0700_0000 CDW12=0x0000_0007</td><td>Read CID 0x0160, 4 KiB at SLBA 0x700_0000</td></tr>
+<tr class="abnormal"><td>3</td><td>Dev→Host</td><td>6.9</td><td>MWr64 ×16</td><td>Addr=0x2_0050_0000 … 0x2_0050_0F00, all payload bytes 00</td><td>Data 5.6 µs after fetch — far below a NAND read</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>8.0</td><td>MWr64</td><td>DW3=0x0001_0160</td><td>Success</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Candidates: (a) the LBAs are deallocated or never written, and DLFEAT says they read as zeros — no media access; (b) a controller cache hit on data that really is zeros; (c) a firmware bug returning zeros instead of the stored data. The trace cannot separate them. Evidence: did the application ever write these LBAs (its own logs, or a filesystem map)? DLFEAT for the namespace; on a test system enable DULBE (then (a) turns into an error status); write a known pattern, read back — fast and correct means the cache works; then power-cycle and read again — media time and correct pattern means the stored data is fine. Only (c) is a bug, and it shows as wrong content after a known write.</p>
+</div>
+</section>
+
+<section id="linux">
+<h2>Linux view</h2>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Size limits the block layer derived from MDTS and the driver</span>
+grep . /sys/block/nvme0n1/queue/{max_hw_sectors_kb,max_sectors_kb,max_segments,logical_block_size}
+<span class="cm"># Link and payload settings, including the Relaxed Ordering enable</span>
+sudo lspci -s 01:00.0 -vvv | grep -E 'LnkSta:|DevCtl:|MaxPayload|RlxdOrd'
+<span class="cm"># IOMMU faults naming the device (wording differs between Intel and AMD)</span>
+sudo dmesg | grep -iE 'dmar|iommu|AMD-Vi' | grep -i '01:00.0' | tail
+<span class="cm"># Per-request latency by stage: driver issue/complete tracepoints</span>
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_setup_cmd/enable; echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_complete_rq/enable'
+sudo timeout 5 cat /sys/kernel/tracing/trace_pipe | grep -E 'opcode=0x2|cmdid' | head -40
+sudo sh -c 'echo 0 &gt; /sys/kernel/tracing/events/nvme/enable'
+<span class="cm"># Read-only load: fio refuses to write with --readonly</span>
+sudo fio --name=rr --filename=/dev/nvme0n1 --readonly --direct=1 --rw=randread --bs=4k --iodepth=32 --runtime=30 --time_based --percentile_list=50:99:99.9:99.99</code></pre>
+<table>
+<caption>What Linux evidence proves about Reads</caption>
+<thead><tr><th>Output</th><th>Category</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+<tbody>
+<tr><td>max_hw_sectors_kb</td><td>Derived limit</td><td>The largest Read the block layer will send (≤ MDTS)</td><td>The PRP layout used</td></tr>
+<tr><td>lspci DevCtl</td><td>Configuration</td><td>MPS, MRRS and whether Relaxed Ordering is enabled</td><td>Whether the device sets RO on any particular TLP</td></tr>
+<tr><td>IOMMU fault log</td><td>Platform event</td><td>Device, direction and address of a blocked access</td><td>Which command caused it</td></tr>
+<tr><td>Tracepoints</td><td>Driver timing</td><td>Submission to completion per CID, status</td><td>Where inside that interval time went</td></tr>
+<tr><td>fio percentiles</td><td>Workload result</td><td>Latency distribution from the application's view</td><td>Cause of the tail</td></tr>
+</tbody>
+</table>
+<aside class="callout warn">
+<p>Use <code>--readonly</code> with fio on any device with data. Commands like <code>nvme read</code> are non-destructive but their option names differ between nvme-cli versions <span class="badge version">Version-dependent</span>; check <code>nvme read --help</code> before use, and never substitute <code>nvme write</code> in a recipe.</p>
+</aside>
+</section>
+
+<section id="labs">
+<h2>Labs</h2>
+
+<h3>Beginner lab — PRP layouts by hand</h3>
+<p><span class="badge safe">Safe lab</span> Paper.</p>
+<h4>Objective</h4><p>Write PRP1, PRP2 and list contents for four Reads.</p>
+<h4>Prerequisites</h4><p><a href="ch36.html">Chapter 36</a>.</p>
+<h4>Setup</h4><p>Buffer pages are consecutive from 0x2_0010_0000; list pages from 0x1_5000_0000. Cases: (1) 4 KiB, offset 0; (2) 8 KiB, offset 0; (3) 6 KiB, offset 0xC00; (4) 128 KiB, offset 0x80.</p>
+<h4>Procedure</h4><ol><li>Count pages touched.</li><li>Choose PRP2: zero, second page, or list pointer.</li><li>Count list entries.</li><li>Count data TLPs at MPS 256.</li></ol>
+<h4>Observations</h4><p>Your table.</p>
+<h4>Questions</h4><ol><li>Why does a 6 KiB read need a list?</li><li>Why does case (4) have 513 TLPs instead of 512?</li></ol>
+<h4>Expected reasoning</h4><p>Pages touched, not bytes, decide the PRP form; boundaries split TLPs.</p>
+<details class="solution"><summary>Solution</summary>
+<p>(1) 1 page: PRP1 = 0x2_0010_0000, PRP2 unused; 16 TLPs. (2) 2 pages: PRP2 = 0x2_0010_1000; 32 TLPs. (3) 0xC00 + 6 KiB spans 3 pages (1 KiB + 4 KiB + 1 KiB): PRP1 = 0x2_0010_0C00, PRP2 = list with 2 entries; 24 TLPs. (4) 33 pages: PRP1 = 0x2_0010_0080, list of 32 entries; the first page holds 3,968 bytes: 15 TLPs of 256 then one of 128 to reach the boundary; 31 full pages × 16; last page 128 bytes in one TLP: 16 + 496 + 1 = 513. The intermediate lab's script prints the same results.</p>
+</details>
+<h4>Extension</h4><p>Redo case (4) with the list at 0x1_5000_0FC0 and draw the chain.</p>
+
+<h3>Intermediate lab — Layout, shaping and link limits</h3>
+<p><span class="badge safe">Safe lab</span> Pure software.</p>
+<h4>Objective</h4><p>Generate PRP structures and data TLPs, and compute the link-limited rate.</p>
+<h4>Prerequisites</h4><p>Beginner lab.</p>
+<h4>Setup</h4>
+<pre class="code" data-kind="executable" data-lang="python" data-title="read_tlps.py"><code># read_tlps.py - PRP layout, data-TLP shaping and reassembly for one NVMe Read (synthetic model).
+PAGE, MPS, ENTRY = 4096, 256, 8
+
+def prp_layout(buf_pages, offset, length, list_addr):
+    """buf_pages: page-aligned host pages. Returns PRP1, PRP2 and list pages {addr: [entries]}."""
+    first = PAGE - offset
+    npages = 1 + max(0, -(-(length - first) // PAGE))
+    prp1 = buf_pages[0] + offset
+    if npages == 1:
+        return prp1, 0, {}
+    if npages == 2:
+        return prp1, buf_pages[1], {}
+    rest, lists, addr = list(buf_pages[1:npages]), {}, list_addr
+    while rest:
+        room = (PAGE - addr % PAGE) // ENTRY          # entries left in this list page
+        if len(rest) &lt;= room:
+            lists[addr] = rest; rest = []
+        else:                                         # last slot chains to the next list page
+            nxt = (addr // PAGE + 7) * PAGE           # illustrative: next list page 7 pages on
+            lists[addr] = rest[:room - 1] + [nxt]; rest = rest[room - 1:]; addr = nxt
+    return prp1, list_addr, lists
+
+def data_tlps(buf_pages, offset, length):
+    """Device-to-host MWr TLPs: at most MPS bytes, never crossing a 4 KiB boundary."""
+    tlps, done, i, off = [], 0, 0, offset
+    while done &lt; length:
+        n = min(MPS, PAGE - off, length - done)
+        tlps.append((buf_pages[i] + off, n)); done += n; off += n
+        if off == PAGE:
+            i, off = i + 1, 0
+    return tlps
+
+def overhead_rate(tlps, raw_gbs=16 * 4 * 128 / 130 / 8):
+    wire = sum(n + 24 for _, n in tlps)                # 4 B framing+seq, 16 B 4DW header, 4 B LCRC
+    payload = sum(n for _, n in tlps)
+    return payload / wire, raw_gbs * payload / wire
+
+pages = [0x2_0010_0000 + k * PAGE for k in range(40)]
+for name, off, ln, la in [("128 KiB aligned", 0, 128 * 1024, 0x1_5000_0000),
+                          ("128 KiB, offset 0x80", 0x80, 128 * 1024, 0x1_5000_0000),
+                          ("128 KiB, list at page end", 0, 128 * 1024, 0x1_5000_0FC0),
+                          ("6 KiB, offset 0xC00", 0xC00, 6 * 1024, 0x1_5000_0000)]:
+    prp1, prp2, lists = prp_layout(pages, off, ln, la)
+    t = data_tlps(pages, off, ln)
+    eff, rate = overhead_rate(t)
+    print("%-26s PRP1=0x%s PRP2=0x%s" % (name, format(prp1, "_x"), format(prp2, "_x")))
+    for a, e in lists.items():
+        print("%28s list page 0x%s: %d entries, last=0x%s" % ("", format(a, "_x"), len(e), format(e[-1], "_x")))
+    sizes = sorted(set(n for _, n in t))
+    print("%28s %d MWr TLPs, sizes %s, efficiency %.3f, link-limited %.2f GB/s" % ("", len(t), sizes, eff, rate))
+
+# Reassembly check: every byte written exactly once, in buffer order.
+t = data_tlps(pages, 0x80, 128 * 1024)
+cover = sum(n for _, n in t)
+contig = all(t[k][0] + t[k][1] == t[k + 1][0] for k in range(len(t) - 1) if (t[k][0] + t[k][1]) % PAGE)
+print("reassembly: %d bytes, contiguous within pages: %s" % (cover, contig))</code></pre>
+<h4>Procedure</h4><ol><li>Run it and compare with your beginner-lab answers.</li><li>Change MPS to 128 and 512 and record efficiency.</li><li>Add a model where the controller emits 64-byte TLPs at page starts until aligned to 256 — a real implementation choice — and measure the cost.</li></ol>
+<h4>Observations</h4>
+<pre class="code" data-kind="simulation" data-lang="text"><code>128 KiB aligned            PRP1=0x2_0010_0000 PRP2=0x1_5000_0000
+                             list page 0x1_5000_0000: 31 entries, last=0x2_0011_f000
+                             512 MWr TLPs, sizes [256], efficiency 0.914, link-limited 7.20 GB/s
+128 KiB, offset 0x80       PRP1=0x2_0010_0080 PRP2=0x1_5000_0000
+                             list page 0x1_5000_0000: 32 entries, last=0x2_0012_0000
+                             513 MWr TLPs, sizes [128, 256], efficiency 0.914, link-limited 7.20 GB/s
+128 KiB, list at page end  PRP1=0x2_0010_0000 PRP2=0x1_5000_0fc0
+                             list page 0x1_5000_0fc0: 8 entries, last=0x1_5000_7000
+                             list page 0x1_5000_7000: 24 entries, last=0x2_0011_f000
+                             512 MWr TLPs, sizes [256], efficiency 0.914, link-limited 7.20 GB/s
+6 KiB, offset 0xC00        PRP1=0x2_0010_0c00 PRP2=0x1_5000_0000
+                             list page 0x1_5000_0000: 2 entries, last=0x2_0010_2000
+                             24 MWr TLPs, sizes [256], efficiency 0.914, link-limited 7.20 GB/s
+reassembly: 131072 bytes, contiguous within pages: True</code></pre>
+<h4>Questions</h4><ol><li>Why does efficiency not change with the offset?</li><li>What is the theoretical 128 KiB transfer time at MPS 256?</li><li>Why can measured throughput still be far below 7.2 GB/s?</li></ol>
+<h4>Expected reasoning</h4><p>Efficiency depends on TLP size distribution; throughput also depends on concurrency and media.</p>
+<details class="solution"><summary>Solution</summary>
+<p>(1) It does change slightly (one 128-byte TLP adds overhead) but rounds to the same three digits. (2) 512 × 280 B / 7.88 GB/s ≈ 18.2 µs. (3) Not enough Reads in flight to keep dies busy, DLLP overhead, IOMMU translation misses, device pacing, root-complex write bandwidth, or MPS below 256. The link ceiling is reached only when media parallelism exceeds it.</p>
+</details>
+<h4>Extension</h4><p>Add a reassembler that takes a shuffled list of MWr TLPs from two Reads and rebuilds both buffers using only addresses and PRP pages.</p>
+
+<h3>Advanced lab — Decompose the latency tail</h3>
+<p><span class="badge safe">Safe lab</span> Pure software.</p>
+<h4>Objective</h4><p>Show which stage owns each percentile.</p>
+<h4>Prerequisites</h4><p>Latency budget in <a href="ch32.html">Chapter 32</a>.</p>
+<h4>Setup</h4>
+<pre class="code" data-kind="simulation" data-lang="python" data-title="lat_decomp.py"><code># lat_decomp.py - split 4 KiB random-read latency into link-visible stages (synthetic data).
+import random
+random.seed(32)
+
+def one_read():
+    """Times in microseconds, as an analyzer plus a host tracepoint would see them."""
+    t_fetch = 0.7 + random.expovariate(1 / 0.3)              # doorbell -&gt; SQE MRd
+    if random.random() &lt; 0.85:
+        media = random.gauss(62, 6)                          # normal NAND read
+    else:
+        media = 62 + random.expovariate(1 / 25)              # die busy (program/erase in progress)
+    if random.random() &lt; 0.004:
+        media += random.choice([900, 1800, 2700])            # read-retry steps on a weak page
+    xfer = 4096 / 7200 + random.expovariate(1 / 0.2)         # data MWrs at ~7.2 GB/s + gaps
+    cqe = 0.3                                                # last data MWr -&gt; CQE MWr
+    irq = 0.1 + random.expovariate(1 / 0.05)                 # CQE -&gt; MSI-X
+    host = 2.5 + random.expovariate(1 / 1.5)                 # MSI-X -&gt; request completed in kernel
+    return dict(fetch=t_fetch, media=max(media, 40), xfer=xfer, cqe=cqe, irq=irq, host=host)
+
+N = 200_000
+samples = [one_read() for _ in range(N)]
+for s in samples:
+    s["total"] = sum(s.values())
+
+def pct(vals, p):
+    vals = sorted(vals); return vals[min(len(vals) - 1, int(p / 100 * len(vals)))]
+
+stages = ["fetch", "media", "xfer", "cqe", "irq", "host", "total"]
+print("%-6s" % "pct" + "".join("%9s" % s for s in stages))
+for p in (50, 99, 99.9, 99.99):
+    print("%-6s" % ("p%g" % p) + "".join("%9.1f" % pct([s[k] for s in samples], p) for k in stages))
+
+slow = sorted(samples, key=lambda s: s["total"])[-int(N * 0.001):]
+share = {k: sum(s[k] for s in slow) / sum(s["total"] for s in slow) for k in stages[:-1]}
+print("share of time in slowest 0.1%: " + ", ".join("%s %.1f%%" % (k, 100 * v) for k, v in share.items()))</code></pre>
+<h4>Procedure</h4><ol><li>Run it.</li><li>Set the retry probability to zero and rerun; compare p99.9.</li><li>Raise host jitter (exponential mean 15 µs) and see when the host starts to matter.</li></ol>
+<h4>Observations</h4>
+<pre class="code" data-kind="simulation" data-lang="text"><code>pct       fetch    media     xfer      cqe      irq     host    total
+p50         0.9     63.2      0.7      0.3      0.1      3.5     69.4
+p99         2.1    142.5      1.5      0.3      0.3      9.4    148.8
+p99.9       2.7   2757.6      2.0      0.3      0.4     12.9   2763.6
+p99.99      3.5   2774.7      2.4      0.3      0.6     16.5   2782.5
+share of time in slowest 0.1%: fetch 0.0%, media 99.8%, xfer 0.0%, cqe 0.0%, irq 0.0%, host 0.1%</code></pre>
+<h4>Questions</h4><ol><li>Why do percentiles of stages not add up to the total percentile?</li><li>Which stage would an analyzer alone measure?</li><li>Why is "average latency" a poor service-level metric here?</li></ol>
+<h4>Expected reasoning</h4><p>Tails are mixtures; stage percentiles are taken over different samples.</p>
+<details class="solution"><summary>Solution</summary>
+<p>(1) Each stage's p99 comes from different requests; the slow requests are slow in one stage. Decompose the slowest requests themselves, as the last line does. (2) Fetch, media (fetch → first data), transfer, CQE and interrupt — everything except host software. (3) A 0.4 % retry population dominates p99.9 while barely moving the mean.</p>
+</details>
+<h4>Extension</h4><p>Fit the model to a real fio run on your own drive (read-only) and estimate the retry population.</p>
+
+<h3>Senior forensic lab — "Reads return stale data, but only on the new server"</h3>
+<p><span class="badge safe">Safe lab</span> Reasoning over synthetic evidence.</p>
+<h4>Objective</h4><p>Find which layer lets the application see old buffer contents.</p>
+<h4>Prerequisites</h4><p>This module's Protocol view; <a href="dd14.html">Module 14 — PCIe Ordering</a>.</p>
+<h4>Setup — evidence (synthetic)</h4>
+<ul>
+<li>About 1 in 10⁸ Reads hands the application data from a previous use of the buffer; re-reading the same LBA returns correct data.</li>
+<li>Same SSD model and firmware work on the old server.</li>
+<li>lspci on the new server: DevCtl shows RlxdOrd+ for 01:00.0; on the old server RlxdOrd-.</li>
+<li>Analyzer capture of one bad case: data MWrs have the Relaxed Ordering attribute set; the CQE MWr also has it set.</li>
+<li>No status errors, no IOMMU faults, no PI configured.</li>
+</ul>
+<h4>Procedure</h4><ol><li>Identify the first abnormal event.</li><li>Explain the mechanism and why it is rare.</li><li>Propose an immediate mitigation and a permanent fix, with owners.</li></ol>
+<h4>Observations</h4><p>Separate what the device did, what the platform allowed and what the host assumed.</p>
+<h4>Questions</h4><ol><li>Is setting RO on data TLPs wrong?</li><li>Why does the old server not show it?</li></ol>
+<h4>Expected reasoning</h4><p>The CQE must not overtake its data; RO on the CQE removes that guarantee.</p>
+<details class="solution"><summary>Solution</summary>
+<p>First abnormal event: the CQE MWr carrying Relaxed Ordering. With RO, the root complex may commit the CQE to memory before earlier data writes; the CPU sees the CQE, completes the request, and the application reads the buffer before the last data lands. RO on data TLPs is legitimate; on the CQE it violates the producer–consumer pattern that ordering protects. The old server either has RO disabled (no attribute is emitted) or a root complex that does not exploit it. Rare because the race needs a reordering in the root complex and a very fast host consumer. Mitigation: disable Relaxed Ordering for this device (a platform or kernel quirk; a configuration change, not a read-only action — follow your change process). Permanent fix: firmware must clear RO on CQE writes (owner: SSD vendor); add a validation test that inspects attributes of CQE TLPs with RO enabled.</p>
+</details>
+<h4>Extension</h4><p>Write the validation test: which captures, which filters, which pass/fail rule.</p>
+</section>
+
+<section id="debugging">
+<h2>Debugging</h2>
+
+<h3>Pattern 1 — Millisecond Read tails without errors</h3>
+<dl>
+<dt>Symptom</dt><dd>p99.9 Read latency in milliseconds; all statuses success.</dd>
+<dt>Possible causes</dt><dd>Read retry on weak pages; contention with program/erase or garbage collection; thermal throttling; host scheduling (if not confirmed device-side).</dd>
+<dt>Evidence</dt><dd>Analyzer gap fetch → first data; temperature; workload mix (writes in parallel?).</dd>
+<dt>First check</dt><dd>Is the delay before the first data TLP? If not, it is host-side.</dd>
+<dt>Second check</dt><dd>Re-read the slow LBAs: persistent slowness points at weak pages.</dd>
+<dt>Disambiguating experiment</dt><dd>Repeat with writes paused; tails that vanish were contention.</dd>
+<dt>Likely conclusion</dt><dd>Device-internal media behaviour; mitigation via workload shaping or vendor features.</dd>
+<dt>Confidence</dt><dd>Medium.</dd>
+</dl>
+
+<h3>Pattern 2 — Data Transfer Error</h3>
+<dl>
+<dt>Symptom</dt><dd>Reads complete with generic status 04h; often bursts after a driver change.</dd>
+<dt>Possible causes</dt><dd>Unmapped data or list pages (IOMMU), miscomputed PRP entries, platform memory errors (poisoned completions).</dd>
+<dt>Evidence</dt><dd>IOMMU fault log addresses; PRP entries in the SQE and lists; completion statuses on list reads.</dd>
+<dt>First check</dt><dd>Match the fault address to a PRP entry or list page of the failing CID.</dd>
+<dt>Second check</dt><dd>Whether failures correlate with list pages starting near page ends (chaining).</dd>
+<dt>Disambiguating experiment</dt><dd>Force list pages to start at offset 0; if errors stop, the chaining path is buggy.</dd>
+<dt>Likely conclusion</dt><dd>Host mapping bug.</dd>
+<dt>Confidence</dt><dd>High.</dd>
+</dl>
+
+<h3>Pattern 3 — Unrecovered Read Errors</h3>
+<dl>
+<dt>Symptom</dt><dd>Status SCT 2h / SC 81h (Linux 0x281) on some LBAs.</dd>
+<dt>Possible causes</dt><dd>Degraded media; Write Uncorrectable injected by a test; firmware recovery bug; LR = 1 causing early failure.</dd>
+<dt>Evidence</dt><dd>SMART media errors; Error Information log LBA; LR bit in SQE; time to failure.</dd>
+<dt>First check</dt><dd>LR bit and time to failure: fast failure with LR = 1 is policy.</dd>
+<dt>Second check</dt><dd>SMART counter increment.</dd>
+<dt>Disambiguating experiment</dt><dd>Re-read with LR = 0 on a non-production copy; recovery means LR policy.</dd>
+<dt>Likely conclusion</dt><dd>Media, unless the test harness injected it.</dd>
+<dt>Confidence</dt><dd>Medium–high.</dd>
+</dl>
+
+<h3>Pattern 4 — Stale or partial data with success status</h3>
+<dl>
+<dt>Symptom</dt><dd>Application sees old buffer contents; re-reads are correct.</dd>
+<dt>Possible causes</dt><dd>RO on CQE; host reads buffer before consuming the CQE (driver bug); buffer reused before completion; non-coherent DMA without cache maintenance (on platforms without coherent I/O).</dd>
+<dt>Evidence</dt><dd>TLP attributes, DevCtl, driver code paths, platform coherency.</dd>
+<dt>First check</dt><dd>RO attribute on CQE writes.</dd>
+<dt>Second check</dt><dd>Buffer lifetime in the application or filesystem.</dd>
+<dt>Disambiguating experiment</dt><dd>Disable RO; if errors persist, look at host buffer handling.</dd>
+<dt>Likely conclusion</dt><dd>Ordering or host lifetime bug.</dd>
+<dt>Confidence</dt><dd>Medium.</dd>
+</dl>
+
+<h3>Pattern 5 — Sequential read throughput far below the link</h3>
+<dl>
+<dt>Symptom</dt><dd>3 GB/s on a link good for about 7 GB/s.</dd>
+<dt>Possible causes</dt><dd>Low queue depth; small I/O size; MPS 128; link trained at lower speed or width; IOMMU translation overhead; device limits.</dd>
+<dt>Evidence</dt><dd>LnkSta, DevCtl, fio settings, TLP sizes in a capture.</dd>
+<dt>First check</dt><dd>Negotiated speed and width.</dd>
+<dt>Second check</dt><dd>Outstanding data in flight (queue depth × size) versus media parallelism.</dd>
+<dt>Disambiguating experiment</dt><dd>Sweep queue depth with fixed size; a plateau below the link means the device or IOMMU limits.</dd>
+<dt>Likely conclusion</dt><dd>Configuration or concurrency, more often than device defect.</dd>
+<dt>Confidence</dt><dd>Medium–high.</dd>
+</dl>
+</section>
+
+<section id="interview">
+<h2>Interview</h2>
+<h3>Beginner</h3>
+<ol>
+<li><p>Which direction do Read data TLPs travel, and what type are they?</p><details class="answer"><summary>Model answer</summary><p>Device to host, as posted Memory Writes.</p></details></li>
+<li><p>How many 256-byte TLPs carry 4 KiB?</p><details class="answer"><summary>Model answer</summary><p>16.</p></details></li>
+<li><p>What is MDTS on the Lab SSD?</p><details class="answer"><summary>Model answer</summary><p>5, meaning 2⁵ × 4 KiB = 128 KiB.</p></details></li>
+<li><p>When is PRP2 a list pointer?</p><details class="answer"><summary>Model answer</summary><p>When the transfer touches more than two memory pages.</p></details></li>
+<li><p>What does a success CQE promise for a Read?</p><details class="answer"><summary>Model answer</summary><p>All requested data has been written to the host buffers.</p></details></li>
+</ol>
+<h3>Intermediate</h3>
+<ol>
+<li><p>Why can two Reads' data TLPs interleave?</p><details class="answer"><summary>Model answer</summary><p>The controller works on many commands at once; the link carries whatever its DMA engines emit.</p></details></li>
+<li><p>How do you attribute an MWr to a command?</p><details class="answer"><summary>Model answer</summary><p>By its address falling inside that command's PRP pages.</p></details></li>
+<li><p>What is the link-limited rate of Gen4 x4 at MPS 256?</p><details class="answer"><summary>Model answer</summary><p>About 7.88 GB/s × 256/280 ≈ 7.2 GB/s before DLLP overhead.</p></details></li>
+<li><p>What does LR trade?</p><details class="answer"><summary>Model answer</summary><p>Less recovery time in exchange for more Unrecovered Read Errors.</p></details></li>
+<li><p>What is a chained PRP list?</p><details class="answer"><summary>Model answer</summary><p>A list that does not fit in the remainder of its page; the last entry points to the next list page.</p></details></li>
+</ol>
+<h3>Advanced</h3>
+<ol>
+<li><p>Why must the CQE not carry Relaxed Ordering?</p><details class="answer"><summary>Model answer</summary><p>It could pass earlier data writes and let the host consume the completion before the data is visible.</p></details></li>
+<li><p>What happens to buffer contents when a Read fails mid-transfer?</p><details class="answer"><summary>Model answer</summary><p>Undefined; some data may be written. The host must not use any of it.</p></details></li>
+<li><p>How do you tell a host-side delay from a device-side one?</p><details class="answer"><summary>Model answer</summary><p>Link timestamps: doorbell → fetch → first data → CQE are device or link; CQE → request completion is host.</p></details></li>
+<li><p>Why can a Read complete in 8 µs?</p><details class="answer"><summary>Model answer</summary><p>Deallocated blocks, controller cache hits, or a bug; only content checks distinguish them.</p></details></li>
+<li><p>A list fetch gets UR. What status should the Read get?</p><details class="answer"><summary>Model answer</summary><p>Data Transfer Error (or a similar generic transfer status); not a media error.</p></details></li>
+</ol>
+<h3>Senior</h3>
+<ol>
+<li><p>Design a Read validation matrix.</p><details class="answer"><summary>Model answer</summary><p>Sizes from one block to MDTS; PRP1 offsets; lists at page starts and ends (chaining); interleaving at high queue depth; FUA and LR; PI types; deallocated and never-written LBAs with and without DULBE; injected uncorrectables; IOMMU fault injection; RO enabled and disabled with attribute checks; content verification for every case.</p></details></li>
+<li><p>How would you prove a firmware bug returns wrong data?</p><details class="answer"><summary>Model answer</summary><p>Known pattern written with FUA or followed by Flush, read back with analyzer capture: the MWr payloads differ from the pattern while the SQE, PRP addresses and ordering are correct.</p></details></li>
+<li><p>What drives the latency tail on a mixed workload?</p><details class="answer"><summary>Model answer</summary><p>Reads waiting behind programs and erases on the same die, garbage collection and retries; mitigations include program/erase suspend, workload isolation and read-priority features.</p></details></li>
+<li><p>How do you set an SLO for Read latency on NVMe?</p><details class="answer"><summary>Model answer</summary><p>Percentiles (p99, p99.9) measured under the production mix, with decomposition showing the media share; averages hide retry populations.</p></details></li>
+<li><p>When would you set LR = 1?</p><details class="answer"><summary>Model answer</summary><p>When a redundancy layer (RAID, replication, erasure coding) can rebuild the block faster than the drive's deep recovery.</p></details></li>
+</ol>
+</section>
+
+<section id="quiz">
+<h2>Quiz</h2>
+<ol class="quiz">
+<li><p>A Read of 6 KiB at buffer offset 0xC00 uses:</p>
+<ul class="options" data-answer="3"><li>PRP1 only</li><li>PRP1 + PRP2 as second page</li><li>PRP1 + a PRP list</li><li>An SGL</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>It touches three pages.</p></details></li>
+<li><p>A data MWr may be at most:</p>
+<ul class="options" data-answer="2"><li>MRRS bytes</li><li>MPS bytes, not crossing 4 KiB</li><li>4 KiB</li><li>MDTS bytes</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>MPS bounds payload; 4 KiB boundaries cannot be crossed.</p></details></li>
+<li><p>DW3 = 0x0009_0130 means:</p>
+<ul class="options" data-answer="1"><li>CID 0x0130, Data Transfer Error</li><li>CID 0x0009, success</li><li>CID 0x0130, Invalid Field</li><li>CID 0x0130, Unrecovered Read Error</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Status word 0x0009 → SC 04h, SCT 0.</p></details></li>
+<li><p>A Read is slow; the gap is between CQE and request completion in the kernel. The cause is:</p>
+<ul class="options" data-answer="4"><li>Media</li><li>Link</li><li>Controller firmware</li><li>Host side</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Everything after the CQE and interrupt is host software.</p></details></li>
+<li><p>Which TLP must never carry Relaxed Ordering in a Read?</p>
+<ul class="options" data-answer="3"><li>Data MWr</li><li>SQE MRd</li><li>CQE MWr</li><li>PRP list MRd</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The CQE must stay ordered behind its data.</p></details></li>
+<li><p>How many 256-byte TLPs for 128 KiB, aligned?</p>
+<ul class="options" data-answer="2"><li>256</li><li>512</li><li>1024</li><li>32</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>131,072 / 256 = 512.</p></details></li>
+<li><p>Why is the 2.8 ms Read in the slow trace not an error?</p><details class="answer"><summary>Model answer</summary><p>It completed with success; the controller spent the time recovering or waiting, which the specification allows.</p></details></li>
+<li><p>List the evidence that separates a deallocated read from a cache hit.</p><details class="answer"><summary>Model answer</summary><p>Write history, DLFEAT, DULBE behaviour on a test system, and a write-pattern/read-back/power-cycle sequence.</p></details></li>
+</ol>
+</section>
+
+<section id="teachback">
+<h2>Teach-back</h2>
+<ol>
+<li><p><strong>To a child:</strong> the library van.</p>
+<details class="answer"><summary>Model explanation</summary><p>"You give the library a list of your shelves. Their van brings books in small boxes, mixed with your neighbour's, and only rings the bell when your last box is in. If the list has a wrong address, the delivery stops and the bell says 'problem' — so you put everything back and ask again."</p></details></li>
+<li><p><strong>To a junior engineer:</strong> how a 128 KiB Read looks on the link.</p>
+<details class="answer"><summary>Model explanation</summary><p>"Doorbell, SQE fetch, PRP list fetch, a media gap of about 60–70 µs, then 512 MWr of 256 bytes into 32 pages, maybe interleaved with other reads, then the CQE and MSI-X. Attribute data by address, check the CQE comes last."</p></details></li>
+<li><p><strong>To a senior engineer:</strong> how you investigate a Read incident.</p>
+<details class="answer"><summary>Model explanation</summary><p>"Split the timeline at the link: before fetch and after CQE are host; fetch to first data is media; data to CQE is transfer. For wrong data I check ordering attributes, addresses against PRP and IOMMU, the SQE's LBAs, and content against a known pattern. The status is authoritative for failure; only content checks prove correct success."</p></details></li>
+</ol>
+</section>
+
+<section id="mastery">
+<h2>Mastery gate</h2>
+<aside class="callout mastery">
+<p>Do not consider this module mastered until you can:</p>
+<ul class="checklist">
+<li>explain the Read contract: data precedes completion; failure invalidates the whole buffer</li>
+<li>diagram a 128 KiB Read with PRP list, interleaved data and CQE</li>
+<li>identify a Read's TLPs in a trace, attribute interleaved data, and find the first abnormal event</li>
+<li>debug tails, Data Transfer Errors, Unrecovered Read Errors, stale data and throughput shortfalls</li>
+<li>distinguish Read from <a href="dd31.html">Write</a>, from <a href="dd34.html">PRP</a> mechanics, from <a href="dd36.html">DMA</a> and from <a href="dd14.html">PCIe ordering</a> concerns</li>
+<li>cite NVM Command Set 1.3 (Read), Base 2.4 (CQE, generic status), NVMe over PCIe 1.4 (PRP) and PCIe Base (ordering, MPS)</li>
+</ul>
+</aside>
+<p>Next: <a href="dd31.html">Module 31 — WRITE</a>.</p>
+</section>

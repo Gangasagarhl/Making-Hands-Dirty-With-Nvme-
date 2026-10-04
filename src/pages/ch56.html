@@ -1,0 +1,816 @@
+<p class="lead">Single Root I/O Virtualization (SR-IOV) lets one PCI Express device appear as many, so that each virtual machine can own a slice of it directly. For an NVMe SSD, that means two layers of virtualization working together: PCIe Physical and Virtual Functions, and NVMe primary and secondary controllers with flexible queue and interrupt resources. This chapter teaches both, how they connect, and where the 2026 NVMe 2.4 work on exported subsystems and live migration fits.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>A cloud server may host dozens of virtual machines (VMs) that all want fast storage. Emulating an NVMe device in the hypervisor costs CPU time on every I/O and adds latency. Giving each VM a whole SSD wastes capacity and slots. SR-IOV offers a third way: the SSD itself presents many independent PCIe functions, the hypervisor assigns one to each VM, and the VM's own NVMe driver talks to its function directly, with DMA protected by the IOMMU.</p>
+  <p>Making that work correctly touches nearly everything earlier in this course: enumeration and Routing IDs (<a href="ch17.html">Chapter 17</a>), configuration space and BARs (<a href="ch18.html">Chapter 18</a>, <a href="ch19.html">Chapter 19</a>), DMA and the IOMMU (<a href="ch20.html">Chapter 20</a>), NVMe controllers and queues (<a href="ch23.html">Chapter 23</a>, <a href="ch25.html">Chapter 25</a>), MSI-X (<a href="ch43.html">Chapter 43</a>), reset (<a href="ch48.html">Chapter 48</a>, <a href="ch49.html">Chapter 49</a>) and isolation (<a href="ch55.html">Chapter 55</a>). If you can explain SR-IOV for NVMe end to end, you understand the whole stack.</p>
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Define Physical Function (PF) and Virtual Function (VF), and explain what a VF shares with and does not share with its PF.</li>
+    <li>Read the SR-IOV Extended Capability: TotalVFs, NumVFs, First VF Offset, VF Stride, VF Device ID, VF BARs, page sizes, VF Enable and VF MSE.</li>
+    <li>Compute VF Routing IDs and VF BAR addresses, and explain when Alternative Routing-ID Interpretation (ARI) is needed.</li>
+    <li>Explain NVMe virtualization: primary and secondary controllers, private and flexible resources (VQ and VI), and the Virtualization Management command's actions.</li>
+    <li>Walk through bringing up a secondary controller and assigning it to a VM, and identify which steps are PCIe and which are NVMe.</li>
+    <li>Explain isolation (IOMMU, ACS, FLR) and resource sharing (bandwidth, IOPS) between VFs, including NVMe 2.4 rate limiting.</li>
+    <li>Place the NVMe 2.4 PCIe Exported NVM Subsystem Migration feature in this architecture.</li>
+  </ul>
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>Routing IDs and enumeration (<a href="ch17.html">Chapter 17</a>), BAR sizing (<a href="ch19.html">Chapter 19</a>), IOMMU and DMA (<a href="ch20.html">Chapter 20</a>), NVMe controller and subsystem architecture (<a href="ch22.html">Chapter 22</a>, <a href="ch23.html">Chapter 23</a>), Admin commands and Identify (<a href="ch30.html">Chapter 30</a>), MSI-X (<a href="ch43.html">Chapter 43</a>), ACS and IOMMU groups (<a href="ch55.html">Chapter 55</a>). Deep-dive companion: <a href="dd52.html">Module 52 — SR-IOV</a>.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Imagine a big school library with one head librarian. The school grows, and now many classes want to borrow books at the same time. Instead of building more libraries, the head librarian sets up several small help desks, each with its own assistant, its own in-tray and its own bell. Each class gets its own desk and never has to queue behind another class.</p>
+    <p>All the assistants share the same shelves behind them. The head librarian decides how many trays and bells each desk gets, opens and closes desks, and decides which shelves each desk may use. A class at desk 3 cannot see or touch desk 5's requests.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A large office building is leased floor by floor. Each tenant gets its own entrance code, mailbox and phone extension, and sees what looks like a private office. The building's management office (which the tenants never see) owns the lifts, the power and the plumbing, decides how many parking spaces each tenant gets, and can reassign them. Tenants share the building's lifts and corridors, so a very busy tenant can still slow others down unless management sets limits.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What it hides:</strong> in SR-IOV, the "management office" (the PF) is itself also a tenant-capable function with its own controller, and the boundaries are enforced by several different mechanisms in different places: the IOMMU in the host (memory isolation), ACS in the fabric (routing isolation), the device's internal design (resource isolation), and NVMe namespace attachment (data isolation).</p>
+    <p><strong>Where it misleads:</strong> a leased floor is physically separate. VFs share one device's internal resources — NAND channels, controller CPUs, DRAM, the PCIe link — so their isolation is only as good as the device's implementation. The specification defines the interfaces, not the quality of internal isolation.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>A PCIe <strong>function</strong> is what software sees as "a device": it has a Routing ID (bus, device, function), a configuration space, BARs and interrupts. A normal NVMe SSD has one function. SR-IOV adds two kinds:</p>
+  <ul>
+    <li>A <span class="g" data-term="pf">Physical Function (PF)</span> is a full PCIe function with an SR-IOV capability. It is discovered at enumeration like any function and is normally managed by the host (hypervisor) driver.</li>
+    <li>A <span class="g" data-term="vf">Virtual Function (VF)</span> is a lightweight function created when software enables SR-IOV in the PF. It has its own Routing ID, its own BAR space and its own MSI-X vectors, but a much smaller configuration space; many of its properties are inherited from the PF.</li>
+  </ul>
+  <p>Software chooses how many VFs to enable (up to the TotalVFs the device supports). Each VF can then be assigned to a VM: the hypervisor maps the VF's BAR into the VM and configures the IOMMU so the VF's DMA can only reach that VM's memory. The VM's ordinary NVMe driver runs on the VF as if it were a whole SSD.</p>
+  <p>For NVMe, a VF is not useful on its own: there must be an NVMe controller behind it. NVMe's virtualization features define a <span class="g" data-term="primary-controller">primary controller</span> (behind the PF) and <span class="g" data-term="secondary-controller">secondary controllers</span> (typically one behind each VF). The primary controller lends queue resources and interrupt resources to secondary controllers and brings them online, using the <strong>Virtualization Management</strong> admin command. Namespaces are then attached to secondary controllers to give each VM its storage.</p>
+  <aside class="callout remember">
+    <p>SR-IOV is a PCIe feature: it creates functions. NVMe virtualization is an NVMe feature: it creates usable controllers behind those functions and moves resources between them. You need both, configured in the right order.</p>
+  </aside>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>The SR-IOV Extended Capability</h3>
+  <p>The PF advertises SR-IOV through an extended capability in its configuration space. Its fields, by name:</p>
+  <table>
+    <caption>SR-IOV Extended Capability (fields by name; see the base specification for offsets and widths)</caption>
+    <thead><tr><th>Field</th><th>Owner</th><th>Purpose</th><th>What breaks if wrong</th></tr></thead>
+    <tbody>
+      <tr><td>SR-IOV Capabilities</td><td>Device (RO)</td><td>Optional features, e.g. ARI Capable Hierarchy Preserved, VF 10-Bit Tag Requester Supported, VF Migration Capable (legacy, see below)</td><td>Software enables a feature the device lacks</td></tr>
+      <tr><td>SR-IOV Control: VF Enable</td><td>Software</td><td>Creates the VFs (NumVFs of them)</td><td>VFs absent; or VFs appear before resources are configured</td></tr>
+      <tr><td>SR-IOV Control: VF MSE</td><td>Software</td><td>Memory Space Enable for all VFs' BARs (VFs do not use their own Command register for this)</td><td>VF MMIO returns UR/all-ones</td></tr>
+      <tr><td>SR-IOV Control: ARI Capable Hierarchy</td><td>Software</td><td>Tells the device that ARI is enabled above it, which can change First VF Offset/VF Stride</td><td>VF Routing IDs unreachable</td></tr>
+      <tr><td>InitialVFs / TotalVFs</td><td>Device (RO)</td><td>Number of VFs initially associated / maximum supported</td><td>—</td></tr>
+      <tr><td>NumVFs</td><td>Software</td><td>Number of VFs to make visible (written before VF Enable)</td><td>Resource over-commit; VF BAR aperture too small</td></tr>
+      <tr><td>Function Dependency Link</td><td>Device (RO)</td><td>Groups PFs whose VFs must be assigned together</td><td>Incorrect assignment of dependent functions</td></tr>
+      <tr><td>First VF Offset / VF Stride</td><td>Device (RO, may depend on NumVFs and ARI)</td><td>Compute VF Routing IDs</td><td>Software probes wrong functions</td></tr>
+      <tr><td>VF Device ID</td><td>Device (RO)</td><td>Device ID reported for VFs (the VF's own Vendor/Device ID registers read FFFFh)</td><td>Wrong driver binds</td></tr>
+      <tr><td>Supported Page Sizes / System Page Size</td><td>Device / Software</td><td>VF BAR alignment granularity (System Page Size must be one of the supported sizes)</td><td>VF BARs cannot be mapped to VMs on page boundaries</td></tr>
+      <tr><td>VF BAR0–VF BAR5</td><td>Software (sizing as normal BARs)</td><td>Each VF BAR describes the per-VF size; the region holds NumVFs consecutive copies</td><td>Overlapping or unassigned VF MMIO</td></tr>
+      <tr><td>VF Migration State Array Offset</td><td>Device (RO)</td><td>Legacy VF Migration (from Multi-Root IOV); unrelated to NVMe live migration</td><td>Confusion only</td></tr>
+    </tbody>
+  </table>
+  <p><span class="badge verified">Verified</span> as the field set of the SR-IOV capability, originally in the PCI-SIG <cite class="spec">Single Root I/O Virtualization and Sharing Specification</cite> and now part of the <cite class="spec">PCI Express Base Specification</cite>. Offsets and bit positions: confirm there.</p>
+
+  <h3>VF Routing IDs</h3>
+  <div class="formula">
+    <div class="eq">RID(VF<sub><var>n</var></sub>) = RID(PF) + FirstVFOffset + (<var>n</var> − 1) × VFStride</div>
+    <dl class="vars">
+      <dt>RID(VF<sub>n</sub>)</dt><dd>16-bit Routing ID (bus:8, device:5, function:3 — or bus:8, function:8 with ARI) of the n-th VF</dd>
+      <dt>RID(PF)</dt><dd>the PF's Routing ID (Lab SSD: 0x0100)</dd>
+      <dt>FirstVFOffset, VFStride</dt><dd>read from the SR-IOV capability after NumVFs and ARI Capable Hierarchy are set</dd>
+      <dt>n</dt><dd>VF number, 1 to NumVFs</dd>
+    </dl>
+  </div>
+  <p>VF Routing IDs can exceed the 8 functions a device normally has, and can even spill into higher bus numbers, which the enumeration software must then reserve. That is why SR-IOV devices are almost always used with <span class="g" data-term="ari">Alternative Routing-ID Interpretation</span> (ARI): with ARI, the device and function fields merge into one 8-bit function number, so a single device on a bus can have up to 256 functions. The downstream port above must have ARI Forwarding Enable set, because without ARI a downstream port only forwards configuration requests for device 0 on its secondary bus.</p>
+  <aside class="callout linux">
+    <p>Linux always prints the 8-bit device/function byte as <code>dd.f</code>, even with ARI. ARI function 8 therefore appears as <code>01:01.0</code>, which looks like "device 1" but is really function 8 of device 0. Do not conclude that a second physical device exists.</p>
+  </aside>
+
+  <h3>VF BARs and MMIO</h3>
+  <p>A VF has no BARs in its own configuration space (they read as zero). Instead, each <strong>VF BAR<var>k</var></strong> in the PF's SR-IOV capability is sized exactly like a normal BAR (write all ones, read back the size mask), giving the per-VF size; software then assigns a base address for a region of NumVFs consecutive copies:</p>
+  <div class="formula">
+    <div class="eq">Base(VF<sub><var>n</var></sub>, BAR<var>k</var>) = VFBAR<var>k</var>.base + (<var>n</var> − 1) × VFBAR<var>k</var>.size</div>
+    <dl class="vars">
+      <dt>VFBARk.base</dt><dd>address software assigned to the PF's VF BARk</dd>
+      <dt>VFBARk.size</dt><dd>per-VF size from BAR sizing (aligned to System Page Size)</dd>
+      <dt>n</dt><dd>VF number, 1 to NumVFs</dd>
+    </dl>
+  </div>
+  <p>For an NVMe VF, the per-VF BAR holds that secondary controller's registers (CAP, CC, CSTS, AQA, ASQ, ACQ…), its doorbells from offset 1000h, and usually its MSI-X table and PBA. The page-size alignment matters because the hypervisor maps each VF's BAR into a VM with page-granular second-level translation; two VFs sharing a page would let one VM touch another's doorbells.</p>
+
+  <h3>What a VF shares and what it owns</h3>
+  <table>
+    <caption>VF properties</caption>
+    <thead><tr><th>Property</th><th>VF</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Routing ID</td><td>Own</td><td>Used for its DMA requests: the IOMMU identifies VFs by RID</td></tr>
+      <tr><td>Configuration space</td><td>Own, reduced</td><td>Many fields are read-only zero or mirror the PF; Vendor/Device ID read FFFFh</td></tr>
+      <tr><td>BARs</td><td>Own region, described by PF</td><td>VF BARs in the PF's SR-IOV capability</td></tr>
+      <tr><td>Memory Space Enable</td><td>Shared control</td><td>VF MSE in the PF</td></tr>
+      <tr><td>Interrupts</td><td>Own MSI-X (or MSI)</td><td>VFs cannot use legacy INTx</td></tr>
+      <tr><td>Function Level Reset (FLR)</td><td>Own</td><td>Resets only that VF; required so a VF can be reassigned safely between VMs</td></tr>
+      <tr><td>Link, power state of the link, AER for link errors</td><td>Shared</td><td>Link-level events affect all functions</td></tr>
+      <tr><td>Device-internal resources</td><td>Shared</td><td>Partitioned by the device; NVMe makes queue/interrupt resources explicit</td></tr>
+    </tbody>
+  </table>
+  <p><span class="badge uncertain">Uncertain</span> on the exact list of VF configuration registers that are "reserved", "RO zero" or "same as PF": the base specification has a register-by-register table for VFs; consult it before writing VF enumeration code.</p>
+
+  <h3>NVMe virtualization: primary and secondary controllers</h3>
+  <p>NVMe's virtualization enhancements (added in NVMe 1.4 and carried forward in the NVMe Base Specification 2.x) define how an NVM subsystem that supports SR-IOV manages its controllers:</p>
+  <ul>
+    <li>The <strong>primary controller</strong> is associated with a PF. It reports the subsystem's virtualization resources and executes Virtualization Management commands.</li>
+    <li>A <strong>secondary controller</strong> is typically associated with a VF. It is a full NVMe controller from the VM's point of view, but it depends on the primary controller for its resources and its online/offline state.</li>
+    <li>Each secondary controller has a Controller Identifier (CNTLID) and is associated with a VF number.</li>
+  </ul>
+  <p>Two resource types are managed:</p>
+  <table>
+    <caption>NVMe controller resources</caption>
+    <thead><tr><th>Type</th><th>Meaning</th><th>Consumed by</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="vq-resource">VQ resource</span> (Virtual Queue)</td><td>One submission/completion queue pair's worth of controller resources</td><td>The admin queue pair and each I/O queue pair the secondary controller's driver creates</td></tr>
+      <tr><td>VI resource (Virtual Interrupt)</td><td>One interrupt vector's worth of controller resources</td><td>MSI-X vectors used by the secondary controller</td></tr>
+    </tbody>
+  </table>
+  <p>Resources are either <strong>private</strong> (permanently belonging to the primary controller) or <strong>flexible</strong> (a pool the primary controller can keep for itself or assign to secondary controllers). The <strong>Primary Controller Capabilities</strong> data structure, returned by Identify, reports totals and limits, including (by name): VQ Flexible Resources Total, VQ Resources Flexible Allocated to Primary, VQ Private Resources Total, VQ Flexible Resources Secondary Maximum, VQ Flexible Resource Preferred Granularity, and the corresponding VI fields. The <strong>Secondary Controller List</strong>, also returned by Identify, lists each secondary controller with its Secondary Controller Identifier, its primary controller, its state (online/offline), its Virtual Function Number, and the number of VQ and VI flexible resources assigned.</p>
+  <p>The <strong>Virtualization Management</strong> admin command (opcode 1Ch) changes allocations and states. Its actions, by name:</p>
+  <table>
+    <caption>Virtualization Management actions (codes as used by nvme-cli; confirm against the Base Specification)</caption>
+    <thead><tr><th>Action</th><th>Code</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td>Primary Controller Flexible Allocation</td><td>1h</td><td>Set how many flexible resources of a type the primary keeps (often takes effect after a reset of the primary)</td></tr>
+      <tr><td>Secondary Controller Offline</td><td>7h</td><td>Take a secondary controller offline (required before changing its resources)</td></tr>
+      <tr><td>Secondary Controller Assign</td><td>8h</td><td>Assign a number of flexible VQ or VI resources to an offline secondary controller</td></tr>
+      <tr><td>Secondary Controller Online</td><td>9h</td><td>Bring a secondary controller online so its VF can be used</td></tr>
+    </tbody>
+  </table>
+  <p>The command also specifies a <strong>Resource Type</strong> (VQ or VI), a <strong>Controller Identifier</strong> and a <strong>Number of Controller Resources</strong>. <span class="badge uncertain">Uncertain</span> on exact field positions and on the minimum resources a secondary needs to go online; the Identify CNS values for these data structures (14h for Primary Controller Capabilities and 15h for the Secondary Controller List in the revisions we have checked) should be confirmed in the <cite class="spec">NVMe Base Specification 2.4 — Virtualization Enhancements</cite> and the Identify command's CNS table.</p>
+  <aside class="callout insight" data-title="Order matters">
+    <p>A secondary controller must be offline to receive resources, and must be online before a driver can enable it. If the VF appears (VF Enable) and a driver binds to it before the secondary is online, the driver's controller enable will not succeed. Linux deployments typically disable automatic VF driver probing, enable the VFs, configure and online each secondary controller, and only then bind drivers or assign VFs to VMs.</p>
+  </aside>
+
+  <h3>Namespaces and data isolation</h3>
+  <p>Resources make a secondary controller work; namespaces give it storage. The host uses Namespace Management to create namespaces and Namespace Attachment to attach each namespace to one or more controllers by CNTLID (see <a href="ch58.html">Chapter 58</a>). Attaching namespace 5 only to secondary controller 3 makes it visible only through VF 3. Data isolation between VMs is therefore an NVMe-layer property, complementing the IOMMU's memory isolation and ACS's routing isolation.</p>
+
+  <h3>Resource sharing and noisy neighbours</h3>
+  <p>All VFs share the link and the device's internals. A VM saturating its VF with writes can raise latency for every other VF. Historically, QoS between VFs was entirely vendor-specific. NVMe 2.4 adds <strong>rate limiting</strong>: controls for allocating PCIe bandwidth and IOPS among multiple controllers, enforced by the controller. <span class="badge version">Version-dependent</span> (NVMe 2.4). Field-level details are defined in the NVMe Base Specification 2.4 and are not reproduced here because we have not verified them; see <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a>.</p>
+
+  <h3>Live migration and NVMe 2.4 Exported NVM Subsystems</h3>
+  <p>SR-IOV assignment gives VMs speed but makes <em>live migration</em> hard: a VM directly driving a VF holds state inside the device (queue pointers, outstanding commands, controller registers, namespace identity) that the hypervisor cannot see or copy. The NVMe 2.4 release adds <span class="g" data-term="exported-nvm-subsystem">PCIe Exported NVM Subsystem Migration</span> for this. As reported for the 2.4 release (see also <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a>):</p>
+  <ul>
+    <li>An SSD can expose <strong>Exported NVM Subsystems</strong> — virtual SSDs within the physical SSD — to VMs.</li>
+    <li>A <strong>configuration template</strong> ("blueprint"), identified by a 128-bit UUID, defines the features, identifiers and behaviours an Exported NVM Subsystem presents, so the source and destination can present an identical device.</li>
+    <li>The reported flow: create the Exported NVM Subsystem on the destination; recreate the exported controller and namespace with matching identifiers; apply the same configuration template; capture the source's runtime state; transfer and apply it; migrate the VM; clean up the source.</li>
+    <li>Related 2.4 additions: a <strong>TDISP information package</strong> through which controllers report detailed state (useful when validating controller state, for example during migration), and <strong>lockdown controls for virtualized environments</strong>.</li>
+  </ul>
+  <figure>
+    <ol class="seq" data-actors="Orchestrator|Source SSD|Destination SSD|VM">
+      <li data-from="Orchestrator" data-to="Destination SSD">create Exported NVM Subsystem</li>
+      <li data-from="Orchestrator" data-to="Destination SSD">recreate controller/namespace, same IDs</li>
+      <li data-from="Orchestrator" data-to="Destination SSD">apply same template (UUID)</li>
+      <li data-from="Orchestrator" data-to="Source SSD">capture runtime state</li>
+      <li data-from="Source SSD" data-to="Orchestrator" class="dashed">state package</li>
+      <li data-from="Orchestrator" data-to="Destination SSD">transfer and apply state</li>
+      <li data-from="Orchestrator" data-to="VM">migrate VM to destination host</li>
+      <li data-from="Orchestrator" data-to="Source SSD">clean up source</li>
+    </ol>
+    <figcaption>Conceptual NVMe 2.4 Exported NVM Subsystem migration flow, as reported for the 2.4 release. Command names, data structures and identifiers are defined in NVMe Base 2.4 and not shown here.</figcaption>
+  </figure>
+  <aside class="callout version">
+    <p>Exported NVM Subsystem migration, its configuration templates, the TDISP information package, virtualization lockdown controls and rate limiting are NVMe 2.4 (2026) features. Our sources for them are the release announcement and press coverage; treat this section as architectural orientation and read the <cite class="spec">NVMe Base Specification 2.4</cite> and the <cite class="spec">NVM Express Revision Changes (2026.07.30)</cite> document for the normative definitions. Do not assume an SSD supports them because it supports SR-IOV.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p>How a given exported subsystem maps onto PCIe functions (PF, VF, or another mechanism) is an architecture and implementation question we have not verified for 2.4; do not equate "Exported NVM Subsystem" with "VF" without checking the specification.</p>
+  </aside>
+
+  <h3>Alternatives and neighbours</h3>
+  <ul>
+    <li><strong>Hypervisor emulation</strong> (virtio-blk, virtio-scsi, emulated NVMe): flexible, migratable, slower.</li>
+    <li><strong>Whole-device passthrough</strong>: one SSD per VM; simplest isolation, poor sharing.</li>
+    <li><strong>Mediated or software-defined sharing</strong> (for example vfio-user or vendor-specific schemes): device-specific trade-offs.</li>
+    <li><strong>Scalable I/O Virtualization</strong> (SIOV) uses Process Address Space IDs (PASIDs) instead of Routing IDs to isolate lightweight interfaces. <span class="badge informative">Informative</span> — outside this chapter's scope.</li>
+    <li><strong>TDISP</strong> (TEE Device Interface Security Protocol) adds a security model for assigning device interfaces to confidential VMs; its relationship to NVMe 2.4's TDISP information package should be studied in the respective specifications.</li>
+  </ul>
+
+  <h3>The central concept on the ladder</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>One library, many help desks: each class gets its own desk, tray and bell; the head librarian hands out trays and bells and opens or closes desks.</p></div>
+    <div class="rung" data-rung="B"><p>One SSD presents many PCIe functions (VFs); each VM drives one directly. Behind each VF is an NVMe secondary controller that borrows queue and interrupt resources from the primary.</p></div>
+    <div class="rung" data-rung="C"><p>The device implements per-VF register sets, doorbells and MSI-X tables in VF BAR regions; per-VF DMA tagged with the VF's RID; internal queue/interrupt resources partitioned by the primary controller.</p></div>
+    <div class="rung" data-rung="D"><p>PCIe: SR-IOV Extended Capability (VF Enable, NumVFs, offsets, VF BARs), ARI, FLR. NVMe: Primary Controller Capabilities, Secondary Controller List, Virtualization Management (opcode 1Ch) actions, Namespace Attachment.</p></div>
+    <div class="rung" data-rung="E"><p>Configuration writes to the PF to enable VFs; admin commands to the primary controller to assign/online; VM driver MMIO to VF BAR; VF DMA with VF RID; MSI-X writes from VF vectors.</p></div>
+    <div class="rung" data-rung="F"><p>Analyzer shows TLPs with Requester IDs 0x0101, 0x0102…; doorbell writes to distinct VF BAR addresses; IOMMU faults show up as UR completions to VF requests.</p></div>
+    <div class="rung" data-rung="G"><p>"VF does not come ready" → secondary offline or no resources; "VF DMA faults" → IOMMU mapping or wrong RID; "VM slow when neighbour busy" → shared internal resources, rate limits.</p></div>
+  </div>
+
+  <h3>The 16 questions, for an NVMe VF with a secondary controller</h3>
+  <table>
+    <caption>VF + secondary controller through the 16 questions</caption>
+    <thead><tr><th>#</th><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>What is it?</td><td>A PCIe VF exposing an NVMe secondary controller that a VM drives directly.</td></tr>
+      <tr><td>2</td><td>Why created?</td><td>Near-native storage performance for VMs while sharing one SSD.</td></tr>
+      <tr><td>3</td><td>Problem solved?</td><td>Hypervisor emulation overhead and poor device sharing.</td></tr>
+      <tr><td>4</td><td>Before it?</td><td>Emulated storage, or whole-device passthrough.</td></tr>
+      <tr><td>5</td><td>Why better?</td><td>Direct DMA and interrupts with IOMMU protection; many VMs per device.</td></tr>
+      <tr><td>6</td><td>Who creates it?</td><td>Host software: PF driver sets NumVFs/VF Enable; host issues Virtualization Management to the primary controller.</td></tr>
+      <tr><td>7</td><td>Who consumes it?</td><td>A guest NVMe driver (through VFIO and the hypervisor).</td></tr>
+      <tr><td>8</td><td>Where does it live?</td><td>In the SSD: VF configuration space, VF BAR region, secondary controller state.</td></tr>
+      <tr><td>9</td><td>Memory/registers?</td><td>SR-IOV capability in the PF; VF BAR (controller registers, doorbells, MSI-X table); guest memory for queues via IOMMU.</td></tr>
+      <tr><td>10</td><td>Before it?</td><td>PF enumerated; ARI enabled; VF BARs assigned; secondary resources assigned and online.</td></tr>
+      <tr><td>11</td><td>After it?</td><td>Guest driver enables the controller, creates queues, issues I/O; on VM teardown, FLR of the VF.</td></tr>
+      <tr><td>12</td><td>If wrong?</td><td>VF invisible, controller never ready, DMA faults, cross-VM interference or data exposure.</td></tr>
+      <tr><td>13</td><td>Analyzer shows?</td><td>Distinct RIDs and BAR addresses per VF; Virtualization Management commands on the PF's admin queue.</td></tr>
+      <tr><td>14</td><td>Linux shows?</td><td>sriov_totalvfs/sriov_numvfs, virtfn links, IOMMU groups, nvme-cli primary capabilities and secondary list.</td></tr>
+      <tr><td>15</td><td>Validation tests?</td><td>Enable/disable cycles, resource assign/online/offline, FLR under I/O, isolation (DMA, namespaces), QoS under contention, error containment per VF.</td></tr>
+      <tr><td>16</td><td>Senior suspects?</td><td>Configuration order, IOMMU mappings, ARI/bus-number reservation, shared-resource contention, and reset scope (VF FLR vs PF reset affecting all VFs).</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <figure>
+    <pre class="diagram">
+                         Host: hypervisor + IOMMU
+          VM A (guest nvme driver)       VM B (guest nvme driver)
+                 |  VFIO                          |  VFIO
+  ---------------+--------------------------------+---------------------
+  Root port 00:01.1 (ARI Forwarding Enable = 1, ACS)
+                 |  Gen4 x4 link (shared by all functions)
+  +--------------+---------------------------------------------------------+
+  | Lab SSD                                                                 |
+  |  PF 01:00.0  RID 0x0100  BAR0 0xFE60_0000  -> primary controller (CNTLID 1)
+  |     SR-IOV cap: TotalVFs 16, NumVFs 2, FirstVFOffset 1, VFStride 1      |
+  |     VF BAR0 base 0x3_8000_0000, 16 KiB per VF                           |
+  |  VF1 01:00.1 RID 0x0101  VF BAR0 0x3_8000_0000 -> secondary CNTLID 2    |
+  |  VF2 01:00.2 RID 0x0102  VF BAR0 0x3_8000_4000 -> secondary CNTLID 3    |
+  |                                                                         |
+  |  Shared: flexible VQ/VI pool, controller CPUs, DRAM, NAND channels,     |
+  |          namespaces (attached per controller)                           |
+  +-------------------------------------------------------------------------+
+    </pre>
+    <figcaption>Synthetic example for teaching: the Lab SSD with SR-IOV enabled and two VFs. VF BAR addresses and controller IDs are illustrative.</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Per-VF hardware</strong>: register file, doorbell array, MSI-X table and pending-bit array, DMA context tagged with the VF's RID. Often implemented as a large shared register file indexed by function.</li>
+    <li><strong>Queue engines</strong>: an SSD has a finite number of hardware queue contexts; VQ resources are the specification's view of them.</li>
+    <li><strong>Interrupt engine</strong>: a finite set of MSI-X vectors across all functions; VI resources reflect it.</li>
+    <li><strong>Back end</strong>: NAND, flash translation layer and DRAM are shared; isolation of performance is the device's design problem.</li>
+    <li><strong>Reset domains</strong>: VF FLR must reset only that VF's controller state; PF reset or link reset affects all VFs.</li>
+  </ul>
+  <aside class="callout hw">
+    <p>VF DMA carries the VF's Requester ID. The IOMMU uses that RID to select the VM's translation tables. If a device mistakenly issues a VF's DMA with the PF's RID, the IOMMU will translate it with the host's tables — a serious isolation bug that only a protocol analyzer or IOMMU fault log will reveal.</p>
+  </aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>PCIe side: <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Single Root I/O Virtualization and Sharing</cite> (formerly the standalone PCI-SIG SR-IOV specification, revision 1.1), plus <cite class="spec">Alternative Routing-ID Interpretation</cite>, <cite class="spec">Function Level Reset</cite> and <cite class="spec">Access Control Services</cite>. NVMe side: <cite class="spec">NVMe Base Specification 2.4 — Virtualization Enhancements; Identify (Primary Controller Capabilities, Secondary Controller List); Virtualization Management command; Namespace Attachment</cite> and the <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite> for how controllers map to PCIe functions. 2026 features: <cite class="spec">NVMe Base Specification 2.4</cite> and <cite class="spec">NVM Express Revision Changes 2026.07.30</cite>.</p>
+  <aside class="callout verified">
+    <p><strong>What is verified?</strong> PF/VF model; SR-IOV capability fields; VF RID formula; VF BAR layout; VFs use MSI/MSI-X not INTx; ARI permits up to 256 functions; NVMe primary/secondary controllers; VQ and VI flexible and private resources; Virtualization Management (opcode 1Ch) with Primary Flexible Allocation, Secondary Offline, Secondary Assign and Secondary Online actions; NVMe 2.4 includes Exported NVM Subsystem migration, rate limiting, virtualization lockdown controls and a TDISP information package (per the release announcement).</p>
+  </aside>
+  <aside class="callout derived">
+    <p><strong>What is derived?</strong> The configuration order recommendation; the resource planning arithmetic; the isolation layering (IOMMU / ACS / namespace attachment / device internals).</p>
+  </aside>
+  <aside class="callout impl">
+    <p><strong>What is implementation-dependent?</strong> TotalVFs, VF BAR sizes, First VF Offset/VF Stride values, VQ/VI totals and granularity, internal QoS and isolation quality, how a device behaves when a VF driver enables an offline secondary controller, VF-to-secondary association policy, and hypervisor/VFIO behaviour.</p>
+  </aside>
+  <aside class="callout version">
+    <p><strong>What is version-dependent?</strong> NVMe virtualization enhancements first appeared in NVMe 1.4; the 2.x restructuring moved them into the Base Specification; 2.4 adds exported subsystems, migration, rate limiting and virtualization lockdown. SR-IOV moved from a standalone PCI-SIG specification into the PCIe Base Specification.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p><strong>What must be checked in the specification?</strong> Identify CNS values and data structure layouts; Virtualization Management field positions; minimum resources for a secondary to go online; whether a Primary Flexible Allocation requires a reset to take effect; the VF configuration register table; System Page Size rules; all NVMe 2.4 identifiers for migration, templates and rate limiting (we have not verified them).</p>
+    <p><strong>What the specification does not say:</strong> how much performance isolation VFs must have; how a hypervisor should schedule VFs; which VM gets which VF.</p>
+  </aside>
+  <aside class="callout warn">
+    <p><strong>What should never be assumed?</strong> That a VF is usable as soon as it appears; that VF FLR resets namespace contents (it resets controller state); that VFs are isolated in performance; that "SR-IOV supported" implies NVMe 2.4 migration support; that the PF driver and the VF driver are the same component.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <figure>
+    <ol class="seq" data-actors="Host (PF driver)|Lab SSD PF / primary|Lab SSD VF1 / secondary|Guest driver (VM)">
+      <li data-from="Host (PF driver)" data-to="Lab SSD PF / primary">Identify: primary capabilities</li>
+      <li data-from="Host (PF driver)" data-to="Lab SSD PF / primary">CfgWr: NumVFs=2, ARI hier., VF BARs</li>
+      <li data-from="Host (PF driver)" data-to="Lab SSD PF / primary">CfgWr: VF Enable=1, VF MSE=1</li>
+      <li data-note="Lab SSD VF1 / secondary">VF1 visible at RID 0x0101</li>
+      <li data-from="Host (PF driver)" data-to="Lab SSD PF / primary">Virt Mgmt: Offline CNTLID 2</li>
+      <li data-from="Host (PF driver)" data-to="Lab SSD PF / primary">Virt Mgmt: Assign VQ=4, VI=4</li>
+      <li data-from="Host (PF driver)" data-to="Lab SSD PF / primary">Virt Mgmt: Online CNTLID 2</li>
+      <li data-from="Host (PF driver)" data-to="Lab SSD PF / primary">Namespace Attachment: NS 5 → CNTLID 2</li>
+      <li data-note="Host (PF driver)">bind VF1 to vfio-pci; assign to VM</li>
+      <li data-from="Guest driver (VM)" data-to="Lab SSD VF1 / secondary">MWr VF BAR0+0x14: CC.EN=1</li>
+      <li data-from="Lab SSD VF1 / secondary" data-to="Guest driver (VM)" class="dashed">CSTS.RDY=1</li>
+      <li data-from="Lab SSD VF1 / secondary" data-to="Guest driver (VM)">MRd/MWr with RID 0x0101 (via IOMMU)</li>
+    </ol>
+    <figcaption>Conceptual bring-up of one NVMe VF. Configuration writes go to the PF's SR-IOV capability; admin commands go to the primary controller's admin queue; guest I/O goes to the VF.</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Configuration requests</strong> (CfgRd/CfgWr) to the PF set up SR-IOV. VF configuration space is reached at the VF's own RID.</li>
+    <li><strong>Admin commands</strong> on the primary controller's admin queue manage secondary controllers. They are ordinary 64-byte SQEs (opcode 1Ch for Virtualization Management, 06h for Identify) and complete with CQEs and status codes as in <a href="ch30.html">Chapter 30</a>.</li>
+    <li><strong>Guest I/O</strong> uses the VF's BAR (doorbells at VF BAR0 + 1000h onward) and generates DMA with the VF's RID. The IOMMU translates guest IOVAs.</li>
+    <li><strong>Interrupts</strong>: MSI-X writes from the VF's vectors are remapped by the interrupt remapping unit to the right VM's virtual CPU.</li>
+    <li><strong>Reset</strong>: FLR on the VF (configuration write to its Device Control's Initiate FLR bit) resets that function; resetting the PF or the link affects every VF.</li>
+  </ul>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>All traces are <strong>synthetic examples for teaching</strong>. Lab SSD PF at 01:00.0 (RID 0x0100); VF1 RID 0x0101 with VF BAR0 at 0x3_8000_0000; VF2 RID 0x0102 at 0x3_8000_4000. IOMMU enabled; guest addresses are IOVAs.</p>
+
+  <h3>Trace 1 — normal: VF enable and first I/O from a guest</h3>
+  <div class="trace" data-kind="synthetic" data-title="SR-IOV enable, secondary online, guest READ on VF1">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 µs</td><td>CfgWr0</td><td>RC → 0x0100, SR-IOV NumVFs = 2</td><td>Host chooses 2 VFs</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>5 µs</td><td>CfgRd0</td><td>SR-IOV First VF Offset / VF Stride</td><td>Read back: 1 / 1 → VF RIDs 0x0101, 0x0102</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>40 µs</td><td>CfgWr0</td><td>SR-IOV Control: VF Enable=1, VF MSE=1</td><td>VFs created</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>110 ms</td><td>CfgRd0</td><td>RC → 0x0101 Vendor/Device ID</td><td>Reads FFFFh/FFFFh: normal for a VF (IDs come from the PF)</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>200 ms</td><td>MWr32</td><td>BAR0+0x1000 (PF admin SQ tail) Data=0x0B</td><td>Host submits Virtualization Management (Assign VQ) to the primary</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>200.9 ms</td><td>MRd64</td><td>RID=0x0100 Addr=0x1_0000_0280 Len=16</td><td>Primary fetches SQE: opcode 1Ch, ACT=8h, RT=VQ, CNTLID=2, NR=4</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>201.4 ms</td><td>MWr64</td><td>RID=0x0100 Addr=0x1_0000_10B0 Len=4</td><td>CQE: Status = Successful Completion</td></tr>
+        <tr class="note"><td colspan="6">Similar pairs for Assign VI (NR=4) and Online (ACT=9h); then Namespace Attachment of NS 5 to CNTLID 2. VF1 bound to vfio-pci and assigned to VM A.</td></tr>
+        <tr class="dir-down"><td>8</td><td>Host→Dev</td><td>2.1 s</td><td>MWr64</td><td>RC Addr=0x3_8000_0014 Data=0x00460001</td><td>Guest writes VF1 CC (CC.EN=1)</td></tr>
+        <tr class="dir-up"><td>9</td><td>Dev→Host</td><td>2.1 s + 30 µs</td><td>CplD</td><td>to RC read of 0x3_8000_001C, Data=0x00000001</td><td>VF1 CSTS.RDY=1: secondary controller ready</td></tr>
+        <tr class="dir-down"><td>10</td><td>Host→Dev</td><td>2.4 s</td><td>MWr64</td><td>Addr=0x3_8000_1008 Data=0x00000001</td><td>Guest rings VF1's SQ1 tail doorbell</td></tr>
+        <tr class="dir-up"><td>11</td><td>Dev→Host</td><td>+0.9 µs</td><td>MRd32</td><td>RID=0x0101 Addr=IOVA 0x0000_7F00_0000 Len=16</td><td>SQE fetch with VF1's RID; IOMMU translates using VM A's tables</td></tr>
+        <tr class="dir-up"><td>12</td><td>Dev→Host</td><td>+75 µs</td><td>MWr64 ×16</td><td>RID=0x0101 to VM A buffers</td><td>Read data</td></tr>
+        <tr class="dir-up"><td>13</td><td>Dev→Host</td><td>+77 µs</td><td>MWr32</td><td>RID=0x0101 Addr=0xFEE0_xxxx</td><td>MSI-X from VF1's vector 1, remapped to VM A</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reading it:</strong> three planes are visible — configuration (#1–#4), NVMe management on the primary's admin queue (#5–#7), and guest I/O on the VF (#8–#13). Every guest-triggered DMA carries RID 0x0101. The FFFFh Vendor ID in #4 is normal and often misread as "device absent."</p>
+  </div>
+
+  <h3>Trace 2 — abnormal: VF driver binds before the secondary is online</h3>
+  <div class="trace" data-kind="synthetic" data-title="VF2 enabled, but CNTLID 3 is offline with no resources">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>CfgWr0</td><td>VF Enable=1 (automatic VF driver probing on)</td><td>Host nvme driver immediately probes VF2</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>15 ms</td><td>MWr64</td><td>Addr=0x3_8000_4024/28/30</td><td>Driver programs AQA/ASQ/ACQ of VF2</td></tr>
+        <tr class="abnormal"><td>3</td><td>Host→Dev</td><td>15.1 ms</td><td>MWr64</td><td>Addr=0x3_8000_4014 CC.EN=1</td><td><strong>First abnormal event:</strong> controller enable issued to a secondary controller that is offline with zero VQ/VI resources</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>15.1 ms … 30 s</td><td>MRd64 (polls)</td><td>Addr=0x3_8000_401C</td><td>CSTS polled repeatedly</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>…</td><td>CplD</td><td>Data=0x00000000</td><td>CSTS.RDY stays 0</td></tr>
+        <tr class="note"><td colspan="6">Linux (illustrative): "nvme nvme3: Device not ready; aborting initialisation, CSTS=0x0". The PCIe side is perfectly healthy: no AER errors, completions are successful.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning:</strong> the PCIe layer did its job (VF exists, BAR works, reads complete). The NVMe layer refused because the secondary controller was not online. Evidence: <code>nvme list-secondary</code> on the PF shows CNTLID 3 offline with 0 VQ/0 VI. The behaviour of an offline secondary controller on enable is specified by NVMe (confirm the exact required behaviour in the Base Specification's virtualization section); either way, the fix is the order: disable VF driver autoprobe, assign and online, then bind.</p>
+  </div>
+
+  <h3>Trace 3 — abnormal: IOMMU blocks a VF's DMA</h3>
+  <div class="trace" data-kind="synthetic" data-title="VF1 DMA to an unmapped IOVA after a VM memory hot-unplug">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0.0</td><td>MRd32</td><td>RID=0x0101 Addr=IOVA 0x0000_7F00_0400 Len=16 Tag=0x21</td><td>SQE fetch: OK</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>0.7</td><td>CplD</td><td>Tag=0x21 SC</td><td>Write command, PRP1 = IOVA 0x0000_9000_0000</td></tr>
+        <tr class="abnormal"><td>3</td><td>Dev→Host</td><td>1.5</td><td>MRd32</td><td>RID=0x0101 Addr=IOVA 0x0000_9000_0000 Len=128 Tag=0x22</td><td><strong>First abnormal event (on the wire):</strong> data fetch to an IOVA the hypervisor has unmapped</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>1.9</td><td>Cpl</td><td>Tag=0x22 Status=UR (Completer ID = RC)</td><td>IOMMU translation fault → root complex completes with Unsupported Request</td></tr>
+        <tr class="note"><td colspan="6">Host log (illustrative, Intel VT-d style): "DMAR: [DMA Read NO_PASID] Request device [01:00.1] fault addr 0x90000000 [fault reason …]". Guest: command completes with a data transfer error status after the device handles the UR.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning:</strong> the fault names device 01:00.1 — VF1, not the PF — because the IOMMU keys on RID. The IOVA was valid when the guest built the command but unmapped by the hypervisor before the device fetched it. Root cause is a hypervisor/guest memory management race, not the SSD. A senior engineer checks that the fault's RID matches the VF assigned to the VM that issued the command; a mismatch would indicate a device bug (DMA issued with the wrong RID).</p>
+  </div>
+
+  <h3>Trace 4 — slow: noisy neighbour</h3>
+  <div class="trace" data-kind="synthetic" data-title="VF1 latency rises while VF2 runs large sequential writes">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ms)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>VF1 SQ1 doorbell (4 KiB READs, QD 1)</td><td>Baseline read latency ~80 µs</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>100</td><td>MRd64 ×N</td><td>RID=0x0102, 512 B each, continuous</td><td>VF2 starts 128 KiB sequential writes, fetching data at link rate</td></tr>
+        <tr class="abnormal"><td>3</td><td>Dev→Host</td><td>100.4</td><td>MWr64</td><td>RID=0x0101 CQE for a VF1 READ</td><td><strong>First abnormal event:</strong> VF1 command completion latency 410 µs (5× baseline)</td></tr>
+        <tr class="note"><td colspan="6">No errors anywhere. Link utilization upstream ~95% from VF2 traffic; NAND program activity high.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning:</strong> nothing is broken; the VFs share the device. Whether the latency comes from the link (VF1's CQE and data waiting behind VF2's traffic), from the back end (reads blocked behind programs on the same NAND die), or from controller scheduling needs device telemetry. NVMe 2.4 rate limiting provides a standard way to cap VF2's bandwidth/IOPS on devices that support it.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Inspection commands are <span class="badge safe">Safe lab</span> (read-only). Commands that change SR-IOV or NVMe virtualization state are marked <span class="badge caution">Caution lab</span>: they can make namespaces or devices disappear from the host and must only be used on test systems with no data you need.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Does the device support SR-IOV? (capability decode)</span>
+sudo lspci -vvv -s 01:00.0 | grep -A12 'Single Root I/O Virtualization'
+
+<span class="cm"># Kernel's view of SR-IOV</span>
+cat /sys/bus/pci/devices/0000:01:00.0/sriov_totalvfs
+cat /sys/bus/pci/devices/0000:01:00.0/sriov_numvfs
+cat /sys/bus/pci/devices/0000:01:00.0/sriov_drivers_autoprobe
+ls -l /sys/bus/pci/devices/0000:01:00.0/ | grep virtfn
+
+<span class="cm"># ARI forwarding at the root port (DevCtl2 shows ARIFwd+ when enabled)</span>
+sudo lspci -vvv -s 00:01.1 | grep -i 'ARIFwd'
+
+<span class="cm"># NVMe virtualization (read-only Identify-based queries, nvme-cli)</span>
+sudo nvme primary-ctrl-caps /dev/nvme0
+sudo nvme list-secondary /dev/nvme0
+sudo nvme id-ctrl /dev/nvme0 | grep -iE '^cntlid|^oacs'   <span class="cm"># OACS indicates Virtualization Management support</span>
+
+<span class="cm"># IOMMU group of each VF</span>
+for f in /sys/bus/pci/devices/0000:01:00.*; do echo "$f -&gt; $(readlink $f/iommu_group)"; done</code></pre>
+  <p>A typical bring-up sequence on a <strong>test system</strong> (<span class="badge caution">Caution lab</span>; values and controller IDs are illustrative, check <code>nvme help virt-mgmt</code> for your nvme-cli version's options):</p>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code><span class="cm"># 1. Do not let drivers grab VFs before they are ready</span>
+echo 0 | sudo tee /sys/bus/pci/devices/0000:01:00.0/sriov_drivers_autoprobe
+<span class="cm"># 2. Create 2 VFs</span>
+echo 2 | sudo tee /sys/bus/pci/devices/0000:01:00.0/sriov_numvfs
+<span class="cm"># 3. For secondary controller 2: offline, assign 4 VQ (rt=0) and 4 VI (rt=1), online</span>
+sudo nvme virt-mgmt /dev/nvme0 --cntlid=2 --act=7
+sudo nvme virt-mgmt /dev/nvme0 --cntlid=2 --rt=0 --nr=4 --act=8
+sudo nvme virt-mgmt /dev/nvme0 --cntlid=2 --rt=1 --nr=4 --act=8
+sudo nvme virt-mgmt /dev/nvme0 --cntlid=2 --act=9
+<span class="cm"># 4. Attach a namespace to controller 2 (see Chapter 58), then bind the VF</span>
+sudo nvme attach-ns /dev/nvme0 --namespace-id=5 --controllers=2
+echo 0000:01:00.1 | sudo tee /sys/bus/pci/drivers_probe</code></pre>
+  <table>
+    <caption>What each output can and cannot prove</caption>
+    <thead><tr><th>Evidence</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>sriov_totalvfs</td><td>Maximum VFs the PF supports</td><td>That NVMe virtualization (secondary controllers) is supported</td></tr>
+      <tr><td>virtfn links</td><td>VFs exist and their BDFs</td><td>That their secondary controllers are online</td></tr>
+      <tr><td>primary-ctrl-caps</td><td>Flexible/private resource totals and limits</td><td>How the device performs with them</td></tr>
+      <tr><td>list-secondary</td><td>Each secondary's state, VF number and resources</td><td>Which VM uses which VF (hypervisor knows)</td></tr>
+      <tr><td>IOMMU groups</td><td>Which VFs can be isolated separately</td><td>That the device emits DMA with the correct RID</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <h3>VF RID, BAR and resource planner (runnable)</h3>
+  <p>This script is <strong>executable</strong> with the standard library. It uses synthetic capability values; change them to match your device's SR-IOV capability and Primary Controller Capabilities.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="sriov_plan.py"><code>#!/usr/bin/env python3
+"""sriov_plan.py - compute VF Routing IDs, VF BAR placement and an NVMe
+flexible-resource plan for a SYNTHETIC SR-IOV NVMe SSD (teaching example).
+
+PCIe facts used (SR-IOV capability):
+  RID(VF n) = PF RID + First VF Offset + (n - 1) * VF Stride   (n = 1..NumVFs)
+  VF BAR k of VF n = VF BARk base + (n - 1) * VF BARk size
+NVMe facts used (virtualization enhancements): flexible VQ/VI resources move
+from the primary controller's pool to secondary controllers with the
+Virtualization Management command; each secondary needs enough VQ resources
+for its admin queue pair plus I/O queue pairs, and VI resources for vectors.
+"""
+
+PF_RID = 0x0100            # Lab SSD 01:00.0
+FIRST_VF_OFFSET = 1
+VF_STRIDE = 1
+NUM_VFS = 10
+VF_BAR0_BASE = 0x3_8000_0000   # assigned by the OS to the PF's VF BAR0 (synthetic)
+VF_BAR0_SIZE = 16 * 1024       # per-VF size, found by BAR sizing
+
+# Synthetic Identify Primary Controller Capabilities values
+VQFRT, VIFRT = 64, 64      # flexible VQ / VI resources total
+VQFRSM, VIFRSM = 16, 16    # max flexible resources per secondary
+VQGRAN, VIGRAN = 1, 1      # preferred granularity
+
+def linux_name(rid):
+    """Linux always prints the 8-bit devfn as device.function, even with ARI."""
+    bus, devfn = rid &gt;&gt; 8, rid &amp; 0xFF
+    return f"{bus:02x}:{devfn &gt;&gt; 3:02x}.{devfn &amp; 7}"
+
+def main():
+    print("VF  RID     Linux name  ARI fn  needs ARI  VF BAR0 range")
+    for n in range(1, NUM_VFS + 1):
+        rid = PF_RID + FIRST_VF_OFFSET + (n - 1) * VF_STRIDE
+        base = VF_BAR0_BASE + (n - 1) * VF_BAR0_SIZE
+        needs_ari = (rid &amp; 0xFF) &gt;&gt; 3 != 0      # non-ARI view: device number != 0
+        print(f"{n:&lt;3} 0x{rid:04x}  {linux_name(rid):&lt;11} {rid &amp; 0xFF:&gt;6}  "
+              f"{'yes' if needs_ari else 'no':&lt;9}  0x{base:x}-0x{base + VF_BAR0_SIZE - 1:x}")
+    print(f"Total VF BAR0 aperture: {NUM_VFS} x {VF_BAR0_SIZE // 1024} KiB = "
+          f"{NUM_VFS * VF_BAR0_SIZE // 1024} KiB (contiguous)")
+    print("needs ARI = yes: read without ARI, the RID's device number is not 0, and a")
+    print("downstream port without ARI Forwarding only reaches device 0 below it")
+
+    # Plan: keep 16 VQ/VI flexible for the primary, share the rest equally.
+    keep_primary = 16
+    per_vf_vq = min(VQFRSM, (VQFRT - keep_primary) // NUM_VFS // VQGRAN * VQGRAN)
+    per_vf_vi = min(VIFRSM, (VIFRT - keep_primary) // NUM_VFS // VIGRAN * VIGRAN)
+    print(f"\nFlexible plan: primary keeps {keep_primary} VQ / {keep_primary} VI; "
+          f"each secondary gets {per_vf_vq} VQ / {per_vf_vi} VI")
+    print(f"Each secondary: 1 admin queue pair + up to {per_vf_vq - 1} I/O queue pairs, "
+          f"{per_vf_vi} interrupt vectors")
+    print("Order per secondary: Offline -&gt; Assign VQ -&gt; Assign VI -&gt; Online")
+    used = keep_primary + NUM_VFS * per_vf_vq
+    assert used &lt;= VQFRT, "over-allocated VQ resources"
+    print(f"VQ used {used}/{VQFRT}; VI used {keep_primary + NUM_VFS * per_vf_vi}/{VIFRT}")
+
+if __name__ == "__main__":
+    main()</code></pre>
+  <p>Output:</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>VF  RID     Linux name  ARI fn  needs ARI  VF BAR0 range
+1   0x0101  01:00.1          1  no         0x380000000-0x380003fff
+2   0x0102  01:00.2          2  no         0x380004000-0x380007fff
+3   0x0103  01:00.3          3  no         0x380008000-0x38000bfff
+4   0x0104  01:00.4          4  no         0x38000c000-0x38000ffff
+5   0x0105  01:00.5          5  no         0x380010000-0x380013fff
+6   0x0106  01:00.6          6  no         0x380014000-0x380017fff
+7   0x0107  01:00.7          7  no         0x380018000-0x38001bfff
+8   0x0108  01:01.0          8  yes        0x38001c000-0x38001ffff
+9   0x0109  01:01.1          9  yes        0x380020000-0x380023fff
+10  0x010a  01:01.2         10  yes        0x380024000-0x380027fff
+Total VF BAR0 aperture: 10 x 16 KiB = 160 KiB (contiguous)
+needs ARI = yes: read without ARI, the RID's device number is not 0, and a
+downstream port without ARI Forwarding only reaches device 0 below it
+
+Flexible plan: primary keeps 16 VQ / 16 VI; each secondary gets 4 VQ / 4 VI
+Each secondary: 1 admin queue pair + up to 3 I/O queue pairs, 4 interrupt vectors
+Order per secondary: Offline -&gt; Assign VQ -&gt; Assign VI -&gt; Online
+VQ used 56/64; VI used 56/64</code></pre>
+  <h3>Building a Virtualization Management command (pseudocode)</h3>
+  <pre class="code" data-kind="pseudocode" data-lang="c"><code><span class="cm">/* Field placement in CDW10/CDW11 must be taken from the NVMe Base Specification;
+   the names below are the specification's field names. */</span>
+struct nvme_sqe sqe = {0};
+sqe.opcode = 0x1C;                 <span class="cm">/* Virtualization Management */</span>
+sqe.nsid   = 0;                    <span class="cm">/* not namespace-specific */</span>
+set_field(&amp;sqe, ACT,  0x8);         <span class="cm">/* Secondary Controller Assign */</span>
+set_field(&amp;sqe, RT,   RT_VQ);       <span class="cm">/* resource type: VQ or VI */</span>
+set_field(&amp;sqe, CNTLID, 2);        <span class="cm">/* target secondary controller */</span>
+set_field(&amp;sqe, NR,   4);           <span class="cm">/* number of resources */</span>
+submit_admin(primary_ctrl, &amp;sqe);
+<span class="cm">/* On success, re-read the Secondary Controller List to confirm NVQ = 4. */</span></code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <h3>Plan ten VMs on one SSD</h3>
+  <p>Synthetic example: the Lab SSD reports TotalVFs = 16, VQ Flexible Resources Total = 64, VI Flexible Resources Total = 64, VQ/VI Flexible Resources Secondary Maximum = 16, granularity 1. Ten VMs each need one VF.</p>
+  <ol>
+    <li><strong>Routing IDs.</strong> First VF Offset 1, VF Stride 1 → RIDs 0x0101–0x010A. VFs 8–10 have device-number bits ≠ 0 when read without ARI, so the root port must have ARI Forwarding enabled (the planner's "needs ARI" column).</li>
+    <li><strong>BAR aperture.</strong> 10 × 16 KiB = 160 KiB of VF BAR0 space, which firmware or the OS must reserve in the root port's memory window. If the platform reserved only enough for the PF, VF Enable will work but VF BARs cannot be assigned — a common bring-up failure.</li>
+    <li><strong>Resources.</strong> Keep 16 VQ / 16 VI for the host's own use of the primary controller; 48 remain → 4 VQ and 4 VI per secondary: one admin queue pair plus 3 I/O queue pairs, and 4 interrupt vectors per VM.</li>
+    <li><strong>Is 3 I/O queues enough?</strong> A VM with 8 vCPUs would like 8 queues (one per CPU, <a href="ch27.html">Chapter 27</a>). With 3, its driver shares queues among CPUs — acceptable for most VMs; for high-performance VMs, give fewer VMs more resources (up to 16 each).</li>
+    <li><strong>Namespaces.</strong> Create 10 namespaces and attach each to exactly one secondary controller.</li>
+    <li><strong>Isolation.</strong> Confirm each VF is in its own IOMMU group. Because all VFs are functions of one device, this depends on the device's ACS support for multi-function isolation (or on the kernel's handling of SR-IOV devices); check the groups, do not assume.</li>
+  </ol>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Binding a driver to a VF before its secondary controller is online.</strong></li>
+    <li><strong>Reading VF Vendor ID = FFFFh as "no device."</strong> VFs report IDs through the PF's SR-IOV capability.</li>
+    <li><strong>Forgetting ARI</strong> when VF RIDs exceed function 7, or forgetting to reserve bus numbers when VFs spill over buses.</li>
+    <li><strong>Not reserving MMIO for VF BARs</strong> in platform firmware.</li>
+    <li><strong>Resetting the PF to "fix" one VF</strong>, which disrupts every VM on the device. Use VF FLR.</li>
+    <li><strong>Confusing the SR-IOV capability's legacy "VF Migration" fields with NVMe live migration.</strong></li>
+    <li><strong>Assuming VF performance isolation.</strong> Measure under contention; use rate limiting where supported.</li>
+    <li><strong>Attaching one namespace to several secondary controllers</strong> unintentionally, exposing data across VMs.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>Split every SR-IOV NVMe problem into its plane first:</p>
+  <div class="flow">
+    <div>PCIe plane<small>VF exists? RID reachable (ARI)? VF BAR assigned? VF MSE set?</small></div>
+    <div>NVMe management plane<small>secondary online? resources assigned? namespace attached?</small></div>
+    <div class="hl">Host plane<small>driver order, VFIO binding, IOMMU group, interrupt remapping</small></div>
+    <div>Guest plane<small>guest driver enables controller, creates queues, I/O</small></div>
+    <div>Shared-resource plane<small>contention, rate limits, reset scope</small></div>
+  </div>
+  <table>
+    <caption>Failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Likely conclusion</th></tr></thead>
+    <tbody>
+      <tr><td>Writing sriov_numvfs fails</td><td>No MMIO/bus space for VFs; PF driver does not support SR-IOV</td><td>dmesg at the write</td><td>VF BAR sizes vs root port window</td><td>Platform resource reservation</td></tr>
+      <tr><td>VF present, controller never ready</td><td>Secondary offline / no resources</td><td>nvme list-secondary</td><td>Order of operations</td><td>Configuration order</td></tr>
+      <tr><td>VF ready, no namespaces in guest</td><td>Namespace not attached to that CNTLID</td><td>nvme list-ctrl / ns attachment</td><td>Guest's Identify active NS list</td><td>Attachment missing</td></tr>
+      <tr><td>DMA faults naming the VF</td><td>Unmapped IOVA; guest/hypervisor race</td><td>IOMMU fault log RID and address</td><td>Hypervisor mapping events</td><td>Host memory management</td></tr>
+      <tr><td>DMA faults naming the PF while a VF is busy</td><td>Device issues VF DMA with PF RID</td><td>Analyzer: RID of DMA during VF I/O</td><td>Repeat with one VF only</td><td>Device bug (isolation)</td></tr>
+      <tr><td>One VM's latency spikes with another's load</td><td>Shared link/back end</td><td>Per-VF throughput and latency</td><td>Rate limit support</td><td>Noisy neighbour</td></tr>
+      <tr><td>All VMs on the device hiccup together</td><td>PF reset, link event, DPC</td><td>AER/DPC logs at the root port</td><td>Host PF driver resets</td><td>Shared reset scope</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <ul>
+    <li><strong>Two virtualization layers, two owners.</strong> PCIe SR-IOV is configured by the PF driver and platform; NVMe secondary controllers by the storage management stack. Bugs hide in the hand-off between them.</li>
+    <li><strong>The RID is the security boundary.</strong> Validate on an analyzer that every DMA during VF I/O carries the VF's RID.</li>
+    <li><strong>Reset scope is a product requirement.</strong> A VF FLR must not disturb other VFs; test it under load on every VF simultaneously.</li>
+    <li><strong>Plan resources from workloads,</strong> not from equal division. Queues and vectors are scarce.</li>
+    <li><strong>Migration changes what "state" means.</strong> With NVMe 2.4 exported subsystems, controller and namespace identity, configuration templates and runtime state become things you must be able to capture, transfer and verify — a new validation dimension.</li>
+    <li><strong>Read the device's virtualization limits early</strong> (Primary Controller Capabilities) during platform selection, not after deployment.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 56 — Conceptual PF/VF topology and secondary controller plan</h3>
+  <dl>
+    <dt>Objective</dt><dd>Build a PF/VF topology for an NVMe SSD on paper and in the planner, covering identity, resources, isolation, queues, interrupts and virtualization; then inspect a real device read-only if available.</dd>
+    <dt>Skills</dt><dd>VF RID and BAR computation; VQ/VI planning; separating specification-defined from implementation-specific behaviour; reading nvme-cli virtualization output.</dd>
+    <dt>Safety</dt><dd>Steps 1–4: <span class="badge safe">Safe lab</span>. Optional Step 5 (enabling VFs and changing secondary controllers) is a <span class="badge caution">Caution lab</span> on a test system with no needed data.</dd>
+    <dt>Hardware required</dt><dd>None for Steps 1–3. Optional: an NVMe SSD supporting SR-IOV and virtualization management.</dd>
+    <dt>Software required</dt><dd>Python 3.8+; <code>pciutils</code>; <code>nvme-cli</code>.</dd>
+    <dt>Input</dt><dd><code>sriov_plan.py</code>; the synthetic capability values in this chapter.</dd>
+    <dt>Expected output</dt><dd>A topology diagram, a resource plan table, and a two-column list: specification-defined vs implementation-specific.</dd>
+  </dl>
+  <h4>Background</h4>
+  <p>A complete plan answers, for each VM: which VF (RID, BDF), which VF BAR range, which secondary controller (CNTLID), how many VQ/VI resources, which namespace, which IOMMU group.</p>
+  <h4>Step 1 — Identity</h4>
+  <p>Using the planner with NUM_VFS = 6, list RIDs, Linux names and VF BAR0 ranges. Mark which require ARI.</p>
+  <h4>Step 2 — Resources</h4>
+  <p>Plan for 6 VMs: two "large" VMs needing 8 I/O queues and 8 vectors each, four "small" VMs needing 2 I/O queues and 3 vectors. Check the plan against VQFRT/VIFRT = 64 and the secondary maximum of 16. Remember each secondary's admin queue consumes a VQ resource.</p>
+  <h4>Step 3 — Isolation and ordering</h4>
+  <p>Write the order of operations from VF creation to guest I/O, labelling each step PCIe or NVMe, and listing the isolation mechanism that protects each VM (IOMMU, ACS, namespace attachment, device internals).</p>
+  <h4>Step 4 — Read-only inspection (optional)</h4>
+  <p>On a system with an SR-IOV NVMe SSD, run the read-only Linux view commands and record TotalVFs, primary capabilities and secondary list.</p>
+  <h4>Step 5 — Bring-up (optional, Caution)</h4>
+  <p>On a test system, follow the bring-up sequence for one VF and confirm with <code>nvme list-secondary</code> that the secondary is online with your resources, then that the VF's controller becomes ready.</p>
+  <h4>Observation</h4>
+  <p>Note which values in your plan came from the device (implementation) and which rules came from the specifications.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>How many VQ resources does a large VM's secondary controller need? A small one?</li>
+    <li>Does your plan fit? If not, what do you change?</li>
+    <li>Which steps would a VF FLR undo, and which would survive?</li>
+    <li>Why must VF BAR sizes respect System Page Size?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Extend <code>sriov_plan.py</code> to accept a list of per-VM requirements and produce a validated assignment, rejecting plans that exceed totals or per-secondary maxima.</p>
+  <details class="hint"><summary>Hints</summary>
+    <p>Large VM: 8 I/O queue pairs + 1 admin pair = 9 VQ; small: 2 + 1 = 3 VQ. Vectors: 8 and 3 (one may be shared between admin and an I/O queue, depending on the driver).</p>
+  </details>
+  <details class="solution"><summary>Solution</summary>
+    <p><strong>Q1:</strong> 9 VQ for large, 3 VQ for small (each I/O queue pair plus the admin pair).</p>
+    <p><strong>Q2:</strong> VQ total = 2 × 9 + 4 × 3 = 30; VI total = 2 × 8 + 4 × 3 = 28. Both fit in 64 with room for the primary, and 9 ≤ 16 per secondary. It fits.</p>
+    <p><strong>Q3:</strong> VF FLR resets the VF's function and its controller state (registers, queues, outstanding commands, MSI-X configuration); the guest must reinitialize. SR-IOV enable, secondary resource assignment and online state, and namespace attachment are managed through the PF/primary and survive (confirm device-specific behaviour for secondary state across VF FLR in the specification and device documentation).</p>
+    <p><strong>Q4:</strong> the hypervisor maps each VF's BAR into a VM's address space with page granularity; if two VFs shared a page, one VM could reach another VF's registers.</p>
+    <p><strong>Spec vs implementation:</strong> spec — SR-IOV fields, RID formula, VF BAR layout, VQ/VI concept, Virtualization Management actions, namespace attachment; implementation — TotalVFs, BAR sizes, resource totals, offline-enable behaviour details, performance isolation, VF/secondary association.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>That the plan's weakest point is not resources but reset and contention behaviour, which no capability field describes; and that the platform's MMIO and bus-number reservations must be part of the plan.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>Request 16 VQ for a secondary with granularity 4: allowed. With secondary maximum 12: rejected.</li>
+    <li>NumVFs larger than the platform can map: VF Enable succeeds but VF BAR assignment fails.</li>
+    <li>Namespace attached to the primary only: guests see no storage.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Read the NVMe 2.4 sections on Exported NVM Subsystems and write down which pieces of your plan would need to be recreated identically on a destination SSD for live migration (identity, configuration template, namespaces, runtime state). See <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a> and <a href="me-feature-labs.html">Feature Labs</a>.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>A PF at RID 0x3A00 has First VF Offset 0x80 and VF Stride 2. What are the RIDs of VF1 and VF5?</li>
+    <li>VF BAR0 is sized at 32 KiB and NumVFs is 8. How much MMIO is needed, and where is VF6's BAR0 if VF BAR0 base is 0x60_0000_0000?</li>
+    <li>Why can a VF not use INTx?</li>
+    <li>List the four Virtualization Management actions in the order you would use them to give a secondary controller more queues.</li>
+    <li>Explain why NVMe live migration needs more than copying namespace data.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p><strong>1.</strong> VF1 = 0x3A00 + 0x80 = 0x3A80. VF5 = 0x3A80 + 4 × 2 = 0x3A88.</p>
+    <p><strong>2.</strong> 8 × 32 KiB = 256 KiB. VF6 = 0x60_0000_0000 + 5 × 0x8000 = 0x60_0002_8000.</p>
+    <p><strong>3.</strong> INTx is a shared, level-triggered legacy mechanism tied to a function's Interrupt Pin; VFs are defined without it so each can have independent, remappable message-signalled interrupts.</p>
+    <p><strong>4.</strong> Secondary Controller Offline → Secondary Controller Assign (VQ, and VI if needed) → Secondary Controller Online. (Primary Controller Flexible Allocation is used first if the primary is holding the flexible resources you need.)</p>
+    <p><strong>5.</strong> The VM's driver holds live controller state — queues, doorbell values, outstanding commands, features, identifiers — and expects the same controller identity after migration. That state must be captured, transferred and applied, and the destination must present identical identifiers and behaviour (the 2.4 configuration template), not just identical data.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>Where are a VF's BARs described?</p>
+      <ul class="options" data-answer="2">
+        <li>In the VF's own Base Address Registers</li>
+        <li>In the VF BAR fields of the PF's SR-IOV capability</li>
+        <li>In the NVMe CAP register</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>VF BARs live in the PF's SR-IOV capability; each describes per-VF size and a region of NumVFs copies.</p></details>
+    </li>
+    <li>
+      <p>VF n's Routing ID is:</p>
+      <ul class="options" data-answer="1">
+        <li>PF RID + First VF Offset + (n − 1) × VF Stride</li>
+        <li>PF RID + n</li>
+        <li>Assigned by the NVMe primary controller</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The SR-IOV formula; offset and stride come from the capability.</p></details>
+    </li>
+    <li>
+      <p>What does a VQ resource represent in NVMe virtualization?</p>
+      <ul class="options" data-answer="3">
+        <li>A namespace</li>
+        <li>An MSI-X vector</li>
+        <li>Controller resources for one submission/completion queue pair</li>
+        <li>A PCIe virtual channel</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>VQ = virtual queue resource; VI = virtual interrupt resource.</p></details>
+    </li>
+    <li>
+      <p>What state must a secondary controller be in to receive resources via Secondary Controller Assign?</p>
+      <ul class="options" data-answer="2">
+        <li>Online</li>
+        <li>Offline</li>
+        <li>Either</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Offline; it is then brought online.</p></details>
+    </li>
+    <li>
+      <p>Why is ARI usually required for SR-IOV devices with more than a few VFs?</p>
+      <details class="answer"><summary>Model answer</summary><p>Without ARI, a device has device number 0 and up to 8 functions below a downstream port; VF RIDs beyond function 7 would need other device numbers, which a non-ARI downstream port does not reach. ARI makes the 8 bits one function number (256 functions).</p></details>
+    </li>
+    <li>
+      <p>An IOMMU fault names device 01:00.2. What does this tell you?</p>
+      <details class="answer"><summary>Model answer</summary><p>The faulting DMA carried RID 0x0102 — VF2 (with the lab numbering). Look at the VM assigned VF2 and its mappings. If VF2 was idle, suspect the device using the wrong RID.</p></details>
+    </li>
+    <li>
+      <p>Which reset affects only one VM's VF?</p>
+      <ul class="options" data-answer="1">
+        <li>Function Level Reset of the VF</li>
+        <li>PF Function Level Reset</li>
+        <li>Secondary bus reset of the root port</li>
+        <li>NVM Subsystem Reset</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>VF FLR is scoped to that function; the others affect every function of the device (or the whole subsystem).</p></details>
+    </li>
+    <li>
+      <p>Which NVMe 2.4 feature addresses VM live migration with SR-IOV-style direct assignment?</p>
+      <ul class="options" data-answer="3">
+        <li>Voltage monitoring</li>
+        <li>Restore manufacturing default settings</li>
+        <li>PCIe Exported NVM Subsystem Migration</li>
+        <li>Idle I/O exit latency limits</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Exported NVM Subsystem Migration, with configuration templates identified by 128-bit UUIDs and state capture/transfer.</p></details>
+    </li>
+    <li>
+      <p>Name two things that are specification-defined and two that are implementation-specific in an SR-IOV NVMe SSD.</p>
+      <details class="answer"><summary>Model answer</summary><p>Spec-defined: SR-IOV capability fields and RID formula; Virtualization Management actions; VQ/VI resource concept; namespace attachment. Implementation: TotalVFs and resource totals; performance isolation; internal scheduling; VF BAR sizes.</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> What is the difference between a PF and a VF?</p>
+      <details class="answer"><summary>Model answer</summary><p>A PF is a full PCIe function with an SR-IOV capability that manages VFs. A VF is a lightweight function created by the PF's VF Enable, with its own RID, BAR region and MSI-X, but reduced configuration space and many properties controlled by the PF.</p></details></li>
+    <li><p><strong>Beginner:</strong> Why does SR-IOV need an IOMMU?</p>
+      <details class="answer"><summary>Model answer</summary><p>A VM's driver programs the VF with guest addresses; the IOMMU translates them per RID and blocks DMA outside the VM's memory. Without it, a VF could read or write any host memory.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Walk through bringing an NVMe VF into service.</p>
+      <details class="answer"><summary>Model answer</summary><p>Disable VF autoprobe; set NumVFs and VF Enable (VF BARs assigned); for its secondary controller: offline, assign VQ and VI, online; create/attach a namespace to that CNTLID; bind the VF to VFIO and assign to a VM; the guest driver enables the controller, creates queues and issues I/O.</p></details></li>
+    <li><p><strong>Intermediate:</strong> What are private and flexible resources?</p>
+      <details class="answer"><summary>Model answer</summary><p>Private resources belong permanently to the primary controller; flexible resources form a pool that the primary can keep or assign to secondary controllers via Virtualization Management, subject to totals, per-secondary maxima and granularity.</p></details></li>
+    <li><p><strong>Advanced:</strong> How would you validate isolation between VFs?</p>
+      <details class="answer"><summary>Model answer</summary><p>Analyzer checks that each VF's DMA uses its own RID; IOMMU fault injection (unmapped IOVAs) per VF; namespace attachment checks; FLR of one VF under load on all others; error injection on one VF and observation of others; MMIO page separation; performance contention tests with and without rate limits.</p></details></li>
+    <li><p><strong>Advanced:</strong> Why is live migration hard with direct-assigned VFs?</p>
+      <details class="answer"><summary>Model answer</summary><p>The device holds guest-visible state the hypervisor cannot see — queues, doorbells, in-flight commands, controller configuration — and the guest expects identical identity after migration. NVMe 2.4's Exported NVM Subsystem Migration standardizes identical presentation (configuration templates) and state capture/transfer.</p></details></li>
+    <li><p><strong>Senior:</strong> A customer complains that VMs on one SSD all stall for 2 s occasionally. What do you suspect?</p>
+      <details class="answer"><summary>Model answer</summary><p>A shared-scope event: PF reset by the host driver (e.g. after an admin timeout), a link event with DPC recovery, a firmware activation, or a device-internal stall (garbage collection, thermal throttling). Correlate host AER/DPC/nvme logs on the PF with guest timeouts; check NVMe telemetry and SMART on the PF; check firmware logs.</p></details></li>
+    <li><p><strong>Senior:</strong> What would you require from an SSD vendor for a multi-tenant SR-IOV deployment?</p>
+      <details class="answer"><summary>Model answer</summary><p>TotalVFs and resource totals sufficient for the plan; documented and tested VF FLR isolation; correct per-VF RIDs; per-VF error containment; QoS or NVMe 2.4 rate limiting; virtualization lockdown controls where relevant; telemetry per controller; a roadmap for 2.4 exported subsystem migration if live migration is required; interoperability with the target hypervisor and kernel versions.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain how one library can have many help desks without classes seeing each other's requests.</li>
+    <li><strong>To a junior engineer:</strong> explain why a VF can appear in lspci but its NVMe controller never becomes ready.</li>
+    <li><strong>To a senior engineer:</strong> explain where NVMe 2.4 Exported NVM Subsystem Migration fits relative to SR-IOV, and what a validation plan must add for it.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "The head librarian sets up little desks, each with its own tray and bell, for each class. Classes only see their own desk. The head librarian decides how many trays each desk gets and opens or closes desks."</p>
+    <p><strong>Junior:</strong> "The VF is the PCIe door — it appears once SR-IOV is enabled. The NVMe controller behind it is a secondary controller that needs queue and interrupt resources and must be put online by the primary controller using Virtualization Management. If the driver tries to enable it before that, it never becomes ready."</p>
+    <p><strong>Senior:</strong> "SR-IOV gives direct assignment; NVMe 2.4 exported subsystems add a standardized, template-defined virtual SSD that can be recreated with identical identity on another device, with runtime state captured, transferred and applied. Validation must add identity equivalence checks, template application, state capture/apply correctness under I/O, failure and rollback paths, and security checks (lockdown, TDISP information package) — field-level details from the 2.4 specification."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>SR-IOV creates VFs from a PF: each VF has its own RID (PF RID + First VF Offset + (n − 1) × VF Stride), its own BAR region carved from the PF's VF BARs, and its own MSI-X, while sharing the link and the device. ARI makes room for many functions. NVMe virtualization puts a primary controller behind the PF and secondary controllers behind VFs; flexible VQ and VI resources move to secondaries with Virtualization Management (Offline → Assign → Online), and namespace attachment gives each its storage. Isolation is layered: IOMMU (by RID), ACS, namespace attachment and device internals. VF FLR resets one VF; PF or link resets affect all. NVMe 2.4 adds rate limiting, virtualization lockdown, a TDISP information package and PCIe Exported NVM Subsystem Migration for live migration.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>compute VF RIDs and VF BAR addresses from the SR-IOV capability</li>
+      <li>explain when ARI is required and how Linux names ARI functions</li>
+      <li>describe primary/secondary controllers, VQ/VI, private/flexible resources</li>
+      <li>order the steps to bring an NVMe VF into service and label each PCIe or NVMe</li>
+      <li>diagnose "VF present but controller not ready" and "IOMMU fault on a VF"</li>
+      <li>explain what NVMe 2.4 Exported NVM Subsystem Migration adds, and what we have not verified about it</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Single Root I/O Virtualization and Sharing; ARI; FLR; ACS</cite>.</li>
+    <li><cite class="spec">NVMe Base Specification 2.4 — Virtualization Enhancements; Virtualization Management command; Identify</cite>.</li>
+    <li><cite class="spec">NVM Express Revision Changes 2026.07.30</cite> for the 2.4 virtualization and migration additions.</li>
+    <li>Linux kernel documentation: <code>Documentation/PCI/pci-iov-howto.rst</code>, VFIO documentation; nvme-cli manual pages for <code>primary-ctrl-caps</code>, <code>list-secondary</code>, <code>virt-mgmt</code>.</li>
+    <li>Course: <a href="dd52.html">Module 52 — SR-IOV</a>, <a href="dd22.html">Module 22 — NVMe Subsystem</a>, <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch57.html">Chapter 57 — SMART / Health</a>: Part XVIII begins with how an NVMe device reports its own health — temperature, wear, spare capacity, errors and power history — and how to read those numbers without fooling yourself.</p>
+</section>

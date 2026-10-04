@@ -1,0 +1,674 @@
+<p class="lead">This module builds on <a href="ch60.html">Chapter 60 — Key Value</a>, which introduced the KV namespace (CSI 01h), the Store, Retrieve, Delete, Exist and List commands, the SIKE/SINKE options, the key and value limits and the KV statuses. Here the subject is building <em>systems</em> on KV namespaces: how a host library maps real names onto short keys, how byte-exact keys break between tools, how to iterate safely, what the device's index costs as it grows, how KV traffic uses the PCIe link compared with block storage, and what "stored" means when the power fails.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p><a href="ch60.html">Chapter 60</a> traced single KV commands: a Store, a Retrieve, a Delete racing a Retrieve (87h), and an oversized key (86h). Real KV deployments fail in ways a single command cannot show — two libraries that disagree on what a key is, a List loop that sees a key twice, latency that rises with the number of keys, and data that disappears after power loss even though every Store succeeded. This module covers those, and gives you tools to quantify when KV is worth using.</p>
+  <aside class="callout prereq">
+    <p>From <a href="ch60.html">Chapter 60</a>: command names and opcodes, statuses 85h–89h, the key-in-SQE design and its open questions. From <a href="dd43.html">Module 43</a>: Unsafe Shutdowns and the Persistent Event log. From <a href="ch53.html">Flow Control and Credits</a> and <a href="ch52.html">Completion Rules</a>: TLP sizing (MPS, MRRS, RCB). From <a href="dd44.html">Module 44</a>: the contrast with zones, where the host owns placement.</p>
+  </aside>
+  <p>Next: <a href="dd46.html">Module 46 — Computational Programs</a>, another command set that moves work into the device.</p>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives for the Key Value module</caption>
+    <thead><tr><th>Level</th><th>You will be able to…</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Encode application names as KV keys, and decode KV statuses in the context of CSI 01h.</td></tr>
+      <tr><td>Intermediate</td><td>Design a key mapping (hashing, structured keys) with collision handling, and iterate a namespace with List safely.</td></tr>
+      <tr><td>Advanced</td><td>Model the link cost of KV against block approaches, and explain latency growth with key count.</td></tr>
+      <tr><td>Senior</td><td>Decide whether KV fits a workload, define durability semantics with the volatile write cache, and investigate data that is missing or stale after failures.</td></tr>
+      <tr><td>Trace analysis</td><td>Read key bytes and lengths in SQEs, follow a List iteration across calls, and spot the absence of Flush before a power loss.</td></tr>
+      <tr><td>Debugging</td><td>Diagnose 87h for keys that "exist", List skips and repeats, value-size failures, index-growth latency and post-power-loss staleness.</td></tr>
+      <tr><td>Validation</td><td>Test byte-exact keys, maximum lengths, List under concurrent changes, durability with and without Flush, and latency against key count.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>A school has a lost-property cupboard with tiny labels — each label fits only a few letters. "Alexandra Montgomery's blue raincoat" will not fit, so the caretaker writes a short code like "AM7" and pins a full note inside the pocket saying whose coat it really is.</p>
+    <p>One day a teacher asks for "AM7 " with a space at the end. The caretaker looks at the label — "AM7", no space — and says "not here". The coat is right there, but the label is not exactly the same.</p>
+    <p>Another day the caretaker writes a new label but has not pinned it yet when the lights go out. In the morning, the old label is still there.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <aside class="callout breaks">
+    <p><strong>What it represents.</strong> The tiny label is the key with its maximum length; the short code is a hash of the real name; the note inside the pocket is the full name stored inside the value to detect collisions; "AM7 " versus "AM7" is the byte-exact key comparison (a NUL-padded key is a different key); the unpinned label is a completed Store that was still in a volatile write cache when power was lost.</p>
+    <p><strong>What it hides.</strong> The caretaker's own index — how the device finds a key among millions — and that it may not fit in the device's fast memory. The fact that asking "what is in the cupboard?" (List) while children are adding and removing coats may show some coats twice or not at all.</p>
+    <p><strong>Where it misleads.</strong> The caretaker could guess that "AM7 " meant "AM7". The device must not: keys are byte strings, not text. And losing an unpinned label is not carelessness — if the drive advertises a volatile write cache, it is allowed until the host sends Flush.</p>
+  </aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Terms used in this module</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="kv-namespace">KV namespace</span></td><td>A cupboard with labels instead of shelf numbers</td><td>Namespace with CSI 01h; no LBAs</td><td>Reached through the generic character device</td><td>Expecting a block device</td></tr>
+      <tr><td>Byte-exact key</td><td>The label must match letter for letter</td><td>Key = byte string plus length; no terminators or padding implied</td><td>Different lengths are different keys</td><td>Treating keys as C strings</td></tr>
+      <tr><td>Key mapping</td><td>Turning long names into short codes</td><td>Host function from application names to keys (hash, structured, dictionary)</td><td>Must be identical in every tool</td><td>Changing it without migration</td></tr>
+      <tr><td>Collision</td><td>Two names, same code</td><td>Two names map to one key; detected by storing the name in the value</td><td>Resolved by probing or chaining</td><td>Assuming a hash never collides</td></tr>
+      <tr><td><span class="g" data-term="value-envelope">Value envelope</span></td><td>The note inside the pocket</td><td>Host header in the value: name, version, checksum</td><td>Enables collision checks and versioning</td><td>Forgetting it counts toward value size</td></tr>
+      <tr><td>List iteration</td><td>Reading the cupboard page by page</td><td>Repeated List calls starting from the last returned key</td><td>Order and completeness implementation-dependent</td><td>Assuming a snapshot</td></tr>
+      <tr><td>Device index</td><td>The caretaker's own notebook</td><td>Firmware structure mapping keys to flash locations</td><td>Its DRAM residency sets latency</td><td>Assuming constant latency</td></tr>
+      <tr><td><span class="g" data-term="sike">SIKE</span> / <span class="g" data-term="sinke">SINKE</span></td><td>"Only if it exists" / "only if new"</td><td>Store options: update-only and create-only, atomic in the device</td><td>Basis of device-side compare-and-set-like patterns</td><td>Emulating them with Exist then Store</td></tr>
+      <tr><td><span class="g" data-term="vwc">Volatile write cache</span></td><td>Labels not yet pinned</td><td>Controller cache whose contents may be lost on power loss; Flush makes data durable</td><td>Identify Controller reports its presence</td><td>Equating success with durability</td></tr>
+      <tr><td>Link efficiency</td><td>How much of the road carries cargo</td><td>Payload bytes divided by all bytes on the link for an operation</td><td>Poor for tiny values</td><td>Ignoring SQE, CQE and interrupt costs</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <figure>
+    <pre class="diagram">
+  Application:  get("https://example.test/objects/000042")
+        |
+  KV library (user space)
+        |  key mapping: name -&gt; hash[0..15]  (same function in every tool!)
+        |  envelope:    value = len | name | version | payload
+        |  durability:  Flush policy, retry on 87h probe chain
+        |  passthrough via /dev/ng0n3 (io_uring or ioctl)
+  NVMe driver --&gt; SQ1/CQ1 --&gt;  Lab SSD namespace 3 (CSI 01h)
+                                 command front end: key from SQE
+                                 index (DRAM cache + flash pages)
+                                 value log on flash, GC
+                                 volatile write cache (if VWC present)
+    </pre>
+    <figcaption>KV host library over a KV namespace. The key mapping and envelope are host conventions, invisible to the device.</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture elements</caption>
+    <thead><tr><th>Element</th><th>Here</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>Application names and values; durability requirements; concurrency between threads and hosts.</td></tr>
+      <tr><td>Outputs</td><td>Store/Retrieve/Delete/Exist/List commands; values and key lists to the application.</td></tr>
+      <tr><td>Actors</td><td>Applications, KV library, kernel pass-through, controller firmware (index, GC, cache).</td></tr>
+      <tr><td>State</td><td>Host: mapping function and version, probe limits, Flush policy. Device: index, value log, cache.</td></tr>
+      <tr><td>Memory</td><td>Host value buffers and List buffers; device DRAM for the index cache and write cache.</td></tr>
+      <tr><td>Registers</td><td>Doorbells only; limits come from the KV Identify Namespace format descriptors.</td></tr>
+      <tr><td>Interfaces</td><td>KV I/O commands; Flush (00h); Identify CNS 05h with CSI 01h; generic character device.</td></tr>
+      <tr><td>Dependencies</td><td>Every reader and writer using one mapping; Flush where durability matters; key limits read from the device.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>The mechanism followed here is a <strong>host library "put" of a long name</strong>, with collision handling and durability. Synthetic example for teaching on namespace 3 of the Lab SSD; key and length fields are named, not positioned, as in <a href="ch60.html">Chapter 60</a>.</p>
+  <ol>
+    <li><strong>Map.</strong> Who: library. What: hash the name to a key no longer than the maximum key length read from the KV format descriptor (16 bytes assumed here, uncertain per Chapter 60). Where: host CPU. Evidence: library logs only.</li>
+    <li><strong>Wrap.</strong> Who: library. What: build the value envelope: name length, name, payload. Evidence: the value bytes the device fetches.</li>
+    <li><strong>Create-only Store.</strong> Who: library. What: Store (01h) with SINKE. Where: SQ1. Evidence: SQE with key bytes, key length, value size, Store option; device MRds pulling exactly the value size.</li>
+    <li><strong>Resolve.</strong> Who: library. What: on 89h Key Exists, Retrieve (02h) the key and compare the stored name: same name → update with a plain Store (or SIKE); different name → collision, probe the next key. Evidence: the 89h CQE then a Retrieve SQE with the same key.</li>
+    <li><strong>Complete.</strong> Who: controller. What: index updated; value possibly in the volatile cache. Evidence: success CQE.</li>
+    <li><strong>Make durable.</strong> Who: library. What: Flush (00h) when the application requires durability, or batch Flushes. Evidence: a Flush SQE and its CQE after the Stores.</li>
+    <li><strong>Acknowledge.</strong> Who: library. What: report success to the application only after the step its contract requires (Store or Flush). Evidence: application logs.</li>
+  </ol>
+  <figure>
+    <ol class="seq" data-actors="Library|Kernel/driver|Lab SSD ns3">
+      <li data-note="Library">key = H(name)[0:16]</li>
+      <li data-from="Library" data-to="Lab SSD ns3">Store SINKE key, envelope</li>
+      <li data-from="Lab SSD ns3" data-to="Library" class="dashed">CQE 89h Key Exists</li>
+      <li data-from="Library" data-to="Lab SSD ns3">Retrieve key</li>
+      <li data-from="Lab SSD ns3" data-to="Library" class="dashed">value: other name → collision</li>
+      <li data-from="Library" data-to="Lab SSD ns3">Store SINKE H(name‖1)</li>
+      <li data-from="Lab SSD ns3" data-to="Library" class="dashed">CQE success</li>
+      <li data-from="Library" data-to="Lab SSD ns3">Flush</li>
+    </ol>
+    <figcaption>Collision-safe put with durability. Probing is a host convention; any reader must probe identically.</figcaption>
+  </figure>
+
+  <h3>The ladder for key mapping</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Long names get short codes on the label and the full name is pinned inside, so mix-ups can be caught.</p></div>
+    <div class="rung" data-rung="B"><p>The host turns names into keys within the device limit and stores the name with the value to detect collisions.</p></div>
+    <div class="rung" data-rung="C"><p>A hash function in the library, SINKE for atomic create, Retrieve to check ownership, probing to resolve, Flush for durability.</p></div>
+    <div class="rung" data-rung="D"><p>NVMe Key Value Command Set 1.4: key and key length in the command, Store options, KV statuses; NVMe Base 2.4: Flush and the volatile write cache.</p></div>
+    <div class="rung" data-rung="E"><p>Each Store is one SQE (key inside) plus value MRds; each collision adds a Store and a Retrieve.</p></div>
+    <div class="rung" data-rung="F"><p>In a capture: 01h SQE → 89h CQE → 02h SQE with the same key bytes → 01h SQE with a different key → success → 00h.</p></div>
+    <div class="rung" data-rung="G"><p>Missing data: compare key bytes and lengths byte for byte between writer and reader; then check probe chains; then check Flush.</p></div>
+  </div>
+
+  <h3>The sixteen questions, applied to KV host libraries</h3>
+  <table>
+    <caption>Sixteen questions for KV systems</caption>
+    <tbody>
+      <tr><td>1 What is it?</td><td>Host software that maps application names to KV keys and manages values, iteration and durability.</td></tr>
+      <tr><td>2 Why created?</td><td>Device keys are short byte strings; applications use long names.</td></tr>
+      <tr><td>3 Problem solved</td><td>Uniform naming, collision safety, versioning.</td></tr>
+      <tr><td>4 Before it</td><td>Host KV stores over file systems over block devices.</td></tr>
+      <tr><td>5 Why better</td><td>Removes host index and compaction while keeping long names.</td></tr>
+      <tr><td>6 Who creates it</td><td>Library and application developers.</td></tr>
+      <tr><td>7 Who consumes it</td><td>Applications; the device only sees keys.</td></tr>
+      <tr><td>8 Where it lives</td><td>User-space library, pass-through path.</td></tr>
+      <tr><td>9 Memory/registers</td><td>Value and List buffers; device index and caches.</td></tr>
+      <tr><td>10 Before</td><td>Read KV limits; agree a mapping version across tools.</td></tr>
+      <tr><td>11 After</td><td>Flush policy; monitoring of collisions and latency.</td></tr>
+      <tr><td>12 If wrong</td><td>87h for present data, silent overwrites, lost updates after power loss.</td></tr>
+      <tr><td>13 Analyzer</td><td>Key bytes and lengths in SQEs, SINKE/89h sequences, Flush placement.</td></tr>
+      <tr><td>14 Linux</td><td>/dev/ng devices, io_uring pass-through, nvme io-passthru.</td></tr>
+      <tr><td>15 Validation</td><td>Cross-tool key compatibility, collision paths (with a weakened hash), List under churn, power-loss tests.</td></tr>
+      <tr><td>16 Senior suspicion</td><td>Padding, encoding and endianness mismatches; missing Flush; unbounded probing.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Link efficiency</h3>
+  <div class="formula">
+    <p>η = v / ( v + B<sub>fixed</sub> + N<sub>TLP</sub> × O )</p>
+    <dl class="vars">
+      <dt>η</dt><dd>link efficiency of one Store: payload bytes over all bytes on the link</dd>
+      <dt>v</dt><dd>value size in bytes</dd>
+      <dt>B<sub>fixed</sub></dt><dd>payload of the fixed parts: 4-byte doorbell, 64-byte SQE, 16-byte CQE, 4-byte MSI-X data</dd>
+      <dt>N<sub>TLP</sub></dt><dd>number of TLPs in the command (doorbell, MRd requests, CplDs, MWrs)</dd>
+      <dt>O</dt><dd>per-TLP overhead in bytes (header, framing, sequence number, LCRC); an assumption of 24 bytes in this module</dd>
+    </dl>
+  </div>
+  <p>Worked example: a 16-byte value takes 7 TLPs and 272 bytes on the link (η ≈ 6%); a 4,000-byte value takes 29 TLPs and about 4,784 bytes (η ≈ 84%). The advanced lab derives these numbers and compares them with block approaches.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Key Value Command Set Specification, Revision 1.4 — Store, Retrieve, Delete, Exist and List commands; Store options; KV Identify Namespace data structure and KV format descriptors; command-specific status values</cite></li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Flush command; Volatile Write Cache feature; Identify Controller (volatile write cache presence); I/O Command Set selection</cite></li>
+  </ul>
+  <aside class="callout verified">
+    <p><span class="badge normative">Normative</span> As recorded in <a href="ch60.html">Chapter 60</a> (libnvme encodings): CSI 01h; Store 01h, Retrieve 02h, List 06h, Delete 10h, Exist 14h; Flush 00h; statuses 85h Invalid Value Size, 86h Invalid Key Size, 87h KV Key Does Not Exist, 88h Unrecovered Error, 89h Key Exists under SCT 0h; SIKE and SINKE.</p>
+  </aside>
+  <aside class="callout spec" data-title="Informative and optional">
+    <p><span class="badge informative">Informative</span> The KV specification's discussion of use cases. <span class="badge optional">Optional</span> Volatile write cache presence; multiple KV formats; List support details. Host API conventions (for example the SNIA Key Value Storage API) are outside NVMe.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>Index structure and DRAM residency; latency against key count; List order; GC of the value log; actual maximum key and value lengths up to the specification maximum.</p>
+  </aside>
+  <aside class="callout version">
+    <p>KV was published as a separate command set with the NVMe 2.0 restructuring; revision 1.4 is current with the 2026 set. Linux pass-through for non-block command sets (generic character devices, io_uring passthrough) arrived in kernel stages <span class="badge version">Version-dependent</span>.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p>The specification does not define host key mapping, collision handling or value envelopes. Uncertain and to check in KV 1.4: the maximum key length and where key bytes sit in the SQE; the List data format, ordering and whether the start key is included; whether Retrieve with a small buffer truncates or fails, and which completion dword carries the value length; Store atomicity on power loss.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume two tools encode keys identically, that List is a snapshot, that 87h means data loss, or that a successful Store is durable when a volatile write cache is present and enabled.</p>
+  </aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Hardware participation</caption>
+    <thead><tr><th>Category</th><th>Hardware</th></tr></thead>
+    <tbody>
+      <tr><td>Must participate</td><td>Command front end extracting the key from the SQE; index structures in DRAM and flash; NAND for values.</td></tr>
+      <tr><td>May participate</td><td>Volatile write cache and its power-loss capacitors (if any); hashing accelerators; separate index and value regions.</td></tr>
+      <tr><td>Observable</td><td>Latency distribution per command type and its change with key count; durability behaviour after power loss.</td></tr>
+      <tr><td>Internal</td><td>Index page cache hit rate, index layout, GC of the value log.</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw" data-title="Why latency grows with the key count">
+    <p>The device needs some bytes of index per key. While the index fits in DRAM, every lookup is a memory probe; once it outgrows DRAM, a lookup may need a flash read for the index page before the flash read for the value. Exist and Delete, which move no data, become slow too — which is how to tell index misses from value-read slowness <span class="badge derived">Derived</span>. Index sizes and cache policies are <span class="badge impl">Implementation-dependent</span>.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>KV commands on the link (lab system: MPS 256, MRRS 512, RCB 64)</caption>
+    <thead><tr><th>Command</th><th>Key</th><th>Data on the link</th><th>Completion</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>Store 01h</td><td>In SQE</td><td>Device MRds for exactly the value size; CplDs</td><td>Status</td><td>Partial last-DWORD byte enables for odd sizes</td></tr>
+      <tr><td>Retrieve 02h</td><td>In SQE</td><td>Device MWrs of the value (up to buffer size)</td><td>Status, value length</td><td>Buffer sizing rules uncertain</td></tr>
+      <tr><td>Exist 14h / Delete 10h</td><td>In SQE</td><td>None</td><td>Status (87h = absent)</td><td>Pure index operations</td></tr>
+      <tr><td>List 06h</td><td>Start key in SQE</td><td>Device MWrs of the key list</td><td>Status</td><td>Format uncertain</td></tr>
+      <tr><td>Flush 00h</td><td>—</td><td>None</td><td>Status</td><td>Durability point when a volatile cache is present</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout proto" data-title="No ordering, even for one key">
+    <p>As <a href="ch60.html">Chapter 60</a> showed with Delete and Retrieve, the controller may execute commands for the same key in any order. A library that offers read-your-writes must wait for the Store's completion; one that offers "last writer wins" across threads must serialise per key or use SIKE/SINKE with versions in the envelope.</p>
+  </aside>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic examples for teaching on the reference system: Lab SSD Requester ID 0x0100; host MMIO as Req=RC; SQ1/CQ1 at IOVA 0x1_2340_0000 / 0x1_2341_0000, SQ1 tail doorbell 0xFE60_1008; MSI-X vector 1 at 0xFEE0_1000 data 0x41; namespace 3 is KV; data buffers from 0x2_0000_0000. Key and length fields are shown by name, not dword position. Completion DW3 shows the status field with P = 1, so 0x010F_xxxx is SCT 0h / SC 87h. Timings illustrative.</p>
+
+  <h3>Trace 1 — normal: List across two calls</h3>
+  <div class="trace" data-kind="synthetic" data-title="Iterating keys with prefix 'user:' using a 512-byte List buffer">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Data=0x0000_0031</td><td>SQ1 tail</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.8 µs</td><td>MRd64</td><td>Req=0x0100 Addr=0x1_2340_0C00 Len=16</td><td>SQE: opc=06h CID=0x0301 NSID=3 start key="user:" (5 bytes) buffer=512 B PRP1=0x2_0000_3000</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>31 µs</td><td>MWr64 ×2</td><td>Addr=0x2_0000_3000 Len=64 each</td><td>List data: count, then keys "user:1001", "user:1002", … with lengths (format per KV 1.4)</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>31 µs</td><td>MWr64</td><td>Addr=0x1_2341_0C00 Len=4</td><td>CQE success</td></tr>
+        <tr class="note"><td colspan="6">The host parses the buffer: the last complete key is "user:1037". It submits a second List starting there.</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>40 µs</td><td>MRd64</td><td>Addr=0x1_2340_0C40 Len=16</td><td>SQE: opc=06h CID=0x0302 start key="user:1037"</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>69 µs</td><td>MWr64 + CQE</td><td>count = 3: "user:1037", "user:1038", "user:1040"</td><td>Start key included in this device's output; host drops the duplicate</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The loop is correct because it is defensive: it de-duplicates the start key (whether the start key is returned is one of Chapter 60's open questions) and stops when a key no longer matches the prefix. Ordering here happens to be sorted; a hash-ordered device would scatter "user:" keys across the whole namespace, and a prefix scan would need to read everything. Note "user:1039" is absent — deleted or never stored; List cannot tell you which.</p>
+  </div>
+
+  <h3>Trace 2 — slow: index outgrows device DRAM</h3>
+  <div class="trace" data-kind="synthetic" data-title="Retrieve and Exist latency at 50 million and 400 million keys">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Same workload, two fill levels. Times from SQE fetch to CQE.</td></tr>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>50 M keys</td><td>Retrieve</td><td>4 KiB value, p50 46 µs</td><td>One NAND read (value)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>50 M keys</td><td>Exist</td><td>p50 3 µs</td><td>Index in DRAM</td></tr>
+        <tr class="abnormal"><td>3</td><td>Dev→Host</td><td>400 M keys</td><td>Retrieve</td><td>p50 95 µs, p99 310 µs</td><td>Two NAND reads (index page + value)</td></tr>
+        <tr class="abnormal"><td>4</td><td>Dev→Host</td><td>400 M keys</td><td>Exist</td><td>p50 49 µs</td><td>Index miss: a NAND read even without data</td></tr>
+        <tr class="note"><td colspan="6">The p99 tail grows further during bursts of Store, when the device also compacts its value log.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The first abnormal event is row 3, but row 4 is the decisive evidence: Exist moves no data and reads no value, so a jump from 3 µs to 49 µs can only come from the index leaving DRAM. If only Retrieve had slowed, value-log GC or media read retries would be the suspects. Mitigations: fewer, larger values (pack small objects), a host-side Bloom filter to avoid Exist and Retrieve for absent keys, or a device with more DRAM per key. Plot latency against key count during qualification — the knee is a property of the device, not a defect.</p>
+  </div>
+
+  <h3>Trace 3 — failed: padded key on retrieval</h3>
+  <div class="trace" data-kind="synthetic" data-title="Writer stores a 9-byte key; reader retrieves the same text NUL-padded to 16 bytes">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64</td><td>Addr=0x1_2340_0D00 Len=16</td><td>SQE: Store CID=0x0310 key length=9 key=75 73 65 72 3A 31 30 30 31</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>12 µs</td><td>MWr64</td><td>CQE DW3=0x0001_0310</td><td>Success</td></tr>
+        <tr class="note"><td colspan="6">A different service, written with a C library that copies keys into a fixed 16-byte array, reads the same user.</td></tr>
+        <tr class="abnormal"><td>3</td><td>Dev→Host</td><td>5 s</td><td>MRd64</td><td>Addr=0x1_2340_0D40 Len=16</td><td>SQE: Retrieve CID=0x0311 key length=16 key=75 73 65 72 3A 31 30 30 31 00 00 00 00 00 00 00</td></tr>
+        <tr class="abnormal"><td>4</td><td>Dev→Host</td><td>5 s + 4 µs</td><td>MWr64</td><td>CQE DW3=0x010F_0311</td><td>SCT 0h / SC 87h KV Key Does Not Exist; no data phase</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The device is right: a 9-byte key and a 16-byte key are different keys. The first abnormal event is row 3, the SQE; the evidence is the key length field (16 versus 9), visible in the SQE bytes. The service logs "user not found", which looks like data loss. Fix: one shared key-encoding function (and a version in the envelope); a test in every client that writes with one library and reads with the other. The advanced simulation reproduces exactly this status.</p>
+  </div>
+
+  <h3>Trace 4 — ambiguous: stale value after power loss</h3>
+  <div class="trace" data-kind="synthetic" data-title="Store of version 2 succeeded; after power loss Retrieve returns version 1">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>t0</td><td>CQE</td><td>Store key="cfg:main" (envelope version 2) success</td><td>Application acknowledged the update</td></tr>
+        <tr class="note"><td colspan="6">No Flush follows for 800 ms. At t0 + 300 ms the rack loses power.</td></tr>
+        <tr class="abnormal"><td>2</td><td>Dev→Host</td><td>after power-up</td><td>CQE + data</td><td>Retrieve key="cfg:main": success, envelope version 1</td><td>Older value returned</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>after power-up</td><td>Log</td><td>SMART Unsafe Shutdowns +1</td><td>The device recorded an unsafe shutdown</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Two explanations fit. A: the controller reports a volatile write cache (Identify Controller), it was enabled (Volatile Write Cache feature), and the host never sent Flush — the device was entitled to lose version 2, and the bug is the library acknowledging before Flush. B: the device reports no volatile cache, or claims power-loss protection, yet lost a completed Store — a device durability bug. Evidence that separates them: the Identify Controller volatile write cache field and the feature's value at the time; the library's Flush policy; the Persistent Event log around the event (<a href="dd43.html">Module 43</a>). A second experiment settles it: repeat the power cut in the lab with a Flush after each Store; if staleness persists, B is likely. Version 1 being returned intact (not a torn mixture) is consistent with an atomic Store, but atomicity on power loss is itself something to confirm in KV 1.4.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Find KV namespaces: a generic char device without a block device, CSI 1</span>
+ls -l /dev/ng0n* /dev/nvme0n* 2&gt;/dev/null
+sudo nvme ns-descs /dev/ng0n3
+<span class="cm"># Volatile write cache: present? enabled?</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -i -A2 '^vwc'
+sudo nvme get-feature /dev/nvme0 -f 0x06 -H
+<span class="cm"># Unsafe shutdowns and persistent events around an incident</span>
+sudo nvme smart-log /dev/nvme0 | grep -i unsafe
+sudo nvme persistent-event-log /dev/nvme0 --action=1 | head -40</code></pre>
+  <table>
+    <caption>What each output proves</caption>
+    <thead><tr><th>Output</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>ns-descs CSI 1</td><td>The namespace is KV</td><td>That your library's key encoding matches other clients</td></tr>
+      <tr><td>VWC present and enabled</td><td>Completed Stores may be lost without Flush</td><td>That a particular Store was lost because of it</td></tr>
+      <tr><td>Unsafe Shutdowns increment</td><td>Power was lost without a clean shutdown</td><td>Which data, if any, was lost</td></tr>
+      <tr><td>Pass-through 87h</td><td>The exact key bytes are absent</td><td>That the data is gone under another encoding</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout linux">
+    <p>The kernel passes KV commands through without interpreting them: from Linux's view a Store is a pass-through command with a data buffer. Errors therefore appear only in the issuing tool or library, not in block-layer messages. Feature 06h is the Volatile Write Cache feature as used by nvme-cli; confirm against your tool's feature list.</p>
+  </aside>
+  <aside class="callout safety">
+    <p><span class="badge safe">Safe lab</span> Reading Identify, features and logs; simulations. <span class="badge caution">Caution lab</span> Any Store or Delete pass-through, power-cut tests — only on a device you own and can erase. <span class="badge expert">Expert only</span> Disabling the volatile write cache on shared systems.</p>
+  </aside>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+
+  <h3>Beginner lab — keys and statuses on paper</h3>
+  <p><span class="badge safe">Safe lab</span> <strong>Objective:</strong> encode keys byte-exactly and decode KV completions. <strong>Prerequisites:</strong> <a href="ch60.html">Chapter 60</a>. <strong>Setup:</strong> names "user:1001", "user:1001\0", "USER:1001", the 64-bit integer 1001 as an 8-byte little-endian and big-endian key; CQE DW3 values 0x010F_0400, 0x0113_0401, 0x010D_0402, 0x0001_0403.</p>
+  <p><strong>Procedure:</strong> write each key's bytes and length; decide which are the same key; decode each DW3. <strong>Questions:</strong> which pairs collide? Which status is not an error for Exist? Why would big-endian integer keys be preferable for a sorted List? <strong>Expected reasoning:</strong> keys are bytes; status = DW3 bits 31:17.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>"user:1001" = 75 73 65 72 3A 31 30 30 31 (9 bytes); with "\0" it is 10 bytes — a different key; "USER:1001" differs in four bytes. 1001 = 0x3E9: little-endian E9 03 00 00 00 00 00 00, big-endian 00 00 00 00 00 00 03 E9 — different keys for the same number; big-endian keys sort numerically if the device sorts bytewise. DW3: 0x010F → SC 87h (key absent; "no" for Exist); 0x0113 → SC 89h Key Exists; 0x010D → SC 86h Invalid Key Size; 0x0001 → success (P = 1). Status field = DW3 bits 31:17: (0x010F &gt;&gt; 1) = 0x87.</p>
+  </details>
+  <p><strong>Extension:</strong> design a 16-byte structured key (table, row, version) and state its sort behaviour.</p>
+
+  <h3>Intermediate lab — a collision-safe key library</h3>
+  <p><span class="badge safe">Safe lab</span> Simulation. <strong>Objective:</strong> exercise hashing, probing and the padding bug. <strong>Prerequisites:</strong> beginner lab. <strong>Setup:</strong> save as kv_key_wrapper.py.</p>
+  <pre class="code" data-kind="simulation" data-lang="python" data-title="kv_key_wrapper.py">#!/usr/bin/env python3
+"""Simulation for learning: a host library that maps long names onto short
+NVMe KV keys, on top of a model device.
+
+Device model: keys are exact byte strings (length matters), statuses use the
+libnvme encodings for the KV command set (SCT 0h): 86h Invalid Key Size,
+87h KV Key Does Not Exist, 89h Key Exists. MAX_KEY is a parameter: read the
+real limit from your namespace's KV format descriptor.
+"""
+import hashlib
+
+MAX_KEY = 16
+OK, INVALID_KEY_SIZE, NO_KEY, KEY_EXISTS = 0x00, 0x86, 0x87, 0x89
+
+class Device:
+    def __init__(self):
+        self.pairs = {}
+    def store(self, key, value, sinke=False):
+        if not 1 &lt;= len(key) &lt;= MAX_KEY:
+            return INVALID_KEY_SIZE
+        if sinke and key in self.pairs:
+            return KEY_EXISTS
+        self.pairs[key] = value
+        return OK
+    def retrieve(self, key):
+        if not 1 &lt;= len(key) &lt;= MAX_KEY:
+            return INVALID_KEY_SIZE, None
+        if key not in self.pairs:
+            return NO_KEY, None
+        return OK, self.pairs[key]
+
+class Library:
+    """Hashes names to hash_bytes-long keys; stores the full name in the
+    value envelope; resolves collisions by probing with a counter."""
+    def __init__(self, dev, hash_bytes=MAX_KEY, pad=False):
+        self.dev, self.n, self.pad = dev, hash_bytes, pad
+        self.collisions = 0
+    def _key(self, name, probe):
+        k = hashlib.sha256(name.encode() + bytes([probe])).digest()[: self.n]
+        return k.ljust(MAX_KEY, b"\0") if self.pad else k
+    @staticmethod
+    def _wrap(name, data):
+        nb = name.encode()
+        return len(nb).to_bytes(2, "little") + nb + data
+    @staticmethod
+    def _unwrap(value):
+        ln = int.from_bytes(value[:2], "little")
+        return value[2:2 + ln].decode(), value[2 + ln:]
+    def put(self, name, data):
+        for probe in range(8):
+            k = self._key(name, probe)
+            st = self.dev.store(k, self._wrap(name, data), sinke=True)
+            if st == OK:
+                return OK
+            if st != KEY_EXISTS:
+                return st
+            # key taken: ours (an update) or someone else's (a collision)?
+            _, v = self.dev.retrieve(k)
+            if self._unwrap(v)[0] == name:
+                return self.dev.store(k, self._wrap(name, data))
+            self.collisions += 1
+        return KEY_EXISTS
+    def get(self, name):
+        for probe in range(8):
+            st, v = self.dev.retrieve(self._key(name, probe))
+            if st != OK:
+                return st, None
+            stored, data = self._unwrap(v)
+            if stored == name:
+                return OK, data
+        return NO_KEY, None
+
+
+if __name__ == "__main__":
+    names = [f"https://example.test/objects/{i:06d}" for i in range(20000)]
+    for hb in (16, 3, 2):
+        dev = Device()
+        lib = Library(dev, hash_bytes=hb)
+        for nm in names:
+            assert lib.put(nm, nm[-6:].encode()) == OK
+        bad = sum(1 for nm in names if lib.get(nm) != (OK, nm[-6:].encode()))
+        print(f"hash {hb:2d} bytes: stored={len(dev.pairs)} "
+              f"collisions resolved={lib.collisions} wrong reads={bad}")
+    # Two libraries, one device: one pads keys to 16 bytes, one does not.
+    dev = Device()
+    writer = Library(dev, hash_bytes=9, pad=False)
+    reader = Library(dev, hash_bytes=9, pad=True)
+    writer.put("user:1001", b'{"name":"Ada"}')
+    st, _ = reader.get("user:1001")
+    print(f"writer 9-byte keys, reader NUL-padded 16-byte keys: status {st:02X}h")
+</pre>
+  <p><strong>Procedure:</strong> run it; then add delete(name) that simply deletes the key, store three colliding names with a 2-byte hash, delete the first, and get the second. <strong>Observations:</strong> collision counts per hash size; status of the padded read. <strong>Questions:</strong> why are wrong reads zero even with a 2-byte hash? Why does naive delete break the probe chain? What does probing cost in commands? <strong>Expected reasoning:</strong> the envelope detects collisions; open addressing needs tombstones.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>Output: 16-byte hash — 0 collisions; 3-byte — 19 resolved; 2-byte — 3,840 resolved; wrong reads 0 in all cases because every get compares the stored name. The padded reader gets 87h, matching Trace 3. Naive delete leaves a hole: get() stops at the first absent probe key and returns 87h for names further down the chain. Fix: tombstones (store a marker envelope) or re-insert the chain. Each collision costs an extra Store (89h) and a Retrieve on put, and an extra Retrieve on get — with a real 16-byte hash these are vanishingly rare, but the code path must exist and be tested with a weakened hash.</p>
+  </details>
+  <p><strong>Extension:</strong> add a mapping version byte to the envelope and write a migration that re-keys values when the hash function changes.</p>
+
+  <h3>Advanced lab — link cost of KV versus block</h3>
+  <p><span class="badge safe">Safe lab</span> Simulation. <strong>Objective:</strong> quantify where KV saves link bandwidth and where it does not. <strong>Prerequisites:</strong> <a href="ch52.html">Completion Rules</a>. <strong>Setup:</strong> save as kv_link_model.py.</p>
+  <pre class="code" data-kind="simulation" data-lang="python" data-title="kv_link_model.py">#!/usr/bin/env python3
+"""Simulation for learning: PCIe link bytes per stored value, KV versus block.
+
+Lab system parameters: MPS 256, MRRS 512, 4 KiB LBAs for the block paths.
+Per-TLP overhead is an assumption (header 16 B for 64-bit addressing, plus
+about 8 B framing, sequence number and LCRC): 24 B. DLLPs are ignored.
+Paths:
+  kv        one Store per value: SQE fetch, value fetch, CQE
+  block-1   one 4 KiB WRITE per value (value padded to a block)
+  block-log host packs values into a log; one 128 KiB WRITE per log segment,
+            plus host compaction rewriting each value WA_HOST more times
+"""
+import math
+
+MPS, MRRS, OVH, LBA = 256, 512, 24, 4096
+WA_HOST = 6           # assumed host LSM compaction rewrites per value
+
+def device_reads(nbytes):
+    """Device fetches nbytes from host memory: MRd requests + CplD data."""
+    if nbytes == 0:
+        return 0, 0
+    mrd = math.ceil(nbytes / MRRS)
+    cpl = sum(math.ceil(min(MRRS, nbytes - i * MRRS) / MPS) for i in range(mrd))
+    return mrd + cpl, nbytes + (mrd + cpl) * OVH
+
+def device_writes(nbytes):
+    """Device writes nbytes into host memory: MWr TLPs of at most MPS."""
+    n = math.ceil(nbytes / MPS)
+    return n, nbytes + n * OVH
+
+def command(read_bytes=0, write_bytes=0):
+    """One NVMe command: doorbell, SQE fetch, data, CQE, MSI-X."""
+    t, b = 1, 4 + OVH                         # SQ tail doorbell MWr
+    tt, bb = device_reads(64); t += tt; b += bb   # SQE fetch
+    tt, bb = device_reads(read_bytes); t += tt; b += bb
+    tt, bb = device_writes(write_bytes); t += tt; b += bb
+    tt, bb = device_writes(16); t += tt; b += bb  # CQE
+    return t + 1, b + 4 + OVH                 # MSI-X MWr
+
+def per_value(v):
+    kv = command(read_bytes=v)
+    blk = command(read_bytes=math.ceil(v / LBA) * LBA)
+    seg = 128 * 1024
+    per_seg = seg / (v + 32)                  # values per segment (32 B index each)
+    t, b = command(read_bytes=seg)
+    log = (t / per_seg, b / per_seg)
+    # compaction: read and write the value WA_HOST more times
+    rt, rb = command(write_bytes=seg)
+    log_c = (log[0] + WA_HOST * (t + rt) / per_seg,
+             log[1] + WA_HOST * (b + rb) / per_seg)
+    return kv, blk, log, log_c
+
+if __name__ == "__main__":
+    print(f"{'value':&gt;7} | {'kv B':&gt;8} {'TLPs':&gt;5} | {'block-1 B':&gt;9} | "
+          f"{'block-log B':&gt;11} | {'log+compact B':&gt;13} | kv efficiency")
+    for v in (16, 100, 512, 4000, 16384, 65536):
+        kv, blk, log, logc = per_value(v)
+        print(f"{v:7d} | {kv[1]:8.0f} {kv[0]:5d} | {blk[1]:9.0f} | "
+              f"{log[1]:11.0f} | {logc[1]:13.0f} | {v / kv[1]:6.1%}")
+</pre>
+  <p><strong>Procedure:</strong> run it; vary OVH (20–30), MRRS (256, 1024) and WA_HOST (2, 10). <strong>Questions:</strong> for which value sizes does KV beat one-write-per-value block storage? Where does a packed log beat KV, and what does compaction change? What does the model leave out? <strong>Expected reasoning:</strong> fixed per-command costs dominate small values; host compaction multiplies link traffic; device-internal GC is invisible on the link.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>Output: 16-byte value — KV 272 B (7 TLPs, η 5.9%), one block per value 4,880 B, packed log 55 B, packed log with compaction 699 B; at 4,000 B — KV 4,784 B, block 4,880 B, log 4,605 B, log+compaction 58,736 B; at 64 KiB — KV and block equal (74,960 B). KV beats per-value block writes up to about 4 KiB and always beats a log that compacts on the host; a packed log without compaction is cheaper on the link for small values. The model omits retrieval traffic, device-internal write amplification (not on the link but on the media), CPU cost of host indexing and compaction, and DLLP overhead — so link bytes alone never decide; they bound one dimension.</p>
+  </details>
+  <p><strong>Extension:</strong> add Retrieve traffic for a 90:10 read/write mix and Bloom-filter hits that avoid Exist.</p>
+
+  <h3>Senior forensic lab — stale configuration after a power event</h3>
+  <p><span class="badge safe">Safe lab</span> Paper forensic. <strong>Objective:</strong> separate host durability bugs from device bugs. <strong>Prerequisites:</strong> Trace 4; <a href="me-forensics.html">Root Cause, Ambiguity and Forensic Reporting</a>.</p>
+  <p><strong>Setup:</strong> after a building power event, 6 of 40 servers returned old values for keys updated in the last second before the outage. Evidence: (1) all 40 use the same Lab SSD model and firmware; (2) Identify Controller reports a volatile write cache on all; (3) the 6 affected ran library version 3.2, which batches Flush every 1 s; the other 34 ran 3.1, which Flushes after each Store; (4) Unsafe Shutdowns +1 on all 40; (5) on the 34 unaffected servers, updates acknowledged within the last second exist; (6) the vendor datasheet does not claim power-loss protection.</p>
+  <p><strong>Procedure:</strong> evaluate both explanations against each item; state root cause, confidence and a test. <strong>Questions:</strong> which item best separates the stories? Is the device at fault? What should library 3.2 have documented? <strong>Expected reasoning:</strong> a controlled difference (library version) within one device population.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>Item 3 with item 5 is the control: same drive and firmware, same power event, staleness only where Flush was deferred. With a volatile cache present and no PLP claim, losing un-flushed Stores is permitted. Root cause, high confidence: library 3.2 acknowledged updates before the batched Flush, changing the durability contract silently. The device is not at fault. Test: in the lab, cut power 200 ms after a Store under 3.1 and 3.2; expect loss only with 3.2. 3.2 should document "acknowledged ≠ durable for up to 1 s" or offer a durable-write call that waits for Flush.</p>
+  </details>
+  <p><strong>Extension:</strong> design a power-cut test matrix (cache on/off, Flush policy, value sizes) that would detect a real device durability bug.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <table>
+    <caption>Pattern 1 — 87h for keys that "exist"</caption>
+    <tbody>
+      <tr><td>Symptom</td><td>One client cannot find data another stored.</td></tr>
+      <tr><td>Possible causes</td><td>Padding or terminator differences; case or encoding differences; endianness of integer keys; different hash or probe rules; wrong NSID.</td></tr>
+      <tr><td>Evidence</td><td>Key bytes and lengths in both clients' SQEs (trace or library debug logs).</td></tr>
+      <tr><td>First check</td><td>Key length field in both commands.</td></tr>
+      <tr><td>Second check</td><td>Byte-for-byte comparison of key bytes.</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Store with client A, Exist with client B, on a lab namespace.</td></tr>
+      <tr><td>Likely conclusion / confidence</td><td>Key-encoding mismatch — high once bytes differ.</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>Pattern 2 — List skips or repeats keys</caption>
+    <tbody>
+      <tr><td>Symptom</td><td>Iteration counts vary between runs; some keys appear twice.</td></tr>
+      <tr><td>Possible causes</td><td>Start key included and not de-duplicated; concurrent Store/Delete during iteration; truncated last entry in the buffer parsed as a key.</td></tr>
+      <tr><td>Evidence</td><td>Buffer contents of consecutive Lists; concurrent writes in the same period.</td></tr>
+      <tr><td>First check</td><td>Does the second List's first key equal the first List's last?</td></tr>
+      <tr><td>Second check</td><td>Was the buffer full at the last entry?</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Iterate a quiescent namespace twice; differences then are parser bugs.</td></tr>
+      <tr><td>Likely conclusion / confidence</td><td>Iteration parser — high if a quiescent run differs; otherwise concurrency, by design.</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>Pattern 3 — large values fail</caption>
+    <tbody>
+      <tr><td>Symptom</td><td>Stores above some size fail while the KV format allows larger values.</td></tr>
+      <tr><td>Possible causes</td><td>Value above MDTS (128 KiB on the Lab SSD); envelope overhead pushes the value over the maximum (85h); PRP list built wrongly for multi-page buffers.</td></tr>
+      <tr><td>Evidence</td><td>Status (85h versus Invalid Field or a data transfer error); exact value size including envelope.</td></tr>
+      <tr><td>First check</td><td>Value size versus MDTS and the KV maximum.</td></tr>
+      <tr><td>Second check</td><td>The failing size boundary: page multiple, MDTS, or the KV maximum?</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Binary search on value size in the lab.</td></tr>
+      <tr><td>Likely conclusion / confidence</td><td>Size-limit handling in the library — high at an exact boundary.</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>Pattern 4 — latency rises as the namespace fills</caption>
+    <tbody>
+      <tr><td>Symptom</td><td>p50 and p99 grow with key count; no errors.</td></tr>
+      <tr><td>Possible causes</td><td>Index outgrowing device DRAM; value-log GC; media read retries.</td></tr>
+      <tr><td>Evidence</td><td>Exist latency (index only) versus Retrieve latency; Store rate during spikes; SMART media errors.</td></tr>
+      <tr><td>First check</td><td>Did Exist latency rise?</td></tr>
+      <tr><td>Second check</td><td>Do spikes align with Store bursts?</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Measure latency at several fill levels with a fixed workload.</td></tr>
+      <tr><td>Likely conclusion / confidence</td><td>Index residency if Exist rises — medium to high.</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>Pattern 5 — data older than acknowledged after power loss</caption>
+    <tbody>
+      <tr><td>Symptom</td><td>Recent updates missing after an outage.</td></tr>
+      <tr><td>Possible causes</td><td>Volatile write cache without Flush; acknowledgement before Flush in batched designs; a device durability bug.</td></tr>
+      <tr><td>Evidence</td><td>Identify VWC, feature value, library Flush policy, Unsafe Shutdowns, Persistent Event log.</td></tr>
+      <tr><td>First check</td><td>Is a volatile write cache present and enabled?</td></tr>
+      <tr><td>Second check</td><td>Was Flush completed before acknowledgement?</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Power-cut test with Flush after every Store.</td></tr>
+      <tr><td>Likely conclusion / confidence</td><td>Host contract — high when losses vanish with Flush.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>Is "abc" the same KV key as "abc\0"?</p><details class="answer"><summary>Model answer</summary><p>No: keys are byte strings with a length; 3 bytes and 4 bytes are different keys.</p></details></li>
+    <li><p>Why are KV keys short?</p><details class="answer"><summary>Model answer</summary><p>They ride inside the 64-byte SQE, so no extra DMA is needed.</p></details></li>
+    <li><p>What does 87h mean on Exist?</p><details class="answer"><summary>Model answer</summary><p>The key is absent — an answer, not a failure.</p></details></li>
+    <li><p>How do you store data under a 60-byte name?</p><details class="answer"><summary>Model answer</summary><p>Hash it to a key within the limit and store the full name in the value to detect collisions.</p></details></li>
+    <li><p>Which command makes Stores durable when a volatile cache is present?</p><details class="answer"><summary>Model answer</summary><p>Flush.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>How do you handle a hash collision?</p><details class="answer"><summary>Model answer</summary><p>Detect it via the name in the envelope after 89h, then probe a deterministic next key; all clients must probe identically.</p></details></li>
+    <li><p>Why does naive Delete break probing?</p><details class="answer"><summary>Model answer</summary><p>Lookups stop at the first missing key in the chain; tombstones are needed.</p></details></li>
+    <li><p>How do you iterate all keys safely?</p><details class="answer"><summary>Model answer</summary><p>Repeated List from the last key, de-duplicate the start key, handle partial buffers, and accept that concurrent changes may appear or not.</p></details></li>
+    <li><p>Why prefer SINKE over Exist then Store?</p><details class="answer"><summary>Model answer</summary><p>The check and store are atomic in the device; Exist then Store races.</p></details></li>
+    <li><p>What limits a single Store's value size?</p><details class="answer"><summary>Model answer</summary><p>The KV format's maximum value length and the controller's MDTS.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>Retrieve latency doubled as the namespace filled. What do you measure next?</p><details class="answer"><summary>Model answer</summary><p>Exist latency: if it rose too, the index left DRAM.</p></details></li>
+    <li><p>Why is link efficiency poor for tiny values?</p><details class="answer"><summary>Model answer</summary><p>Fixed costs (doorbell, SQE fetch, CQE, MSI-X) and per-TLP overhead dwarf a few bytes of payload.</p></details></li>
+    <li><p>When does KV reduce total link traffic versus a host LSM?</p><details class="answer"><summary>Model answer</summary><p>When host compaction would rewrite data several times; the device's internal GC stays off the link.</p></details></li>
+    <li><p>A Store succeeded but the value was gone after power loss. Is the device broken?</p><details class="answer"><summary>Model answer</summary><p>Not if a volatile cache was enabled and no Flush completed; check VWC and Flush first.</p></details></li>
+    <li><p>Why are big-endian integer keys useful?</p><details class="answer"><summary>Model answer</summary><p>They sort numerically under bytewise ordering, if the device's List order is bytewise.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>When would you choose a KV namespace over a block namespace with RocksDB?</p><details class="answer"><summary>Model answer</summary><p>When host CPU and DRAM for indexing and compaction dominate cost, values are moderate in size, prefix scans are rare, and the KV device's latency curve fits the key count.</p></details></li>
+    <li><p>What must a KV library document?</p><details class="answer"><summary>Model answer</summary><p>Key encoding and mapping version, collision handling, durability point (Store or Flush), iteration semantics, size limits.</p></details></li>
+    <li><p>How would you qualify a KV device?</p><details class="answer"><summary>Model answer</summary><p>Limits at max and max+1, latency against fill level, List behaviour under churn, power-cut durability with and without Flush, cross-client key compatibility.</p></details></li>
+    <li><p>How do you migrate keys when the hash changes?</p><details class="answer"><summary>Model answer</summary><p>Version the mapping in the envelope, dual-read during migration, re-key with SINKE, delete old keys with tombstone awareness.</p></details></li>
+    <li><p>What is the biggest operational risk of KV namespaces?</p><details class="answer"><summary>Model answer</summary><p>Tooling: Linux and most tools do not understand them, so diagnosis depends on the library's own logging and on traces.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>CQE DW3 = 0x0113_0042 on a KV namespace means…</p>
+      <ul class="options" data-answer="4"><li>Invalid Key Size</li><li>KV Key Does Not Exist</li><li>Success</li><li>Key Exists</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>0x0113 &gt;&gt; 1 = 0x89, SCT 0h.</p></details></li>
+    <li><p>In Trace 3, what proves a host bug?</p>
+      <ul class="options" data-answer="2"><li>The 87h status</li><li>Key length 16 versus 9 in the SQEs</li><li>No data phase</li><li>The 5 s delay</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Different key lengths for the same name are different keys.</p></details></li>
+    <li><p>Which measurement separates index misses from value-read slowness?</p>
+      <ul class="options" data-answer="3"><li>Store latency</li><li>List latency</li><li>Exist latency</li><li>Flush latency</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Exist touches only the index.</p></details></li>
+    <li><p>A 16-byte value Store on the lab system uses about how many link bytes in the model?</p>
+      <ul class="options" data-answer="1"><li>272</li><li>64</li><li>4,880</li><li>16</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Fixed command costs dominate: 7 TLPs, 272 bytes.</p></details></li>
+    <li><p>Which is required for a Store to survive power loss on a drive with an enabled volatile cache?</p>
+      <ul class="options" data-answer="2"><li>SINKE</li><li>A completed Flush</li><li>An Exist</li><li>A List</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Flush makes cached data durable.</p></details></li>
+    <li><p>Why are wrong reads zero in the 2-byte-hash simulation?</p>
+      <details class="answer"><summary>Model answer</summary><p>Every get compares the full name stored in the envelope and probes past collisions.</p></details></li>
+    <li><p>Give two reasons a List loop might repeat a key.</p>
+      <details class="answer"><summary>Model answer</summary><p>The start key is included in the next call; the key was deleted and re-stored during iteration (depending on order).</p></details></li>
+    <li><p>In the senior forensic lab, what is the control group and what does it show?</p>
+      <details class="answer"><summary>Model answer</summary><p>The 34 servers with per-Store Flush on the same drives: no loss, so the deferred Flush is the cause.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <ol>
+    <li><p><strong>To a child:</strong> why did the caretaker say the coat was not there?</p>
+      <details class="answer"><summary>Model explanation</summary><p>"The label had to match exactly. 'AM7 with a space' is a different label from 'AM7', so she could not find it, even though the coat was right there."</p></details></li>
+    <li><p><strong>To a junior engineer:</strong> how does a KV library store an object with a long name?</p>
+      <details class="answer"><summary>Model explanation</summary><p>"Hash the name to a key within the device limit, put the name inside the value, Store with create-only, and if the key exists check whose it is and probe on a collision. Flush when you promise durability."</p></details></li>
+    <li><p><strong>To a senior engineer:</strong> what decides whether KV is a good fit?</p>
+      <details class="answer"><summary>Model explanation</summary><p>"Host cost saved (index, compaction, CPU, DRAM) against what you lose: prefix scans, tooling, long keys and link efficiency for tiny values. Qualify the device's latency against key count, define durability with Flush explicitly, and make key encoding a shared, versioned contract."</p></details></li>
+  </ol>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain key mapping, collision handling, List iteration and the durability point</li>
+      <li>diagram a collision-safe put with Flush</li>
+      <li>identify key bytes, key lengths, List continuation and missing Flush in a trace</li>
+      <li>debug the five patterns above with their disambiguating experiments</li>
+      <li>distinguish KV namespaces from block (<a href="ch31.html">NVM Command Set</a>) and zoned (<a href="dd44.html">Module 44</a>) namespaces, KV 87h from NVM-set statuses (<a href="ch44.html">NVMe Errors</a>), and device durability from host contracts (<a href="dd43.html">Module 43</a>)</li>
+      <li>cite the Key Value Command Set 1.4 (Store, Retrieve, List, Delete, Exist, statuses) and NVMe Base 2.4 (Flush, Volatile Write Cache)</li>
+    </ul>
+  </aside>
+  <p>Next: <a href="dd46.html">Module 46 — Computational Programs</a>.</p>
+</section>

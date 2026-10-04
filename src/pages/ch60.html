@@ -1,0 +1,678 @@
+<p class="lead">The Key Value (KV) Command Set lets a host store and fetch variable-sized values by key, with no logical block addresses at all. This chapter explains why such a command set exists, how Store, Retrieve, Delete, Exist and List work, what limits apply to keys and values, how KV compares with block storage, and how KV traffic looks in a trace.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>A great deal of the world's data is accessed by name, not by address: user records by ID, images by hash, cache entries by URL. Today that is usually built in layers: an application asks a key-value store (RocksDB, a hash table, an object store), which keeps its own index and log in a file system, which maps files to blocks, which an SSD's Flash Translation Layer (FTL) maps again to flash pages. Every layer has its own index, its own garbage collection and its own write amplification.</p>
+  <p>The NVM Express (NVMe) Key Value Command Set asks a simple question: the SSD already runs a translation layer that maps names (LBAs) to flash locations — why not let the name be the application's key? The host then sends "store this value under this key" directly, and the device does the indexing it was doing anyway. Whether that is a good trade depends on workload, key size limits, ecosystem and failure handling, and an engineer needs to be able to argue both sides.</p>
+  <p>The KV command set is also the clearest demonstration of a point made in <a href="ch58.html">Namespaces</a>: the NVMe Base architecture — queues, doorbells, PCI Express (PCIe) transport, admin commands — is independent of what a namespace contains. A KV namespace uses exactly the same Submission and Completion Queues as a block namespace. Only the meaning of the 64-byte command changes.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Explain the key/value model and how a KV namespace differs from an LBA-addressed namespace.</li>
+    <li>Describe the Store, Retrieve, Delete, Exist and List commands: purpose, data direction and typical outcomes.</li>
+    <li>Explain where the key travels, where the value travels, and why key length is tightly limited.</li>
+    <li>Read the KV-specific statuses (Invalid Key Size, Invalid Value Size, KV Key Does Not Exist, Key Exists) in a completion.</li>
+    <li>Use the Store options "store if key exists" and "store if no key exists" to implement update-only and create-only semantics.</li>
+    <li>Compare KV with block storage on indexing, write amplification, host CPU, ecosystem and failure behaviour.</li>
+    <li>Identify KV commands in a synthetic PCIe trace and find the first abnormal event.</li>
+    <li>Explain how Linux exposes a KV namespace and why there is no KV block device.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>Namespaces and the Command Set Identifier from <a href="ch58.html">Namespaces</a>; the SQE/CQE layout from <a href="ch29.html">NVMe Command Structure</a>; data pointers from <a href="ch36.html">Physical Region Pages</a>; READ and WRITE from <a href="ch32.html">READ</a> and <a href="ch33.html">WRITE</a>; how an FTL maps names to flash from <a href="ch02.html">What Is Storage?</a>; NVMe status fields from <a href="ch44.html">NVMe Errors</a>.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>In the block-storage library, you ask for books by shelf number: "bring me whatever is on shelf 4,812." You must remember yourself which shelf holds your dinosaur book, so you keep a notebook: "dinosaur book → shelf 4,812."</p>
+    <p>The key-value library works differently. You hand the librarian a label — "DINOSAURS" — and a box, and say "keep this under DINOSAURS." Later you say "give me DINOSAURS" and she brings the box. You don't need a notebook; the librarian keeps it. You can ask "do you have anything called DINOSAURS?", "throw away DINOSAURS", or "list the labels starting from D".</p>
+    <p>The rule is that labels must be short — they have to fit on the request slip itself.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A coat check at a theatre. You hand over a coat (the value) and receive a ticket number (the key) — except in KV storage you choose the ticket number yourself. The attendant decides which rail and hanger to use; you never know or care. To retrieve, you present the ticket. "Is ticket 1001 here?" is a quick question with no coat moved. "Put this coat on 1001 only if 1001 is free" prevents two guests overwriting each other. Block storage, by contrast, is a rail of numbered hangers that you must manage yourself: you decide that coat A goes on hanger 7 and you keep the list.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What it hides.</strong> The attendant is not free: the device runs a hash table or index in its own memory and flash, has a maximum number of keys, and must garbage-collect values of many different sizes. Values are moved by DMA through host memory buffers exactly like block data.</p>
+    <p><strong>Where it misleads.</strong> A coat check returns coats in any order and has no notion of "the next ticket". KV List does exist, but its ordering and completeness under concurrent updates are defined by the specification and the implementation, not by intuition. And the "short label" limit is severe — a few bytes, not a URL — so real applications usually hash long names into fixed-size keys, which brings back a host-side mapping for collisions.</p>
+    <p><strong>Where it breaks.</strong> A coat check never loses half a coat. A KV Store of a large value interrupted by power loss must be atomic (old value or new value, never a mix) — whether and how a device guarantees that is a specification and implementation question you must check, not assume.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>A KV namespace is a namespace whose command set is Key Value (Command Set Identifier <code>01h</code>). Instead of blocks numbered from 0, it holds <strong>pairs</strong>: a <strong>key</strong> (a short byte string) and a <strong>value</strong> (a byte string that can be much larger). The device stores, finds and deletes pairs by key.</p>
+  <p>The five core commands are:</p>
+  <ul>
+    <li><strong>Store</strong> — write a value under a key (create or replace).</li>
+    <li><strong>Retrieve</strong> — read the value for a key into a host buffer.</li>
+    <li><strong>Delete</strong> — remove a key and its value.</li>
+    <li><strong>Exist</strong> — ask whether a key exists; no data moves.</li>
+    <li><strong>List</strong> — get a list of keys present, starting from a given key.</li>
+  </ul>
+  <p>The key is short enough to travel <em>inside</em> the 64-byte command itself, so the device does not need to fetch it separately. The value travels like block data: the command carries a data pointer to a host buffer, and the device reads it (Store) or writes it (Retrieve) by DMA.</p>
+  <p>Errors are new but simple: a key that is empty or too long is rejected (Invalid Key Size); a value too large is rejected (Invalid Value Size); Retrieve, Delete or Exist of a key that is not there returns "KV Key Does Not Exist"; a Store with "only if absent" on a key that is present returns "Key Exists".</p>
+  <p>Linux does not turn a KV namespace into a disk. Applications reach it through the NVMe <em>generic character device</em> and pass-through commands, or through a user-space library.</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>The key/value model</h3>
+  <p>A <span class="g" data-term="kv-namespace">KV namespace</span> is defined by the <cite class="spec">NVM Express Key Value Command Set Specification, Revision 1.4</cite>, which is current in the 2026 release. Each pair is a key — a byte string with a length between 1 and the namespace's maximum key length — and a value — a byte string from 0 to the namespace's maximum value length. Keys are compared as byte strings; there is no hierarchy, no type and no character set. A namespace holds at most a reported maximum number of keys and a reported capacity in bytes.</p>
+  <p>The KV-specific Identify Namespace data structure (Identify CNS <code>05h</code> with CSI <code>01h</code>) reports these limits through one or more KV format descriptors. The descriptor fields include a maximum key length, a maximum value length and a maximum number of keys; namespace size and utilization are reported in bytes rather than in logical blocks. <span class="badge uncertain">Uncertain</span> on exact field names, offsets and units — read them from the KV Identify Namespace definition in KV 1.4 before writing code.</p>
+
+  <h3>Key size limits</h3>
+  <p>The defining design choice of NVMe KV is that the key is carried in the Submission Queue Entry. A 64-byte command has room for the common fields (opcode, Command Identifier, NSID, data pointer) and a handful of command-specific dwords; the KV command set uses some of those dwords to hold the key bytes and a key length field. The widely documented consequence is a <strong>maximum key length of 16 bytes</strong>. <span class="badge uncertain">Uncertain</span> — the brief for this course asked us to check the specification for this value, and we could not consult the KV 1.4 text directly while writing; confirm the maximum key length (and whether any revision allows longer keys through a separate key buffer) in the KV Identify Namespace and command definitions. Your device's KV format descriptor reports the actual limit, which may be smaller than the specification maximum.</p>
+  <p>Why so small? Because a key inside the command costs no extra DMA: when the controller fetches the 64-byte SQE (one PCIe Memory Read), it already has the key and can start the index lookup. A longer key would need a second DMA to fetch a key buffer, adding latency to every operation, including Exist and Delete which otherwise move no data at all.</p>
+  <p>What applications do about it: hash long names (for example, a 128-bit hash of a URL → 16 bytes) and handle collisions by storing the full name inside the value and checking it on Retrieve; or use structured binary keys (8-byte table ID + 8-byte row ID). Neither is free — collisions, ordering and prefix listing all change.</p>
+  <aside class="callout warn"><p>Never hard-code 16. Read the maximum key length from the namespace's KV format descriptor and reject longer keys in the host, so that "Invalid Key Size" in the field means a bug, not normal operation.</p></aside>
+
+  <h3>Value size limits</h3>
+  <p>The maximum value length is reported per KV format. Values are moved through the data pointer (PRP or SGL), so a single command's transfer is also bounded by the controller's Maximum Data Transfer Size (MDTS) — a value larger than MDTS cannot be moved in one command, whatever the KV limit says. <span class="badge uncertain">Uncertain</span> whether KV 1.4 defines a mechanism for storing a value in multiple commands; check the Store command's options. A Store with a value length above the namespace maximum fails with <strong>Invalid Value Size</strong>.</p>
+
+  <h3>The commands</h3>
+  <table>
+    <caption>KV Command Set I/O commands (opcodes as encoded in the open-source libnvme library; confirm in KV 1.4)</caption>
+    <thead><tr><th>Command</th><th>Opcode</th><th>Key</th><th>Data direction</th><th>Success means</th><th>Typical failures</th></tr></thead>
+    <tbody>
+      <tr><td>Flush</td><td><code>00h</code></td><td>—</td><td>None</td><td>Volatile data made durable</td><td>—</td></tr>
+      <tr><td>Store</td><td><code>01h</code></td><td>In SQE</td><td>Host → controller (value)</td><td>Pair stored (created or replaced)</td><td>Invalid Key Size, Invalid Value Size, Key Exists (with "if no key exists"), KV Key Does Not Exist (with "if key exists")</td></tr>
+      <tr><td>Retrieve</td><td><code>02h</code></td><td>In SQE</td><td>Controller → host (value)</td><td>Value copied to host buffer; value length reported</td><td>KV Key Does Not Exist, Invalid Key Size</td></tr>
+      <tr><td>List</td><td><code>06h</code></td><td>Start key in SQE</td><td>Controller → host (key list)</td><td>Buffer holds a count and a list of keys</td><td>Invalid Key Size</td></tr>
+      <tr><td>Delete</td><td><code>10h</code></td><td>In SQE</td><td>None</td><td>Pair removed</td><td>KV Key Does Not Exist</td></tr>
+      <tr><td>Exist</td><td><code>14h</code></td><td>In SQE</td><td>None</td><td>Key is present</td><td>KV Key Does Not Exist (meaning "no")</td></tr>
+    </tbody>
+  </table>
+  <p>Reservation commands (Register, Report, Acquire, Release) are also part of the KV command set, with the same purpose as in the NVM set: coordinating shared namespaces among hosts.</p>
+
+  <h4>Store</h4>
+  <p>The host places the value in a buffer, builds an SQE with the key, the key length, the value length and the data pointer, and submits. The controller fetches the SQE, reads the value by DMA, updates its index, writes the value to media (possibly buffered), and completes. The <strong>Store Option</strong> field selects conditional behaviour:</p>
+  <ul>
+    <li><strong><span class="g" data-term="sike">Store If Key Exists (SIKE)</span></strong> — update only: if the key does not exist, fail with KV Key Does Not Exist.</li>
+    <li><strong><span class="g" data-term="sinke">Store If No Key Exists (SINKE)</span></strong> — create only: if the key exists, fail with Key Exists.</li>
+    <li>Neither — upsert: create or replace.</li>
+  </ul>
+  <p>These conditionals are atomic in the device: check and store happen as one operation, which a host cannot achieve with Exist followed by Store when several hosts or threads are racing. That is a real reason to prefer device KV for some coordination patterns.</p>
+
+  <h4>Retrieve</h4>
+  <p>The host supplies the key and a buffer with its size. The controller looks up the key, DMA-writes the value (up to the buffer size) to host memory and completes. The completion reports the value's length, so a host that supplied a too-small buffer can learn how much it needs and retry. <span class="badge uncertain">Uncertain</span> on whether a too-small buffer yields success with truncation or an error, and on which completion dword carries the length — confirm in the Retrieve command's completion definition.</p>
+
+  <h4>Delete and Exist</h4>
+  <p>Both carry only the key; no data is transferred. Exist is the cheapest possible KV operation — one SQE fetch, one index probe, one CQE — and is ideal for Bloom-filter-like checks. Note that Exist reports "no" as an <em>error status</em> (KV Key Does Not Exist). Host software must not log it as a failure or count it in error statistics.</p>
+
+  <h4>List</h4>
+  <p>List returns keys present in the namespace, beginning at (or after) a key the host supplies, into a host buffer. The returned data begins with the number of keys returned and then the keys themselves, each with its length. Hosts iterate by calling List again starting after the last key received. <span class="badge uncertain">Uncertain</span> on the exact list format (length field widths, padding), on whether the start key itself is included, and on the order of keys — read the List command's data structure in KV 1.4. <span class="badge impl">Implementation-dependent</span> whether the order is sorted at all; a hash-based device may return keys in hash order, which makes prefix listing impossible without scanning everything.</p>
+
+  <h3>Statuses</h3>
+  <table>
+    <caption>KV-related statuses (generic Status Code Type 0h, I/O command set specific range). Values as encoded in libnvme.</caption>
+    <thead><tr><th>SC</th><th>Name</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td><code>85h</code></td><td>Invalid Value Size</td><td>Value length exceeds the namespace maximum (or is otherwise invalid)</td></tr>
+      <tr><td><code>86h</code></td><td>Invalid Key Size</td><td>Key length zero or above the maximum</td></tr>
+      <tr><td><code>87h</code></td><td>KV Key Does Not Exist</td><td>Retrieve, Delete, Exist of a missing key; Store with SIKE on a missing key</td></tr>
+      <tr><td><code>88h</code></td><td>Unrecovered Error</td><td>Media error reading the value</td></tr>
+      <tr><td><code>89h</code></td><td>Key Exists</td><td>Store with SINKE on an existing key</td></tr>
+    </tbody>
+  </table>
+  <p>The range 80h–BFh in the generic status type is reserved for I/O-command-set-specific meanings, so the same value means different things in different command sets: generic 81h is <em>Capacity Exceeded</em> in the NVM Command Set. Always decode a status in the context of the namespace's CSI.</p>
+
+  <h3>Why a KV command set exists</h3>
+  <ol>
+    <li><strong>Remove a translation layer.</strong> Host KV stores maintain an index from key to file offset; the file system maps offsets to LBAs; the FTL maps LBAs to flash. KV collapses the last two into the device's index.</li>
+    <li><strong>Reduce write amplification.</strong> Log-structured merge (LSM) tree stores rewrite data repeatedly during compaction (application-level write amplification of 10× or more is common), on top of device GC. A device KV index can update in place in its own structures and avoid compaction traffic across PCIe.</li>
+    <li><strong>Save host CPU and DRAM.</strong> Indexing, compaction and caching consume host cores and memory; offloading them frees both.</li>
+    <li><strong>Atomic conditional operations.</strong> SIKE/SINKE give per-key atomic create/update semantics at the device.</li>
+    <li><strong>Variable-size values without padding.</strong> A 100-byte value does not occupy a 4 KiB block on the host side.</li>
+  </ol>
+
+  <h3>Comparison with block storage</h3>
+  <figure>
+    <pre class="diagram">
+   Block path (three name-to-location maps)          KV path (one map)
+
+   application  get("user:1001")                     application  get("user:1001")
+        |                                                 |
+   KV store (RocksDB...)  key -&gt; file + offset            KV library: build Retrieve SQE
+        |   index, memtable, compaction                   |   key inside the SQE
+   file system            file offset -&gt; LBA              |
+        |   extents, journal                              |
+   NVMe driver  READ  NSID=1 SLBA=... NLB=...        NVMe driver (pass-through)
+        |                                                 |
+   ------------------- PCIe: SQE, data, CQE ------------------------------------
+        |                                                 |
+   SSD FTL                LBA -&gt; flash page          KV SSD index   key -&gt; flash location
+        |                                                 |
+   NAND                                               NAND</pre>
+    <figcaption>Conceptual comparison of the layers between an application's key and the flash, for a block namespace and a KV namespace.</figcaption>
+  </figure>
+  <table>
+    <caption>Block (NVM Command Set) namespace versus Key Value namespace</caption>
+    <thead><tr><th>Aspect</th><th>Block namespace</th><th>KV namespace</th></tr></thead>
+    <tbody>
+      <tr><td>Address</td><td>LBA (64-bit integer), fixed-size blocks</td><td>Key (short byte string), variable-size values</td></tr>
+      <tr><td>Who keeps the name→location index</td><td>Host (file system, database) + device FTL</td><td>Device</td></tr>
+      <tr><td>Smallest unit moved</td><td>One logical block (512 B or 4 KiB)</td><td>Value length (bytes)</td></tr>
+      <tr><td>Overwrite</td><td>In place by LBA</td><td>Store replaces value</td></tr>
+      <tr><td>Existence check</td><td>Not meaningful (every LBA "exists")</td><td>Exist command</td></tr>
+      <tr><td>Enumeration</td><td>Host metadata (directories)</td><td>List command</td></tr>
+      <tr><td>Range/prefix query</td><td>Host index</td><td>Only what List offers; often unordered</td></tr>
+      <tr><td>Atomic create-if-absent</td><td>Host locking</td><td>Store with SINKE</td></tr>
+      <tr><td>Linux integration</td><td>Block device, every file system</td><td>Generic char device + pass-through, user-space libraries</td></tr>
+      <tr><td>Ecosystem / tooling</td><td>Universal</td><td>Narrow</td></tr>
+      <tr><td>Device complexity</td><td>FTL</td><td>FTL + KV index + variable-size GC</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout insight" data-title="The honest trade-off"><p>KV wins when the application's natural interface is already get/put by short keys, values are small to medium, and host CPU or write amplification is the bottleneck. It loses when the application needs ordered scans, long keys, transactions across keys, or portability — which is why KV SSDs have remained a niche compared with ZNS and FDP. A senior engineer frames the decision in terms of who owns the index and who pays for garbage collection.</p></aside>
+
+  <h3>2026 context</h3>
+  <p>The current revision is <cite class="spec">NVM Express Key Value Command Set Specification, Revision 1.4</cite>, released with the NVMe 2.4 set on 2026-08-04. "Updated Key Value" is among the reported 2026 changes; this chapter does not describe field-level changes — see <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a> and the official Revision Changes document.</p>
+
+  <h3>The central concept on the ladder</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>A coat check: hand over a coat with your own ticket number; get it back by the number; ask if a number is in use; throw a coat away.</p></div>
+    <div class="rung" data-rung="B"><p>A KV namespace stores variable-size values under short byte-string keys. Store, Retrieve, Delete, Exist and List replace READ and WRITE; the device maintains the key index.</p></div>
+    <div class="rung" data-rung="C"><p>Inside the controller, a hash or tree index maps keys to flash locations, stored in DRAM and journaled to flash; values are packed into flash pages; a GC process reclaims space from deleted or replaced values of varying sizes.</p></div>
+    <div class="rung" data-rung="D"><p>The KV Command Set 1.4 defines the commands, Store options SIKE/SINKE, KV formats with key and value limits, KV Identify structures and statuses 85h–89h. The Base 2.4 specification supplies queues, admin commands and CSI 01h.</p></div>
+    <div class="rung" data-rung="E"><p>Each command is one 64-byte SQE with the key inside; Store pulls the value with device MRds; Retrieve and List push data with device MWrs; Exist and Delete move no data. Completions carry status and, for Retrieve, the value length.</p></div>
+    <div class="rung" data-rung="F"><p>In a trace: SQE fetch, then either a value-sized DMA (often a non-multiple of 4 bytes, visible as partial byte enables) or nothing, then a CQE. A "does not exist" completion arrives with no data phase.</p></div>
+    <div class="rung" data-rung="G"><p>Debugging: distinguish "no" (87h on Exist) from failure; check key length handling in the host; check value length against MDTS and the KV maximum; check buffer sizes on Retrieve; check List iteration for skipped or repeated keys under concurrent Store/Delete.</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for "KV Store"</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>An I/O command that writes a value under a key in a KV namespace.</dd>
+    <dt>2. Why was it created?</dt><dd>To let applications that think in keys skip host-side indexing and block mapping.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Duplicate indexing, compaction write amplification, host CPU/DRAM cost, and racy create/update semantics.</dd>
+    <dt>4. What existed before it?</dt><dd>Host key-value stores over file systems over block devices; proprietary KV SSD interfaces; the SNIA Key Value Storage API as a host-side API standard.</dd>
+    <dt>5. Why is the current design better?</dt><dd>It standardizes KV on the same NVMe queues, transports and management as block storage, so one controller can offer both.</dd>
+    <dt>6. Who creates it?</dt><dd>The host driver or user-space library builds the SQE on behalf of the application.</dd>
+    <dt>7. Who consumes it?</dt><dd>The controller's KV engine.</dd>
+    <dt>8. Where does it live?</dt><dd>The SQE in an I/O Submission Queue in host memory; the value in a host data buffer; the stored pair in device media.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>SQ tail doorbell; SQE (key, key length, value length, options, data pointer); host value buffer; CQ entry; device DRAM index.</dd>
+    <dt>10. What happens before it?</dt><dd>KV namespace created (CSI 01h) and attached; KV command set enabled; KV Identify read for limits.</dd>
+    <dt>11. What happens after it?</dt><dd>Completion; the pair may be in a volatile write cache until Flush if a volatile cache is present.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Invalid Key/Value Size, Key Exists or KV Key Does Not Exist; or silent overwrite of another application's key if keys collide.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>SQE with opcode 01h, device MRds pulling exactly the value length, a CQE.</dd>
+    <dt>14. What does Linux show?</dt><dd>A <code>/dev/ngXnY</code> generic device; <code>nvme list</code> may show the namespace; no block device; pass-through command results in the tool you use.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>Key lengths 0, 1, max, max+1; value lengths 0, 1, odd sizes, max, max+1, above MDTS; SIKE/SINKE on present/absent keys; concurrent Store/Delete/List; power loss during Store (atomicity); max number of keys.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>Host key truncation or padding differences (is "abc" the same key as "abc\0"?), buffer-size and value-length confusion, treating 87h as an error, and List iteration bugs.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>On the PCIe side nothing changes: the same Base Address Register (BAR), doorbells, queues and MSI-X interrupts. The difference is in the controller's back end.</p>
+  <table>
+    <caption>Inside a KV-capable SSD controller (implementation-dependent)</caption>
+    <thead><tr><th>Block</th><th>Role in KV</th></tr></thead>
+    <tbody>
+      <tr><td>Command front end</td><td>Decodes the SQE, extracts key and key length without any extra DMA</td></tr>
+      <tr><td>Hash/index engine (often hardware-assisted)</td><td>Maps key → value location; must handle collisions and the maximum key count</td></tr>
+      <tr><td>DRAM</td><td>Holds the hot index; size bounds the number of keys or forces index paging from flash</td></tr>
+      <tr><td>Packing logic</td><td>Packs variable-size values into flash pages; small values share pages</td></tr>
+      <tr><td>Garbage collector</td><td>Reclaims space from replaced and deleted values; must move values and update the index</td></tr>
+      <tr><td>Power-loss protection</td><td>Makes index updates and value writes atomic per Store</td></tr>
+    </tbody>
+  </table>
+  <p>DMA of values is byte-granular from the host's perspective: a 14-byte value is fetched with a 4-DWORD Memory Read with a Last DW Byte Enable of 0011b. Small-value workloads therefore generate many small TLPs — the PCIe efficiency of KV for tiny values is poor, which the device compensates for by saving whole round trips of host indexing.</p>
+  <aside class="callout hw"><p>A KV device's maximum number of keys is often a DRAM budget in disguise. An index entry of tens of bytes per key times billions of keys is many gigabytes; a device either carries that DRAM or pages its index from flash and accepts slower lookups.</p></aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Key Value Command Set Specification, Revision 1.4</cite> — KV model, commands, Store options, KV Identify structures, statuses. Current in the August 2026 release. <span class="badge normative">Normative</span></li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4</cite> — CSI (KV = 01h), command set selection, queue and completion mechanics, admin commands used to create and identify KV namespaces. <span class="badge normative">Normative</span></li>
+  </ul>
+  <aside class="callout verified"><p>CSI <code>01h</code> for Key Value; opcodes Store <code>01h</code>, Retrieve <code>02h</code>, List <code>06h</code>, Delete <code>10h</code>, Exist <code>14h</code>; statuses 85h–89h with the names above; the SIKE/SINKE Store options. These match the libnvme definitions, which track the specifications.</p></aside>
+  <aside class="callout derived"><p>That the key travels in the SQE to avoid a second DMA, the PCIe efficiency of small values, the DRAM cost of the index and the comparison with block storage are reasoned, not quoted.</p></aside>
+  <aside class="callout impl"><p>Maximum key length actually supported (up to the specification maximum), maximum value length, maximum number of keys, List ordering, index structure, GC behaviour and performance are <span class="badge impl">Implementation-dependent</span>.</p></aside>
+  <aside class="callout version"><p>KV was among the first separate I/O command set specifications published with the NVMe 2.0 restructuring (2021). Revision 1.4 is current with the 2026 set; changes since 1.0 are listed in the specification's revision history and in the Revision Changes document. See <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a>.</p></aside>
+  <aside class="callout notsaid">
+    <p>Check in KV 1.4 before relying on:</p>
+    <ul>
+      <li>the maximum key length the specification permits and where key bytes sit in the SQE;</li>
+      <li>the exact field positions of key length, value length, Store options and Retrieve options;</li>
+      <li>where the value length is returned on Retrieve and what happens with a too-small buffer;</li>
+      <li>the List data format and ordering rules;</li>
+      <li>atomicity guarantees for Store and behaviour on power loss;</li>
+      <li>units of namespace size and utilization in KV Identify.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn"><p>Never assume keys are NUL-terminated strings, that List is sorted, that 87h is an error, that a value can be larger than MDTS in one command, or that every NVMe tool understands KV namespaces.</p></aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <figure>
+    <ol class="seq" data-actors="Application|KV library|Host memory|Controller">
+      <li data-from="Application" data-to="KV library">put("user:1001", 14 B)</li>
+      <li data-from="KV library" data-to="Host memory">value into DMA buffer; SQE with key</li>
+      <li data-from="KV library" data-to="Controller">SQ tail doorbell (MWr)</li>
+      <li data-from="Controller" data-to="Host memory">MRd: fetch SQE (key inside)</li>
+      <li data-note="Controller">index lookup by key</li>
+      <li data-from="Controller" data-to="Host memory">MRd: fetch 14-byte value</li>
+      <li data-from="Host memory" data-to="Controller" class="dashed">CplD: value</li>
+      <li data-note="Controller">store pair; update index</li>
+      <li data-from="Controller" data-to="Host memory" class="dashed">MWr: CQE success</li>
+      <li data-from="Controller" data-to="KV library" class="dashed">MSI-X</li>
+      <li data-from="KV library" data-to="Application" class="dashed">ok</li>
+    </ol>
+    <figcaption>Conceptual sequence of a KV Store over PCIe.</figcaption>
+  </figure>
+  <p><strong>Direction.</strong> Store moves data host → controller (device-issued reads). Retrieve and List move data controller → host (device-issued writes). Exist and Delete move no data. In every case the key arrives with the SQE fetch.</p>
+  <p><strong>Ordering.</strong> As in all NVMe command sets, commands are not ordered with respect to each other. A Store and a Retrieve of the same key submitted together may execute in either order; a Delete and a Store of the same key likewise. If the application needs read-your-writes, it must wait for the Store's completion before submitting the Retrieve. Conditional Stores (SIKE/SINKE) are atomic per command, not per sequence of commands.</p>
+  <p><strong>Errors and layer.</strong> All KV outcomes, including "does not exist", are NVMe completion statuses. PCIe errors (for example a completion timeout while fetching a value) are transport faults and leave the pair's state for the controller to resolve: the specification decides whether a failed Store leaves the old value intact.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic examples for teaching on the course lab system. For this chapter, namespace 3 is a KV namespace (CSI 01h). I/O SQ1 at IOVA 0x1_2340_0000, CQ1 at 0x1_2341_0000, data buffers at 0x2_0000_0000. Key and length fields are shown by name; their exact dword positions are given in KV 1.4 and are not asserted here. Timings illustrative.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 1 — normal: Store a 14-byte value under key &quot;user:1001&quot;">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Len=1 Data=0x00000021</td><td>SQ1 tail = 0x21</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>800</td><td>MRd64</td><td>Req=0x0100 Tag=0x70 Addr=0x1_2340_0800 Len=16</td><td>Fetch SQE slot 0x20</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,430</td><td>CplD</td><td>Tag=0x70 Len=16</td><td>SQE: opc=01h (Store) CID=0x0201 NSID=3 PRP1=0x2_0000_0000; key length=9, key=75 73 65 72 3A 31 30 30 31 ("user:1001"); value size=14; Store Option=none</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>2,050</td><td>MRd64</td><td>Tag=0x71 Addr=0x2_0000_0000 Len=4 FirstBE=1111 LastBE=0011</td><td>Fetch exactly 14 bytes (3 full DWORDs + 2 bytes)</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2,640</td><td>CplD</td><td>Tag=0x71 Len=4 ByteCount=14</td><td>Value: {"name":"Ada"}</td></tr>
+        <tr class="note"><td colspan="6">Device: index insert, value packed into a flash page buffer. ~9 µs.</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>11,800</td><td>MWr64</td><td>Addr=0x1_2341_0200 Len=4</td><td>CQE: CID=0x0201 SQID=1 SQHD=0x21 P=1 Status=0 (success)</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>12,100</td><td>MWr32</td><td>Addr=0xFEE0_1000 Len=1 Data=0x0000_0041</td><td>MSI-X vector 1</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the key never appears as a separate DMA — it rode in the SQE (row 3). The value fetch's length (row 4) equals the value size field, with a partial last-DWORD byte enable; a mismatch between the two is a host bug in building the SQE. This is the cleanest way to tell KV traffic from block traffic in an unlabelled trace: block transfers are multiples of the LBA size.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 2 — normal: Retrieve &quot;user:1001&quot; into a 4 KiB buffer">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000022</td><td>SQ1 tail = 0x22</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>790</td><td>MRd64</td><td>Tag=0x72 Addr=0x1_2340_0840 Len=16</td><td>Fetch SQE slot 0x21</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,410</td><td>CplD</td><td>Tag=0x72 Len=16</td><td>SQE: opc=02h (Retrieve) CID=0x0202 NSID=3 PRP1=0x2_0000_1000; key="user:1001"; host buffer size=4096</td></tr>
+        <tr class="note"><td colspan="6">Device: index lookup, value read from flash (~45 µs for a NAND read; illustrative).</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>47,300</td><td>MWr64</td><td>Addr=0x2_0000_1000 Len=4 FirstBE=1111 LastBE=0011</td><td>Value (14 bytes) written to host buffer</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>47,500</td><td>MWr64</td><td>Addr=0x1_2341_0210 Len=4</td><td>CQE: CID=0x0202 success; value length = 14 reported in the completion</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>47,800</td><td>MWr32</td><td>Addr=0xFEE0_1000 Len=1 Data=0x0000_0041</td><td>MSI-X</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the posted data MWr (row 4) precedes the CQE MWr (row 5) on the same path, and PCIe ordering for posted writes guarantees the host sees the value before it sees the completion — the same rule that makes block READs safe (<a href="ch14.html">PCIe Ordering</a>). The buffer was 4096 bytes but only 14 moved; the host learns the length from the completion, not from the buffer.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 3 — abnormal: Retrieve of a key that was deleted moments earlier">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000024</td><td>SQ1 tail = 0x24 (two new SQEs: slots 0x22, 0x23)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>780</td><td>MRd64</td><td>Tag=0x73 Addr=0x1_2340_0880 Len=32</td><td>Fetch both SQEs in one 128-byte read</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,500</td><td>CplD</td><td>Tag=0x73 Len=32</td><td>Slot 0x22: opc=10h (Delete) CID=0x0203 key="user:1001". Slot 0x23: opc=02h (Retrieve) CID=0x0204 key="user:1001"</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>6,200</td><td>MWr64</td><td>Addr=0x1_2341_0220 Len=4</td><td>CQE: CID=0x0203 (Delete) success</td></tr>
+        <tr class="abnormal"><td>5</td><td>Dev→Host</td><td>6,450</td><td>MWr64</td><td>Addr=0x1_2341_0230 Len=4</td><td>CQE: CID=0x0204 DW3=0x010F0204 → SCT=0h SC=87h <strong>KV Key Does Not Exist</strong>; no data phase</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>6,700</td><td>MWr32</td><td>Addr=0xFEE0_1000 Len=1 Data=0x0000_0041</td><td>MSI-X (coalesced for both completions)</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the first abnormal event is row 5 — but whether it is a bug depends on intent. Two threads submitted Delete and Retrieve for the same key in the same doorbell batch; the controller executed the Delete first, which it is entitled to do. If the application expected to read the value before deleting it, it violated NVMe's no-ordering rule and must wait for Retrieve's completion before submitting Delete. The absence of any data MWr before row 5 confirms the controller found no key; this is not a media error (which would be 88h). Decoding DW3: bit 16 phase = 1, bits 24:17 = 0x87, bits 27:25 = 0 (generic), DNR = 0 here (illustrative).</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 4 — abnormal: 20-byte key rejected">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64</td><td>Tag=0x74 Addr=0x1_2340_0900 Len=16</td><td>Fetch SQE slot 0x24</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>620</td><td>CplD</td><td>Tag=0x74 Len=16</td><td>SQE: opc=01h (Store) CID=0x0205 key length=20 (exceeds the namespace maximum)</td></tr>
+        <tr class="abnormal"><td>3</td><td>Dev→Host</td><td>1,100</td><td>MWr64</td><td>Addr=0x1_2341_0240 Len=4</td><td>CQE: SC=86h <strong>Invalid Key Size</strong>; the value was never fetched</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the device rejected the command during SQE validation (480 ns after fetch, no data phase). Root cause is host-side: the library accepted a 20-byte key without checking the KV format's maximum key length. Fix in the host; add a unit test for maximum and maximum+1.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>The Linux NVMe driver creates block devices only for command sets it can drive as block storage (NVM, and ZNS as zoned block devices). Since kernel 5.13 it also creates a <strong>generic character device</strong> per namespace, <code>/dev/ng&lt;ctrl&gt;n&lt;ns&gt;</code>, including for namespaces whose command set it does not otherwise support. KV namespaces are reached through that node with pass-through ioctls or io_uring pass-through. <span class="badge version">Version-dependent</span></p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Does the controller support the KV command set? (Identify Controller, I/O command set data)</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -iE 'command set|cmic|oncs'
+sudo nvme id-iocs /dev/nvme0                 <span class="cm"># I/O Command Set data structure (CNS 1Ch), if your nvme-cli supports it</span>
+
+<span class="cm"># Which command set is each namespace? Look at the CSI descriptor.</span>
+sudo nvme ns-descs /dev/ng0n3                <span class="cm"># "csi : 1" means Key Value</span>
+ls -l /dev/ng* /dev/nvme*n*                  <span class="cm"># a KV namespace has /dev/ng0n3 but no /dev/nvme0n3</span>
+
+<span class="cm"># Raw KV-specific Identify Namespace (CNS 05h, CSI 01h) via admin pass-through, read-only</span>
+sudo nvme admin-passthru /dev/nvme0 --opcode=0x06 --namespace-id=3 \
+     --cdw10=0x05 --cdw11=0x01000000 --data-len=4096 --read -b &gt; kv_idns.bin</code></pre>
+  <p>The last command is an Identify (opcode 06h) with CNS 05h in CDW10 bits 7:0 and CSI 01h in CDW11 bits 31:24. It only reads. Decode the result against the KV Identify Namespace definition in KV 1.4.</p>
+  <table>
+    <caption>What Linux observations prove for KV</caption>
+    <thead><tr><th>Observation</th><th>Proves</th><th>Does not prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>/dev/ng0n3</code> exists, <code>/dev/nvme0n3</code> does not</td><td>Namespace 3 is active, and the kernel does not drive it as a block device</td><td>That it is KV (could be compute, memory, or an unsupported format)</td></tr>
+      <tr><td><code>ns-descs</code> CSI = 1</td><td>Namespace 3 uses the KV command set</td><td>That the controller has KV enabled in the current I/O command set profile</td></tr>
+      <tr><td>Pass-through Exist returns status 0x87</td><td>The key is absent</td><td>A failure of any kind</td></tr>
+    </tbody>
+  </table>
+  <p>nvme-cli has no dedicated KV subcommands at the time of writing; KV I/O is issued with <code>nvme io-passthru</code> (which writes data — keep it in the lab) or a library. The SNIA Key Value Storage API specification defines a host API that libraries can map onto NVMe KV commands.</p>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>The simulation below models the KV command semantics — key and value limits, conditional Store, Retrieve with a host buffer, Exist, List, Delete — and prints statuses with the libnvme encodings. The limits are parameters because a real device reports them; 16 bytes is used as the default key maximum, subject to the caveat above.</p>
+  <pre class="code" data-kind="simulation" data-lang="python" data-title="kv_sim.py"><code>#!/usr/bin/env python3
+"""Key Value namespace behaviour model (teaching simulation).
+Command names follow the NVMe KV Command Set; opcodes and status values are the
+libnvme encodings. KEY_MAX and VALUE_MAX stand in for the limits a real device
+reports in its KV Identify Namespace data -- read those from your device."""
+
+OPC = {"Store": 0x01, "Retrieve": 0x02, "List": 0x06, "Delete": 0x10, "Exist": 0x14}
+SC = {"SUCCESS": (0x0, 0x00, "Successful Completion"),
+      "INVALID_VALUE_SIZE": (0x0, 0x85, "Invalid Value Size"),
+      "INVALID_KEY_SIZE": (0x0, 0x86, "Invalid Key Size"),
+      "KEY_NOT_EXIST": (0x0, 0x87, "KV Key Does Not Exist"),
+      "KEY_EXISTS": (0x0, 0x89, "Key Exists")}
+
+class KVNamespace:
+    def __init__(self, key_max=16, value_max=1 &lt;&lt; 20):
+        self.key_max, self.value_max = key_max, value_max
+        self.store_ = {}
+        self.used = 0
+
+    def _check_key(self, key):
+        return 1 &lt;= len(key) &lt;= self.key_max
+
+    def store(self, key, value, sike=False, sinke=False):
+        """sike: store only if key exists; sinke: store only if key does not exist."""
+        if not self._check_key(key):      return SC["INVALID_KEY_SIZE"], None
+        if len(value) &gt; self.value_max:   return SC["INVALID_VALUE_SIZE"], None
+        exists = key in self.store_
+        if sike and not exists:           return SC["KEY_NOT_EXIST"], None
+        if sinke and exists:              return SC["KEY_EXISTS"], None
+        delta = len(value) - (len(self.store_[key]) if exists else 0)
+        self.store_[key] = bytes(value)
+        self.used += delta
+        return SC["SUCCESS"], None
+
+    def retrieve(self, key, host_buf_len):
+        """Returns (status, (bytes copied, full value length))."""
+        if not self._check_key(key):      return SC["INVALID_KEY_SIZE"], None
+        if key not in self.store_:        return SC["KEY_NOT_EXIST"], None
+        v = self.store_[key]
+        return SC["SUCCESS"], (v[:host_buf_len], len(v))
+
+    def delete(self, key):
+        if not self._check_key(key):      return SC["INVALID_KEY_SIZE"], None
+        if key not in self.store_:        return SC["KEY_NOT_EXIST"], None
+        self.used -= len(self.store_.pop(key))
+        return SC["SUCCESS"], None
+
+    def exist(self, key):
+        if not self._check_key(key):      return SC["INVALID_KEY_SIZE"], None
+        return (SC["SUCCESS"] if key in self.store_ else SC["KEY_NOT_EXIST"]), None
+
+    def list(self, start_key, max_keys):
+        """Keys at or after start_key. Ordering is implementation-dependent;
+        this model returns byte-wise sorted order."""
+        if not self._check_key(start_key): return SC["INVALID_KEY_SIZE"], None
+        keys = sorted(k for k in self.store_ if k &gt;= start_key)
+        return SC["SUCCESS"], keys[:max_keys]
+
+def show(cmd, key, result):
+    (sct, sc, name), data = result
+    k = key if isinstance(key, str) else key.decode(errors="replace")
+    extra = "" if data is None else f"  data={data!r}"
+    print(f"{cmd:9s} (opc {OPC[cmd]:02X}h) key={k!r:24s} -&gt; SCT={sct}h SC={sc:02X}h {name}{extra}")
+
+if __name__ == "__main__":
+    ns = KVNamespace()
+    show("Store",    b"user:1001",  ns.store(b"user:1001", b'{"name":"Ada"}'))
+    show("Store",    b"user:1001",  ns.store(b"user:1001", b'{"name":"Bob"}', sinke=True))
+    show("Store",    b"user:1002",  ns.store(b"user:1002", b'{"name":"Cy"}', sike=True))
+    show("Store",    b"user:1002",  ns.store(b"user:1002", b'{"name":"Cy"}'))
+    show("Retrieve", b"user:1001",  ns.retrieve(b"user:1001", 4096))
+    show("Retrieve", b"user:1001",  ns.retrieve(b"user:1001", 8))
+    show("Exist",    b"user:9999",  ns.exist(b"user:9999"))
+    show("Store",    b"x" * 17,     ns.store(b"x" * 17, b"too long key"))
+    show("Store",    b"",           ns.store(b"", b"empty key"))
+    show("List",     b"user:",      ns.list(b"user:", 10))
+    show("Delete",   b"user:1001",  ns.delete(b"user:1001"))
+    show("Delete",   b"user:1001",  ns.delete(b"user:1001"))
+    print(f"bytes in use: {ns.used}")</code></pre>
+  <p>The second listing is pseudocode for a host-side KV library call built on pass-through. It shows the checks that belong in the host.</p>
+  <pre class="code" data-kind="pseudocode" data-lang="c" data-title="kv_put (pseudocode)"><code>int kv_put(int ng_fd, uint32_t nsid, const void *key, size_t klen,
+           const void *val, size_t vlen, enum put_mode mode)
+{
+    if (klen == 0 || klen &gt; ns_limits.max_key_len)   return -EINVAL;  /* never let 86h happen */
+    if (vlen &gt; ns_limits.max_value_len)              return -EFBIG;   /* never let 85h happen */
+    if (vlen &gt; ctrl_limits.mdts_bytes)               return -E2BIG;   /* cannot move in one command */
+
+    void *buf = dma_buffer_copy(val, vlen);          /* pinned, page-aligned */
+    struct kv_sqe sqe = { .opcode = KV_STORE /*01h*/, .nsid = nsid };
+    kv_sqe_set_key(&amp;sqe, key, klen);                 /* positions per KV 1.4 */
+    kv_sqe_set_value_size(&amp;sqe, vlen);
+    kv_sqe_set_store_option(&amp;sqe, mode == PUT_CREATE ? SINKE : mode == PUT_UPDATE ? SIKE : 0);
+    sqe_set_prp(&amp;sqe, buf, vlen);
+
+    status = passthru_io(ng_fd, &amp;sqe, /*result*/ NULL);
+    switch (status) {
+    case 0:                return 0;
+    case SC_KEY_EXISTS:    return -EEXIST;            /* 89h: expected for PUT_CREATE races */
+    case SC_KEY_NOT_EXIST: return -ENOENT;            /* 87h: expected for PUT_UPDATE races */
+    default:               return log_and_map(status); /* real errors */
+    }
+}</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Problem.</strong> A session cache stores 300 million entries, keys are 36-character UUID strings, values average 600 bytes. Evaluate storing it in a KV namespace with a 16-byte key limit, versus a host hash table on a block namespace with 4 KiB blocks. <em>Synthetic example for teaching.</em></p>
+  <ol>
+    <li><strong>Key fit.</strong> A 36-character UUID string is 36 bytes; its binary form is 16 bytes. Converting text UUIDs to binary gives exactly 16 bytes — fits, no hashing needed.</li>
+    <li><strong>Capacity.</strong> 300 M × 600 B = 180 GB of values. KV namespace stores values without block padding (device-internal packing overhead aside). A naive block design with one 4 KiB block per entry would need 300 M × 4 KiB = 1.2 TB; packing several entries per block needs a host index and compaction.</li>
+    <li><strong>Host DRAM.</strong> A host hash table at ~32 bytes per entry (key 16 + location 8 + overhead) = 9.6 GB of host DRAM. With KV, the host needs none; the device needs its own index memory, so check the device's maximum number of keys ≥ 300 M.</li>
+    <li><strong>Operations.</strong> A lookup with KV: one Retrieve; PCIe moves 64 B SQE + ~600 B value + 16 B CQE. With a block design and host index in DRAM: one READ of 4 KiB; PCIe moves 64 B + 4096 B + 16 B. KV moves about 6× less data per lookup (680 B versus 4,176 B).</li>
+    <li><strong>Writes.</strong> KV: one Store per update. Block with packed blocks: read-modify-write of a 4 KiB block, or log-append plus compaction later.</li>
+    <li><strong>Risks.</strong> Device maximum keys, List semantics (needed for expiry scans?), single-vendor availability, Linux tooling, and portability of backups (you cannot <code>dd</code> a KV namespace).</li>
+  </ol>
+  <p>Conclusion: technically attractive for this workload; operationally contingent on device limits and ecosystem. That is the typical KV verdict.</p>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Treating "KV Key Does Not Exist" from Exist as an error</strong> and alarming on it.</li>
+    <li><strong>String keys with and without a terminating NUL</strong>, or with padding: "abc" and "abc\0" are different keys.</li>
+    <li><strong>Hard-coding the key limit</strong> instead of reading the KV format descriptor.</li>
+    <li><strong>Assuming List is sorted</strong> and building prefix scans on it.</li>
+    <li><strong>Submitting Store then Retrieve without waiting</strong> and expecting the new value.</li>
+    <li><strong>Exist-then-Store for create-only semantics</strong> instead of SINKE — a race between hosts.</li>
+    <li><strong>Values larger than MDTS</strong> in a single command.</li>
+    <li><strong>Expecting a block device</strong> to appear for a KV namespace.</li>
+    <li><strong>Confusing 87h across command sets</strong>: in a non-KV namespace the generic 80h–BFh range means something else.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>KV failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Disambiguating experiment</th></tr></thead>
+    <tbody>
+      <tr><td>Retrieve returns 87h for a key "just written"</td><td>Store not yet complete; different key bytes (NUL, padding, encoding)</td><td>Hex-dump the key bytes in both SQEs from a trace</td><td>Retrieve after Store's CQE with byte-identical keys</td></tr>
+      <tr><td>86h Invalid Key Size in production</td><td>Host did not enforce max key length; new key format</td><td>Key length field in the failing SQE</td><td>Unit test max and max+1</td></tr>
+      <tr><td>85h on large objects</td><td>Value above KV maximum</td><td>Value size vs KV format descriptor</td><td>Split objects or store a manifest</td></tr>
+      <tr><td>Truncated values</td><td>Host buffer too small on Retrieve</td><td>Returned value length vs buffer size</td><td>Retrieve again with the returned length</td></tr>
+      <tr><td>List skips or repeats keys</td><td>Concurrent Store/Delete during iteration; wrong start-key logic</td><td>Compare iteration on a quiesced namespace</td><td>Repeat with no concurrent writers</td></tr>
+      <tr><td>Throughput collapse at high key counts</td><td>Device index spilling from DRAM to flash</td><td>Key count vs device maximum; latency histogram</td><td>Measure Exist latency at increasing key counts</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight" data-title="Ask who owns the index">
+    <p>Every storage design has an index from names to bytes. Block storage puts most of it in the host and a second copy (the FTL) in the device. KV puts it in the device. ZNS puts it in the host and strips it from the device. FDP shares it. When someone proposes a KV SSD, the senior questions are: can the device's index hold our key count with our access pattern; what happens to latency when it cannot; how do we back up, migrate and inspect data when no standard tool can read the namespace; and is the saving in host CPU worth a single-purpose device?</p>
+    <p>A second insight: KV statuses turn data-plane outcomes into status codes. Monitoring systems that count every non-zero status as an error will report a healthy KV cache as failing. Instrumentation must be command-set aware.</p>
+  </aside>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 60 — KV semantics, limits and trace reading</h3>
+  <h4>Objective</h4>
+  <p>Build intuition for KV command behaviour and its trace signature using the simulator, then (optionally) identify KV support on a real or emulated controller with read-only commands.</p>
+  <h4>Skills</h4>
+  <p>Predicting KV statuses; using conditional Store; reading byte enables for odd-sized values; recognising KV namespaces in Linux; separating "no" from "error".</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Steps 1–4 run only a Python simulation and read-only Linux commands. Issuing KV Store/Delete pass-through commands to real hardware is out of scope; do it only on a device you own and are prepared to erase.</p></aside>
+  <h4>Hardware required</h4>
+  <p>Any computer with Python 3. Optional: a Linux system with an NVMe controller (KV support is rare; most will show none, which is a valid result).</p>
+  <h4>Software required</h4>
+  <p>Python 3; <code>kv_sim.py</code>; optionally <code>nvme-cli</code>.</p>
+  <h4>Input</h4>
+  <p>The simulator and a list of operations you design.</p>
+  <h4>Expected output</h4>
+  <p>A table of operations with predicted and observed status; a sketch of the PCIe TLPs for each; a statement about KV support on your controller.</p>
+  <h4>Background</h4>
+  <p>This chapter's engineering, protocol and trace sections.</p>
+  <h4>Step 1 — predict</h4>
+  <p>Before running, write the expected status for each line of the simulator's main block. Then run <code>python3 kv_sim.py</code> and compare.</p>
+  <h4>Step 2 — design a create-only race</h4>
+  <p>Modify the main block to simulate two clients both trying to create <code>b"lock:42"</code> with SINKE. Show that exactly one succeeds. Then show the broken version with Exist-then-Store and explain, using the no-ordering rule, how both could "succeed" on a real device.</p>
+  <h4>Step 3 — sketch TLPs</h4>
+  <p>For a Store of a 4,000-byte value and a Retrieve of a 1-byte value on the lab system (MPS 256, MRRS 512), list the TLPs: count, type, Length field and byte enables.</p>
+  <h4>Step 4 — inspect a controller (read-only)</h4>
+  <p>Run the Linux view commands. Determine whether the controller supports the KV command set and whether any namespace has CSI 1.</p>
+  <h4>Observation</h4>
+  <p>Note which simulator outcomes you mispredicted and why.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Why does Exist return a status rather than a data byte?</li>
+    <li>In Step 3, why does the 1-byte Retrieve still need a full 64-byte SQE fetch and a 16-byte CQE?</li>
+    <li>What would you check first if every Retrieve returned 87h after a firmware update?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Extend the simulator with a <code>max_keys</code> limit and a List that returns keys in hash order (use <code>hashlib.blake2b</code> of each key). Write a prefix-scan function and measure how many List calls it needs to find all keys with prefix <code>user:</code> among 10,000 mixed keys.</p>
+  <h4>Hints</h4>
+  <details class="hint"><summary>Hint</summary><p>For Step 3: 4,000 bytes at MRRS 512 is eight reads (seven of 512 bytes and one of 416 bytes, assuming a page-aligned buffer); each 512-byte read completes as two 256-byte CplDs (MPS). The 416-byte read completes as 256 + 160.</p></details>
+  <h4>Solution</h4>
+  <details class="solution"><summary>Solution</summary>
+    <p>Step 1: outputs as printed by the simulator (success; Key Exists; KV Key Does Not Exist; success; success with 14-byte value; success with 8-byte truncated copy and full length 14 — a modelling choice; KV Key Does Not Exist; Invalid Key Size twice; List of two keys; success; KV Key Does Not Exist).</p>
+    <p>Step 2: with SINKE, the second Store returns Key Exists. With Exist-then-Store, both clients can receive "does not exist" before either Store executes, and both Stores then succeed — last writer wins silently.</p>
+    <p>Step 3: Store 4,000 B: SQE fetch (MRd Len=16 + CplD), eight value MRds (Len=128 ×7, Len=104 ×1), sixteen CplDs, CQE MWr (Len=4), MSI-X MWr. Retrieve 1 B: SQE fetch, one MWr Len=1 FirstBE=0001 (LastBE=0000 for a single-DW request), CQE, MSI-X. The SQE and CQE are fixed-size regardless of payload — the per-command overhead that makes tiny values inefficient on the link.</p>
+    <p>Step 4: on most systems, no KV support; the controller's I/O command set data shows only NVM (and maybe ZNS).</p>
+    <p>Questions: 1 — status codes are how NVMe reports per-command outcomes without a data phase; Exist avoids DMA entirely. 2 — the command and completion formats are fixed by the Base specification. 3 — whether key byte encoding changed (host or device), whether the namespace was reformatted, and whether the right NSID/CSI is in use.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>That the simulator's truncation behaviour is a modelling choice, not a fact — and that the real behaviour must be read from the specification before any library depends on it.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>Zero-length key → Invalid Key Size.</li>
+    <li>Value length field not matching the PRP buffer length → host memory overrun or short fetch.</li>
+    <li>SIKE on a deleted key → KV Key Does Not Exist.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Read the SNIA Key Value Storage API specification and map each of its calls to an NVMe KV command, noting where the API offers something the command set does not.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Give the PCIe TLP sequence for an Exist of an absent key. How many data TLPs?</li>
+    <li>A CQE DW3 is 0x01130203. Decode it, assuming CID 0x0203 was a Store.</li>
+    <li>Why is generic status 81h ambiguous unless you know the namespace's CSI?</li>
+    <li>Design a 16-byte key format for (tenant ID up to 2<sup>20</sup>, object ID up to 2<sup>64</sup>, version up to 2<sup>16</sup>).</li>
+    <li>List three reasons a team might choose ZNS over KV for a large object store.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p>1. Doorbell MWr; SQE MRd + CplD; CQE MWr (status 87h); MSI-X MWr. Zero data TLPs.</p>
+    <p>2. Phase 1; SC = 0x89; SCT = 0; DNR = 0; CID 0x0203 → Key Exists: the Store had SINKE set and the key was present.</p>
+    <p>3. The generic 80h–BFh range is I/O command set specific: 81h is Capacity Exceeded for the NVM command set, while KV's assignments are different; the opcode and CSI give the context.</p>
+    <p>4. Example: 4 bytes tenant (20 bits used, 12 reserved) + 8 bytes object ID + 2 bytes version + 2 bytes reserved/flags = 16 bytes, big-endian so byte-wise order groups tenants (useful only if List is ordered).</p>
+    <p>5. Ordered scans and arbitrary-length names stay in host software they already have; ZNS has broader industry support and Linux integration; the host controls placement and GC policy; values far larger than KV limits are natural in zones.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>What is the Command Set Identifier of a KV namespace?</p>
+      <ul class="options" data-answer="2"><li><code>00h</code></li><li><code>01h</code></li><li><code>02h</code></li><li><code>04h</code></li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>NVM is 00h, KV 01h, ZNS 02h, SLM 03h, Computational Programs 04h.</p></details></li>
+    <li><p>Where does the key of a KV command travel?</p>
+      <ul class="options" data-answer="1"><li>Inside the Submission Queue Entry</li><li>In a separate key buffer fetched by DMA</li><li>In the doorbell write</li><li>In the completion</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The KV design places the key in command dwords of the 64-byte SQE so no extra DMA is needed. That is why keys are short.</p></details></li>
+    <li><p>Which command moves no data in either direction?</p>
+      <ul class="options" data-answer="4"><li>Store</li><li>Retrieve</li><li>List</li><li>Exist</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Exist (and Delete) carry only the key; the answer is the completion status.</p></details></li>
+    <li><p>A Store with "Store If No Key Exists" targets an existing key. Status?</p>
+      <ul class="options" data-answer="3"><li>KV Key Does Not Exist</li><li>Invalid Key Size</li><li>Key Exists</li><li>Success, value replaced</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>SINKE is create-only; an existing key yields Key Exists (89h in libnvme).</p></details></li>
+    <li><p>Which statement about KV List is safe to assume without reading your device's documentation?</p>
+      <ul class="options" data-answer="2"><li>Keys are returned sorted</li><li>A host may need several List commands to enumerate all keys</li><li>List returns values as well as keys</li><li>List is atomic with respect to concurrent Stores</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>A host buffer has finite size, so iteration over multiple commands is inherent. Ordering, atomicity and contents beyond keys must be checked.</p></details></li>
+    <li><p>In a trace, how can you tell a KV Store's value fetch from a block WRITE's data fetch?</p>
+      <ul class="options" data-answer="1"><li>Its length need not be a multiple of the block size and may end with partial byte enables</li><li>It uses Configuration Write TLPs</li><li>It carries a different Requester ID</li><li>It is always a single TLP</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Block transfers are multiples of the LBA size; KV values are any byte length, visible as odd lengths and partial Last DW BE.</p></details></li>
+    <li><p>Why is it dangerous to implement create-only semantics with Exist followed by Store?</p><details class="answer"><summary>Model answer</summary><p>Because the two commands are separate and NVMe does not order or lock across commands; two clients can both observe "does not exist" and both Store, with the last one silently winning. Store with SINKE performs the check and the store atomically in the device.</p></details></li>
+    <li><p>Why does Linux not create <code>/dev/nvme0n3</code> for a KV namespace, and how do applications reach it?</p><details class="answer"><summary>Model answer</summary><p>The block layer needs LBA-addressed fixed-size blocks; KV has neither. The driver exposes a generic character device <code>/dev/ng0n3</code> (kernel 5.13+), through which user space sends pass-through KV commands via ioctl or io_uring.</p></details></li>
+    <li><p>Give two reasons KV might reduce total write amplification compared with an LSM-tree store on a block SSD.</p><details class="answer"><summary>Model answer</summary><p>The host no longer performs compaction rewrites across PCIe, and the device maintains one index instead of host index + file system + FTL, so data is relocated by one garbage collector instead of several stacked ones.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner.</strong> What are the main KV commands?</p><details class="answer"><summary>Model answer</summary><p>Store, Retrieve, Delete, Exist and List (plus Flush and reservation commands).</p></details></li>
+    <li><p><strong>Beginner.</strong> How does a KV namespace differ from a block namespace?</p><details class="answer"><summary>Model answer</summary><p>It is addressed by keys instead of LBAs, holds variable-size values instead of fixed-size blocks, and the device maintains the key index.</p></details></li>
+    <li><p><strong>Intermediate.</strong> Why are KV keys limited to a small size?</p><details class="answer"><summary>Model answer</summary><p>To fit inside the 64-byte SQE, so the controller has the key as soon as it fetches the command, with no extra DMA. The limit is reported per KV format and must be read from Identify.</p></details></li>
+    <li><p><strong>Intermediate.</strong> How would you recognise KV traffic in an unlabelled PCIe capture?</p><details class="answer"><summary>Model answer</summary><p>Decode SQEs: NSID of a KV namespace and opcodes 01h/02h/06h/10h/14h with non-LBA fields; data transfers of arbitrary byte lengths with partial byte enables; commands with no data phase (Exist/Delete); statuses in 85h–89h.</p></details></li>
+    <li><p><strong>Advanced.</strong> A team reports 3% of Retrieves fail with 87h under load but never in single-threaded tests. Diagnose.</p><details class="answer"><summary>Model answer</summary><p>Ordering: Retrieves submitted before the corresponding Store completes, or Delete/Store races, across queues or within a doorbell batch. Evidence: trace with CIDs and completion times; check whether the failing Retrieve's SQE fetch precedes the Store's CQE. Fix: enforce completion-before-dependent-submission in the host.</p></details></li>
+    <li><p><strong>Senior.</strong> Make the case for and against adopting KV SSDs for a metadata service.</p><details class="answer"><summary>Model answer</summary><p>For: fewer layers, lower host CPU and DRAM, lower write amplification, atomic conditional puts, byte-granular values. Against: small key limit, unclear List ordering, limited vendor support, weak Linux tooling, harder backup/migration/forensics, device index limits under growth, lock-in. Decide by measuring key-count scaling, tail latency and operational tooling cost, not only throughput.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> the coat check where you choose your own ticket number, and why ticket numbers must be short.</li>
+    <li><strong>To a junior engineer:</strong> the five commands, which move data in which direction, and why "does not exist" is a normal answer.</li>
+    <li><strong>To a senior engineer:</strong> the index-ownership argument across block, KV, ZNS and FDP, and the operational risks of KV.</li>
+  </ul>
+  <details class="answer"><summary>Model explanation for the senior engineer</summary><p>Every design maps names to bytes. Block storage keeps that map twice — host and FTL. KV keeps it once, in the device, at the cost of a fixed key format and device-bounded scale. ZNS moves it to the host and slims the device. FDP keeps block semantics but lets the host hint placement. KV's technical benefits are real for short-key get/put workloads; its risks are operational: tooling, backups, portability, and monitoring that understands that 87h is an answer, not an error.</p></details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>The Key Value Command Set (KV 1.4, CSI 01h) addresses data by short byte-string keys and stores variable-size values. Store (01h), Retrieve (02h), List (06h), Delete (10h) and Exist (14h) replace LBA reads and writes; the key travels inside the SQE, which is why keys are short (a 16-byte maximum is widely documented — confirm in KV 1.4 and read your device's limit); values move by DMA like block data. Store options SIKE and SINKE give atomic update-only and create-only semantics. Statuses 85h–89h report key/value size problems, absence and presence. KV removes host indexing layers and can reduce write amplification, but it trades away ordered scans, long keys, ecosystem and tooling.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>explain the key/value model and why a KV command set exists</li>
+      <li>state each KV command's purpose and data direction</li>
+      <li>explain where the key travels and why that limits key size</li>
+      <li>decode KV statuses and tell "no" from "error"</li>
+      <li>use SIKE/SINKE correctly and explain why Exist-then-Store races</li>
+      <li>recognise KV commands in a PCIe trace by length and byte enables</li>
+      <li>compare KV, block, ZNS and FDP by who owns the index</li>
+      <li>find a KV namespace in Linux and explain why there is no block device</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Key Value Command Set Specification, Revision 1.4</cite> — "Key Value Command Set model", "Store command", "Retrieve command", "List command", "Delete command", "Exist command", "Identify Namespace data structure (Key Value specific)", status values.</li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4</cite> — "Command Set Identifier", "I/O Command Set selection"; <cite class="spec">NVM Express Revision Changes (2026-07-30)</cite>, summarized in <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a>.</li>
+    <li><cite class="spec">SNIA Key Value Storage API Specification</cite> — host API context.</li>
+    <li>Linux: NVMe generic character devices and io_uring pass-through documentation in the kernel tree.</li>
+    <li>Deeper in this course: the <a href="dd45.html">Key Value</a> deep-dive module.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch61.html">Computational Programs</a> — moving computation into the device, next to the data.</p>
+</section>

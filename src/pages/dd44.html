@@ -1,0 +1,648 @@
+<p class="lead">This module builds on <a href="ch59.html">Chapter 59 — ZNS</a>, which taught zone geometry, the state machine, the write-pointer rule, Zone Append, Zone Management Send and Receive, the open and active limits and the ZNS status codes. Here the subject is the <em>host system</em> built on zones: garbage collection, resource accounting over days, recovery after resets, the cost of implicit closes, shrinking zone capacity, and the device asking for help through zone attributes and events.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p><a href="ch59.html">Chapter 59</a> ended where most real ZNS bugs begin. Its traces showed single commands failing for clear reasons: a reordered WRITE (BCh), a fourth active zone (BDh). In production, failures come from host software that keeps a model of the device — a write-pointer cache, an active-zone count, a capacity table — and lets that model drift from the device's truth. This module follows that drift: through a host garbage-collection (GC) cycle, through an open-resource thrash that costs throughput without any error, through a controller reset that leaves the host's write pointers wrong, and through zone capacity that changes under the host's feet.</p>
+  <aside class="callout prereq">
+    <p>From <a href="ch59.html">Chapter 59</a>: ZS encodings, ZSA and filter values, the descriptor layout, statuses B8h–BFh, MOR/MAR as 0's-based values. From <a href="dd41.html">Module 41</a>: what a controller reset does to outstanding commands. From <a href="dd43.html">Module 43</a>: asynchronous events and RAE. From <a href="ch58.html">Namespaces</a>: CSI and command-set-specific Identify.</p>
+  </aside>
+  <p>Next: <a href="dd45.html">Module 45 — Key Value</a>, the other command set that changes what a "write" means.</p>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives for the ZNS module</caption>
+    <thead><tr><th>Level</th><th>You will be able to…</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Compute zone numbers, usable capacity, report buffer sizes and the real open/active limits from Identify values.</td></tr>
+      <tr><td>Intermediate</td><td>Walk through a host GC cycle at command level and explain how Zone Append changes the recovery story.</td></tr>
+      <tr><td>Advanced</td><td>Rebuild host zone state after a controller reset, explain implicit-close cost, and handle capacity changes and zone attribute events.</td></tr>
+      <tr><td>Senior</td><td>Design host zone allocation and GC policy (stream-to-zone mapping, finish versus share, GC thresholds) and investigate resource exhaustion that appears after days.</td></tr>
+      <tr><td>Trace analysis</td><td>Separate GC traffic from foreground traffic, recognise stale-write-pointer retries, and decode Zone Descriptor Changed events.</td></tr>
+      <tr><td>Debugging</td><td>Diagnose intermittent Zone Invalid Write, delayed Too Many Active Zones, throughput collapse with no errors, and data placed at the wrong LBA by appends.</td></tr>
+      <tr><td>Validation</td><td>Test reset and power loss with open zones, limits at and beyond MOR/MAR over long runs, capacity changes on reset, and Finish/Reset Recommended handling.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>A class keeps its drawings in notebooks. The rule: you always draw on the next empty page, and you can never rub out one page — to reuse a notebook you must wipe the whole thing. When most drawings in an old notebook are no longer wanted, a helper copies the good ones into a fresh notebook and wipes the old one.</p>
+    <p>The teacher has a list of where each child's next empty page is. One day the lights go out in the middle of drawing time. When they come back on, the teacher's list says Mia's next page is page 12 — but Mia had already finished page 12 before the lights went out. If the teacher sends her to page 12, the rule is broken. The teacher must look in every open notebook again before anyone draws.</p>
+    <p>And there are only so many desks: each notebook still being filled takes a desk, even if nobody is drawing in it right now.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <aside class="callout breaks">
+    <p><strong>What it represents.</strong> Notebooks are zones; "next empty page" is the write pointer; wiping a whole notebook is Reset Zone; the helper is host GC; the teacher's list is the host's write-pointer cache; looking in every notebook is a zone report; desks are active resources (MAR+1), and the children drawing right now are open resources (MOR+1).</p>
+    <p><strong>What it hides.</strong> A notebook's usable page count can shrink when it is wiped (zone capacity may change on reset). The device can also ask the class to close a notebook early (Finish Zone Recommended). Copying drawings costs time the class could have spent drawing — write amplification moves from the device to the host but does not vanish.</p>
+    <p><strong>Where it misleads.</strong> The lights going out is a controller reset, not power loss; with a volatile write cache, power loss can also lose recently completed writes, which is a different and worse problem. And unlike the teacher, the host may have many writes in flight to a zone with Zone Append, so "the next page" is the device's decision, not the host's.</p>
+  </aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Terms used in this module</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="write-pointer">Write pointer</span> cache</td><td>The host's note of each zone's next page</td><td>Host-side copy of WP per zone, updated on completions</td><td>Must be rebuilt from a report after any reset or error</td><td>Updating it on submission</td></tr>
+      <tr><td><span class="g" data-term="host-gc">Host GC</span></td><td>Copying the good drawings out</td><td>Read live data from victim zones, rewrite elsewhere, Reset Zone</td><td>Replaces device GC; write amplification is now host-visible</td><td>Thinking ZNS removes write amplification</td></tr>
+      <tr><td>Victim zone</td><td>The notebook to wipe next</td><td>Full zone chosen for GC by live-data fraction or age</td><td>Its live fraction sets the copy cost</td><td>Choosing by age alone</td></tr>
+      <tr><td><span class="g" data-term="mar">Active resource</span></td><td>A desk</td><td>Zone in Implicitly Opened, Explicitly Opened or Closed; at most MAR+1</td><td>Released only by Finish or Reset</td><td>Believing Close releases it</td></tr>
+      <tr><td><span class="g" data-term="mor">Open resource</span></td><td>A child drawing</td><td>Zone in an opened state; at most MOR+1</td><td>Controller may implicitly close to free one</td><td>Expecting an error at the open limit</td></tr>
+      <tr><td><span class="g" data-term="implicit-close">Implicit close</span></td><td>Putting a notebook away to free a hand</td><td>Controller moves an implicitly opened zone to Closed to open another</td><td>Silent; costs flush of write buffers and parity</td><td>Seeing no error and assuming no cost</td></tr>
+      <tr><td><span class="g" data-term="zcap">Zone capacity</span> change</td><td>Fewer usable pages after a wipe</td><td>ZCAP may differ per zone and may shrink on reset</td><td>Host must read ZCAP from reports, not cache it forever</td><td>Using ZSZE as capacity</td></tr>
+      <tr><td>Finish / Reset Zone Recommended</td><td>The device asking for help</td><td>Zone attribute bits set after FRL / RRL limits</td><td>Can trigger a Zone Descriptor Changed event</td><td>Treating them as errors</td></tr>
+      <tr><td><span class="g" data-term="changed-zone-list">Changed Zone List</span></td><td>The list of notebooks with news</td><td>Log page listing zones whose descriptors changed (libnvme: BFh)</td><td>Read after the event to re-arm it</td><td>Reporting all zones instead</td></tr>
+      <tr><td>Stream-to-zone mapping</td><td>Which child gets which notebook</td><td>Host policy assigning data of similar lifetime to the same zone</td><td>Determines GC cost and active-zone use</td><td>One zone per file</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <figure>
+    <pre class="diagram">
+  Application / database (log-structured: RocksDB-style, object store)
+        |  streams of similar lifetime
+  Zone-aware layer (zoned file system, user-space allocator, or dm/zonefs)
+        |  state: WP cache, active set, open set, ZCAP table, live-data map
+        |  policies: allocate, finish/share, GC victim choice, recovery
+  Linux zoned block layer: one write in flight per zone (WRITE), append path
+        |
+  NVMe driver --&gt; SQ/CQ --&gt;  ZNS namespace (CSI 02h), NSID 2
+                              per zone: state, WP, ZCAP, attributes
+                              per namespace: MOR, MAR, ZASL, FRL, RRL
+                              events: Zone Descriptor Changed -&gt; log BFh
+    </pre>
+    <figcaption>Host-managed zoned storage stack. The host layer owns placement and GC; the device owns zone states and enforces the rules.</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture elements</caption>
+    <thead><tr><th>Element</th><th>Here</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>Application writes tagged by lifetime; deletes and overwrites (which create dead data); device reports and events.</td></tr>
+      <tr><td>Outputs</td><td>Writes and appends to zones, Zone Management Send actions, reports; to applications, durable placement records.</td></tr>
+      <tr><td>Actors</td><td>Zone-aware layer, kernel block layer, NVMe driver, controller firmware.</td></tr>
+      <tr><td>State</td><td>Device: per-zone state, WP, ZCAP, attributes. Host: a model of all of these plus a live-data map per zone.</td></tr>
+      <tr><td>Memory</td><td>Host buffers for reports (64-byte header plus 64-byte descriptors); data buffers; device write buffers per open zone.</td></tr>
+      <tr><td>Registers</td><td>None beyond queue doorbells; everything else is in Identify structures and reports.</td></tr>
+      <tr><td>Interfaces</td><td>Zone Management Send 79h, Receive 7Ah, Zone Append 7Dh, Write 01h, Read 02h; Asynchronous Event Request and Get Log Page for zone events.</td></tr>
+      <tr><td>Dependencies</td><td>Reports after any reset, error or event; accurate accounting of active zones; GC that keeps enough Empty zones.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>The mechanism followed here is a <strong>host GC cycle</strong> on namespace 2 of the Lab SSD (synthetic example for teaching: 4 KiB LBAs, ZSZE = 0x1_0000, ZCAP = 0xD800 as in <a href="ch59.html">Chapter 59</a>; MOR = 11 and MAR = 13, so 12 open and 14 active zones).</p>
+  <ol>
+    <li><strong>Trigger.</strong> Who: host GC. What: the count of Empty zones falls below a threshold. Where: host free-zone list. Evidence: host metrics only.</li>
+    <li><strong>Choose a victim.</strong> Who: host. What: among Full zones, pick the lowest live fraction. Where: host live-data map; optionally confirmed with Zone Management Receive filtered to Full (filter 5h). Evidence: a 7Ah SQE with ZRASF = 5h.</li>
+    <li><strong>Reserve a destination.</strong> Who: host. What: pick an open GC zone, counting it against the active budget. Evidence: none until the first write.</li>
+    <li><strong>Copy.</strong> Who: host. What: Read live extents of the victim, Zone Append them to the GC zone, record returned LBAs. Where: I/O queues. Evidence: reads to the victim's range; appends with CDW10–11 = GC zone's ZSLBA; CQE DW0–DW1 with new LBAs.</li>
+    <li><strong>Commit metadata.</strong> Who: host. What: durably update the mapping from the old to the new LBAs (often with a Flush first). Evidence: writes to the host's metadata zone, Flush.</li>
+    <li><strong>Reset.</strong> Who: host. What: Zone Management Send ZSA 4h on the victim. Where: device zone state. Evidence: 79h SQE, CQE success; a report now shows ZS = 1h, WP = ZSLBA and possibly a new ZCAP.</li>
+    <li><strong>Return.</strong> Who: host. What: put the victim on the free list with the ZCAP from the report. Evidence: host state.</li>
+  </ol>
+  <figure>
+    <ol class="seq" data-actors="Host GC|Kernel/driver|Lab SSD ns2">
+      <li data-from="Host GC" data-to="Lab SSD ns2">Report Zones, filter Full</li>
+      <li data-from="Lab SSD ns2" data-to="Host GC" class="dashed">descriptors: victim zone 9</li>
+      <li data-from="Host GC" data-to="Lab SSD ns2">READ live extents of zone 9</li>
+      <li data-from="Host GC" data-to="Lab SSD ns2">Zone Append ×N to GC zone 40</li>
+      <li data-from="Lab SSD ns2" data-to="Host GC" class="dashed">CQE DW0–1: assigned LBAs</li>
+      <li data-from="Host GC" data-to="Lab SSD ns2">metadata write + Flush</li>
+      <li data-from="Host GC" data-to="Lab SSD ns2">Zone Mgmt Send: Reset zone 9</li>
+      <li data-note="Lab SSD ns2">zone 9 Empty; ZCAP may change</li>
+    </ol>
+    <figcaption>Host GC cycle. Ordering matters: metadata must be durable before Reset, or a crash loses the only copy.</figcaption>
+  </figure>
+
+  <h3>The ladder for host GC</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Copy the good drawings into a new notebook, write down where they went, then wipe the old one.</p></div>
+    <div class="rung" data-rung="B"><p>The host reclaims space by copying live data out of a Full zone and resetting it; the device no longer does this on its own.</p></div>
+    <div class="rung" data-rung="C"><p>The host keeps a live-data map per zone; the device keeps per-zone WP and state; Reset marks the zone's erase blocks for erase later.</p></div>
+    <div class="rung" data-rung="D"><p>NVMe Zoned Namespace Command Set 1.5: Zone Management Receive (report and filters), Zone Append, Zone Management Send Reset Zone; zone capacity may change on reset.</p></div>
+    <div class="rung" data-rung="E"><p>Reads to the victim range, appends with the GC zone's ZSLBA, LBAs returned in completions, then a single 79h command.</p></div>
+    <div class="rung" data-rung="F"><p>In a capture: MRd-heavy then MWr-heavy phases on one queue, CQEs with non-zero DW0–DW1, and a 79h SQE with ZSA 4h.</p></div>
+    <div class="rung" data-rung="G"><p>Data loss after crash: was metadata durable before Reset? Throughput loss: what live fraction were victims? Errors: did the GC zone count against the active limit?</p></div>
+  </div>
+
+  <h3>The sixteen questions, applied to host-managed zone systems</h3>
+  <table>
+    <caption>Sixteen questions for host zone management</caption>
+    <tbody>
+      <tr><td>1 What is it?</td><td>Host software that places data in zones, accounts for limits, reclaims space and recovers state.</td></tr>
+      <tr><td>2 Why created?</td><td>ZNS hands placement and GC to the host to cut device DRAM, over-provisioning and write amplification.</td></tr>
+      <tr><td>3 Problem solved</td><td>Lifetime-aware placement the device cannot infer.</td></tr>
+      <tr><td>4 Before it</td><td>Device FTL GC; streams and directives as hints; open-channel SSDs.</td></tr>
+      <tr><td>5 Why better</td><td>The host knows which data dies together and can make GC nearly free.</td></tr>
+      <tr><td>6 Who creates it</td><td>File system or application developers.</td></tr>
+      <tr><td>7 Who consumes it</td><td>The device (commands) and the application (placement records).</td></tr>
+      <tr><td>8 Where it lives</td><td>Host memory, host metadata zones, device zone state.</td></tr>
+      <tr><td>9 Memory/registers</td><td>Report buffers, data buffers, device open-zone buffers; no special registers.</td></tr>
+      <tr><td>10 Before</td><td>Identify (MOR, MAR, ZASL, ZSZE), a full report to build the model.</td></tr>
+      <tr><td>11 After</td><td>Continuous reconciliation with reports, events and completions.</td></tr>
+      <tr><td>12 If wrong</td><td>BCh after resets, BDh after days, lost data if Reset precedes durable metadata, silent throughput loss.</td></tr>
+      <tr><td>13 Analyzer</td><td>GC phases, 79h and 7Ah frequency, append DW0–DW1, retry patterns after resets.</td></tr>
+      <tr><td>14 Linux</td><td>sysfs zone limits, blkzone, nvme zns report-zones, zonefs, zoned file systems.</td></tr>
+      <tr><td>15 Validation</td><td>Long-run limit tests, reset with writes in flight, capacity changes, event handling.</td></tr>
+      <tr><td>16 Senior suspicion</td><td>Model drift: stale WP cache, leaked active zones, cached ZCAP, unread Changed Zone List.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>GC cost and capacity formulas</h3>
+  <div class="formula">
+    <p>WA<sub>host</sub> = 1 / (1 − u) ,   usable fraction = ZCAP / ZSZE</p>
+    <dl class="vars">
+      <dt>WA<sub>host</sub></dt><dd>host write amplification: blocks written to the device per block of new data, in steady state with greedy GC</dd>
+      <dt>u</dt><dd>live fraction of the victim zone when it is collected (0 to 1)</dd>
+      <dt>ZCAP</dt><dd>zone capacity in blocks, from the zone descriptor</dd>
+      <dt>ZSZE</dt><dd>zone size in blocks, from the LBA Format Extension</dd>
+    </dl>
+  </div>
+  <p>Worked example: with victims at u = 0.25, WA = 1.33 — every 3 blocks of new data cost 1 extra block of copying. At u = 0.75, WA = 4. Separating short-lived from long-lived data drives victims' u toward 0, which is the entire point of host placement. For the Lab SSD, ZCAP/ZSZE = 0xD800/0x1_0000 = 55,296/65,536 = 84.4%: LBA space is not capacity, and a host that sizes its allocator by ZSZE will try to write 10,240 non-writable blocks per zone.</p>
+
+  <h3>What a reset does to zones</h3>
+  <p>As <a href="ch59.html">Chapter 59</a> notes, zones in the opened states become Closed across a controller reset or power cycle. Writes that were in flight when the reset hit may or may not have been executed: the host saw no completion, but the device may have advanced the write pointer. So after any reset the host's WP cache is unreliable exactly for the zones it was writing — which is why recovery begins with a report, not with a retry <span class="badge derived">Derived</span>.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Zoned Namespace Command Set Specification, Revision 1.5 — Zoned Namespace model (zone states, zone capacity, write pointer, resource limits); Zone Management Send; Zone Management Receive; Zone Append; I/O Command Set specific Identify Namespace and Controller data structures; Changed Zone List log page; Zone Descriptor Changed asynchronous event</cite></li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Asynchronous Event Request; Get Log Page; Asynchronous Event Configuration; Controller Reset</cite></li>
+  </ul>
+  <aside class="callout verified">
+    <p><span class="badge normative">Normative</span> As recorded in <a href="ch59.html">Chapter 59</a> (values agreeing with libnvme): opcodes 79h, 7Ah, 7Dh; ZSA 1h–5h; report filter 5h = Full; ZS 1h Empty and 4h Closed; statuses B8h–BFh under SCT 1h. Zone capacity may vary between zones; writes must start at the write pointer; Close does not release an active resource.</p>
+  </aside>
+  <aside class="callout spec" data-title="Informative and optional">
+    <p><span class="badge informative">Informative</span> The specification's explanation of why ZNS exists and how hosts may use it. <span class="badge optional">Optional</span> Zone Descriptor Extensions, ZRWA, Read Across Zone Boundaries, the Zone Descriptor Changed event and its enable bit, FRL/RRL-driven attributes.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>Which implicitly opened zone the controller closes; how long Reset and Finish take; whether and how ZCAP shrinks; when Finish/Reset Recommended are set within FRL/RRL; the internal cost of an implicit close.</p>
+  </aside>
+  <aside class="callout version">
+    <p>ZRWA, extra report filters and zone attributes arrived after ZNS 1.0 <span class="badge version">Version-dependent</span>. Linux added max_active_zones and zone append support in stages; older kernels expose only some limits.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p>The specification does not say how to choose victims, how many streams to map to a zone, or how to recover host metadata. Check in the text: which status a write that exceeds remaining zone capacity (but not the zone size) returns; the Asynchronous Event Information value for Zone Descriptor Changed; the Feature 0Bh bit that enables it; the exact Changed Zone List layout and its overflow behaviour; what happens to the write pointer of an opened zone across a controller reset when writes were in flight.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume the host's WP cache is right after a reset, that ZCAP is constant, that Close frees an active resource, that an implicit close is free, or that Reset may precede durable metadata.</p>
+  </aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Hardware participation</caption>
+    <thead><tr><th>Category</th><th>Hardware</th></tr></thead>
+    <tbody>
+      <tr><td>Must participate</td><td>NAND erase blocks grouped into zone stripes; controller zone state table; write buffers for each open zone.</td></tr>
+      <tr><td>May participate</td><td>Power-loss capacitors sized for MOR+1 open zones; parity engines per open stripe; bad-block retirement shrinking ZCAP.</td></tr>
+      <tr><td>Observable</td><td>Zone states, WP, ZCAP, attributes in reports; latency of writes after implicit closes; Reset latency.</td></tr>
+      <tr><td>Internal</td><td>Which dies a zone spans, when erase happens, parity layout, why capacity changed.</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw" data-title="Why implicit closes cost time">
+    <p>An open zone owns a partially programmed stripe: data sitting in buffers, parity accumulating, perhaps a NAND page that needs multi-pass programming. Closing it means padding or flushing that state so it is safe without a buffer. Reopening it means rebuilding the context. When a host writes round-robin across more zones than MOR+1, every write may force a close and a reopen — no error, just lower throughput and higher latency <span class="badge impl">Implementation-dependent</span> in magnitude.</p>
+  </aside>
+  <aside class="callout hw" data-title="Why capacity shrinks">
+    <p>ZCAP usually covers whole erase-block stripes across dies. When a block in the stripe is retired, the device can either borrow a spare or offer a smaller zone after the next reset. A drive with few spares left will show shrinking capacities — a health signal that belongs next to the SMART spare counter of <a href="dd43.html">Module 43</a>.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>Commands in the GC and recovery paths</caption>
+    <thead><tr><th>Step</th><th>Command</th><th>Key fields</th><th>Completion carries</th><th>Typical errors</th></tr></thead>
+    <tbody>
+      <tr><td>Find victims</td><td>Zone Mgmt Receive 7Ah</td><td>SLBA, NUMD, ZRA 0h, ZRASF 5h, Partial</td><td>Status; descriptors by DMA</td><td>Invalid Field</td></tr>
+      <tr><td>Copy out</td><td>Read 02h</td><td>SLBA in victim, NLB</td><td>Status</td><td>Media errors (SCT 2h)</td></tr>
+      <tr><td>Copy in</td><td>Zone Append 7Dh</td><td>ZSLBA of GC zone, NLB ≤ ZASL</td><td>Assigned LBA in DW0–DW1</td><td>B9h Full, BDh, Invalid Field</td></tr>
+      <tr><td>Reclaim</td><td>Zone Mgmt Send 79h</td><td>SLBA = ZSLBA, ZSA 4h</td><td>Status</td><td>BFh Invalid Zone State Transition</td></tr>
+      <tr><td>Recover</td><td>Zone Mgmt Receive 7Ah</td><td>Filter 0h (all) or by state</td><td>Fresh WP and ZCAP</td><td>—</td></tr>
+      <tr><td>Events</td><td>AER 0Ch, Get Log Page (Changed Zone List)</td><td>RAE = 0 to re-arm</td><td>List of changed zones</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout proto" data-title="Ordering between GC and foreground writes">
+    <p>NVMe orders nothing between commands. A foreground WRITE to a zone must never be in flight while GC appends to the same zone with WRITE semantics; GC zones should receive appends only, and foreground zones only one writer at a time. Reset Zone issued while a read of the victim is still in flight is a host bug that may return deallocated data rather than an error <span class="badge derived">Derived</span>.</p>
+  </aside>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic examples for teaching on the reference system: Lab SSD Requester ID 0x0100; host MMIO as Req=RC; SQ1/CQ1 at IOVA 0x1_2340_0000 / 0x1_2341_0000, SQ1 tail doorbell BAR0+0x1008 = 0xFE60_1008; MSI-X vector 1 at 0xFEE0_1000 data 0x41; data buffers from 0x2_0000_0000; namespace 2 zoned as in the Mechanism section. Timings illustrative. Rows are summarised at command level where the TLP pattern is the same as <a href="ch59.html#trace">Chapter 59's traces</a>.</p>
+
+  <h3>Trace 1 — normal: one GC cycle</h3>
+  <div class="trace" data-kind="synthetic" data-title="Host GC: report Full zones, copy 25% live data, reset victim">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Data=0x0000_0021</td><td>SQ1 tail: Zone Mgmt Receive</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.8 µs</td><td>MRd64</td><td>Req=0x0100 Addr=0x1_2340_0800 Len=16</td><td>SQE: opc=7Ah NSID=2 SLBA=0 NUMD=0x3FF CDW13=0x0001_0500 (ZRA 0h, filter 5h Full, Partial=1)</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>14 µs</td><td>MWr64 ×16 + CQE</td><td>Addr=0x2_0000_8000</td><td>Report: zones 0, 9, 17 Full; host map says zone 9 is 25% live</td></tr>
+        <tr class="note"><td colspan="6">GC reads 0x3600 live blocks (54 MiB) from zone 9 as 432 READs of 32 blocks (MDTS 128 KiB) and rewrites them as 1,728 appends of 8 blocks (ZASL 32 KiB).</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>2 ms–180 ms</td><td>SQEs</td><td>opc=02h SLBA in 0x9_0000–0x9_D7FF; then opc=7Dh CDW10–11=0x28_0000 CDW12=0x0007 (8 blocks)</td><td>Reads of victim, appends to GC zone 40 (ZSLBA 0x28_0000)</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>~190 µs each</td><td>MWr64</td><td>CQE DW0=0x0028_0000, 0x0028_0008, 0x0028_0010 …</td><td>Assigned LBAs recorded in the host map</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>182 ms</td><td>SQEs</td><td>Write to metadata zone, then Flush (opc=00h)</td><td>New locations durable</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>184 ms</td><td>SQE</td><td>opc=79h SLBA=0x9_0000 CDW13=0x0000_0004</td><td>Reset Zone 9</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>184.3 ms</td><td>MWr64</td><td>CQE Status=0</td><td>Zone 9 Empty, WP=0x9_0000</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Correct ordering: copies (row 4–5), durable metadata (row 6), then Reset (row 7). The cost is 54 MiB of reads and writes to reclaim 216 MiB, WA = 1/(1−0.25) = 1.33. GC I/O sizes are bounded by MDTS (128 KiB on the Lab SSD) and appends additionally by ZASL (32 KiB in this example); a GC that ignores ZASL gets Invalid Field on its appends. The host should read zone 9's ZCAP from its next report rather than assume 0xD800.</p>
+  </div>
+
+  <h3>Trace 2 — slow: implicit-close thrash</h3>
+  <div class="trace" data-kind="synthetic" data-title="14 writers round-robin across 14 zones with 12 open resources">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">MOR = 11 (12 open), MAR = 13 (14 active). The application has 14 log streams, one zone each (zones 20–33), and writes 64 KiB to each in turn.</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>SQE</td><td>WRITE zone 20 at WP, 16 blocks</td><td>Zone 20 open: completes in 24 µs</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>…</td><td>SQEs</td><td>WRITE zones 21–31</td><td>12 zones now open; 24 µs each</td></tr>
+        <tr class="abnormal"><td>3</td><td>Host→Dev</td><td>0.4 ms</td><td>SQE</td><td>WRITE zone 32 (Closed)</td><td>Needs an open resource: controller implicitly closes zone 20; completes in 410 µs</td></tr>
+        <tr class="abnormal"><td>4</td><td>Host→Dev</td><td>0.8 ms</td><td>SQE</td><td>WRITE zone 33 (Closed)</td><td>Closes zone 21; 395 µs</td></tr>
+        <tr class="abnormal"><td>5</td><td>Host→Dev</td><td>1.2 ms</td><td>SQE</td><td>WRITE zone 20 (now Closed)</td><td>Closes zone 22; 402 µs — and so on, every write</td></tr>
+        <tr class="note"><td colspan="6">No error status anywhere. Throughput falls from ~2.6 GB/s to ~0.16 GB/s; a report at any moment shows two zones Closed and twelve Implicitly Opened, a different pair each time.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> With least-recently-used closing and round-robin access, the zone written next is always the one just closed: the worst case for any cache. The first abnormal event is row 3 — the first write whose latency jumps — and its cause is resource pressure, not media. Evidence: latency correlated with "zone was Closed before the write" in successive reports; zero errors. Fixes: map 14 streams onto at most 12 zones (merge streams of similar lifetime), or explicitly open the hottest 12 and serialise the rest. Which zone the controller closes is implementation-dependent; another device may degrade differently but will still pay for closes.</p>
+  </div>
+
+  <h3>Trace 3 — failed: retry after reset with a stale write pointer</h3>
+  <div class="trace" data-kind="synthetic" data-title="Write in flight at a controller reset, retried at the cached WP">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>SQE</td><td>WRITE CID=0x0150 NSID=2 SLBA=0x5_2000 NLB=0xFF (256 blocks)</td><td>Host WP cache for zone 5: 0x5_2000</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>2 µs–1.1 ms</td><td>MRd64 ×…</td><td>Addr=0x2_0040_0000…</td><td>Data fetched; device executes the write; WP → 0x5_2100</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.2 ms</td><td>MWr32</td><td>Req=RC Addr=0xFE60_0014 Data=0x0046_0060</td><td>Timeout handler on another command: CC.EN = 0 (controller reset)</td></tr>
+        <tr class="note"><td colspan="6">The CQE for CID 0x0150 was never posted. Reset completes, queues are recreated as in Module 41. Zone 5 transitions from Implicitly Opened to Closed.</td></tr>
+        <tr class="abnormal"><td>4</td><td>Host→Dev</td><td>1.9 s</td><td>SQE</td><td>Requeued WRITE SLBA=0x5_2000 NLB=0xFF</td><td>First abnormal event: retry at the cached WP without a report</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1.9 s</td><td>MWr64</td><td>CQE DW3 status SCT=1h SC=BCh</td><td>Zone Invalid Write: device WP is 0x5_2100</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>1.9 s</td><td>SQE</td><td>Zone Mgmt Receive for zone 5</td><td>Report: ZS=4h (Closed), WP=0x5_2100</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The device executed the write before the reset; only the completion was lost. The host requeued the command from its unacknowledged list — the right thing for a block device, the wrong thing for a zone. The correct recovery: after any reset, report every zone the host was writing; if WP moved past the in-flight range, treat the write as done (verify by reading back if the data matters); if WP did not move, resubmit at the new WP. Zone Append avoids part of the problem — a requeued append never fails with BCh — but creates the opposite one: the data may now be written twice, and only the host's metadata knows which copy is current. Regression test: inject a reset with writes in flight and assert that no retry precedes a report.</p>
+  </div>
+
+  <h3>Trace 4 — ambiguous: shrinking capacity and a zone event</h3>
+  <div class="trace" data-kind="synthetic" data-title="ZCAP drops after reset; Zone Descriptor Changed event; a write fails near the end">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>day 300</td><td>Report after Reset of zone 9</td><td>ZS=1h ZSLBA=0x9_0000 ZCAP=0xC000</td><td>Capacity 0xC000 (192 MiB), was 0xD800</td></tr>
+        <tr class="abnormal"><td>2</td><td>Host→Dev</td><td>day 302</td><td>SQE</td><td>WRITE SLBA=0x9_BF00 NLB=0x1FF (512 blocks)</td><td>Host allocator still uses 0xD800; range ends at 0x9_C0FF</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>day 302</td><td>CQE</td><td>Status SCT=1h SC=B9h</td><td>Zone Is Full in this synthetic device; confirm the required status in ZNS 1.5</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>day 302</td><td>CQE (AER)</td><td>Type 2h Notice, info = Zone Descriptor Changed, LID = Changed Zone List</td><td>Device signals attribute changes</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>day 302</td><td>SQE</td><td>Get Log Page Changed Zone List (libnvme BFh), NSID=2, RAE=0</td><td>Zones 3, 17, 40 listed</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>day 302</td><td>Report</td><td>Zones 3, 17, 40: ZA bit 1 Finish Zone Recommended</td><td>Device asks the host to finish them</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Two facts are certain: the host ignored ZCAP from the report (row 2 is a host bug whatever the status), and the device asked for three zones to be finished. The ambiguity is what the device is telling you. Story A: normal ageing — FRL expired for zones that stayed open too long (open data retention), and capacity variation is routine for this model. Story B: the drive is running out of spare blocks — shrinking capacity and early finish requests are how it protects data. Disambiguating evidence: SMART Available Spare and Percentage Used trends (<a href="dd43.html">Module 43</a>), the count of zones with reduced ZCAP over time, any Read Only zones (ZS Dh), how long zones 3, 17 and 40 had been open compared with FRL from Identify. A rising number of shrunken zones plus falling spare supports B; a single shrink with long-open zones supports A. Confidence is low until the trend is plotted.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Limits as the kernel sees them (0 means "no limit reported")</span>
+cat /sys/block/nvme0n2/queue/{zoned,chunk_sectors,nr_zones,max_open_zones,max_active_zones,zone_append_max_bytes}
+<span class="cm"># Device view: 0's based MOR/MAR, FRL/RRL, ZASL</span>
+sudo nvme zns id-ns /dev/nvme0n2 -H | grep -i -E 'mar|mor|frl|rrl|ozcs'
+sudo nvme zns id-ctrl /dev/nvme0
+<span class="cm"># Count zones by state and find shrunken capacities</span>
+sudo blkzone report /dev/nvme0n2 | awk '{print $NF}' | sort | uniq -c
+sudo nvme zns report-zones /dev/nvme0n2 -o json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(sorted({z.get("cap") for z in d.get("zone_list", [])}))'
+<span class="cm"># Kernel messages about zone errors and resets</span>
+sudo dmesg | grep -i -E 'nvme0n2|zone|reset'</code></pre>
+  <table>
+    <caption>What each output proves</caption>
+    <thead><tr><th>Output</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>State histogram from blkzone</td><td>How many zones are active now</td><td>Which host component leaked them</td></tr>
+      <tr><td>Distinct capacities</td><td>That ZCAP varies across zones</td><td>Whether it is wear or design</td></tr>
+      <tr><td>max_active_zones = 0</td><td>The kernel has no limit recorded</td><td>That the device has none</td></tr>
+      <tr><td>dmesg zone errors</td><td>Which statuses were returned</td><td>Whether a retry was the cause</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout linux">
+    <p>The JSON field names of nvme-cli's zone report differ between versions <span class="badge version">Version-dependent</span>; adapt the one-liner. The kernel's zoned block layer serialises regular writes per zone (one in flight), and zone-aware file systems manage their own GC and recovery — the patterns in this module apply to them and to any user-space allocator.</p>
+  </aside>
+  <aside class="callout safety">
+    <p><span class="badge safe">Safe lab</span> Reports and sysfs reads. <span class="badge caution">Caution lab</span> Any write, append, finish, reset or controller reset — only on an emulated or scratch zoned namespace.</p>
+  </aside>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+
+  <h3>Beginner lab — zone arithmetic for a host allocator</h3>
+  <p><span class="badge safe">Safe lab</span> Paper. <strong>Objective:</strong> derive the numbers an allocator needs. <strong>Prerequisites:</strong> <a href="ch59.html">Chapter 59</a>. <strong>Setup:</strong> Lab SSD namespace 2: 4 KiB LBAs, ZSZE 0x1_0000, ZCAP 0xD800, 1,024 zones, MOR 11, MAR 13, ZASL 3 (with MPSMIN 4 KiB), MDTS 128 KiB.</p>
+  <p><strong>Procedure:</strong> compute (a) usable capacity in GiB; (b) zone and last writable LBA for LBA 0x2A_7F00; (c) open and active zone limits; (d) maximum append size; (e) the report buffer for all zones with Partial = 1. <strong>Observations:</strong> which numbers differ from the "obvious" ones. <strong>Questions:</strong> what goes wrong if the allocator uses ZSZE? If it treats MOR as 1's based? <strong>Expected reasoning:</strong> careful units and 0's-based fields.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(a) 1,024 × 55,296 × 4 KiB = 216 GiB (LBA space is 256 GiB). (b) 0x2A_7F00 / 0x1_0000 = zone 0x2A (42); last writable LBA 0x2A_D7FF; 0x2A_7F00 is writable. (c) 12 open, 14 active. (d) ZASL 3 → 2<sup>3</sup> × 4 KiB = 32 KiB, smaller than MDTS (confirm ZASL units in ZNS 1.5). (e) 64 + 1,024 × 64 = 65,600 bytes, which fits in one 128 KiB transfer; larger namespaces need a loop. Using ZSZE tries to write 10,240 non-writable blocks per zone. Reading MOR as 1's based plans for one zone fewer than allowed, which is harmless; the dangerous error is the opposite (adding 2 instead of 1), which ends in BDh.</p>
+  </details>
+  <p><strong>Extension:</strong> compute WA at victim live fractions 0.1, 0.5 and 0.9, and the GC read bandwidth needed to sustain 1 GB/s of new writes at u = 0.5.</p>
+
+  <h3>Intermediate lab — controller reset with zones open</h3>
+  <p><span class="badge caution">Caution lab</span> QEMU VM with an emulated zoned namespace, as in <a href="ch59.html#lab">Chapter 59's lab</a> (options such as <code>zoned.max_open=4,zoned.max_active=6</code>; names version-dependent). <strong>Objective:</strong> see what a reset does to zone states and write pointers. <strong>Setup:</strong> guest with nvme-cli and blkzone; scratch image only.</p>
+  <p><strong>Procedure:</strong></p>
+  <ol>
+    <li>Write 64 KiB to zones 0, 1 and 2 with <code>nvme write</code> at each zone's WP; explicitly open zone 3 with <code>nvme zns open-zone</code>.</li>
+    <li>Report zones 0–4; note states and WPs.</li>
+    <li>Reset the controller: <code>nvme reset /dev/nvme0</code>.</li>
+    <li>Report again; compare states and WPs.</li>
+    <li>Repeat step 1's write to zone 0 at the <em>old</em> WP; observe the status.</li>
+  </ol>
+  <p><strong>Observations:</strong> state changes across the reset; whether WPs moved. <strong>Questions:</strong> which zones changed state? Did explicitly opened zone 3 behave differently? What status did step 5 return, and why? <strong>Expected reasoning:</strong> opened zones become Closed; completed writes keep their WP; a write at a stale WP is invalid.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>Zones 0–2 (Implicitly Opened) and zone 3 (Explicitly Opened) report Closed after the reset (QEMU's emulation follows the specification here in recent versions; confirm on yours), with WPs unchanged because their writes completed. Step 5 writes at the old WP, which is now below the device's WP: SCT 1h / SC BCh Zone Invalid Write. In this lab no writes were in flight, so the WP is predictable; the dangerous case (Trace 3) is a reset with writes in flight, which you can approximate by issuing a large write in the background and resetting immediately.</p>
+  </details>
+  <p><strong>Extension:</strong> fill five zones to make them active and reset; check that Closed zones still count against max_active and that a write to a seventh zone still fails with BDh.</p>
+
+  <h3>Advanced lab — allocation policy versus active-zone leaks</h3>
+  <p><span class="badge safe">Safe lab</span> Simulation. <strong>Objective:</strong> quantify how stream count and the "end of stream" policy affect resource exhaustion and wasted capacity. <strong>Setup:</strong> save as zone_alloc_sim.py.</p>
+  <pre class="code" data-kind="simulation" data-lang="python" data-title="zone_alloc_sim.py">#!/usr/bin/env python3
+"""Simulation for learning: host zone allocation against open/active limits.
+
+Synthetic model of namespace 2 of the course Lab SSD (ZNS):
+ZCAP = 0xD800 blocks per zone, MOR = 11 (12 open), MAR = 13 (14 active),
+both 0's based as Identify reports them. The controller here implicitly
+closes the least recently written implicitly opened zone when it needs an
+open resource (one simple choice; real controllers choose for themselves).
+"""
+import random
+
+ZCAP = 0xD800          # writable blocks per zone
+MOR, MAR = 11, 13      # 0's based limits from Identify
+NZONES = 512
+
+class Device:
+    def __init__(self):
+        self.state = ["E"] * NZONES      # E, IO (impl. open), C, F
+        self.wp = [0] * NZONES
+        self.last = [0] * NZONES
+        self.implicit_closes = 0
+        self.clock = 0
+        self.wasted = 0          # blocks skipped by Finish
+
+    def count(self, *states):
+        return sum(1 for s in self.state if s in states)
+
+    def write(self, z, nblocks):
+        """Write at the write pointer. Returns status name."""
+        self.clock += 1
+        s = self.state[z]
+        if s == "F":
+            return "ZONE_IS_FULL"
+        if s == "E" and self.count("IO", "C") &gt;= MAR + 1:
+            return "TOO_MANY_ACTIVE_ZONES"
+        if s in ("E", "C") and self.count("IO") &gt;= MOR + 1:
+            # need an open resource: implicitly close the LRU open zone
+            lru = min((i for i, x in enumerate(self.state) if x == "IO"),
+                      key=lambda i: self.last[i])
+            self.state[lru] = "C"
+            self.implicit_closes += 1
+        n = min(nblocks, ZCAP - self.wp[z])
+        self.wp[z] += n
+        self.state[z] = "F" if self.wp[z] == ZCAP else "IO"
+        self.last[z] = self.clock
+        return "OK"
+
+    def finish(self, z):
+        if self.state[z] in ("IO", "C", "E"):
+            self.wasted += ZCAP - self.wp[z]
+            self.state[z] = "F"
+
+    def reset(self, z):
+        self.state[z], self.wp[z] = "E", 0
+
+
+def run(policy, streams, days=30, seed=7):
+    """policy: 'leaky' leaves a stream's partial zone active when the stream
+    ends; 'finish' finishes it; 'share' lets a new stream reuse it."""
+    rnd = random.Random(seed)
+    dev = Device()
+    zone_of = {}            # stream -&gt; current zone
+    free = list(range(NZONES))
+    orphans = []            # partial zones whose stream ended
+    for day in range(1, days + 1):
+        for tick in range(200):
+            sid = rnd.randrange(streams)
+            if sid not in zone_of:
+                if policy == "share" and orphans:
+                    zone_of[sid] = orphans.pop()
+                else:
+                    zone_of[sid] = free.pop(0)
+            z = zone_of[sid]
+            st = dev.write(z, rnd.randint(64, 2048))
+            if st != "OK" and st != "ZONE_IS_FULL":
+                return day, st, dev
+            if dev.state[z] == "F":
+                del zone_of[sid]
+            # a stream occasionally ends (file closed, compaction done)
+            if rnd.random() &lt; 0.004 and sid in zone_of:
+                z = zone_of.pop(sid)
+                if policy == "finish":
+                    dev.finish(z)
+                elif policy == "share":
+                    orphans.append(z)
+                # leaky: nothing; the zone stays active forever
+        # host GC: reset full zones whose data is dead (simplified: oldest half)
+        full = [i for i, s in enumerate(dev.state) if s == "F"]
+        for z in full[: len(full) // 2]:
+            dev.reset(z)
+            free.append(z)
+    return None, "OK", dev
+
+
+if __name__ == "__main__":
+    for streams in (8, 12, 16):
+        for policy in ("leaky", "finish", "share"):
+            day, st, dev = run(policy, streams)
+            when = f"failed day {day} with {st}" if day else "30 days clean"
+            print(f"streams={streams:2d} {policy:6s}: {when:42s} "
+                  f"active={dev.count('IO', 'C'):2d} "
+                  f"implicit_closes={dev.implicit_closes:2d} "
+                  f"finished_unwritten={dev.wasted * 4 // 1024} MiB")
+</pre>
+  <p><strong>Procedure:</strong> run it; change the stream-end probability from 0.004 to 0.001 and 0.02; give "finish" a rule that finishes only zones more than 90% full and shares the rest. <strong>Questions:</strong> why does "leaky" fail sooner with more streams? Why does every policy fail at 16 streams? What does "finish" cost? <strong>Expected reasoning:</strong> active zones are a budget; leaks consume it; Finish trades capacity for budget.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>Output: with 8 streams, leaky fails on day 8 with Too Many Active Zones, finish and share run 30 days clean; with 12 streams leaky fails on day 2; at 16 streams every policy fails on day 1 because 16 concurrent streams need 16 active zones and only 14 exist — no end-of-stream policy fixes an over-subscribed design. Finish costs capacity: about 3.3 GiB of finished-but-unwritten space over 30 days at 8 streams, which is lost until GC resets those zones. Share wastes nothing but mixes lifetimes in a zone, raising future GC cost. Implicit closes appear whenever more than 12 zones are written concurrently.</p>
+  </details>
+  <p><strong>Extension:</strong> add a GC model that tracks live fraction per zone and compare host WA for "share" versus "finish".</p>
+
+  <h3>Senior forensic lab — Too Many Active Zones after nine days</h3>
+  <p><span class="badge safe">Safe lab</span> Paper forensic. <strong>Objective:</strong> find a leak from evidence, not code. <strong>Prerequisites:</strong> all labs above; <a href="me-forensics.html">Root Cause, Ambiguity and Forensic Reporting</a>.</p>
+  <p><strong>Setup:</strong> an object store on Lab SSDs (MAR 13) starts failing writes with SCT 1h / SC BDh nine days after deployment. Evidence: (1) daily zone-state histograms: active zones 4, 5, 6, 7, 8, 9, 11, 12, 14 on days 1–9; (2) the store's logs: 3–5 "compaction aborted" events per day, on lock timeout; (3) the store's code review notes: compaction writes to a dedicated zone, and on success it finishes that zone; (4) no controller resets; (5) SMART normal; (6) a sister cluster running the same build with compaction disabled shows a steady 4 active zones.</p>
+  <p><strong>Procedure:</strong> build a timeline; estimate leak rate; propose root cause, confirming experiment and fix. <strong>Questions:</strong> which evidence rules out the device? What leaks? Why did the store not see Too Many Open Zones first? What is the correct immediate mitigation? <strong>Expected reasoning:</strong> a monotonic active count with abort events and a control group points to an error path.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>Active zones rise about one per day, close to the number of compaction aborts that left a partially written zone (not every abort had written data yet). The sister cluster with compaction disabled is the control: no growth. The device is behaving correctly (BDh only at 14 active, no resets, normal SMART). Root cause, high confidence: the abort path abandons its compaction zone without Finish or Reset, so each abort leaks one active resource. Open-resource pressure never surfaced because the controller implicitly closes abandoned zones — they move to Closed, which still counts as active. Confirming experiment: force an abort in staging and watch the active count rise by one. Mitigation: Finish (or Reset, if the data is not referenced) every Closed zone that no live stream owns; fix: release the zone in the abort path and add an invariant check comparing the host's active set with a daily report.</p>
+  </details>
+  <p><strong>Extension:</strong> write the invariant check as pseudocode that runs after every reset and once a day.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <table>
+    <caption>Pattern 1 — intermittent Zone Invalid Write after errors or resets</caption>
+    <tbody>
+      <tr><td>Symptom</td><td>BCh appears only after timeouts, resets or path failover.</td></tr>
+      <tr><td>Possible causes</td><td>Requeued writes at a stale cached WP; two paths writing one zone; WP cache updated at submission.</td></tr>
+      <tr><td>Evidence</td><td>Reset and requeue events in dmesg; report WP versus the failing SLBA.</td></tr>
+      <tr><td>First check</td><td>Was there a report between the reset and the retry?</td></tr>
+      <tr><td>Second check</td><td>Device WP minus failing SLBA equals the in-flight length?</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Inject a reset with one large write in flight in a VM.</td></tr>
+      <tr><td>Likely conclusion / confidence</td><td>Stale host WP — high when the difference equals the in-flight write.</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>Pattern 2 — Too Many Active Zones after days</caption>
+    <tbody>
+      <tr><td>Symptom</td><td>BDh after long uptime; restart of the application "fixes" it only if it finishes zones on startup.</td></tr>
+      <tr><td>Possible causes</td><td>Error paths abandoning zones; Close used to release resources; stream count above MAR+1.</td></tr>
+      <tr><td>Evidence</td><td>Daily state histograms; application error-path events.</td></tr>
+      <tr><td>First check</td><td>Count Closed zones that no host component owns.</td></tr>
+      <tr><td>Second check</td><td>Correlate growth with specific application events.</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Trigger the suspect path in staging; watch the count.</td></tr>
+      <tr><td>Likely conclusion / confidence</td><td>Host leak — high when the count is monotonic and a control group is flat.</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>Pattern 3 — throughput collapse with no errors</caption>
+    <tbody>
+      <tr><td>Symptom</td><td>Write latency rises tenfold; no error statuses.</td></tr>
+      <tr><td>Possible causes</td><td>Implicit-close thrash; GC competing with foreground; device-internal erase backlog after mass resets.</td></tr>
+      <tr><td>Evidence</td><td>Number of distinct zones written per second versus MOR+1; GC activity; reset rate.</td></tr>
+      <tr><td>First check</td><td>Successive reports: do Closed zones rotate?</td></tr>
+      <tr><td>Second check</td><td>Latency of writes to previously Closed zones versus open ones.</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Reduce concurrent zones to MOR+1 and re-measure.</td></tr>
+      <tr><td>Likely conclusion / confidence</td><td>Open-resource thrash — high if latency recovers.</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>Pattern 4 — data read from the wrong place after appends</caption>
+    <tbody>
+      <tr><td>Symptom</td><td>Records come back out of order or swapped, no I/O errors.</td></tr>
+      <tr><td>Possible causes</td><td>Host recorded LBAs by submission order instead of from CQE DW0–DW1; driver path discards DW0–DW1; requeued append written twice.</td></tr>
+      <tr><td>Evidence</td><td>CQE DW0–DW1 in a trace compared with the host's map.</td></tr>
+      <tr><td>First check</td><td>Does the map match completion LBAs?</td></tr>
+      <tr><td>Second check</td><td>Any appends requeued after resets?</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Run appends at queue depth 1; if the bug disappears, the ordering assumption is wrong.</td></tr>
+      <tr><td>Likely conclusion / confidence</td><td>Host mapping bug — high.</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>Pattern 5 — writes fail near the end of some zones</caption>
+    <tbody>
+      <tr><td>Symptom</td><td>Zone Is Full or boundary errors on a few zones, older drives more often.</td></tr>
+      <tr><td>Possible causes</td><td>Allocator caches ZCAP or uses ZSZE; capacity shrank on reset.</td></tr>
+      <tr><td>Evidence</td><td>Distinct ZCAP values in reports; host capacity table.</td></tr>
+      <tr><td>First check</td><td>ZCAP of the failing zone now versus host's value.</td></tr>
+      <tr><td>Second check</td><td>Number of reduced-capacity zones over time; SMART spare.</td></tr>
+      <tr><td>Disambiguating experiment</td><td>Re-read ZCAP after each reset in a long test.</td></tr>
+      <tr><td>Likely conclusion / confidence</td><td>Host ignores ZCAP — high; whether wear is behind it — medium, from trends.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>Who does garbage collection on a ZNS drive?</p><details class="answer"><summary>Model answer</summary><p>The host: it copies live data out of zones and resets them.</p></details></li>
+    <li><p>Why is ZCAP not equal to ZSZE?</p><details class="answer"><summary>Model answer</summary><p>Zone size is a power-of-two LBA span; capacity matches whole erase stripes and can be smaller.</p></details></li>
+    <li><p>Does Close Zone free an active resource?</p><details class="answer"><summary>Model answer</summary><p>No. Only Finish or Reset does.</p></details></li>
+    <li><p>Where does Zone Append report the LBA written?</p><details class="answer"><summary>Model answer</summary><p>Completion Dwords 0–1.</p></details></li>
+    <li><p>What must the host do after a controller reset?</p><details class="answer"><summary>Model answer</summary><p>Report the zones it was writing and rebuild its write-pointer cache before writing.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>Give the GC cost formula.</p><details class="answer"><summary>Model answer</summary><p>WA = 1/(1−u), with u the victim's live fraction.</p></details></li>
+    <li><p>Why must metadata be durable before Reset Zone?</p><details class="answer"><summary>Model answer</summary><p>After Reset the old copy is gone; a crash before the new mapping is durable loses the data.</p></details></li>
+    <li><p>What is an implicit close and why does it cost time?</p><details class="answer"><summary>Model answer</summary><p>The controller closes an implicitly opened zone to free an open resource, flushing that zone's buffers and parity.</p></details></li>
+    <li><p>How do you find Full zones efficiently?</p><details class="answer"><summary>Model answer</summary><p>Zone Management Receive with the Full filter (5h), paging with Partial = 1.</p></details></li>
+    <li><p>Why can a requeued append be worse than a requeued write?</p><details class="answer"><summary>Model answer</summary><p>It silently succeeds and duplicates data; only host metadata can tell which copy is valid.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>A write fails with BCh right after a reset. What do you compare?</p><details class="answer"><summary>Model answer</summary><p>The device WP from a report with the failing SLBA; a difference equal to an in-flight write proves it executed.</p></details></li>
+    <li><p>How do you handle a Zone Descriptor Changed event?</p><details class="answer"><summary>Model answer</summary><p>Read the Changed Zone List with RAE = 0, report the listed zones, act on Finish/Reset Recommended and capacity changes.</p></details></li>
+    <li><p>Fourteen streams, twelve open resources: what happens?</p><details class="answer"><summary>Model answer</summary><p>No errors, but implicit-close thrash; merge streams or explicitly manage open zones.</p></details></li>
+    <li><p>Why might ZCAP shrink over a drive's life?</p><details class="answer"><summary>Model answer</summary><p>Retired erase blocks in the zone's stripe without spares to replace them.</p></details></li>
+    <li><p>What invariant should a host check daily?</p><details class="answer"><summary>Model answer</summary><p>Device active zones equal the host's owned active set; any surplus is a leak.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>Design stream-to-zone mapping for a key-value store.</p><details class="answer"><summary>Model answer</summary><p>Group data by expected lifetime (per compaction level), keep concurrent zones under MOR+1, reserve active budget for GC and metadata, and use appends for parallel writers.</p></details></li>
+    <li><p>When would you choose Finish over sharing a partial zone?</p><details class="answer"><summary>Model answer</summary><p>When active budget is scarce or the partial zone's lifetime differs from the next stream's; accept lost capacity until GC.</p></details></li>
+    <li><p>How would you validate reset recovery?</p><details class="answer"><summary>Model answer</summary><p>Fault-inject resets and power loss with writes and appends in flight; assert no write before a report and no duplicate or lost records.</p></details></li>
+    <li><p>What would make you suspect the device rather than the host in a ZNS incident?</p><details class="answer"><summary>Model answer</summary><p>A status that contradicts a fresh report (BCh at the reported WP, BDh below MAR+1 active) reproduced with a minimal host.</p></details></li>
+    <li><p>How does ZNS change drive-health monitoring?</p><details class="answer"><summary>Model answer</summary><p>Add zone-level signals — shrinking capacities, Read Only or Offline zones, recommendation rates — beside SMART spare and wear.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>Victim zones average 40% live data. Host WA is about…</p>
+      <ul class="options" data-answer="2"><li>1.4</li><li>1.67</li><li>2.5</li><li>0.6</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>1/(1−0.4) = 1.67.</p></details></li>
+    <li><p>MAR = 13. How many zones may be Closed plus Opened at once?</p>
+      <ul class="options" data-answer="3"><li>12</li><li>13</li><li>14</li><li>15</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>0's based: MAR + 1 = 14.</p></details></li>
+    <li><p>In Trace 3, what is the first abnormal event?</p>
+      <ul class="options" data-answer="2"><li>The controller reset</li><li>The retry without a report</li><li>The BCh completion</li><li>The report</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The reset is legitimate recovery; the retry at a stale WP is the host error that BCh reports.</p></details></li>
+    <li><p>Which action releases an active resource while keeping data readable?</p>
+      <ul class="options" data-answer="3"><li>Close Zone</li><li>Open Zone</li><li>Finish Zone</li><li>Reset Zone</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Finish moves to Full; Reset discards data.</p></details></li>
+    <li><p>Report filter value for Full zones in Zone Management Receive?</p>
+      <ul class="options" data-answer="4"><li>1h</li><li>2h</li><li>4h</li><li>5h</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>5h Full, per Chapter 59's table.</p></details></li>
+    <li><p>Why did Trace 2 show no errors?</p>
+      <details class="answer"><summary>Model answer</summary><p>Open-resource pressure is handled by implicit closes; only active-resource pressure returns an error.</p></details></li>
+    <li><p>Name two explanations for a shrinking ZCAP and one piece of evidence for each.</p>
+      <details class="answer"><summary>Model answer</summary><p>Wear (falling SMART spare, growing count of shrunken zones); design variation (stable distribution of capacities from day one).</p></details></li>
+    <li><p>What must happen between GC copies and Reset Zone?</p>
+      <details class="answer"><summary>Model answer</summary><p>The new mapping must be made durable (metadata write and Flush).</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <ol>
+    <li><p><strong>To a child:</strong> why must the teacher look in the notebooks after the lights go out?</p>
+      <details class="answer"><summary>Model explanation</summary><p>"Some children finished a page in the dark. The list does not know, so the teacher checks each open notebook before anyone draws again."</p></details></li>
+    <li><p><strong>To a junior engineer:</strong> how does host GC work on ZNS?</p>
+      <details class="answer"><summary>Model explanation</summary><p>"Pick a Full zone with little live data, copy the live data into a GC zone with appends, save the new locations durably, then reset the old zone and read its new capacity from a report."</p></details></li>
+    <li><p><strong>To a senior engineer:</strong> what are the system risks of host-managed zones?</p>
+      <details class="answer"><summary>Model explanation</summary><p>"Drift between the host's model and the device: stale write pointers after resets, leaked active zones in error paths, cached capacities, ignored recommendations. Each is silent until it fails, so build reconciliation into the design — reports after every reset and event, daily invariant checks — and size stream counts to the open and active limits."</p></details></li>
+  </ol>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain host GC, reset recovery, implicit-close cost and capacity change</li>
+      <li>diagram the GC cycle with its ordering constraint</li>
+      <li>identify GC phases, stale-WP retries and zone events in a trace</li>
+      <li>debug the five patterns above with their disambiguating experiments</li>
+      <li>distinguish ZNS from conventional block namespaces (<a href="ch31.html">NVM Command Set</a>), Zone Append from WRITE (<a href="ch59.html">Chapter 59</a>), and zone-level health from SMART (<a href="dd43.html">Module 43</a>)</li>
+      <li>cite the Zoned Namespace Command Set 1.5 (Zone Management Send/Receive, Zone Append, Changed Zone List) and NVMe Base 2.4 (Asynchronous Event Request)</li>
+    </ul>
+  </aside>
+  <p>Next: <a href="dd45.html">Module 45 — Key Value</a>.</p>
+</section>

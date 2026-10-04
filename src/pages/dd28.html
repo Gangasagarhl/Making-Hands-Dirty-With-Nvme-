@@ -1,0 +1,648 @@
+<p class="lead">Chapter 29 taught you to read the 64-byte command and the 16-byte completion field by field. This module treats them as a contract with rules about ordering of checks, pairing, identity and retry — and teaches you to settle "was it the driver or the firmware?" arguments using the bytes themselves as witnesses.</p>
+
+<section id="orientation">
+<h2>Orientation</h2>
+<p>Knowing where every field lives is the entry ticket. Senior work starts with questions the layout alone does not answer. In what order does a controller validate the fields, and why does that make the returned status implementation-dependent when several fields are wrong? What exactly are the rules for fused commands? How do Command Identifiers (CIDs) behave over time, across aborts and timeouts? What do Do Not Retry (DNR), More (M) and Command Retry Delay (CRD) oblige the host to do? And how does a Submission Queue Entry (SQE) look when a PCI Express (PCIe) completer splits it across several completions? This module answers those, using the reference lab system and four new traces.</p>
+<aside class="callout prereq">
+<p>You need the SQE and Completion Queue Entry (CQE) layouts, the Status Field sub-fields and the (SQID, CID) key from <a href="ch29.html">Chapter 29 — NVMe Command Structure</a>. Doorbells are in <a href="ch28.html">Chapter 28</a>; completion splitting at the Read Completion Boundary in <a href="ch13.html">Chapter 13</a> and <a href="dd12.html">Module 12 — PCIe Completions</a>.</p>
+</aside>
+<p>Where it goes next: <a href="dd29.html">Module 29 — NVM Command Set</a> fills in CDW10–15 for every I/O command, and <a href="dd39.html">Module 39 — NVMe Errors</a> takes the Status Field into full error handling.</p>
+</section>
+
+<section id="objectives">
+<h2>Required learning objectives</h2>
+<table>
+<caption>Objectives for this module, by level</caption>
+<thead><tr><th>Level</th><th>You will be able to…</th></tr></thead>
+<tbody>
+<tr><td>Beginner</td><td>Name the fields every command shares and explain why a fixed 64-byte layout makes decoding unknown commands possible.</td></tr>
+<tr><td>Intermediate</td><td>Encode and validate a fused Compare-and-Write pair and predict both completions in success and failure.</td></tr>
+<tr><td>Advanced</td><td>Explain why the status for a command with several bad fields is implementation-dependent, and use the Error Information log's Parameter Error Location to find the offending field.</td></tr>
+<tr><td>Senior</td><td>Design a host completion policy that honours DNR, M and CRD (with Advanced Command Retry enabled or not) and arbitrate driver-versus-firmware disputes from fetched bytes.</td></tr>
+<tr><td>Trace analysis</td><td>Reassemble SQEs from Read Completion Boundary splits, detect byte-order errors from raw payloads, and pair every CQE with its SQE by (SQID, CID) and time.</td></tr>
+<tr><td>Debugging</td><td>Diagnose CID conflicts, phantom completions, fused-pair failures, endianness bugs and retry storms.</td></tr>
+<tr><td>Validation</td><td>Write a command-format negative-test matrix: reserved bits, opcode on wrong queue type, FUSE pairing, PSDT, NSID classes, CID reuse, MDTS edges.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="kid">
+<h2>Kid story</h2>
+<aside class="callout kid" data-title="The ticket gate at the train station">
+<p>Every train ticket is printed on the same size of card with the same boxes in the same places. The gate machine reads the first box — what kind of ticket it is — and that tells it how to read all the other boxes. Next to it is a number you write yourself, so you can match the receipt that comes out later.</p>
+<p>The gate is strict. If you scribble in the box marked "office use only", it may refuse your ticket, even if everything else is right. Some tickets are for two travellers who must go through together: the first ticket says "I am the first of a pair", the second says "I am the second of a pair", and they must be put in one right after the other. If the first one is refused, the second one is refused too.</p>
+<p>The receipt that comes out is tiny: your number, a colour dot that tells you the receipt is new, and a short code saying "OK" or what was wrong. Sometimes the code says "don't bother trying again", sometimes "try again in a little while", and sometimes "ask at the office for the long story".</p>
+</aside>
+</section>
+
+<section id="boundary">
+<h2>Analogy boundary</h2>
+<aside class="callout breaks">
+<p><strong>What it represents.</strong> The fixed card is the 64-byte SQE; the first box is the opcode; your number is the CID; "office use only" boxes are reserved fields; the pair of tickets is a fused operation; the receipt is the 16-byte CQE with its Phase Tag, Status Code, DNR ("don't bother"), CRD ("try again in a while") and More ("ask at the office" — the Error Information log).</p>
+<p><strong>What it hides.</strong> The gate (controller) does not receive the ticket from your hand: it reads it out of host memory with a PCIe Memory Read when it chooses, and the bytes may arrive in several pieces. The ticket's number is unique only among tickets in flight on the same Submission Queue, not across the station. The gate may check boxes in any order it likes, so when several boxes are wrong, which complaint you get is up to the gate.</p>
+<p><strong>Where it misleads.</strong> A gate rejecting scribbles is guaranteed in the story; in NVMe, controllers may reject or ignore non-zero reserved fields — never rely on either. And "try again in a little while" is only honoured if the host told the controller it understands retry delays (Advanced Command Retry Enable); otherwise the delay field should be zero.</p>
+</aside>
+</section>
+
+<section id="vocabulary">
+<h2>Vocabulary</h2>
+<table>
+<caption>Terms used in this module</caption>
+<thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship to adjacent terms</th><th>Common confusion</th></tr></thead>
+<tbody>
+<tr><td>Command Dword (CDW)</td><td>One 4-byte box</td><td>CDW0–CDW15 of the SQE, little-endian</td><td>CDW10–15 are command specific</td><td>Reading analyzer Dword views as byte views</td></tr>
+<tr><td><span class="g" data-term="opcode">Opcode</span></td><td>Kind of ticket</td><td>CDW0 bits 7:0, interpreted per queue type and command set</td><td>Bits 1:0 hint at data direction for standard opcodes</td><td>01h means Create I/O SQ on Admin, Write on I/O</td></tr>
+<tr><td><span class="g" data-term="fused">Fused operation</span></td><td>Two tickets that go together</td><td>FUSE (CDW0 bits 9:8): 01b first, 10b second; adjacent SQ slots; executed as an atomic unit</td><td>Compare-and-Write is the standard fused pair</td><td>Thinking any two commands can be fused</td></tr>
+<tr><td><span class="g" data-term="psdt">PSDT</span></td><td>How the address boxes are written</td><td>CDW0 bits 15:14: PRP (00b) or SGL (01b/10b)</td><td>Must match Identify Controller SGL support</td><td>Using SGL on Admin commands over PCIe</td></tr>
+<tr><td><span class="g" data-term="cid">CID</span></td><td>Your number</td><td>CDW0 bits 31:16, host-chosen, unique per SQ among outstanding commands</td><td>Echoed in CQE DW3 bits 15:00</td><td>Assuming global uniqueness</td></tr>
+<tr><td><span class="g" data-term="reserved-field">Reserved field</span></td><td>"Office use only"</td><td>Bits the host must write as zero; controller may check</td><td>A source of version skew when later revisions assign meaning</td><td>Assuming they are ignored</td></tr>
+<tr><td><span class="g" data-term="nvme-status-field">Status Field</span></td><td>The receipt code</td><td>CQE DW3 bits 31:17: SC, SCT, CRD, M, DNR</td><td>Phase Tag sits just below it in bit 16</td><td>Forgetting to shift out the Phase Tag</td></tr>
+<tr><td><span class="g" data-term="dnr">DNR</span></td><td>"Don't bother trying again"</td><td>Do Not Retry, DW3 bit 31</td><td>Overrides the host's retry policy</td><td>Retrying anyway and causing storms</td></tr>
+<tr><td><span class="g" data-term="crd">CRD</span></td><td>"Try again in a while"</td><td>Command Retry Delay, DW3 bits 29:28, selects CRDT1–3 from Identify Controller</td><td>Meaningful when Advanced Command Retry is enabled</td><td>Reading CRD as a time value itself</td></tr>
+<tr><td><span class="g" data-term="more-bit">More (M)</span></td><td>"Ask at the office"</td><td>DW3 bit 30: Error Information log has more detail</td><td>Get Log Page, Log Identifier 01h</td><td>Ignoring it and losing the field location</td></tr>
+<tr><td><span class="g" data-term="error-information-log">Error Information log</span></td><td>The long story</td><td>Log page with entries naming SQID, CID, status, Parameter Error Location, LBA, namespace</td><td>Pointed to by M and by Asynchronous Events</td><td>Assuming it always identifies the field</td></tr>
+<tr><td>Commands Supported and Effects log</td><td>The gate's list of accepted tickets</td><td>Log page listing supported opcodes and their effects per command set</td><td>Better than guessing support from errors</td><td>Assuming every listed command behaves identically across controllers</td></tr>
+<tr><td><span class="g" data-term="rcb">Read Completion Boundary</span></td><td>Where a long answer may be cut</td><td>PCIe rule letting a completer split read completions at aligned boundaries (64 bytes on the reference root complex)</td><td>An SQE fetch may arrive as several CplDs</td><td>Expecting one CplD per SQE fetch</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="architecture">
+<h2>Architecture</h2>
+<figure>
+<pre class="diagram">
+ Host (producer)                       Link                                   Controller (consumer)
+ ───────────────                       ────                                   ─────────────────────
+ alloc CID ─► zero 64 B ─► fill  ──►  SQ slot (DRAM)
+ barrier ─► doorbell ─────────────►  MWr32 SQyTDBL ─────────────────────────► latch tail
+                                      MRd64 SQ base + head × 64  ◄──────────── fetch engine
+                                      CplD (≤ 64 B pieces at RCB) ──────────► reassemble 64 B
+                                                                                │
+                                                     ┌──────────────────────────┤ parse CDW0
+                                                     │ validate (order is implementation-dependent):
+                                                     │   opcode for queue type · reserved bits · FUSE pairing
+                                                     │   PSDT vs SGL support · NSID · command-specific (range, MDTS)
+                                                     └──► reject ─► build CQE (status) ─┐
+                                                          accept ─► execute (DMA) ──────┤
+ reap by phase ◄─ MSI-X ◄─ CQE in CQ (DRAM) ◄──────── MWr64 CQE (SQID, SQHD, CID, P, status)
+ key (SQID, CID) ─► request; DNR / CRD / M policy
+</pre>
+<figcaption>The command record's path and the controller's validation pipeline. Synthetic, conceptual.</figcaption>
+</figure>
+<table>
+<caption>Architecture of the command/completion contract</caption>
+<thead><tr><th>Aspect</th><th>Content</th></tr></thead>
+<tbody>
+<tr><td>Inputs</td><td>64-byte SQEs in an SQ; controller configuration (CC.IOSQES = 6, CC.IOCQES = 4); Identify capabilities (SGL support, MDTS, fused support, Command Retry Delay Times).</td></tr>
+<tr><td>Outputs</td><td>16-byte CQEs; Error Information log entries; data transfers for accepted commands.</td></tr>
+<tr><td>Actors</td><td>Driver (builds SQE, assigns CID, interprets status); controller front end (fetch, parse, validate); command-set engine (executes); completion engine.</td></tr>
+<tr><td>State</td><td>Host: outstanding table keyed by (SQID, CID), retry counters. Controller: outstanding command table, fused-pair state, error log ring.</td></tr>
+<tr><td>Memory</td><td>SQ and CQ rings; data, metadata and PRP/SGL structures referenced by DPTR and MPTR.</td></tr>
+<tr><td>Registers</td><td>CC.IOSQES/IOCQES, doorbells, CAP (for MPSMIN used in MDTS arithmetic).</td></tr>
+<tr><td>Interfaces</td><td>PCIe MRd/CplD (SQE), MWr (CQE), Get Log Page (Error Information, Commands Supported and Effects), Set Features (Host Behavior Support, for Advanced Command Retry).</td></tr>
+<tr><td>Dependencies</td><td>Queues created with matching entry sizes; host and controller agree on byte order (little-endian), on revision-dependent use of CDW2–3 and CQE DW1, and on which optional features (SGL, fused, retry delay) are enabled.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="mechanism">
+<h2>Mechanism</h2>
+<p>A fused Compare-and-Write on SQ1, the most demanding use of the common format. Reference lab system, synthetic example for teaching.</p>
+<ol>
+<li><strong>Allocate two CIDs.</strong> <em>Who:</em> driver. <em>What:</em> 0x0010 for Compare, 0x0011 for Write; both unused among SQ1's outstanding commands. <em>Where:</em> host tag table. <em>Evidence:</em> later, in both SQE payloads.</li>
+<li><strong>Build both SQEs in adjacent slots.</strong> <em>Who:</em> driver. <em>What:</em> slot 32: CDW0 0x0010_0105 (opcode 05h Compare, FUSE 01b). Slot 33: CDW0 0x0011_0201 (opcode 01h Write, FUSE 10b). Same NSID and same LBA range. <em>Where:</em> SQ1 memory. <em>Evidence:</em> payloads in the CplDs.</li>
+<li><strong>Publish both with one doorbell.</strong> <em>Who:</em> driver. <em>What:</em> SQ1 tail 32 → 34. A doorbell that published only slot 32 would leave the pair split across doorbells, which a careful driver avoids. <em>Evidence:</em> MWr32 0xFE60_1008 = 0x22.</li>
+<li><strong>Fetch and reassemble.</strong> <em>Who:</em> controller and root complex. <em>What:</em> one MRd of 32 Dwords; the root complex may answer with two CplDs split at the 64-byte Read Completion Boundary. <em>Evidence:</em> CplDs with the same Tag, decreasing Byte Count (128 then 64) and Lower Address 0x00 then 0x40.</li>
+<li><strong>Validate the pair.</strong> <em>Who:</em> controller. <em>What:</em> first is Compare with FUSE 01b; next slot is a Write with FUSE 10b; ranges match. <em>Where:</em> controller parser. <em>Evidence:</em> none unless rejected.</li>
+<li><strong>Execute atomically.</strong> <em>Who:</em> controller. <em>What:</em> fetch Compare data, compare with media; if equal, fetch Write data and write; no other command may modify the range in between. <em>Evidence:</em> MRd/CplD for both buffers.</li>
+<li><strong>Complete both.</strong> <em>Who:</em> controller. <em>What:</em> two CQEs (CIDs 0x0010 and 0x0011), each with status. If the compare fails: Compare completes with Compare Failure and the Write with Command Aborted due to Failed Fused Command. <em>Evidence:</em> two CQE MWrs.</li>
+<li><strong>Apply the host policy.</strong> <em>Who:</em> driver. <em>What:</em> success → done; Compare Failure → report "condition not met" to the caller, no retry; any status with DNR = 0 and CRD ≠ 0 under Advanced Command Retry → delayed retry. <em>Evidence:</em> tracepoints.</li>
+</ol>
+<figure>
+<ol class="seq" data-actors="Driver|SQ1 / CQ1 (host memory)|Root complex|Controller">
+<li data-from="Driver" data-to="SQ1 / CQ1 (host memory)">SQEs: slot 32 Compare F=01b, slot 33 Write F=10b</li>
+<li data-from="Driver" data-to="Controller" data-t="0 ns">MWr32 SQ1TDBL = 0x22</li>
+<li data-from="Controller" data-to="Root complex" data-t="680 ns">MRd 0x1_2340_0800, 32 DW</li>
+<li data-from="Root complex" data-to="Controller" class="dashed">CplD BC=128 LowAddr 0x00 (slot 32)</li>
+<li data-from="Root complex" data-to="Controller" class="dashed">CplD BC=64 LowAddr 0x40 (slot 33)</li>
+<li data-note="Controller">validate pair; lock LBA range</li>
+<li data-from="Controller" data-to="Root complex">MRd compare data, then write data</li>
+<li data-note="Controller">compare equal → write media</li>
+<li data-from="Controller" data-to="SQ1 / CQ1 (host memory)">CQE CID 0x0010, CQE CID 0x0011</li>
+</ol>
+<figcaption>A fused Compare-and-Write as seen from the link. Synthetic, illustrative timing.</figcaption>
+</figure>
+
+<h3>The central concept on the ladder: the command contract</h3>
+<div class="ladder">
+<div class="rung" data-rung="A"><p>Same-size tickets with fixed boxes; the first box says how to read the rest; pairs go through together; the receipt says OK, never retry, retry later, or ask for details.</p></div>
+<div class="rung" data-rung="B"><p>The SQE's common fields (opcode, FUSE, PSDT, CID, NSID, MPTR, DPTR) are fixed; CDW10–15 depend on the opcode. The CQE returns SQID, SQHD, CID, Phase Tag and a Status Field whose DNR, CRD and M bits direct the host's next step.</p></div>
+<div class="rung" data-rung="C"><p>The controller fetches 64 bytes, reassembles them from completions, parses CDW0 in hardware or firmware, runs checks in its own order, then either dispatches or builds an error CQE without any data transfer.</p></div>
+<div class="rung" data-rung="D"><p>NVMe Base 2.4 defines the common command format, fused operations, the CQE, the Status Field, Command Retry Delay, the Error Information and Commands Supported and Effects logs; the NVM Command Set 1.3 defines Compare and Write fields.</p></div>
+<div class="rung" data-rung="E"><p>SQE: MRd from the device and CplD(s) from the root complex. CQE: posted MWr from the device. No status crosses the link except inside the CQE payload.</p></div>
+<div class="rung" data-rung="F"><p>Reassemble by Tag, Byte Count and Lower Address; decode little-endian; pair CQE to SQE by SQID, CID and the most recent fetch before the CQE.</p></div>
+<div class="rung" data-rung="G"><p>Fast rejection (CQE microseconds after fetch, no data) means a validation failure: decode every field, then read the Error Information log's Parameter Error Location.</p></div>
+</div>
+</section>
+
+<section id="spec">
+<h2>Specification discipline</h2>
+<p>Sources: <cite class="spec">NVM Express Base Specification, Revision 2.4 — Submission Queue Entry (common command format); Fused Operations; Completion Queue Entry; Status Field Definition; Command Retry Delay; Error Information log; Commands Supported and Effects log; Host Behavior Support feature</cite>; <cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3 — Compare command; Write command</cite>; <cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4 — PRP usage for Admin commands, queue entry sizes</cite>; <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 family — completion splitting and Read Completion Boundary</cite>.</p>
+<table>
+<caption>Classifying command-structure statements</caption>
+<thead><tr><th>Statement</th><th>Kind</th></tr></thead>
+<tbody>
+<tr><td>Field positions of CDW0, NSID, MPTR, DPTR, CDW10–15; CQE DW2/DW3 layout.</td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Fused commands occupy adjacent slots of the same SQ; the first uses FUSE 01b, the second 10b; if one fails, the other is aborted with a defined status.</td><td><span class="badge normative">Normative</span>; support reported by the controller (<span class="badge optional">Optional</span>)</td></tr>
+<tr><td>(SQID, CID) uniquely identifies an outstanding command.</td><td><span class="badge derived">Derived</span> from the CID uniqueness rule and the SQID in every CQE</td></tr>
+<tr><td>Which status a controller returns when several fields are invalid.</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+<tr><td>Whether non-zero reserved fields are rejected.</td><td><span class="badge impl">Implementation-dependent</span>; host obligation to write zero is <span class="badge normative">Normative</span></td></tr>
+<tr><td>CRD values are meaningful when the host has enabled Advanced Command Retry; the delays come from Command Retry Delay Times in Identify Controller.</td><td><span class="badge normative">Normative</span>, <span class="badge version">introduced in the NVMe 1.4 era</span></td></tr>
+<tr><td>Use of CDW2–3 and CQE DW1 by specific commands.</td><td><span class="badge version">Version-dependent</span></td></tr>
+<tr><td>Parameter Error Location populated for a given error.</td><td><span class="badge impl">Implementation-dependent</span> whether it is meaningful; the field's existence is normative</td></tr>
+</tbody>
+</table>
+<aside class="callout notsaid">
+<p>The specification does not define the order in which a controller validates fields, how a host allocates CIDs, how many times a host should retry, or how long to wait when CRD is zero. It does not say what a host should do with a completion whose CID matches nothing (that is host policy; Linux logs and ignores it). The exact unit of the Command Retry Delay Times and the precise conditions for the fused-abort statuses must be confirmed in the Base 2.4 text <span class="badge uncertain">Check details</span>; this module gives the names but not the numeric codes of the fused statuses and of Command ID Conflict.</p>
+</aside>
+</section>
+
+<section id="hardware">
+<h2>Hardware view</h2>
+<table>
+<caption>Hardware handling of the command record</caption>
+<thead><tr><th>Category</th><th>Hardware</th><th>What it does with the 64 or 16 bytes</th></tr></thead>
+<tbody>
+<tr><td rowspan="3">Must</td><td>CPU</td><td>Stores the SQE (one cache line on x86); loads the CQE after checking the phase.</td></tr>
+<tr><td>Root complex</td><td>Answers the SQE fetch from memory, possibly in several CplDs; accepts the CQE write.</td></tr>
+<tr><td>Controller fetch engine and parser</td><td>Reassembles the SQE, parses CDW0, dispatches. Hot-path opcodes (Read, Write) are often parsed in hardware, others by firmware.</td></tr>
+<tr><td rowspan="2">May</td><td>IOMMU</td><td>Translates SQ/CQ and data addresses.</td></tr>
+<tr><td>Controller Memory Buffer</td><td>Holds the SQ; then the SQE arrives as host posted writes instead of a fetch.</td></tr>
+<tr><td>Observable</td><td colspan="2">Fetched SQE bytes, CQE bytes, timing between them, data TLPs in between (or none).</td></tr>
+<tr><td>Unobservable</td><td colspan="2">Which validation check fired, the controller's outstanding table, the fused-pair lock on the LBA range, internal retries before a status is returned.</td></tr>
+</tbody>
+</table>
+<aside class="callout impl">
+<p>Because the parser and validator are designed independently by each vendor, two compliant controllers can return different statuses for the same doubly-invalid command — one Invalid Command Opcode, another Invalid Field in Command. Validation suites must accept any status the specification allows for each invalid field, and tests should break one field at a time.</p>
+</aside>
+</section>
+
+<section id="protocol">
+<h2>Protocol view</h2>
+<table>
+<caption>How the two records cross the link</caption>
+<thead><tr><th>Record</th><th>TLPs</th><th>Request/response</th><th>Ordering</th><th>Errors that can hit it</th></tr></thead>
+<tbody>
+<tr><td>SQE</td><td>Device MRd (Length 16 DW per SQE, possibly several SQEs), root complex CplD(s)</td><td>Non-posted; matched by Requester ID 0x0100 and Tag</td><td>Completions for one request arrive in address order; different requests' completions may interleave</td><td>Unsupported Request or Completer Abort completion (SQ not mapped), completion timeout, poisoned data</td></tr>
+<tr><td>CQE</td><td>Device MWr, 4 DW per CQE, possibly several consecutive CQEs in one TLP</td><td>Posted</td><td>After the command's data writes on the same path (absent Relaxed Ordering)</td><td>Dropped silently by an IOMMU if the CQ is unmapped</td></tr>
+</tbody>
+</table>
+<p>Two decoding hazards follow. First, <strong>split completions</strong>: an MRd for two SQEs (128 bytes) may come back as one CplD (Byte Count 128) or two (Byte Count 128 then 64, Lower Address 0x00 then 0x40). Byte Count in each CplD is the number of bytes remaining including this one; reassemble in order before decoding. Second, <strong>packed CQEs</strong>: one MWr of 8 or 16 Dwords carries two or four CQEs; a tool that decodes only the first 16 bytes misses completions and later reports phantom timeouts.</p>
+<p>Status never travels as a PCIe completion status. A command rejected for an invalid field produces a perfectly successful PCIe exchange: MRd, CplD with Successful Completion, MWr of a CQE. The only error is inside the CQE payload.</p>
+</section>
+
+<section id="trace">
+<h2>Trace view</h2>
+<p>Synthetic examples for teaching on the reference lab system: Requester ID 0x0100, BAR0 0xFE60_0000, SQ1 at 0x1_2340_0000, CQ1 at 0x1_2341_0000, Read Completion Boundary 64 bytes, MRRS 512 bytes, MPS 256 bytes. Namespace 1 has 512-byte LBAs. Doorbells and MSI-X are MWr32; queue and data addresses MRd64/MWr64.</p>
+
+<h3>Normal: a fused Compare-and-Write</h3>
+<div class="trace" data-kind="synthetic" data-title="Normal: fused pair in SQ1 slots 32-33, SQE fetch split at the RCB">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Len=1 Data=0x0000_0022</td><td>SQ1 tail 32 → 34: both halves published together</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>680</td><td>MRd64</td><td>Req=0x0100 Tag=0x12 Addr=0x1_2340_0800 Len=32 DW</td><td>Fetch slots 32–33 (0x800 = 32 × 64)</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,330</td><td>CplD</td><td>Cpl=RC Tag=0x12 Status=SC ByteCount=128 LowAddr=0x00 Len=16 DW; CDW0=0x0010_0105 NSID=1 PRP1=0x2_0000_1000 CDW10=0x0000_0500 CDW12=0x0000_0007</td><td>Slot 32: Compare (05h), FUSE 01b, CID 0x0010, SLBA 0x500, 8 blocks</td></tr>
+<tr class="dir-down"><td>4</td><td>Host→Dev</td><td>1,360</td><td>CplD</td><td>Tag=0x12 Status=SC ByteCount=64 LowAddr=0x40 Len=16 DW; CDW0=0x0011_0201 NSID=1 PRP1=0x2_0000_2000 CDW10=0x0000_0500 CDW12=0x0000_0007</td><td>Slot 33: Write (01h), FUSE 10b, CID 0x0011, same range</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1,900</td><td>MRd64 ×8</td><td>Tags 0x13–0x1A Addr=0x2_0000_1000 … 0x2_0000_1E00 Len=128 DW each</td><td>Compare data, 4 KiB in 512-byte reads</td></tr>
+<tr class="note"><td colspan="6">CplDs for compare data, media read and comparison, then 8 MRd64 for the Write data at 0x2_0000_2000 and their CplDs (omitted).</td></tr>
+<tr class="dir-up"><td>6</td><td>Dev→Host</td><td>96,400</td><td>MWr64</td><td>Addr=0x1_2341_0120 Len=8 DW; CQE A DW2=0x0001_0022 DW3=0x0001_0010; CQE B DW2=0x0001_0022 DW3=0x0001_0011</td><td>Two CQEs in one TLP: Compare success, Write success, both SQHD 34</td></tr>
+<tr class="dir-up"><td>7</td><td>Dev→Host</td><td>96,500</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x0000_0041</td><td>MSI-X vector 1</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Reassemble rows 3–4: Byte Count 128 then 64 and Lower Address 0x00 then 0x40 show one 128-byte answer split at the 64-byte boundary. The pair satisfies every fused rule visible on the wire: adjacent slots, same SQ, first = Compare with 01b, second = Write with 10b, identical NSID and range, published by one doorbell. Row 6 packs both CQEs into one 8-Dword write — decode both. The pairing is (SQ1, 0x0010) and (SQ1, 0x0011).</p>
+</div>
+
+<h3>Slow: a retry delay requested by the controller</h3>
+<div class="trace" data-kind="synthetic" data-title="Slow: Namespace Not Ready with CRD = 1 after a firmware activation">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ms)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Host enabled Advanced Command Retry through the Host Behavior Support feature. Identify Controller Command Retry Delay Time 1 corresponds to 100 ms in this synthetic configuration.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.000</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0032</td><td>SQ1 tail → 50</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.0007</td><td>MRd64</td><td>Tag=0x30 Addr=0x1_2340_0C40 Len=16 DW</td><td>Fetch slot 49</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>0.0013</td><td>CplD</td><td>Tag=0x30 ByteCount=64 CDW0=0x0031_0002</td><td>Read, CID 0x0031</td></tr>
+<tr class="abnormal"><td>4</td><td>Dev→Host</td><td>0.0041</td><td>MWr64</td><td>Addr=0x1_2341_0310 Len=4 DW DW2=0x0001_0032 DW3=0x1105_0031</td><td>Status word 0x1105: SC 82h (Namespace Not Ready), SCT 0, CRD 1, M 0, DNR 0</td></tr>
+<tr class="note"><td colspan="6">No traffic for this request for 100 ms: the host is honouring CRD = 1.</td></tr>
+<tr class="dir-down"><td>5</td><td>Host→Dev</td><td>100.20</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0033</td><td>Resubmitted in slot 50 (new SQE, same CID reused — legal, the first completed)</td></tr>
+<tr class="dir-up"><td>6</td><td>Dev→Host</td><td>100.27</td><td>MWr64</td><td>Addr=0x1_2341_0320 Len=4 DW DW3=0x0001_0031</td><td>Success after media time (data TLPs omitted)</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> The 100 ms latency is a policy outcome, not a fault: the controller said "retry after delay 1" and the host obeyed. Decode the status word carefully: 0x1105 → bit 0 P = 1; SC = (0x1105 &gt;&gt; 1) &amp; 0xFF = 0x82; SCT = (0x1105 &gt;&gt; 9) &amp; 7 = 0; CRD = (0x1105 &gt;&gt; 12) &amp; 3 = 1; M = 0; DNR = 0. Two questions remain for the senior reviewer: was the 100 ms appropriate (is the namespace ready that fast after activation?) and would a host without Advanced Command Retry have retried immediately and repeatedly, creating a retry storm?</p>
+</div>
+
+<h3>Failed: a big-endian SQE</h3>
+<div class="trace" data-kind="synthetic" data-title="Failed: test harness writes CDW0 and NSID in big-endian order">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">A new user-space test harness logs: "submit Read CID 0x0007 NSID 1 SLBA 0x100000 NLB 7 to SQ1 slot 12".</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_000D</td><td>SQ1 tail 12 → 13</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>640</td><td>MRd64</td><td>Tag=0x44 Addr=0x1_2340_0300 Len=16 DW</td><td>Fetch slot 12</td></tr>
+<tr class="abnormal"><td>3</td><td>Host→Dev</td><td>1,290</td><td>CplD</td><td>Tag=0x44 ByteCount=64 bytes 0–7: 00 07 00 02 00 00 00 01</td><td>First abnormal event: as little-endian, CDW0 = 0x0200_0700 and NSID = 0x0100_0000</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>2,950</td><td>MWr64</td><td>Addr=0x1_2341_00C0 Len=4 DW DW2=0x0001_000D DW3=0x8005_0200</td><td>CQE: CID 0x0200 (not 0x0007), SC 02h Invalid Field in Command, DNR 1</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>3,050</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x0000_0041</td><td>MSI-X vector 1</td></tr>
+<tr class="note"><td colspan="6">Harness: "completion for unknown CID 0x0200", then a timeout for CID 0x0007.</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> The controller decoded what it received: opcode 00h (Flush on an I/O queue), FUSE bits 9:8 = 11b (reserved), reserved bit 10 set, CID 0x0200, NSID 16,777,216. Any of these could produce the rejection; which check fired first is implementation-dependent, and Invalid Field in Command is a natural outcome for the reserved FUSE value. The host's two symptoms — an unknown CID and a timeout for the CID it actually used — are both explained by byte swapping, and so is the fast rejection without data. The bytes in row 3 are the witness: the harness serialised Dwords big-endian. Fix: serialise every multi-byte field little-endian; add a self-check that decodes each SQE before ringing (the intermediate lab's linter would have flagged it).</p>
+</div>
+
+<h3>Ambiguous: Invalid Field in Command on a Write that looks valid</h3>
+<div class="trace" data-kind="synthetic" data-title="Ambiguous: Invalid Field in Command with More = 1">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0041</td><td>SQ1 tail → 65</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>660</td><td>MRd64</td><td>Tag=0x50 Addr=0x1_2340_1000 Len=16 DW</td><td>Fetch slot 64</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,320</td><td>CplD</td><td>Tag=0x50 ByteCount=64 CDW0=0x0055_0001 NSID=1 PRP1=0x2_0000_6000 CDW10=0x0002_0000 CDW12=0x0010_0007 CDW13=0x0003_0000</td><td>Write, CID 0x0055, SLBA 0x20000, 8 blocks; CDW12 bits 23:16 = 0x10; CDW13 upper half = 3</td></tr>
+<tr class="abnormal"><td>4</td><td>Dev→Host</td><td>2,800</td><td>MWr64</td><td>Addr=0x1_2341_0400 Len=4 DW DW3=0xC005_0055</td><td>SC 02h Invalid Field in Command, M = 1, DNR = 1; no data was fetched</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Opcode, NSID, range, MDTS and PRP all look fine. Two fields are non-zero beyond the basics: CDW12 bits 23:16 and CDW13 bits 31:16. Candidate stories: (a) a directive type for streams or data placement was set without the directive being enabled; (b) the host was built against a newer revision that assigns meaning to bits this controller treats as reserved; (c) something else entirely that the controller checks (for example a protection field). The CQE cannot decide. M = 1 says the Error Information log has more; its entry for (SQID 1, CID 0x0055) carries a Parameter Error Location (byte and bit within the command). If it points at byte 50 (CDW12 bits 23:16), story (a) or (b) is confirmed; if the controller filled the location with the "not applicable" value, the ambiguity remains and you bisect by clearing one field at a time. Confirm the bit positions of directive fields in the NVM Command Set Write description for your revision <span class="badge uncertain">Check bit positions</span>.</p>
+</div>
+</section>
+
+<section id="linux">
+<h2>Linux view</h2>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Which opcodes the controller implements, per command set, and their effects</span>
+sudo nvme effects-log /dev/nvme0
+<span class="cm"># Entry sizes, SGL support, MDTS, fused support, retry delay times</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -iE '^(sqes|cqes|sgls|mdts|fuses|crdt)'
+<span class="cm"># Error Information log: SQID, CID, status, parameter error location per entry</span>
+sudo nvme error-log /dev/nvme0 | head -60
+<span class="cm"># Commands and completions as the driver sees them (disable afterwards)</span>
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_setup_cmd/enable'
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_complete_rq/enable'
+sudo timeout 5 cat /sys/kernel/tracing/trace_pipe
+sudo sh -c 'echo 0 &gt; /sys/kernel/tracing/events/nvme/enable'</code></pre>
+<table>
+<caption>What Linux evidence proves about commands and completions</caption>
+<thead><tr><th>Output</th><th>Category</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+<tbody>
+<tr><td>effects-log</td><td>Capability</td><td>Opcodes the controller claims and their side effects</td><td>Correct implementation</td></tr>
+<tr><td>id-ctrl fuses, sgls, crdt</td><td>Capability</td><td>Fused, SGL and retry-delay support values</td><td>Whether the host enabled Advanced Command Retry</td></tr>
+<tr><td>error-log</td><td>Controller's account</td><td>Which (SQID, CID) failed, with status and possibly field location</td><td>That the host built what it intended</td></tr>
+<tr><td>nvme_setup_cmd</td><td>Driver's intent</td><td>Fields as the driver built them</td><td>The bytes the controller fetched</td></tr>
+<tr><td>nvme_complete_rq</td><td>Driver's view of the CQE</td><td>Status and result as consumed</td><td>When the CQE was written, or completions the driver rejected as unknown</td></tr>
+</tbody>
+</table>
+<aside class="callout linux">
+<p>Linux prints NVMe status values as the CQE status word shifted right by one (dropping the Phase Tag), so SCT appears in bits 10:8 and SC in bits 7:0 — "0x281" is SCT 2h, SC 81h. Recent kernels also carry the More and DNR bits in that value (as 0x2000 and 0x4000) and may print them as flags; exact formatting is <span class="badge version">Version-dependent</span>. When comparing a kernel message with an analyzer CQE, convert both to (SCT, SC, CRD, M, DNR) before arguing.</p>
+</aside>
+</section>
+
+<section id="labs">
+<h2>Labs</h2>
+
+<h3>Beginner lab — Encode a fused pair and its two outcomes</h3>
+<p><span class="badge safe">Safe lab</span> Paper or a hex editor.</p>
+<h4>Objective</h4><p>Produce the 128 bytes of a fused Compare-and-Write and the CQEs for success and for compare failure.</p>
+<h4>Prerequisites</h4><p><a href="ch29.html">Chapter 29</a> field tables; Compare in <a href="ch31.html">Chapter 31</a>.</p>
+<h4>Setup</h4><p>SQ1 slots 40–41, CIDs 0x0100 and 0x0101, NSID 1, SLBA 0x7000, 1 block (512 B), compare buffer 0x2_0000_A000, write buffer 0x2_0000_B000.</p>
+<h4>Procedure</h4><ol><li>Write CDW0, NSID, PRP1, CDW10, CDW12 for both SQEs.</li><li>Write the first 16 bytes of each as they sit in memory.</li><li>Write both CQEs (DW2, DW3) for success, assuming SQHD 42 and phase 1.</li><li>Describe both CQEs for a compare mismatch, by status name.</li></ol>
+<h4>Observations</h4><p>Your byte layouts and decoded fields.</p>
+<h4>Questions</h4><ol><li>What is NLB?</li><li>Which doorbell value publishes the pair?</li><li>Why must the pair not straddle two doorbells?</li></ol>
+<h4>Expected reasoning</h4><p>Little-endian bytes; FUSE in bits 9:8; NLB 0's based.</p>
+<details class="solution"><summary>Solution</summary>
+<p>Compare: CDW0 = 0x0100_0105 → bytes 05 01 00 01; NSID 01 00 00 00; PRP1 = 0x2_0000_A000 → bytes 00 A0 00 00 02 00 00 00; CDW10 = 0x0000_7000; CDW12 = 0 (NLB 0 = one block). Write: CDW0 = 0x0101_0201 → 01 02 01 01; PRP1 0x2_0000_B000; same CDW10/12. Success CQEs: DW2 = 0x0001_002A (SQID 1, SQHD 42) for both; DW3 = 0x0001_0100 and 0x0001_0101. Mismatch: Compare completes with Compare Failure (a media and data integrity status), the Write with Command Aborted due to Failed Fused Command. Doorbell: SQ1 tail = 42 (0x2A). A split publish lets the controller see the first half alone; well-behaved hosts publish both together so no time window exists where a lone first command is visible.</p>
+</details>
+<h4>Extension</h4><p>Write the same pair with PSDT = 01b and explain why it fails on the reference controller (no SGL support).</p>
+
+<h3>Intermediate lab — An SQE linter</h3>
+<p><span class="badge safe">Safe lab</span> Pure software.</p>
+<h4>Objective</h4><p>Catch host-side command construction errors before the doorbell — or from captured payloads after the fact.</p>
+<h4>Prerequisites</h4><p>This module's Protocol and Trace views.</p>
+<h4>Setup</h4>
+<pre class="code" data-kind="executable" data-lang="python" data-title="sqe_lint.py"><code>#!/usr/bin/env python3
+"""Lint 64-byte Submission Queue Entries before (or after) they hit the wire.
+Synthetic teaching model, standard library only. Rules follow the common
+command format; limits come from a synthetic Identify of the reference system.
+"""
+import struct
+
+CTRL = {"sgl_supported": False, "mdts_bytes": 128 * 1024, "active_nsids": {1, 2},
+        "lba_bytes": {1: 512, 2: 4096}}
+ADMIN_OPS = {0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0C}
+IO_OPS = {0x00, 0x01, 0x02, 0x05, 0x08, 0x09}
+LBA_RANGE_OPS = {0x01, 0x02, 0x05}            # Write, Read, Compare move data
+
+def lint(raw, admin=False, prev=None):
+    dw = struct.unpack("&lt;16I", raw)
+    opc, fuse = dw[0] &amp; 0xFF, (dw[0] &gt;&gt; 8) &amp; 3
+    rsvd, psdt, cid = (dw[0] &gt;&gt; 10) &amp; 0xF, (dw[0] &gt;&gt; 14) &amp; 3, dw[0] &gt;&gt; 16
+    nsid = dw[1]
+    out = []
+    if opc not in (ADMIN_OPS if admin else IO_OPS):
+        out.append(f"opcode {opc:02X}h not supported on this queue type -&gt; Invalid Command Opcode")
+    if rsvd:
+        out.append("CDW0 bits 13:10 reserved but non-zero -&gt; Invalid Field in Command (if checked)")
+    if fuse == 3:
+        out.append("FUSE = 11b is reserved")
+    if fuse == 2 and (prev is None or ((prev[0] &gt;&gt; 8) &amp; 3) != 1):
+        out.append("second fused command without a first one in the previous slot")
+    if fuse == 1 and opc != 0x05:
+        out.append("first fused command is not Compare")
+    if psdt == 3:
+        out.append("PSDT = 11b is reserved")
+    if psdt in (1, 2) and (admin or not CTRL["sgl_supported"]):
+        out.append("SGL requested but not allowed/supported -&gt; Invalid Field in Command")
+    if not admin and opc in LBA_RANGE_OPS | {0x08}:
+        if nsid not in CTRL["active_nsids"]:
+            out.append(f"NSID {nsid} not active -&gt; Invalid Namespace or Format")
+        else:
+            nbytes = ((dw[12] &amp; 0xFFFF) + 1) * CTRL["lba_bytes"][nsid]
+            if opc in LBA_RANGE_OPS and nbytes &gt; CTRL["mdts_bytes"]:
+                out.append(f"transfer {nbytes} B exceeds MDTS {CTRL['mdts_bytes']} B -&gt; Invalid Field in Command")
+        prp1 = dw[6] | dw[7] &lt;&lt; 32
+        if opc in LBA_RANGE_OPS and psdt == 0 and (prp1 == 0 or prp1 &amp; 0x3):
+            out.append("PRP1 zero or not Dword aligned")
+    return cid, out
+
+def sqe(cdw0, nsid=0, prp1=0, prp2=0, cdw10=0, cdw11=0, cdw12=0):
+    return struct.pack("&lt;16I", cdw0, nsid, 0, 0, 0, 0, prp1 &amp; 0xFFFFFFFF, prp1 &gt;&gt; 32,
+                       prp2 &amp; 0xFFFFFFFF, prp2 &gt;&gt; 32, cdw10, cdw11, cdw12, 0, 0, 0)
+
+if __name__ == "__main__":
+    cases = [
+        ("good read",         sqe(0x0007_0002, 1, 0x2_0000_0000, 0, 0x0010_0000, 0, 7)),
+        ("fused compare",     sqe(0x0010_0105, 1, 0x2_0000_1000, 0, 0x500, 0, 7)),
+        ("fused write",       sqe(0x0011_0201, 1, 0x2_0000_2000, 0, 0x500, 0, 7)),
+        ("big-endian CDW0",   bytes.fromhex("00070002") + sqe(0, 1, 0x2_0000_0000, 0, 0x10_0000, 0, 7)[4:]),
+        ("SGL, unsupported",  sqe(0x000C_4002, 1, 0x2_0000_0000, 0, 0, 0, 7)),
+        ("too large",         sqe(0x0020_0002, 2, 0x2_0000_0000, 0x1_5000_0000, 0, 0, 63)),
+        ("NSID 3",            sqe(0x0021_0001, 3, 0x2_0000_0000, 0, 0, 0, 0)),
+        ("lone second fused", sqe(0x0022_0201, 1, 0x2_0000_0000, 0, 0, 0, 0)),
+    ]
+    prev = None
+    for name, raw in cases:
+        cid, problems = lint(raw, prev=prev)
+        verdict = "OK" if not problems else "; ".join(problems)
+        print(f"{name:18s} CDW0={struct.unpack_from('&lt;I', raw)[0]:08X} CID={cid:04X}  {verdict}")
+        prev = struct.unpack("&lt;16I", raw)</code></pre>
+<h4>Procedure</h4><ol><li>Run it.</li><li>Add a check that CDW2, CDW3 and CDW13–15 are zero for Read and Write on a namespace without protection information or directives.</li><li>Add a CID-reuse check across a list of SQEs with a set of outstanding (SQID, CID).</li></ol>
+<h4>Observations</h4>
+<pre class="code" data-kind="simulation" data-lang="text"><code>good read          CDW0=00070002 CID=0007  OK
+fused compare      CDW0=00100105 CID=0010  OK
+fused write        CDW0=00110201 CID=0011  OK
+big-endian CDW0    CDW0=02000700 CID=0200  CDW0 bits 13:10 reserved but non-zero -&gt; Invalid Field in Command (if checked); FUSE = 11b is reserved
+SGL, unsupported   CDW0=000C4002 CID=000C  SGL requested but not allowed/supported -&gt; Invalid Field in Command
+too large          CDW0=00200002 CID=0020  transfer 262144 B exceeds MDTS 131072 B -&gt; Invalid Field in Command
+NSID 3             CDW0=00210001 CID=0021  NSID 3 not active -&gt; Invalid Namespace or Format
+lone second fused  CDW0=00220201 CID=0022  second fused command without a first one in the previous slot</code></pre>
+<h4>Questions</h4><ol><li>Why does the linter not flag the big-endian opcode as invalid?</li><li>For "too large", what status should a controller return, and why is it not an LBA-range error?</li><li>What false positive would the CDW13 check produce on a host that uses streams?</li></ol>
+<h4>Expected reasoning</h4><p>A linter encodes the specification's rules plus the controller's advertised capabilities; it cannot know host intent.</p>
+<details class="solution"><summary>Solution</summary>
+<p>(1) The swapped opcode is 00h — Flush — which is a valid I/O opcode; only the reserved FUSE value and reserved bit betray the error. Byte-order bugs often produce valid-looking but wrong commands. (2) Invalid Field in Command: the transfer exceeds MDTS (2⁵ × 4 KiB = 128 KiB); the LBA range itself is fine. (3) Directive fields in CDW12/13 are legitimately non-zero when streams or data placement are enabled; the check must consult the enabled directives.</p>
+</details>
+<h4>Extension</h4><p>Feed it the SQE payloads of the four traces above.</p>
+
+<h3>Advanced lab — A completion policy engine</h3>
+<p><span class="badge safe">Safe lab</span> Pure software.</p>
+<h4>Objective</h4><p>Turn CQE Dword 3 into a host action that honours DNR, CRD, M and path-related status.</p>
+<h4>Prerequisites</h4><p>Status Field sub-fields (<a href="ch29.html">Chapter 29</a>).</p>
+<h4>Setup</h4>
+<pre class="code" data-kind="executable" data-lang="python" data-title="status_policy.py"><code>#!/usr/bin/env python3
+"""Decide what a host does with a completion, from CQE Dword 3 alone.
+Synthetic teaching model of a host policy (not a specification algorithm).
+CRDT values are the three Command Retry Delay Times from Identify Controller,
+here already converted to milliseconds; acre is whether the host enabled
+Advanced Command Retry (through the Host Behavior Support feature).
+"""
+SCT_NAMES = {0: "Generic", 1: "Command Specific", 2: "Media/Data Integrity",
+             3: "Path Related", 7: "Vendor Specific"}
+
+def split(dw3):
+    return {"cid": dw3 &amp; 0xFFFF, "p": (dw3 &gt;&gt; 16) &amp; 1, "sc": (dw3 &gt;&gt; 17) &amp; 0xFF,
+            "sct": (dw3 &gt;&gt; 25) &amp; 7, "crd": (dw3 &gt;&gt; 28) &amp; 3, "m": (dw3 &gt;&gt; 30) &amp; 1,
+            "dnr": dw3 &gt;&gt; 31}
+
+def decide(dw3, retries, acre=True, crdt_ms=(100, 500, 2000), max_retries=5):
+    f = split(dw3)
+    actions = []
+    if f["m"]:
+        actions.append("read Error Information log (LID 01h)")
+    if f["sc"] == 0 and f["sct"] == 0:
+        return f, ["complete OK"] + actions
+    if f["dnr"]:
+        return f, ["fail now (DNR=1)"] + actions
+    if retries &gt;= max_retries:
+        return f, ["fail: retry budget exhausted"] + actions
+    if f["sct"] == 3:
+        actions.insert(0, "retry, preferably on another path")
+    elif acre and f["crd"]:
+        actions.insert(0, f"retry after {crdt_ms[f['crd'] - 1]} ms (CRD={f['crd']})")
+    else:
+        actions.insert(0, "retry now")
+    return f, actions
+
+if __name__ == "__main__":
+    tests = [0x0001_0007, 0x8005_000C, 0x9105_0031, 0x1105_0031, 0x6105_0040,
+             0x0607_0050, 0x8503_0009]
+    for dw3 in tests:
+        f, act = decide(dw3, retries=0)
+        print(f"DW3={dw3:08X} CID={f['cid']:04X} SCT={f['sct']}({SCT_NAMES.get(f['sct'], 'rsvd')}) "
+              f"SC={f['sc']:02X} CRD={f['crd']} M={f['m']} DNR={f['dnr']} -&gt; {'; '.join(act)}")
+    print("same CRD=1 status with ACRE disabled:", decide(0x1105_0031, 0, acre=False)[1])</code></pre>
+<h4>Procedure</h4><ol><li>Run it and check every decision by hand.</li><li>Add exponential back-off for CRD = 0 retries.</li><li>Add a rule: a media status with DNR = 0 is retried at most once, with Limited Retry cleared.</li></ol>
+<h4>Observations</h4>
+<pre class="code" data-kind="simulation" data-lang="text"><code>DW3=00010007 CID=0007 SCT=0(Generic) SC=00 CRD=0 M=0 DNR=0 -&gt; complete OK
+DW3=8005000C CID=000C SCT=0(Generic) SC=02 CRD=0 M=0 DNR=1 -&gt; fail now (DNR=1)
+DW3=91050031 CID=0031 SCT=0(Generic) SC=82 CRD=1 M=0 DNR=1 -&gt; fail now (DNR=1)
+DW3=11050031 CID=0031 SCT=0(Generic) SC=82 CRD=1 M=0 DNR=0 -&gt; retry after 100 ms (CRD=1)
+DW3=61050040 CID=0040 SCT=0(Generic) SC=82 CRD=2 M=1 DNR=0 -&gt; retry after 500 ms (CRD=2); read Error Information log (LID 01h)
+DW3=06070050 CID=0050 SCT=3(Path Related) SC=03 CRD=0 M=0 DNR=0 -&gt; retry, preferably on another path
+DW3=85030009 CID=0009 SCT=2(Media/Data Integrity) SC=81 CRD=0 M=0 DNR=1 -&gt; fail now (DNR=1)
+same CRD=1 status with ACRE disabled: ['retry now']</code></pre>
+<h4>Questions</h4><ol><li>Why does 0x9105_0031 fail immediately although CRD = 1?</li><li>What is the risk of "retry now" when Advanced Command Retry is disabled?</li><li>Why prefer another path for SCT 3h?</li></ol>
+<h4>Expected reasoning</h4><p>DNR dominates; CRD is a delay selector; path-related statuses concern the route to the namespace, not the media.</p>
+<details class="solution"><summary>Solution</summary>
+<p>(1) DNR = 1 overrides everything: the controller says retrying the same command will fail. (2) A tight retry loop against a controller that is temporarily not ready: thousands of commands per second that all fail, consuming queue slots and log entries — a retry storm. Hosts that do not enable Advanced Command Retry need their own back-off. (3) Path-related statuses (for example asymmetric-access states in multipath configurations) mean this controller path cannot serve the namespace now; another controller in the subsystem may.</p>
+</details>
+<h4>Extension</h4><p>Compare your policy with the Linux driver's retry handling in your kernel version, and list the differences.</p>
+
+<h3>Senior forensic lab — "The firmware corrupts our commands"</h3>
+<p><span class="badge safe">Safe lab</span> Reasoning over supplied synthetic evidence.</p>
+<h4>Objective</h4><p>Decide, from evidence only, whether the host or the controller altered a command.</p>
+<h4>Prerequisites</h4><p>This module; <a href="ch41.html">Chapter 41 — Command-to-TLP Correlation</a>.</p>
+<h4>Setup — evidence (synthetic)</h4>
+<ul>
+<li>Customer claim: about 1 in 10⁷ Writes lands at the wrong LBA; "the firmware corrupts the SLBA".</li>
+<li>Driver tracepoint for a bad case: Write CID 0x1a2c SLBA 0x0000_0001_0000_0000 (above 2 TiB on 512-byte LBAs), 8 blocks.</li>
+<li>Analyzer CplD payload for the matching fetch: CDW10 = 0x0000_0000, CDW11 = 0x0000_0000.</li>
+<li>Controller Error Information log: nothing for that CID. Data later found at LBA 0.</li>
+<li>The driver's command-building code was recently changed to build the SQE on the stack and copy it into the SQ slot with a 32-byte copy routine "for speed".</li>
+</ul>
+<h4>Procedure</h4><ol><li>Identify the first abnormal event.</li><li>Decide whose bytes are wrong and why.</li><li>Propose a confirming experiment and a regression test.</li></ol>
+<h4>Observations</h4><p>Separate the driver's intent, the bytes on the wire and the controller's action.</p>
+<h4>Questions</h4><ol><li>Where are CDW10–11 in the SQE, by byte offset?</li><li>Why would a 32-byte copy lose them?</li></ol>
+<h4>Expected reasoning</h4><p>Three witnesses: tracepoint (intent), CplD (fetched bytes), media effect (action). The first place two of them disagree is the fault boundary.</p>
+<details class="solution"><summary>Solution</summary>
+<p>CDW10–11 occupy bytes 40–47. A 32-byte copy writes only bytes 0–31 (CDW0–CDW7); bytes 32–63 keep whatever the slot held before — for this slot, a previous command whose CDW10–11 were zero. The tracepoint shows intent (SLBA 2³²); the fetched payload shows SLBA 0; the controller wrote exactly what it fetched. First abnormal event: the CplD payload's CDW10/CDW11 disagreeing with the driver's intent — host side. It is rare because most previous slot contents happen to match or the bug only matters when the new SLBA differs in the upper bytes. Confirming experiment: poison every SQ slot with a pattern (for example 0xA5) after completion; the next fetched SQEs will show the pattern in bytes 32–63. Regression test: decode-after-copy assertion in debug builds, plus a randomised test that compares every fetched SQE (from an emulated controller's trace) with the driver's intent.</p>
+</details>
+<h4>Extension</h4><p>Write the two-paragraph incident summary for the firmware team that clears them and thanks them for the error-log evidence.</p>
+</section>
+
+<section id="debugging">
+<h2>Debugging</h2>
+
+<h3>Pattern 1 — "Completion for unknown command ID"</h3>
+<dl>
+<dt>Symptom</dt><dd>Host logs a CQE whose CID matches no outstanding request; often followed by a timeout.</dd>
+<dt>Possible causes</dt><dd>Byte-order or copy bug in CDW0; duplicate or stale CQE from the controller; CID generation bits mismatched after a reset; CQ shared but host demultiplexes by CID only.</dd>
+<dt>Evidence</dt><dd>Fetched SQE payload for the slot; SQID in the CQE; driver CID allocation trace.</dd>
+<dt>First check</dt><dd>Does any fetched SQE carry that CID?</dd>
+<dt>Second check</dt><dd>Was it already completed once (duplicate CQE)?</dd>
+<dt>Disambiguating experiment</dt><dd>Poison SQ slots after use; if the unknown CIDs carry the poison pattern, the controller fetched stale or partial SQEs.</dd>
+<dt>Likely conclusion</dt><dd>Usually host construction or ordering; controller duplicates are rarer but real.</dd>
+<dt>Confidence</dt><dd>High once the fetched payload is decoded.</dd>
+</dl>
+
+<h3>Pattern 2 — Fast rejections with Invalid Field in Command</h3>
+<dl>
+<dt>Symptom</dt><dd>CQE within a few microseconds of the fetch, no data, SC 02h.</dd>
+<dt>Possible causes</dt><dd>Reserved bits set; PSDT not supported; MDTS exceeded; revision skew in CDW2–3/13; directive or protection fields without the feature enabled.</dd>
+<dt>Evidence</dt><dd>Decoded SQE; Identify Controller; Error Information log.</dd>
+<dt>First check</dt><dd>M bit: if set, read the Error Information log for the Parameter Error Location.</dd>
+<dt>Second check</dt><dd>Compare non-zero fields against the revision the controller reports in VS.</dd>
+<dt>Disambiguating experiment</dt><dd>Clear one non-zero optional field at a time.</dd>
+<dt>Likely conclusion</dt><dd>Host field usage.</dd>
+<dt>Confidence</dt><dd>High.</dd>
+</dl>
+
+<h3>Pattern 3 — Fused Writes "randomly" aborted</h3>
+<dl>
+<dt>Symptom</dt><dd>Some fused Writes complete with an abort status; Compares complete with failure or success.</dd>
+<dt>Possible causes</dt><dd>Genuine compare mismatches (concurrency in the application); pair split by a wrap where a doorbell published only the first half; second command not adjacent because of a concurrent submitter on the same SQ.</dd>
+<dt>Evidence</dt><dd>Compare's status; slot numbers of both halves; doorbell values between them.</dd>
+<dt>First check</dt><dd>Compare status: failure means the application condition simply was not met.</dd>
+<dt>Second check</dt><dd>Adjacency and same-doorbell publication.</dd>
+<dt>Disambiguating experiment</dt><dd>Serialise submissions on that SQ; if aborts with successful compares disappear, it was a pairing race.</dd>
+<dt>Likely conclusion</dt><dd>Application semantics or host pairing.</dd>
+<dt>Confidence</dt><dd>Medium–high.</dd>
+</dl>
+
+<h3>Pattern 4 — Retry storm after a transient condition</h3>
+<dl>
+<dt>Symptom</dt><dd>Thousands of identical failing commands per second during a firmware activation or namespace change.</dd>
+<dt>Possible causes</dt><dd>Host ignores CRD (Advanced Command Retry not enabled, or policy bug); host ignores DNR = 0 versus 1 distinction.</dd>
+<dt>Evidence</dt><dd>Status sub-fields of the failures; time between retries.</dd>
+<dt>First check</dt><dd>Decode CRD and DNR on the failing CQEs.</dd>
+<dt>Second check</dt><dd>Whether Host Behavior Support enabled Advanced Command Retry.</dd>
+<dt>Disambiguating experiment</dt><dd>Enable it (or add host back-off) and rerun the activation.</dd>
+<dt>Likely conclusion</dt><dd>Host policy.</dd>
+<dt>Confidence</dt><dd>High.</dd>
+</dl>
+
+<h3>Pattern 5 — Decoder shows "missing" completions</h3>
+<dl>
+<dt>Symptom</dt><dd>An analysis tool reports commands without completions, yet the host saw no timeouts.</dd>
+<dt>Possible causes</dt><dd>Packed CQEs (several per MWr) decoded as one; SQE fetches split across CplDs not reassembled; capture filter dropping part of the CQ range.</dd>
+<dt>Evidence</dt><dd>MWr lengths to the CQ range (4, 8, 16 Dwords); CplD Byte Counts.</dd>
+<dt>First check</dt><dd>Count CQEs as Length / 4 per MWr.</dd>
+<dt>Second check</dt><dd>Reassemble CplDs by Tag before decoding.</dd>
+<dt>Disambiguating experiment</dt><dd>Compare tool counts with driver tracepoint counts for the same interval.</dd>
+<dt>Likely conclusion</dt><dd>Tool bug, not device bug.</dd>
+<dt>Confidence</dt><dd>High.</dd>
+</dl>
+</section>
+
+<section id="interview">
+<h2>Interview</h2>
+<h3>Beginner</h3>
+<ol>
+<li><p>Which byte of an SQE in memory is the opcode?</p><details class="answer"><summary>Model answer</summary><p>Byte 0, the least significant byte of CDW0.</p></details></li>
+<li><p>Who chooses the CID?</p><details class="answer"><summary>Model answer</summary><p>The host; the controller copies it into the CQE.</p></details></li>
+<li><p>What does DNR mean?</p><details class="answer"><summary>Model answer</summary><p>Do Not Retry: resubmitting the same command is expected to fail again.</p></details></li>
+<li><p>What are CDW10–15?</p><details class="answer"><summary>Model answer</summary><p>Command-specific Dwords whose meaning depends on the opcode.</p></details></li>
+<li><p>Can two SQs use the same CID at the same time?</p><details class="answer"><summary>Model answer</summary><p>Yes; uniqueness is per SQ among outstanding commands.</p></details></li>
+</ol>
+<h3>Intermediate</h3>
+<ol>
+<li><p>State the rules for a fused Compare-and-Write.</p><details class="answer"><summary>Model answer</summary><p>Adjacent slots in the same SQ; Compare with FUSE 01b first, Write with 10b second; same namespace and range; executed atomically; if the Compare fails the Write is aborted with the failed-fused status; controller support must be advertised.</p></details></li>
+<li><p>Why can an SQE fetch produce two CplDs?</p><details class="answer"><summary>Model answer</summary><p>The completer may split a read completion at Read Completion Boundaries; a 128-byte read can return as 64 + 64 bytes.</p></details></li>
+<li><p>How does the CRD field get turned into a delay?</p><details class="answer"><summary>Model answer</summary><p>CRD 1–3 selects Command Retry Delay Time 1–3 from Identify Controller; it applies when the host has enabled Advanced Command Retry.</p></details></li>
+<li><p>Why can a doubly-invalid command return different statuses on different controllers?</p><details class="answer"><summary>Model answer</summary><p>Validation order is implementation-dependent; the first check that fails determines the status.</p></details></li>
+<li><p>What does M = 1 tell you to do?</p><details class="answer"><summary>Model answer</summary><p>Read the Error Information log (Get Log Page 01h) for the entry matching the SQID and CID.</p></details></li>
+</ol>
+<h3>Advanced</h3>
+<ol>
+<li><p>How would you detect a big-endian SQE in a trace?</p><details class="answer"><summary>Model answer</summary><p>Decode the CplD bytes little-endian: unusual opcodes, reserved FUSE values, CIDs with byte-swapped patterns (0x0700 for 7), NSIDs like 0x0100_0000. The CQE's CID will not match any host CID.</p></details></li>
+<li><p>Why is SQHD not a completion indicator?</p><details class="answer"><summary>Model answer</summary><p>It reports how far the controller has consumed (fetched) the SQ; completion of a command is its own CQE, in any order.</p></details></li>
+<li><p>What makes a CQE the "commit point" for read data, and when does that fail?</p><details class="answer"><summary>Model answer</summary><p>Posted-write ordering puts data before the CQE on the same path; Relaxed Ordering on the CQE or non-compliant fabrics can break it.</p></details></li>
+<li><p>How does the Commands Supported and Effects log help a driver?</p><details class="answer"><summary>Model answer</summary><p>It lists implemented opcodes and their effects (for example, whether a command changes namespace capability or requires quiescing), so the host need not probe with failing commands.</p></details></li>
+<li><p>What host bug produces Command ID Conflict?</p><details class="answer"><summary>Model answer</summary><p>Reusing a CID on the same SQ while the earlier command is still outstanding — often in timeout or abort paths that free a tag too early.</p></details></li>
+</ol>
+<h3>Senior</h3>
+<ol>
+<li><p>Design a negative-test matrix for the common command format.</p><details class="answer"><summary>Model answer</summary><p>One invalid field per test: each reserved bit range, every reserved FUSE/PSDT value, opcode on wrong queue type, unsupported opcodes from the effects log, NSID 0/inactive/broadcast where not allowed, MDTS ± 1 block, misaligned PRP1, CID reuse while outstanding, fused pair split across doorbells, non-adjacent fused halves. Accept any status the specification permits; record which one each controller returns.</p></details></li>
+<li><p>How do you settle a host-versus-firmware dispute about a command?</p><details class="answer"><summary>Model answer</summary><p>Collect three witnesses: host intent (tracepoint/log), bytes on the wire (CplD payload), controller action (data TLPs, error log). The first disagreement locates the fault.</p></details></li>
+<li><p>What would you change in a driver's CID scheme for debuggability?</p><details class="answer"><summary>Model answer</summary><p>Encode a small generation counter in upper bits so stale or duplicate CQEs are detectable; log CID allocation and free events; never free a CID until its CQE is consumed or the queue is deleted.</p></details></li>
+<li><p>A controller fills Parameter Error Location with "not applicable" for all errors. Is that compliant, and what do you ask the vendor?</p><details class="answer"><summary>Model answer</summary><p>Possibly compliant, since meaningful location reporting depends on the error, but it costs host debuggability; ask for location reporting on field-validation failures and document their validation order.</p></details></li>
+<li><p>How do revision differences show up in command structure?</p><details class="answer"><summary>Model answer</summary><p>Fields that were reserved gain meaning (CDW2–3, CDW12/13 directive and protection fields, CQE DW1, CRD). A host built for a newer revision can trigger Invalid Field on an older controller; the reverse can make new fields silently zero. Check VS and Identify before using new fields.</p></details></li>
+</ol>
+</section>
+
+<section id="quiz">
+<h2>Quiz</h2>
+<ol class="quiz">
+<li><p>CDW0 = 0x0011_0201 means:</p>
+<ul class="options" data-answer="2"><li>Read, CID 0x0011, first fused</li><li>Write, CID 0x0011, second fused</li><li>Write, CID 0x0201</li><li>Compare, CID 0x0011</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Opcode 01h (Write on an I/O queue), bits 9:8 = 10b (second fused), CID in bits 31:16.</p></details></li>
+<li><p>A CplD has Byte Count 64 and Lower Address 0x40 for a 128-byte SQE fetch. It is:</p>
+<ul class="options" data-answer="3"><li>An error</li><li>The first half</li><li>The second (final) part</li><li>A different request</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Byte Count counts remaining bytes; 64 remaining at offset 0x40 is the last piece.</p></details></li>
+<li><p>Status word 0x1105 contains:</p>
+<ul class="options" data-answer="1"><li>SC 82h, CRD 1, DNR 0</li><li>SC 05h, CRD 1</li><li>SC 82h, DNR 1</li><li>SC 11h</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>(0x1105 &gt;&gt; 1) &amp; 0xFF = 0x82; bits 13:12 = 01b; bit 15 = 0.</p></details></li>
+<li><p>Which statement about reserved fields is true?</p>
+<ul class="options" data-answer="4"><li>Controllers must ignore them</li><li>Controllers must reject them</li><li>Hosts may use them freely</li><li>Hosts must write zero; controller behaviour may vary</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The host obligation is normative; whether a controller checks is implementation-dependent.</p></details></li>
+<li><p>A Write exceeding MDTS should complete with:</p>
+<ul class="options" data-answer="2"><li>LBA Out of Range</li><li>Invalid Field in Command</li><li>Data Transfer Error</li><li>Capacity Exceeded</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Exceeding the maximum data transfer size is an invalid field, not a range error.</p></details></li>
+<li><p>One CQ MWr has Length 16 DW. How many CQEs?</p>
+<ul class="options" data-answer="3"><li>1</li><li>2</li><li>4</li><li>16</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>16 bytes per CQE: 64 bytes / 16 = 4.</p></details></li>
+<li><p>Why must a fused pair be published by one doorbell?</p><details class="answer"><summary>Model answer</summary><p>So the controller never sees the first half without the second in the next slot; a split publish creates a window where the pairing rules cannot be satisfied and the pair may be aborted.</p></details></li>
+<li><p>Name the three witnesses for a disputed command and what each proves.</p><details class="answer"><summary>Model answer</summary><p>Host trace (what the driver intended), the fetched CplD payload (what the controller received), and the controller's action and logs (what it did). Their first disagreement locates the fault.</p></details></li>
+</ol>
+</section>
+
+<section id="teachback">
+<h2>Teach-back</h2>
+<ol>
+<li><p><strong>To a child:</strong> the ticket gate, the "office use only" box and the pair tickets.</p>
+<details class="answer"><summary>Model explanation</summary><p>"Every ticket is the same shape so the gate knows where to look. The first box tells it what kind of ticket it is. Don't write in the office box. Pair tickets go in one after the other; if the first is refused, so is the second. The receipt has your number and tells you if it worked, if you should try again later, or if you shouldn't bother."</p></details></li>
+<li><p><strong>To a junior engineer:</strong> how to read a CQE and decide what to do.</p>
+<details class="answer"><summary>Model explanation</summary><p>"Check the phase first. Then SQID and CID to find the request. Status zero: done. Otherwise split the status: SCT and SC say what; DNR says whether retrying can work; CRD says how long to wait if we enabled retry delays; M says read the error log. Never retry DNR = 1."</p></details></li>
+<li><p><strong>To a senior engineer:</strong> why the status alone is weak evidence and what you add.</p>
+<details class="answer"><summary>Model explanation</summary><p>"Status reflects the first check that failed in the controller's own order and says nothing about who built the bad field. I add the fetched bytes (reassembled from CplDs), the host's intent from tracepoints, and the Error Information log's Parameter Error Location. With those three, a command dispute usually resolves in minutes."</p></details></li>
+</ol>
+</section>
+
+<section id="mastery">
+<h2>Mastery gate</h2>
+<aside class="callout mastery">
+<p>Do not consider this module mastered until you can:</p>
+<ul class="checklist">
+<li>explain the command contract: common fields, command-specific Dwords, pairing, identity and status semantics</li>
+<li>diagram the controller's fetch–reassemble–validate–dispatch–complete pipeline</li>
+<li>identify SQEs and CQEs in a trace, including split CplDs and packed CQEs, and pair them by (SQID, CID)</li>
+<li>debug unknown CIDs, fast rejections, fused aborts, retry storms and decoder artefacts</li>
+<li>distinguish command structure from <a href="dd27.html">doorbells</a>, from <a href="dd29.html">NVM command semantics</a>, from <a href="dd11.html">TLP formats</a> and from <a href="dd34.html">PRP</a>/<a href="dd35.html">SGL</a> data descriptions</li>
+<li>cite NVMe Base 2.4 (Submission Queue Entry, Fused Operations, Completion Queue Entry, Status Field, Error Information log) and NVM Command Set 1.3 (Compare, Write)</li>
+</ul>
+</aside>
+<p>Next: <a href="dd29.html">Module 29 — NVM Command Set</a>.</p>
+</section>

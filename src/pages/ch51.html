@@ -1,0 +1,645 @@
+<p class="lead">Chapter 14 taught that posted writes stay in order and that this is what makes a completion trustworthy. This advanced chapter takes the whole Peripheral Component Interconnect Express (PCIe) ordering rules matrix apart cell by cell, shows which cells exist for correctness and which for deadlock freedom, and then applies Relaxed Ordering and ID-Based Ordering to the specific write sequence an NVMe controller produces: data, then completion queue entry, then interrupt. It ends with the bug patterns that ordering mistakes actually produce in the field.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>An NVMe host never checks that data has arrived. It sees a completion queue entry (CQE) with the right phase tag and trusts that the data buffer is complete. That trust rests on PCIe ordering rules, on the Root Complex's implementation of them, on the device not setting the wrong attribute bits, and on the CPU-side memory barriers in the driver. When any link of that chain fails, the result is the most expensive kind of bug: silent data corruption that appears only under load, only on some platforms.</p>
+  <p>Ordering also has a second job that is easy to forget: <em>preventing deadlock</em>. Half of the ordering table says "this must be allowed to pass that", not "this must stay behind that". Engineers who only remember the "must not pass" entries design switches, bridges and endpoints that hang.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Reconstruct the PCIe ordering rules summary (row passes column) for posted requests, non-posted requests and completions, and justify every entry as either a correctness rule, a deadlock-avoidance rule or a freedom.</li>
+    <li>Explain the producer–consumer guarantee and map it onto NVMe's data → CQE → MSI-X sequence and onto the host's SQE → doorbell sequence.</li>
+    <li>Explain exactly what Relaxed Ordering (RO) and ID-Based Ordering (IDO) relax, who may set them, and which NVMe transactions may safely carry them.</li>
+    <li>Explain the deadlock scenarios that the "must be able to pass" entries prevent.</li>
+    <li>Separate PCIe fabric ordering from Root Complex internal ordering and from CPU memory ordering, and know where each one is defined.</li>
+    <li>Identify ordering violations in a trace and recognize the main field bug patterns.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>Required: <a href="ch12.html">Chapter 12 — Posted vs Non-Posted Transactions</a>, <a href="ch13.html">Chapter 13 — PCIe Tags</a>, <a href="ch14.html">Chapter 14 — PCIe Ordering</a> (the basic rules; this chapter does not repeat them slowly), <a href="ch16.html">Chapter 16 — PCIe Flow Control</a>, <a href="ch11.html">Chapter 11 — TLP Header Anatomy</a> (the Attr field), and the end-to-end NVMe flows in <a href="ch39.html">Chapter 39</a>, <a href="ch40.html">Chapter 40</a> and <a href="ch43.html">Chapter 43 — MSI-X</a>.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>The librarian sends three things down the same slide to the teacher's desk: first the books, then a note saying "your books are here", then she rings a little bell. Because they all go down the same slide, they land in that order, so when the teacher hears the bell, the note is already there, and when she reads the note, the books are already there. But imagine the librarian put the note in a special "express" envelope that is allowed to jump ahead on the slide. The teacher could read "your books are here" — and find an empty desk.</p>
+    <p>There is a second rule on the slide: if someone's big box gets stuck waiting for an answer, the small letters behind it must be allowed to slip past. Otherwise everybody waits for everybody and nothing ever moves.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A hospital pneumatic-tube system. The lab sends test results (data), then a "results posted" slip (CQE), then pages the doctor (interrupt). Doctors trust the page because the tube is first-in, first-out. Some tubes are marked "urgent — may overtake": fine for independent samples, disastrous for the "results posted" slip. Meanwhile, requests for new samples (non-posted reads) must never block the deliveries the lab is waiting on, or the whole system jams.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p>A tube system is one physical channel. PCIe has separate buffers and credits for posted, non-posted and completion traffic, multiple Virtual Channels with no ordering between them, switches that merge traffic from many sources, and a Root Complex that turns TLPs into memory-system operations under its own (CPU-architecture-specific) ordering rules. The analogy also hides that CPU stores to host memory are not PCIe transactions at all — they need CPU barriers, not PCIe rules.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>Every Transaction Layer Packet (TLP) belongs to one of three ordering classes:</p>
+  <ul>
+    <li><span class="g" data-term="posted-request"><strong>Posted requests</strong></span> — Memory Writes and Messages. No reply.</li>
+    <li><strong>Non-posted requests</strong> — Memory Reads, I/O and Configuration requests, AtomicOps. They expect a completion.</li>
+    <li><strong>Completions</strong> — replies to non-posted requests.</li>
+  </ul>
+  <p>For traffic going the same direction through the same path, in the same Traffic Class, the PCIe specification gives a table: for each pair (a later TLP of class X, an earlier TLP of class Y), may X overtake Y? The answer is one of: <strong>No</strong> (must not pass — needed for correctness), <strong>Yes</strong> (must be <em>allowed</em> to pass — needed to avoid deadlock), or <strong>Y/N</strong> (may or may not; no requirement).</p>
+  <p>Two attribute bits in the TLP header can turn some "No" entries into "Y/N": <span class="g" data-term="relaxed-ordering"><strong>Relaxed Ordering</strong> and</span> <span class="g" data-term="ido"><strong>ID-Based Ordering</strong>. They</span> exist for performance. Used on the wrong TLP, they break correctness.</p>
+  <p>The single most important consequence for NVMe: a posted write must not pass an earlier posted write (unless relaxed). The controller writes data, then the CQE, then the MSI-X interrupt — all posted writes, in that order — so the host can trust the CQE once it sees it, and the interrupt once it arrives.</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>Scope: what the rules order, and what they do not</h3>
+  <ul>
+    <li>Rules apply to transactions <strong>in the same direction through the same path</strong> — for example, everything an endpoint sends upstream through the same ports. Requests going down and completions coming up are different streams.</li>
+    <li>Rules apply <span class="g" data-term="traffic-class"><strong>within a Traffic Class</strong> (TC)</span>. There is no ordering between different TCs, which may map to different Virtual Channels (VCs). An NVMe SSD normally uses TC0 for everything.</li>
+    <li>Rules are about what an <em>observer downstream of a point</em> can see. Inside the Root Complex, the PCIe rules hand over to the platform's memory-ordering model.</li>
+    <li>Rules say nothing about CPU loads and stores to cacheable host memory (the SQ entries the driver writes, the CQ entries the driver reads). That ordering belongs to the CPU architecture and is enforced with barriers.</li>
+  </ul>
+
+  <h3>The ordering rules summary, cell by cell</h3>
+  <p>The PCI Express Base Specification gives the rules as a table whose rows are the <em>later</em> transaction and whose columns are the <em>earlier</em> transaction: "may the row pass the column?" The table below follows the structure and lettering commonly used for it (rows A–D, columns 2–5). <span class="badge uncertain">Uncertain</span> in details: sub-entry conditions changed across revisions (for example, IDO was added in 2.1 and Flit Mode in 6.0); confirm every cell in the "Ordering Rules Summary" table of your revision.</p>
+  <table>
+    <caption>Ordering rules summary — may the row (later) pass the column (earlier)?</caption>
+    <thead><tr><th>Row passes column?</th><th>Posted request (col 2)</th><th>Read request (col 3)</th><th>Non-posted request with data (col 4)</th><th>Completion (col 5)</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Posted request (row A)</strong></td><td>A2a: <strong>No</strong><br>A2b: Y/N if RO or IDO conditions apply</td><td>A3: <strong>Yes</strong></td><td>A4: <strong>Yes</strong></td><td>A5a: Y/N<br>A5b: Yes inside a PCIe-to-PCI/PCI-X bridge in specific modes</td></tr>
+      <tr><td><strong>Read request (row B)</strong></td><td>B2a: <strong>No</strong><br>B2b: Y/N with IDO</td><td>B3: Y/N</td><td>B4: Y/N</td><td>B5: Y/N</td></tr>
+      <tr><td><strong>Non-posted request with data (row C)</strong></td><td>C2a: <strong>No</strong><br>C2b: Y/N with IDO</td><td>C3: Y/N</td><td>C4: Y/N</td><td>C5: Y/N</td></tr>
+      <tr><td><strong>Completion (row D)</strong></td><td>D2a: <strong>No</strong><br>D2b: Y/N if RO or IDO conditions apply</td><td>D3: <strong>Yes</strong></td><td>D4: <strong>Yes</strong></td><td>D5a: Y/N (different Transaction IDs)<br>D5b: <strong>No</strong> (same Transaction ID — multiple completions of one request stay in address order)</td></tr>
+    </tbody>
+  </table>
+  <p>Read the table as three groups.</p>
+  <h4>Correctness entries ("No")</h4>
+  <ul>
+    <li><strong>A2a</strong> — a write must not pass an earlier write. This is the producer–consumer rule: data then flag.</li>
+    <li><strong>B2a / C2a</strong> — a read (or non-posted write) must not pass an earlier posted write. This makes "a read flushes earlier writes" true: when the completion of a read returns, all writes the requester sent earlier in the same direction have reached the completer. Drivers rely on this when they read a device register to make sure their MMIO writes landed.</li>
+    <li><strong>D2a</strong> — a completion must not pass an earlier posted write. Consider a device that writes data to memory and then answers a host's read of a status register: the host must not see "done" in the completion before the data writes have been pushed ahead of it.</li>
+    <li><strong>D5b</strong> — completions for the same request stay in increasing address order (see <a href="ch52.html">Chapter 52</a>).</li>
+  </ul>
+  <h4>Deadlock-avoidance entries ("Yes")</h4>
+  <ul>
+    <li><strong>A3 / A4</strong> — posted writes must be able to pass non-posted requests.</li>
+    <li><strong>D3 / D4</strong> — completions must be able to pass non-posted requests.</li>
+  </ul>
+  <p>The reasoning is about buffers. A non-posted request can be stuck because the completer has no room to accept it or because it is waiting for its own resources. If posted writes and completions were stuck behind it, and the thing the completer is waiting for is one of those writes or completions, nobody moves. Making posted and completion traffic always able to pass non-posted traffic breaks every such cycle. This is also why flow control keeps separate credits for posted, non-posted and completion traffic (<a href="ch16.html">Chapter 16</a>, <a href="ch53.html">Chapter 53</a>).</p>
+  <h4>Freedoms ("Y/N")</h4>
+  <ul>
+    <li><strong>B3/B4/C3/C4</strong> — non-posted requests may be reordered among themselves; a completer may service reads out of order.</li>
+    <li><strong>B5/C5</strong> — requests may pass completions or not.</li>
+    <li><strong>D5a</strong> — completions for different requests may return in any order. A requester must match completions by Tag and must not assume the order in which it issued reads.</li>
+    <li><strong>A5a</strong> — writes may pass completions or not.</li>
+  </ul>
+  <aside class="callout insight">
+    <p>A "Y/N" entry is a <em>freedom for the fabric</em> and therefore an <em>obligation for the receiver</em>: any design that works only if a Y/N case happens to be ordered is relying on implementation luck. Many "works on platform A, fails on platform B" bugs are exactly that.</p>
+  </aside>
+
+  <h3>A deadlock, constructed</h3>
+  <p>Imagine a (non-compliant) switch that keeps a single first-in-first-out queue per port for all TLP types.</p>
+  <ol>
+    <li>Endpoint E1 sends many Memory Read requests to E2 (peer-to-peer). They fill E2's non-posted receive buffer and back up into the switch queue toward E2.</li>
+    <li>E2 cannot accept more reads until it has returned completions for the ones it has. Its completions go to E1.</li>
+    <li>E1's receive path from the switch is also a single queue, now holding posted writes from the host that are ahead of E2's completions; E1 cannot drain those writes because its internal write path is blocked behind its own outgoing reads waiting in the full switch queue.</li>
+    <li>Cycle: E1 waits for E2's completions, which wait behind posted writes to E1, which wait for E1's internal resources, which wait for E1's reads to drain, which wait for E2.</li>
+  </ol>
+  <p>The PCIe rules make this impossible in a compliant fabric: separate per-class buffering and credits, plus "posted and completions may always pass non-posted", ensure that completions and posted writes keep flowing even when non-posted traffic is stalled. A related rule: requesters must have space for the completions they solicit (endpoints and Root Complexes typically advertise "infinite" completion credits, meaning they promise to accept them). <span class="badge uncertain">Uncertain</span> — check the exact completion-credit advertisement rules in "Flow Control" of your revision.</p>
+  <figure>
+    <ol class="seq" data-actors="Endpoint E1|Switch (single FIFO, non-compliant)|Endpoint E2">
+      <li data-from="Endpoint E1" data-to="Switch (single FIFO, non-compliant)">MRd x N (peer-to-peer reads)</li>
+      <li data-from="Switch (single FIFO, non-compliant)" data-to="Endpoint E2">MRd until E2 NP buffer full</li>
+      <li data-note="Switch (single FIFO, non-compliant)">FIFO toward E2 full of MRd</li>
+      <li data-from="Endpoint E2" data-to="Switch (single FIFO, non-compliant)" class="dashed">CplD for E1</li>
+      <li data-note="Switch (single FIFO, non-compliant)">CplD queued behind posted writes to E1</li>
+      <li data-note="Endpoint E1">E1 cannot drain writes until its MRds move</li>
+      <li data-from="Switch (single FIFO, non-compliant)" data-to="Endpoint E1" class="bad">nothing moves: circular wait</li>
+    </ol>
+    <figcaption>Conceptual deadlock in a design that ignores the "must be able to pass" entries. A compliant switch lets completions and posted writes bypass blocked non-posted requests.</figcaption>
+  </figure>
+
+  <h3>The producer–consumer model and NVMe</h3>
+  <p>The ordering rules exist to support <span class="g" data-term="producer-consumer">one programming model: a <strong>producer</strong></span> writes data, then writes a <strong>flag</strong>; a <strong>consumer</strong> that sees the flag must see the data. PCIe guarantees this when producer, data, flag and consumer are arranged according to the rules (the specification has an informative appendix discussing producer–consumer configurations). NVMe uses it twice:</p>
+  <table>
+    <caption>NVMe's producer–consumer pairs on PCIe</caption>
+    <thead><tr><th>Producer</th><th>Data</th><th>Flag</th><th>Consumer</th><th>What guarantees order</th></tr></thead>
+    <tbody>
+      <tr><td>Controller</td><td>Read data written to host buffers (MWr)</td><td>CQE written to the CQ (MWr), then MSI-X (MWr)</td><td>Host CPU</td><td>PCIe A2a (posted must not pass posted) from controller to Root Complex; the Root Complex's commitment of writes to memory in order; the CPU's load ordering (driver barrier after reading the phase tag).</td></tr>
+      <tr><td>Host CPU</td><td>SQE stored in host memory (CPU store, not a TLP)</td><td>SQ tail doorbell (MWr to BAR0)</td><td>Controller</td><td>CPU architecture: the store to cacheable memory must be globally visible before the uncached MMIO write leaves the CPU (driver write barrier, e.g. Linux <code>writel()</code> semantics). The controller's later SQE fetch (MRd) then reads the stored data via the coherent Root Complex.</td></tr>
+      <tr><td>Controller</td><td>CQE written to host memory</td><td>MSI-X write</td><td>Host interrupt handler</td><td>A2a again; MSI-X is a posted write in the same stream.</td></tr>
+      <tr><td>Host CPU</td><td>MMIO writes (doorbells, register updates)</td><td>MMIO read of a register</td><td>Host CPU</td><td>B2a: the read cannot pass earlier posted writes; its completion proves earlier writes arrived. (D2a further ensures device writes issued before the completion are visible.)</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout derived">
+    <p>The NVMe specification defines posting the CQE as the moment the command completes; with PCIe posted-write ordering and a coherent Root Complex, "CQE visible" therefore implies "data visible" — provided the controller emits the data writes before the CQE write and does not set RO on the CQE. This is a reasoned conclusion, not a quoted rule; confirm the controller-side requirements in the NVMe Base and NVMe over PCIe Transport specifications.</p>
+  </aside>
+
+  <h3>Relaxed Ordering precisely</h3>
+  <p>Relaxed Ordering is TLP attribute bit Attr[1]. A requester may set it only if <strong>Enable Relaxed Ordering</strong> is set in its Device Control register. A completer copies the request's RO bit into its completions.</p>
+  <ul>
+    <li>A <strong>posted request with RO = 1</strong> may pass earlier posted requests (A2b). Important: RO describes the <em>later</em> TLP. A CQE write with RO = 0 cannot pass earlier data writes even if those data writes had RO = 1.</li>
+    <li>A <strong>completion with RO = 1</strong> may pass earlier posted requests (D2b).</li>
+    <li>RO does not let anything pass a non-posted request in a way it couldn't already, and does not affect D5b.</li>
+  </ul>
+  <p>Why use it? In the Root Complex, strictly ordered writes to memory can serialize behind cache-coherency operations; letting independent data writes complete out of order raises write bandwidth on some platforms. For an NVMe controller, the safe policy is:</p>
+  <table>
+    <caption>Relaxed Ordering on NVMe controller traffic (derived policy)</caption>
+    <thead><tr><th>Transaction</th><th>RO allowed?</th><th>Reason</th></tr></thead>
+    <tbody>
+      <tr><td>Read data MWr (Read command data to host)</td><td>Yes, if enabled</td><td>Data chunks are independent of each other; only the CQE must follow them.</td></tr>
+      <tr><td>CQE MWr</td><td><strong>No</strong></td><td>If the CQE could pass data writes, the host could see completion before data.</td></tr>
+      <tr><td>MSI-X MWr</td><td><strong>No</strong> (check spec rules for MSI attributes)</td><td>The interrupt must not overtake the CQE.</td></tr>
+      <tr><td>MRd for SQE, PRP/SGL lists, Write command data</td><td>Usually yes</td><td>RO on the read request is copied to its completions, letting them pass host→device posted writes (doorbells). The device does not use doorbell order to validate fetched data, so this is harmless in the usual design. Check your design's assumptions.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>ID-Based Ordering precisely</h3>
+  <p>ID-Based Ordering is Attr[2]. It relaxes ordering between TLPs from <em>different</em> sources: a TLP with IDO = 1 may pass an earlier TLP with a different Requester ID (for requests) or different Completer ID (for completions), in the cells marked "with IDO" (A2b, B2b, C2b, D2b). Same-source traffic stays ordered. Enabling bits: <strong>IDO Request Enable</strong> and <strong>IDO Completion Enable</strong> in Device Control 2.</p>
+  <p>Why it exists: in a switch, traffic from SSD 1 should not have to wait behind traffic from SSD 2 — they are unrelated producers. IDO lets fabrics avoid this head-of-line blocking while keeping each source's own producer–consumer ordering intact.</p>
+  <aside class="callout warn">
+    <p>IDO assumes that each producer–consumer relationship is contained within one source ID. With SR-IOV (<a href="ch56.html">Chapter 56</a>), every Virtual Function has its own Requester ID. That is fine as long as each VF's data, CQE and MSI-X carry the same VF's Requester ID. A device that, for example, sends data with a VF's ID but a CQE or interrupt with the Physical Function's ID breaks IDO's assumption — the CQE could pass the data. Validate that the IDs on data, CQE and MSI-X match.</p>
+  </aside>
+
+  <h3>No Snoop is not an ordering attribute</h3>
+  <p><span class="g" data-term="no-snoop">Attr[0], No Snoop,</span> tells the Root Complex the transaction need not be snooped against CPU caches. It does not change PCIe ordering rules, but it changes <em>visibility</em>: data written with No Snoop may not be coherent with CPU caches unless software manages them. NVMe drivers on coherent platforms generally rely on snooped DMA; a CQE written with No Snoop could be invisible to a CPU spinning on a cached copy. Treat No Snoop as "visibility risk", not "ordering risk".</p>
+
+  <h3>Where PCIe ordering ends: the Root Complex and the CPU</h3>
+  <figure>
+<pre class="diagram">
+  SSD  --TLPs in order (A2a)-->  Switch(es)  --in order-->  Root Port
+                                                              |
+                                          Root Complex: converts TLPs into
+                                          coherent memory writes. Must make
+                                          ordered writes visible in order to
+                                          CPUs (platform-specific mechanism).
+                                          RO writes may become visible out of order.
+                                                              |
+                                          CPU caches / memory  &lt;-- CPU loads
+                                                              |
+                                          Driver: read phase tag, then
+                                          dma_rmb()-style barrier, then read
+                                          the rest of the CQE and the data.
+</pre>
+    <figcaption>Three ordering domains: PCIe fabric (specified by PCI-SIG), Root Complex to memory (platform), CPU loads and stores (CPU architecture).</figcaption>
+  </figure>
+  <p>On strongly ordered CPUs (x86 for normal loads), the CPU-side barrier is mostly a compiler barrier. On weakly ordered CPUs (Arm, POWER, RISC-V), the driver must order the phase-tag load before the loads of the CQE's command identifier and status, and before the application reads the data. Linux's NVMe driver uses a read barrier after detecting a valid phase tag for this reason.</p>
+  <p>In the other direction, the driver stores the SQE in normal memory and then writes the doorbell. On weakly ordered CPUs the MMIO write could otherwise become visible to the device before the SQE store is visible to the device's coherent read. Linux's <code>writel()</code> includes the barrier that orders prior normal-memory stores before the MMIO write; the relaxed variant (<code>writel_relaxed()</code>) does not.</p>
+
+  <h3>Atomicity and granularity of a single write</h3>
+  <p>A 16-byte CQE is one MWr TLP. The host's phase-tag check assumes the entire entry becomes visible no later than its phase-tag bit. PCIe has rules about update ordering and granularity, and Root Complexes typically commit a small aligned write as one unit, but this is a platform property. <span class="badge uncertain">Uncertain</span> — read the PCIe Base Specification's discussion of update ordering and granularity, and your platform's documentation, rather than assuming atomicity beyond what is stated.</p>
+
+  <h3>Real bug patterns</h3>
+  <p>The following are recurring classes of defects. The Linux quirk is a real mechanism in the kernel; the others are described as patterns, not as specific vendor incidents.</p>
+  <table>
+    <caption>Ordering bug patterns</caption>
+    <thead><tr><th>Pattern</th><th>Mechanism</th><th>Symptom</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>RO set on CQE writes</td><td>Device firmware or DMA engine applies RO to all writes when enabled</td><td>Rare stale/partial data under load on platforms that exploit RO; clean on platforms that ignore RO</td><td>Analyzer: Attr RO = 1 on the CQ address range</td></tr>
+      <tr><td>Platform with problematic RO handling</td><td>Some Root Ports have errata or performance problems with RO completions/writes</td><td>Corruption or poor performance only with RO enabled</td><td>Linux marks certain Root Ports with a "no relaxed ordering" quirk flag and clears Enable Relaxed Ordering on devices below them (see Linux view)</td></tr>
+      <tr><td>Interrupt before CQE</td><td>Device has separate DMA engines for CQEs and MSI-X that are not ordered internally before the link</td><td>Interrupt handler finds no new CQE; "spurious" interrupts; latency spikes; with polling-only fallback, missed completions</td><td>Analyzer: MSI-X MWr precedes the CQE MWr for the same completion</td></tr>
+      <tr><td>Missing write barrier before doorbell</td><td>Driver uses a relaxed MMIO write or custom code on a weakly ordered CPU</td><td>Controller fetches a stale or half-written SQE: invalid opcode, wrong LBA, invalid field status</td><td>Analyzer: SQE fetch returns data that differs from what the driver logged</td></tr>
+      <tr><td>Missing read barrier after phase check</td><td>Driver reads command identifier before ordering after phase tag on weakly ordered CPU</td><td>Completions matched to the wrong command; rare "unknown command id" warnings</td><td>Only on weakly ordered CPUs; disappears with debug code (timing)</td></tr>
+      <tr><td>Relying on read completion order across tags</td><td>Device assumes completions return in issue order (violates D5a freedom)</td><td>Data scrambled across PRP entries only behind certain switches/RCs</td><td>Analyzer: CplDs for different tags out of issue order, device mis-assigns them</td></tr>
+      <tr><td>Completions of one request out of address order</td><td>Buggy completer violates D5b</td><td>Data corruption within a transfer</td><td>Analyzer: Lower Address / Byte Count sequence not monotonic for one tag (<a href="ch52.html">Ch 52</a>)</td></tr>
+      <tr><td>Mismatched IDs with IDO</td><td>Data and CQE carry different Requester IDs with IDO enabled</td><td>Rare stale data behind switches that exploit IDO</td><td>Analyzer: Requester ID differs between data and CQE MWr</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The ladder for "CQE implies data"</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>The books, the note and the bell go down the same slide in order, so the bell means the note is there and the note means the books are there.</p></div>
+    <div class="rung" data-rung="B"><p>The controller writes data, then the CQE, then MSI-X; posted writes keep their order; the host trusts the CQE without checking the data.</p></div>
+    <div class="rung" data-rung="C"><p>The controller's DMA engines must emit TLPs in that order onto the link; switches keep per-class FIFO order; the Root Complex commits them to coherent memory in order; the CPU orders its loads after the phase check.</p></div>
+    <div class="rung" data-rung="D"><p>PCI Express Base Specification ordering rule A2a (posted must not pass posted unless RO/IDO conditions), Relaxed Ordering and IDO definitions, producer–consumer discussion; NVMe: completion queue entry posting semantics.</p></div>
+    <div class="rung" data-rung="E"><p>Sequence of MWr TLPs from Requester ID 0x0100: data (Attr RO may be 1), CQE (RO = 0), MSI-X (RO = 0), all TC0.</p></div>
+    <div class="rung" data-rung="F"><p>On an analyzer: check the CQE TLP's Attr field and that it follows the last data TLP for that command; check the MSI-X write follows the CQE; check Requester IDs match.</p></div>
+    <div class="rung" data-rung="G"><p>If the host sees stale data, find the first TLP whose ordering or attributes permit a reordering the host relies on; then check platform RO handling and the driver's barriers.</p></div>
+  </div>
+
+  <h3>The sixteen questions, applied to Relaxed Ordering</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>A TLP attribute (Attr[1]) that permits a posted request or completion to pass earlier posted requests.</dd>
+    <dt>2. Why was it created?</dt><dd>To let independent writes and completions avoid unnecessary serialization in fabrics and Root Complexes.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Head-of-line blocking and memory-write throughput limits caused by strict ordering.</dd>
+    <dt>4. What existed before it?</dt><dd>PCI-X introduced Relaxed Ordering; conventional PCI had strict ordering for posted writes.</dd>
+    <dt>5. Why is the current design better?</dt><dd>It is per-TLP, chosen by the requester who knows which writes are independent, and gated by an enable bit software controls.</dd>
+    <dt>6. Who creates it?</dt><dd>The requester (device DMA engine or Root Complex) sets it; completers copy it into completions.</dd>
+    <dt>7. Who consumes it?</dt><dd>Switches, Root Complexes and completers that may reorder.</dd>
+    <dt>8. Where does it live?</dt><dd>In the TLP header Attr field; the enable is in Device Control.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>Device Control (Enable Relaxed Ordering), the TLP header, the host buffers being written.</dd>
+    <dt>10. What happens before it?</dt><dd>Software enables (or disables) RO for the function; the device decides per TLP.</dd>
+    <dt>11. What happens after it?</dt><dd>The fabric or Root Complex may commit RO TLPs out of order relative to earlier posted writes.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>On the flag (CQE, MSI-X): silent data corruption or spurious interrupts. On platforms with errata: corruption or slowdowns.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>The RO bit in each TLP's Attr field; the order of TLPs on the link (which does not reveal Root Complex internal reordering).</dd>
+    <dt>14. What does Linux show?</dt><dd><code>RlxdOrd+/-</code> in DevCtl from lspci; quirk-related kernel messages on affected platforms.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>Attr bits per TLP class under all command types; data integrity with RO enabled on platforms known to reorder; RO disabled path performance.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>RO on the CQE/MSI-X, platform errata, or a driver barrier missing on a weakly ordered CPU masquerading as an RO problem.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>Ordering is implemented by queues and by the rules that choose which queue head may go next.</p>
+  <figure>
+<pre class="diagram">
+  Transmit side of a port (per Virtual Channel)
+  +----------------+  +----------------+  +----------------+
+  | Posted queue   |  | Non-posted q.  |  | Completion q.  |
+  | P3 P2 P1       |  | N2 N1          |  | C2 C1          |
+  +-------+--------+  +-------+--------+  +-------+--------+
+          |                   |                   |
+          +---------+---------+---------+---------+
+                    |  Ordering / arbitration logic:
+                    |   - P must not pass P (unless RO/IDO)
+                    |   - N must not pass P; C must not pass P (unless RO/IDO for C)
+                    |   - P and C may always pass a blocked N
+                    |   - flow-control credits checked per class
+                    v
+               Data Link Layer (sequence numbers, replay)
+</pre>
+    <figcaption>Conceptual transmit queues in a PCIe port. A switch has this structure at every egress port; the Root Complex has it at each Root Port, plus its own internal ordering into memory.</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Endpoints</strong> (the SSD): ordering must hold from the point where the controller's firmware decides "command done" to the link. Many controllers have several DMA engines (data, CQE, interrupt); they need an internal ordering point — often a single posted-write queue toward the PCIe core, or explicit fences — so the CQE TLP cannot leave before the last data TLP.</li>
+    <li><strong>Switches</strong> merge traffic from many ports. IDO lets them reorder between different sources; without it, a slow destination for one source can stall unrelated sources' writes.</li>
+    <li><strong>Root Complexes</strong> turn each MWr into coherent memory operations. Maintaining strict write ordering often means waiting for each write's coherency to resolve before making the next visible. RO lets the Root Complex pipeline these. That is where RO's performance benefit — and its risk — lives.</li>
+    <li><strong>The Data Link Layer</strong> replays TLPs in sequence-number order after errors, so link errors do not reorder TLPs (<a href="ch15.html">Chapter 15</a>).</li>
+  </ul>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>Documents: <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Transaction Ordering (Ordering Rules Summary; Relaxed Ordering and ID-Based Ordering usage; Update Ordering and Granularity); appendix discussion of producer–consumer ordering</cite>; <cite class="spec">NVM Express Base Specification 2.4 — Completion Queue Entry; Command completion</cite>; <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite>.</p>
+  <aside class="callout verified">
+    <p>Posted requests must not pass earlier posted requests unless relaxed by RO or IDO conditions; reads must not pass earlier posted requests; completions must not pass earlier posted requests unless relaxed; posted requests and completions must be allowed to pass non-posted requests; completions of the same request are returned in address order. RO is Attr[1] gated by Enable Relaxed Ordering in Device Control; IDO is Attr[2] gated by IDO enables in Device Control 2; No Snoop is Attr[0]. There is no ordering requirement between different Traffic Classes.</p>
+  </aside>
+  <aside class="callout derived">
+    <p>For NVMe: the controller must not set RO (or rely on IDO with mismatched IDs) on CQE and MSI-X writes; the host's correctness additionally depends on the Root Complex honoring ordering into memory and on driver barriers. Peer-to-peer DMA between NVMe devices and other endpoints inherits the same producer–consumer reasoning, with the added complexity of the path through switches and ACS redirection.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>Whether a given switch or Root Complex actually reorders RO or IDO traffic, how a Root Complex commits writes to memory, whether a device's DMA engines are internally ordered, and which TLPs a device marks with RO are implementation-dependent. An analyzer on the link cannot see Root Complex internal reordering.</p>
+  </aside>
+  <aside class="callout version">
+    <p>RO came from PCI-X and is present from PCIe 1.0. IDO was added in the 2.1 era. Flit Mode (6.0) changed the TLP header format (the attribute bits are carried differently), so decode attributes with the right header format for the link mode. Some sub-entries of the ordering table were refined across revisions.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p>The PCIe specification does not define how a CPU observes memory, or what barriers a driver needs. The NVMe specification does not say which TLP attributes a controller should use. Check in the specs: the current wording of each ordering-table sub-entry; MSI/MSI-X attribute requirements; the update-granularity rules for a single multi-DWORD write; and any NVMe over PCIe Transport statements about write ordering.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume: that completions return in the order reads were issued; that TLPs in different Traffic Classes are ordered; that "the analyzer shows the CQE after the data" means the CPU saw them in that order (RO and Root Complex behaviour matter); that x86 behaviour proves a driver correct on Arm.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>In the non-Flit TLP header, the attribute bits are split across DW0 (layout from <a href="ch11.html">Chapter 11</a>).</p>
+  <table class="packet">
+    <thead><tr><th class="row-label">DW</th><th colspan="8">Byte 0 (31…24)</th><th colspan="8">Byte 1 (23…16)</th><th colspan="8">Byte 2 (15…8)</th><th colspan="8">Byte 3 (7…0)</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">DW0</td><td colspan="3">Fmt</td><td colspan="5">Type</td><td>T9</td><td colspan="3">TC</td><td>T8</td><td class="hl">Attr[2] (IDO)</td><td>LN</td><td>TH</td><td>TD</td><td>EP</td><td colspan="2" class="hl">Attr[1:0] (RO, NS)</td><td colspan="2">AT</td><td colspan="10">Length</td></tr>
+    </tbody>
+  </table>
+  <p>Attr[1] is Relaxed Ordering, Attr[0] is No Snoop, Attr[2] is ID-Based Ordering. T9/T8 are tag extension bits (10-bit tags) and LN/TH relate to Lightweight Notification and TLP Processing Hints. Confirm the exact bit positions against the header figure in your specification revision; in Flit Mode the header is different.</p>
+  <table>
+    <caption>NVMe transactions by ordering class and typical attributes (Lab SSD)</caption>
+    <thead><tr><th>Transaction</th><th>Direction</th><th>Class</th><th>Typical attributes</th><th>Ordering role</th></tr></thead>
+    <tbody>
+      <tr><td>SQ tail / CQ head doorbell</td><td>Host→Dev</td><td>Posted</td><td>RO 0, NS 0</td><td>Must follow the CPU's SQE store (CPU barrier)</td></tr>
+      <tr><td>Register read (CSTS)</td><td>Host→Dev</td><td>Non-posted</td><td>—</td><td>Flushes earlier doorbells (B2a)</td></tr>
+      <tr><td>SQE fetch, PRP/SGL list fetch, write-data fetch</td><td>Dev→Host</td><td>Non-posted</td><td>RO may be 1</td><td>Completions may be reordered across tags (D5a)</td></tr>
+      <tr><td>Completions for those fetches</td><td>Host→Dev</td><td>Completion</td><td>RO copied from request</td><td>Same-request completions in address order (D5b)</td></tr>
+      <tr><td>Read data</td><td>Dev→Host</td><td>Posted</td><td>RO may be 1</td><td>Data of the producer–consumer pair</td></tr>
+      <tr><td>CQE</td><td>Dev→Host</td><td>Posted</td><td><strong>RO 0</strong></td><td>Flag; must not pass data</td></tr>
+      <tr><td>MSI-X</td><td>Dev→Host</td><td>Posted</td><td><strong>RO 0</strong></td><td>Second flag; must not pass CQE</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <div class="trace" data-kind="synthetic" data-title="Normal: 4 KiB READ completion with Relaxed Ordering on data only (Lab SSD, MPS 256)">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MWr64</td><td>Addr=0x2_0000_0000 Len=64 Attr: RO=1 NS=0 Req=0x0100 TC0</td><td>Data bytes 0–255</td></tr>
+        <tr class="note"><td colspan="6">Rows 2–15: 14 more 256-byte data writes, each RO=1, addresses +0x100.</td></tr>
+        <tr class="dir-up"><td>16</td><td>Dev→Host</td><td>2,100</td><td>MWr64</td><td>Addr=0x2_0000_0F00 Len=64 RO=1</td><td>Last data chunk</td></tr>
+        <tr class="dir-up"><td>17</td><td>Dev→Host</td><td>2,180</td><td>MWr64</td><td>Addr=0x1_2341_0040 Len=4 Attr: RO=0 NS=0 Req=0x0100</td><td>CQE (CQ1 slot 4, phase 1); cannot pass rows 1–16</td></tr>
+        <tr class="dir-up"><td>18</td><td>Dev→Host</td><td>2,260</td><td>MWr32</td><td>Addr=0xFEE0_1000 Len=1 Data=0x0000_0041 RO=0 Req=0x0100</td><td>MSI-X vector 1; cannot pass the CQE</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the Root Complex may commit rows 1–16 to memory in any order among themselves (they are RO), but row 17 has RO = 0 and must not become visible before any of them; row 18 must not pass row 17. Attributes and Requester IDs are consistent. This is the desired pattern.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: CQE written with Relaxed Ordering; host reads stale data">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Context: new controller firmware "enables RO for all DMA writes for performance". Platform Root Complex exploits RO. Database reports checksum failures at ~1 per 10<sup>9</sup> reads, only under high load.</td></tr>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MWr64</td><td>Addr=0x2_0040_0000 Len=64 RO=1</td><td>Data chunk 0</td></tr>
+        <tr class="note"><td colspan="6">Rows 2–15: data chunks 1–14, RO=1.</td></tr>
+        <tr class="dir-up"><td>16</td><td>Dev→Host</td><td>2,090</td><td>MWr64</td><td>Addr=0x2_0040_0F00 Len=64 RO=1</td><td>Data chunk 15</td></tr>
+        <tr class="abnormal"><td>17</td><td>Dev→Host</td><td>2,170</td><td>MWr64</td><td>Addr=0x1_2341_3A80 Len=4 Attr: RO=1 Req=0x0100</td><td>First abnormal event: CQE carries RO=1 — it is now permitted to pass rows 1–16</td></tr>
+        <tr class="dir-up"><td>18</td><td>Dev→Host</td><td>2,250</td><td>MWr32</td><td>MSI-X, RO=1</td><td>Interrupt also relaxed</td></tr>
+        <tr class="note"><td colspan="6">The link order looks perfect. Inside the Root Complex, row 17 became visible while row 16's coherency resolution was still pending. The CPU read the CQE, completed the I/O, and the application read the last 256 bytes before they were written.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Walk-through.</strong> An engineer looking only at TLP order would declare this trace clean — the CQE is after the data on the wire. The first abnormal event is the attribute, not the order. The hypothesis is confirmed by (1) failures only on platforms whose Root Complex exploits RO, (2) failures disappearing when Linux's Enable Relaxed Ordering is cleared for the device (<code>setpci</code> on a test machine, or a firmware option), and (3) the corrupted region always being the tail of the transfer. Root cause: firmware applied RO to CQE and MSI-X writes. Corrective action: RO only on data writes; regression test that checks Attr bits per address range on an analyzer and a data-integrity stress on an RO-exploiting platform.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Ambiguous: SQE fetch completions arriving out of issue order">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64</td><td>Addr=0x1_2340_0200 Len=64 Tag=0x40</td><td>Fetch SQEs 8–11 (256 bytes)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>8</td><td>MRd64</td><td>Addr=0x1_5000_0000 Len=128 Tag=0x41</td><td>Fetch a PRP list page fragment</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>610</td><td>CplD</td><td>Tag=0x41 Len=64 BC=512 LA=0x00</td><td>First half of the PRP list fragment returned first (MPS 256 forces two CplDs; the second follows later)</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>690</td><td>CplD</td><td>Tag=0x40 Len=64 BC=256 LA=0x00</td><td>SQEs returned second</td></tr>
+      </tbody>
+    </table>
+    <p>This is legal (D5a: completions for different requests may pass each other). It is only a bug if the device processes the data according to issue order rather than by tag. The analyzer alone cannot tell; you need the device's behaviour afterward (are the right PRP entries used for the right command?). The safe conclusion is "legal reordering; verify the device matches by tag" — confidence high that the fabric is fine, unknown for the device until checked.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Relaxed Ordering and No Snoop enables (DevCtl), IDO enables (DevCtl2)</span>
+sudo lspci -vvv -s 01:00.0 | grep -E 'DevCtl:|RlxdOrd|NoSnoop|DevCtl2:|IDO'
+
+<span class="cm"># Same for the Root Port: platform policy is visible here too</span>
+sudo lspci -vvv -s 00:01.1 | grep -E 'DevCtl:|DevCtl2:'
+
+<span class="cm"># Kernel messages from relaxed-ordering quirks on affected platforms (wording varies)</span>
+sudo dmesg | grep -i 'relaxed ordering'</code></pre>
+  <aside class="callout linux">
+    <p>The PCI core has a per-device flag marking Root Ports whose Relaxed Ordering handling is problematic; during enumeration, devices below such a port get Enable Relaxed Ordering cleared in Device Control (see <code>pci_configure_relaxed_ordering()</code> and the related quirks in drivers/pci). Drivers that care can ask <code>pcie_relaxed_ordering_enabled()</code>. On the CPU side, the NVMe driver relies on <code>writel()</code> ordering for doorbells and uses a read barrier after detecting a valid phase tag when processing CQEs. Exact code is <span class="badge version">Version-dependent</span>; read drivers/nvme/host/pci.c for your kernel.</p>
+  </aside>
+  <p>What Linux output proves: whether the function is <em>allowed</em> to use RO/NS/IDO. It does not prove which TLPs the device actually marks — only an analyzer shows that.</p>
+  <aside class="callout safety">
+    <p><span class="badge expert">Expert lab</span> Clearing Enable Relaxed Ordering with <code>setpci</code> on a test machine is a valid experiment for the abnormal case above; it is reversible but bypasses the kernel's view of the device and must not be done on production systems.</p>
+  </aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>A Monte Carlo model of a Root Complex that may commit RO writes early. It counts how often a consumer sees the CQE before all data — with RO on the CQE and without.</p>
+<pre class="code" data-kind="simulation" data-lang="python" data-title="ro_ordering_sim.py"><code>#!/usr/bin/env python3
+"""Model: posted writes arrive in order; an RO write may become visible before
+earlier writes; a non-RO write becomes visible only after all earlier writes."""
+import random
+
+def run(cqe_ro, data_chunks=16, trials=20000, seed=7):
+    rng = random.Random(seed)
+    writes = [("data", True)] * data_chunks + [("cqe", cqe_ro), ("msix", False)]
+    bad_cqe = 0
+    for _ in range(trials):
+        visible = [False] * len(writes)
+        while not all(visible):
+            eligible = [i for i, (_, ro) in enumerate(writes)
+                        if not visible[i] and (ro or all(visible[:i]))]
+            i = rng.choice(eligible)
+            visible[i] = True
+            if writes[i][0] == "cqe" and not all(visible[:data_chunks]):
+                bad_cqe += 1          # consumer could read stale data now
+                break
+    return bad_cqe / trials
+
+if __name__ == "__main__":
+    print(f"CQE RO=0: stale-data window in {run(False):.2%} of commands")
+    print(f"CQE RO=1: stale-data window in {run(True):.2%} of commands")</code></pre>
+  <p>Expected result: 0.00% with RO = 0 on the CQE; a large percentage with RO = 1, because the model lets RO writes become visible at any time (a real Root Complex reorders far less often — which is why the real bug appears at one in a billion, not one in two).</p>
+  <p>The host-side half of the contract, as C pseudocode in Linux style:</p>
+<pre class="code" data-kind="pseudocode" data-lang="c" data-title="nvme_ordering_host.c (pseudocode)"><code>void submit(struct queue *q, const struct sqe *cmd)
+{
+    memcpy(&amp;q-&gt;sq[q-&gt;tail], cmd, 64);       <span class="cm">/* normal cacheable stores */</span>
+    q-&gt;tail = (q-&gt;tail + 1) % q-&gt;depth;
+    writel(q-&gt;tail, q-&gt;sq_doorbell);          <span class="cm">/* writel orders prior stores before MMIO */</span>
+    <span class="cm">/* writel_relaxed() here would be a bug on weakly ordered CPUs */</span>
+}
+
+int poll_cq(struct queue *q)
+{
+    int n = 0;
+    while ((READ_ONCE(q-&gt;cq[q-&gt;head].status) &amp; 1) == q-&gt;phase) {
+        dma_rmb();                            <span class="cm">/* order phase load before other CQE loads */</span>
+        complete_cmd(q-&gt;cq[q-&gt;head].command_id, q-&gt;cq[q-&gt;head].status &gt;&gt; 1);
+        if (++q-&gt;head == q-&gt;depth) { q-&gt;head = 0; q-&gt;phase ^= 1; }
+        n++;
+    }
+    if (n)
+        writel(q-&gt;head, q-&gt;cq_doorbell);      <span class="cm">/* release CQ slots */</span>
+    return n;
+}</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p>Apply the table to six pairs, all in the same direction and TC0. For each: may the later TLP pass the earlier one, and does it matter for NVMe?</p>
+  <table>
+    <caption>Ordering decisions</caption>
+    <thead><tr><th>#</th><th>Earlier TLP</th><th>Later TLP</th><th>Rule</th><th>Answer</th><th>NVMe consequence</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Data MWr, RO=1</td><td>CQE MWr, RO=0</td><td>A2a (later has RO=0)</td><td>No</td><td>CQE safe</td></tr>
+      <tr><td>2</td><td>Data MWr, RO=0</td><td>Data MWr, RO=1</td><td>A2b</td><td>Y/N</td><td>Harmless: independent data</td></tr>
+      <tr><td>3</td><td>Doorbell MWr (host→dev)</td><td>CSTS MRd (host→dev)</td><td>B2a</td><td>No</td><td>Read result reflects the doorbell's arrival</td></tr>
+      <tr><td>4</td><td>SQE fetch MRd (dev→host)</td><td>Data MWr (dev→host)</td><td>A3</td><td>Yes (must be allowed)</td><td>Data from an earlier command must not wait for a new fetch</td></tr>
+      <tr><td>5</td><td>CplD tag 0x40 (host→dev)</td><td>CplD tag 0x41 (host→dev)</td><td>D5a</td><td>Y/N</td><td>Device must match by tag</td></tr>
+      <tr><td>6</td><td>CplD tag 0x40, bytes 0–63</td><td>CplD tag 0x40, bytes 64–127</td><td>D5b</td><td>No</td><td>Device may rely on address order within one request</td></tr>
+    </tbody>
+  </table>
+  <p>Pair 4 deserves emphasis: an endpoint's outgoing MRd stuck for lack of non-posted credits must not block its outgoing data writes and CQEs — otherwise a full non-posted queue could stop completions of earlier commands, which is precisely the deadlock pattern.</p>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li>Reading only the "No" cells and treating "Yes" as "may".</li>
+    <li>Thinking RO on an earlier TLP lets a later non-RO TLP pass it. RO is a property of the TLP that wants to pass.</li>
+    <li>Assuming read completions come back in issue order.</li>
+    <li>Treating link order as memory-visibility order (RO and Root Complex internals).</li>
+    <li>Applying PCIe rules to CPU stores and loads (the SQE write, the CQE read). Those need CPU barriers.</li>
+    <li>Assuming ordering across Traffic Classes.</li>
+    <li>Confusing No Snoop with Relaxed Ordering.</li>
+    <li>Testing ordering-sensitive firmware only on platforms that never reorder.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>Ordering-related failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Likely conclusion</th></tr></thead>
+    <tbody>
+      <tr><td>Rare data corruption at the end of read buffers under load</td><td>Analyzer: Attr RO on CQE/MSI-X TLPs</td><td>Platform RO behaviour; Linux RO quirk status</td><td>Clear Enable Relaxed Ordering for the device (test machine)</td><td>RO misuse or platform errata</td></tr>
+      <tr><td>Spurious interrupts / handler finds nothing</td><td>Analyzer: MSI-X before CQE?</td><td>Interrupt coalescing settings</td><td>Poll CQ just after interrupt with a delay; if late CQEs appear, ordering is broken</td><td>Device internal DMA ordering</td></tr>
+      <tr><td>Invalid opcode or field errors on random commands, only on Arm servers</td><td>Driver MMIO write variant before doorbell</td><td>Compare logged SQE with analyzer-captured SQE fetch data</td><td>Add a full barrier before the doorbell</td><td>Missing CPU barrier</td></tr>
+      <tr><td>Wrong command completed ("unknown command id")</td><td>CQE handling barrier after phase check</td><td>CPU architecture</td><td>Stress on weakly ordered CPU with and without barrier</td><td>Load reordering in driver</td></tr>
+      <tr><td>Hang under peer-to-peer traffic through a switch</td><td>Credit state per class (analyzer: UpdateFC)</td><td>Which queue is blocked</td><td>Disable P2P; reduce outstanding reads</td><td>Non-compliant buffering causing deadlock</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight">
+    <p><strong>Ordering bugs are invisible to anyone who only checks TLP order.</strong> The decisive evidence is often an attribute bit, a Requester ID, a platform property, or a CPU barrier — none of which show up as "out of order" on the wire. A senior review of a controller's DMA design asks: where is the single ordering point before the link, which TLP classes carry RO/IDO, and how is that verified on an RO-exploiting platform?</p>
+  </aside>
+  <ul>
+    <li>RO is a performance feature whose benefit depends on the Root Complex; measure before enabling it in firmware, and never on flags.</li>
+    <li>Data integrity validation must include platforms that exploit RO and weakly ordered CPUs; x86-only validation hides whole classes of bugs.</li>
+    <li>When reviewing switch or bridge designs, ask how deadlock freedom is guaranteed — "we never saw a hang" is not evidence.</li>
+    <li>For SR-IOV and multi-function devices, verify that every producer–consumer pair uses one Requester ID if IDO is enabled.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab: ordering audit of an NVMe completion path</h2>
+  <h4>Objective</h4>
+  <p>Determine, from configuration and (optionally) analyzer data, whether a device's completion path is safe with respect to RO and IDO, and quantify the hazard with the simulator.</p>
+  <h4>Skills</h4>
+  <p>Ordering-table reasoning, attribute decoding, separating fabric ordering from CPU ordering.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p>Steps 1–3 <span class="badge safe">Safe lab</span>. The optional RO-disable experiment is <span class="badge expert">Expert lab</span> and is not required.</p></aside>
+  <h4>Hardware required</h4>
+  <p>Any Linux machine with an NVMe SSD. Optional: PCIe analyzer.</p>
+  <h4>Software required</h4>
+  <p>pciutils, Python 3.</p>
+  <h4>Input</h4>
+  <p>lspci output for the SSD and its Root Port; the simulator; the synthetic traces in this chapter.</p>
+  <h4>Expected output</h4>
+  <p>A one-page ordering audit: enables (RO, NS, IDO) on device and port, which NVMe TLP classes may carry them, the hazard if CQE/MSI-X carried RO, and a recommendation.</p>
+  <h4>Background</h4>
+  <p>Ordering table, RO/IDO sections, NVMe producer–consumer table.</p>
+  <h4>Step 1</h4>
+  <p>Record DevCtl RlxdOrd/NoSnoop and DevCtl2 IDO bits for the SSD and the Root Port. Check dmesg for relaxed-ordering quirk messages.</p>
+  <h4>Step 2</h4>
+  <p>Run <code>ro_ordering_sim.py</code>. Modify it so that RO writes become visible early only with probability 0.001 per opportunity, and estimate the failure rate per command.</p>
+  <h4>Step 3</h4>
+  <p>Using the abnormal trace, write the root-cause statement, corrective action and regression test in the root-cause template (<a href="debug-method.html">Debugging Methodology</a>).</p>
+  <h4>Observation</h4>
+  <p>How does the per-command failure rate scale with the number of data chunks per command?</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>If RlxdOrd is "-" on your SSD, can the CQE RO bug occur?</li>
+    <li>Why can't an analyzer on the SSD's link prove the Root Complex reordered writes?</li>
+    <li>Which CPU-side mistakes would produce symptoms similar to RO misuse?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Extend the simulator with two Requester IDs and IDO, and show the hazard when data uses one ID and the CQE another.</p>
+  <details class="hint"><summary>Hints</summary><p>A requester may set RO only if enabled. Analyzers see link order, not memory visibility. Look at the barriers in submit/poll pseudocode.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>Q1: A compliant device must not set RO when Enable Relaxed Ordering is clear, so no — unless the device is non-compliant (worth checking on an analyzer). Q2: the link shows TLP order before the Root Complex; reordering happens inside the Root Complex's commit to memory, which the analyzer cannot observe — only the effect (stale data) is visible. Q3: missing read barrier after the phase check (reading CQE fields or data early) and missing write barrier before the doorbell (stale SQE). Challenge: give each write a source ID; with IDO, a write may become visible early if all earlier writes it has not yet passed have a different ID; show that a CQE with a different ID from the data now behaves like RO = 1.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>Whether RO is enabled on a platform with known RO issues, whether the device's documentation states which TLPs use RO, and whether validation includes a weakly ordered host.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>RO enabled by BIOS on the device but disabled on the Root Port: the device may still emit RO TLPs; what the port does with them depends on the platform.</li>
+    <li>IDO enabled without SR-IOV: effectively harmless for one function with one ID.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Capture a real read workload on an analyzer and build a per-address-range histogram of Attr bits (data buffers vs CQ ring vs MSI-X window).</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>For each "Yes" entry in the table, describe a concrete deadlock that would occur without it.</li>
+    <li>A device issues MRd tags 1, 2, 3 and receives CplDs 3, 1, 2. Which rule permits this, and what must the device do?</li>
+    <li>A driver reads CSTS after writing a doorbell to "make sure the doorbell landed". Which rule makes this work, and what does it not guarantee?</li>
+    <li>Why is RO on Write-command data fetches (MRd from the device) generally harmless for NVMe?</li>
+    <li>Explain the difference between "the CQE must not pass the data" and "the CPU must not read the data before the CQE".</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p>1. A3/A4: posted writes stuck behind a non-posted request whose completer waits for those writes (or for buffer space freed by them) — e.g. a bridge forwarding reads that cannot complete until its posted buffer drains. D3/D4: completions stuck behind non-posted requests at a port where the requester of those non-posted requests waits for the completions to free resources — the peer-to-peer example in the chapter.</p>
+    <p>2. D5a: completions for different Transaction IDs may pass each other. The device must match completions by Tag (and Requester ID) and place data by the request's address, not by arrival order.</p>
+    <p>3. B2a: the read cannot pass the earlier posted write, so by the time the controller produces the read completion, the doorbell has arrived. It does not guarantee the controller has <em>processed</em> the doorbell (fetched the SQE) — only that the write reached it.</p>
+    <p>4. RO on the read request is copied to its completions, allowing them to pass host→device posted writes (doorbells, register writes). NVMe does not use the relative order of a doorbell and a data completion to validate data; the data was produced by the CPU before the command was submitted, so no producer–consumer pair is broken.</p>
+    <p>5. The first is a fabric/Root Complex property (PCIe ordering, RO usage). The second is a CPU load-ordering property, enforced by the driver's read barrier after the phase check. Both are needed.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>"May a later Memory Read pass an earlier posted Memory Write in the same direction?" (no IDO)</p>
+      <ul class="options" data-answer="2"><li>Yes, must be allowed</li><li>No</li><li>Y/N</li><li>Only with RO</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>B2a: No. This is why reads flush writes.</p></details></li>
+    <li><p>Which entries exist to prevent deadlock?</p>
+      <ul class="options" data-answer="3"><li>A2a and D2a</li><li>D5b</li><li>A3/A4 and D3/D4</li><li>B3/B4</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Posted and completions must be able to pass non-posted.</p></details></li>
+    <li><p>A data write has RO = 1; the following CQE write has RO = 0. May the CQE pass the data?</p>
+      <ul class="options" data-answer="1"><li>No</li><li>Yes</li><li>Only across different TCs</li><li>Only if No Snoop is set</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>RO applies to the passing TLP; the CQE has RO = 0, so A2a forbids passing.</p></details></li>
+    <li><p>Which attribute bit is ID-Based Ordering?</p>
+      <ul class="options" data-answer="4"><li>Attr[0]</li><li>Attr[1]</li><li>TH</li><li>Attr[2]</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Attr[2] is IDO; Attr[1] RO; Attr[0] No Snoop.</p></details></li>
+    <li><p>Two completions for the same read request — may the second pass the first?</p>
+      <ul class="options" data-answer="2"><li>Yes</li><li>No</li><li>Y/N</li><li>Only with RO</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>D5b: same Transaction ID completions stay in address order.</p></details></li>
+    <li><p>Why can't an analyzer on the endpoint link alone prove a CQE was visible before its data in memory?</p>
+      <details class="answer"><summary>Model answer</summary><p>The analyzer sees link order. Visibility in memory is decided by the Root Complex after the link, and RO allows it to reorder; the CPU's load order adds a third domain.</p></details></li>
+    <li><p>What CPU-side mechanism orders the SQE store before the doorbell MMIO write in Linux?</p>
+      <details class="answer"><summary>Model answer</summary><p>The ordering semantics of <code>writel()</code>, which includes the necessary write barrier on weakly ordered architectures; <code>writel_relaxed()</code> does not.</p></details></li>
+    <li><p>Is ordering guaranteed between TC0 and TC1 traffic?</p>
+      <details class="answer"><summary>Model answer</summary><p>No. Ordering rules apply within a Traffic Class; different TCs may map to different VCs with independent arbitration.</p></details></li>
+    <li><p>Give the safe RO policy for an NVMe controller.</p>
+      <details class="answer"><summary>Model answer</summary><p>RO may be set (if enabled) on read-data writes and on read requests for SQEs, PRP/SGL lists and write data; never on CQE writes or MSI-X writes.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> What are the three ordering classes in PCIe?</p><details class="answer"><summary>Model answer</summary><p>Posted requests, non-posted requests (reads and non-posted requests with data), and completions.</p></details></li>
+    <li><p><strong>Beginner:</strong> Why does an NVMe host trust the CQE?</p><details class="answer"><summary>Model answer</summary><p>Because the controller writes data before the CQE, posted writes keep their order on PCIe, and the Root Complex makes them visible in order — so a visible CQE implies visible data, given correct driver barriers.</p></details></li>
+    <li><p><strong>Intermediate:</strong> What does Relaxed Ordering relax?</p><details class="answer"><summary>Model answer</summary><p>It lets a posted request or completion carrying RO pass earlier posted requests (A2b, D2b). It requires Enable Relaxed Ordering; completers copy RO from the request.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Why must completions be able to pass non-posted requests?</p><details class="answer"><summary>Model answer</summary><p>Non-posted requests can block waiting for resources; if completions (which free those resources) were stuck behind them, the system could deadlock. Separate credit classes plus the passing rule prevent it.</p></details></li>
+    <li><p><strong>Advanced:</strong> Explain IDO and a scenario where it breaks NVMe correctness.</p><details class="answer"><summary>Model answer</summary><p>IDO lets TLPs from different source IDs reorder. If a device sends data with a VF's Requester ID and the CQE with the PF's ID while IDO is enabled, the CQE may pass the data. Correct designs keep each producer–consumer pair within one ID.</p></details></li>
+    <li><p><strong>Advanced:</strong> A storage team sees corruption only on Arm servers. Ordering hypotheses?</p><details class="answer"><summary>Model answer</summary><p>Missing CPU barriers: relaxed MMIO before doorbell (stale SQE fetch) or missing read barrier after phase check. Also platform RO handling differences. Check driver code paths, compare analyzer-captured SQE data with logged commands, and test with barriers added.</p></details></li>
+    <li><p><strong>Senior:</strong> Review a controller DMA design with three engines (data, CQE, MSI-X). What do you ask?</p><details class="answer"><summary>Model answer</summary><p>Where is the ordering point before the PCIe core? Can a CQE be enqueued before the last data TLP has been handed to the core? Which TLPs carry RO/NS/IDO and under which enables? How do Requester IDs work with SR-IOV? How is this verified (analyzer checks on attributes and order, RO-exploiting platform stress, weakly ordered host)?</p></details></li>
+    <li><p><strong>Senior:</strong> Is it ever right to enable RO on a data-center NVMe fleet?</p><details class="answer"><summary>Model answer</summary><p>Yes, if measurements show a throughput benefit on the target Root Complex, the device uses RO only on data, the platform has no RO errata (or the kernel quirk handles them), and validation proves data integrity under stress. Otherwise the benefit is not worth the risk; the default should be evidence-driven.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>Child:</strong> why the note must never jump ahead of the books on the slide, and why little letters may slip past a stuck box.</li>
+    <li><strong>Junior engineer:</strong> the three classes, the "No" and "Yes" cells, and how they make NVMe completions safe and the fabric deadlock-free.</li>
+    <li><strong>Senior engineer:</strong> the three ordering domains (fabric, Root Complex, CPU) and where RO/IDO and barriers fit.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "If the note arrives first, the teacher thinks her books came but the desk is empty. And if a big box is stuck, everything behind it would be stuck forever — so small letters are allowed to slip by."</p>
+    <p><strong>Junior:</strong> "Writes can't pass writes, reads can't pass writes, completions can't pass writes — that keeps data before flags. Writes and completions must be able to pass reads — that prevents deadlock. Completions for different reads can come back in any order. RO and IDO relax some 'No' cells; never put them on the CQE or interrupt."</p>
+    <p><strong>Senior:</strong> "PCIe orders the link and switches; the Root Complex must preserve ordering into memory except where RO/IDO allow; the CPU needs barriers for the SQE→doorbell and phase→payload orders. A bug in any domain looks like 'the SSD returned bad data'. Evidence: attributes and IDs from an analyzer, platform quirks, and the driver's barrier usage."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>The PCIe ordering table has correctness entries (posted must not pass posted; reads and completions must not pass posted; same-request completions stay ordered), deadlock-avoidance entries (posted and completions must be able to pass non-posted) and freedoms (non-posted among themselves; completions of different requests). NVMe relies on the producer–consumer guarantee for data → CQE → MSI-X, plus CPU barriers for SQE → doorbell and phase → payload. Relaxed Ordering (Attr[1]) and ID-Based Ordering (Attr[2]) relax specific "No" cells for performance; they are safe on data and fatal on flags. Most real ordering bugs are invisible in TLP order: they hide in attribute bits, Requester IDs, Root Complex behaviour and driver barriers.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>reproduce the ordering table and classify every cell as correctness, deadlock-avoidance or freedom</li>
+      <li>construct a deadlock that the "Yes" cells prevent</li>
+      <li>state exactly which cells RO and IDO relax and who may set them</li>
+      <li>give the safe RO policy for NVMe controller traffic</li>
+      <li>separate fabric, Root Complex and CPU ordering domains</li>
+      <li>find an ordering bug in a trace where TLP order looks correct</li>
+      <li>cite the PCIe Base specification sections by name</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Transaction Ordering; Relaxed Ordering and ID-Based Ordering; Update Ordering and Granularity; producer–consumer appendix</cite></li>
+    <li><cite class="spec">NVM Express Base Specification 2.4 — Completion Queue Entry; Phase Tag</cite></li>
+    <li>Linux: Documentation/memory-barriers.txt (I/O barriers section), drivers/nvme/host/pci.c, drivers/pci/probe.c and quirks.c (relaxed ordering configuration).</li>
+    <li>Deeper: <a href="dd14.html">Deep-Dive Module 14 — PCIe Ordering</a>; <a href="dd38.html">Module 38 — Trace Correlation</a>.</li>
+  </ul>
+  <p>Next: <a href="ch52.html">Chapter 52 — Completion Rules</a>, where we zoom into the completions themselves: splitting, Read Completion Boundary, Byte Count and Lower Address arithmetic, and timeouts.</p>
+</section>

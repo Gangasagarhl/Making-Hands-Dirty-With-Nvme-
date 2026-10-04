@@ -1,0 +1,917 @@
+<p class="lead">A Zoned Namespace (ZNS) divides its logical blocks into zones that must be written from start to end, in order, and erased only as a whole. This chapter teaches the zone model, its state machine, the write pointer, Zone Append, Zone Management Send and Receive, open and active zone limits, and how all of it looks in a trace, in Linux and when it fails.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>NAND flash cannot overwrite in place. It programs pages in order inside an erase block and can only erase whole blocks. A conventional SSD hides that from the host with a Flash Translation Layer (FTL) that remaps every logical block, keeps spare capacity (over-provisioning) and runs garbage collection. The price is a large mapping table in DRAM, 7–28% of the flash held back as spare, and write amplification that steals bandwidth and endurance — all of it invisible and unpredictable from the host's side.</p>
+  <p>The Zoned Namespace Command Set exposes a model much closer to how flash wants to be written. The host promises to write each zone sequentially and to reset a zone before rewriting it; in return the device can shrink its mapping table, its spare capacity and its garbage collection. Log-structured file systems (F2FS, Btrfs in zoned mode), key-value stores (RocksDB with ZenFS) and object stores already write mostly sequentially, so they can carry the responsibility the device gives up.</p>
+  <p>For an engineer the consequence is that a whole new class of errors appears: writes that are "valid" for a block device are rejected because they are not at the write pointer, because the zone is full, or because too many zones are open. Understanding the zone state machine is now required to read traces from cloud and hyperscale storage, and the ZNS model is the clearest example in NVMe of a command set that changes the meaning of a WRITE.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Define zone, zone size, zone capacity, zone start LBA and write pointer, and compute zone boundaries.</li>
+    <li>Draw the zone state machine — Empty, Implicitly Opened, Explicitly Opened, Closed, Full, Read Only, Offline — and name the event behind each transition.</li>
+    <li>State the sequential write requirement and predict the status of a WRITE that violates it.</li>
+    <li>Explain Zone Append, why it exists, and where the device returns the assigned LBA.</li>
+    <li>Use Zone Management Send actions (Open, Close, Finish, Reset, Offline) and Zone Management Receive (Report Zones) and decode a zone report.</li>
+    <li>Explain Maximum Open Resources and Maximum Active Resources and predict when Too Many Open/Active Zones occurs.</li>
+    <li>Compare a conventional namespace with a ZNS namespace in hardware cost, host responsibility and failure modes.</li>
+    <li>Find the first abnormal event in a ZNS trace and inspect a zoned namespace safely in Linux.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>Namespaces, CSI, Identify and LBA formats from <a href="ch58.html">Namespaces</a>; the WRITE command and its LBA fields from <a href="ch33.html">WRITE</a>; deallocation from <a href="ch35.html">Dataset Management</a>; command and completion layouts from <a href="ch29.html">NVMe Command Structure</a>; status codes from <a href="ch44.html">NVMe Errors</a>. A memory of how NAND programs and erases from <a href="ch02.html">What Is Storage?</a> helps.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Imagine a giant warehouse with long aisles. Each aisle is a <strong>zone</strong>. The warehouse has one strict rule: in each aisle, boxes must be put down one after another starting from the front, with no gaps and no jumping ahead. A little flag on the floor, the <strong>write pointer</strong>, shows where the next box must go. When an aisle is full, nothing more can go in. To use it again, the workers must empty the <em>whole</em> aisle — you cannot take out just one box and put a new one in its place.</p>
+    <p>The warehouse also has only a few forklifts. Each aisle someone is actively filling needs a forklift parked in it. If all the forklifts are busy, you cannot start a new aisle until you park one somewhere (close an aisle) or finish one.</p>
+    <p>Sometimes you don't care exactly where your box goes, you just want it in aisle 7. Then you hand it to the aisle-7 worker and say "put it wherever the flag is, and tell me the spot number." That is <strong>Zone Append</strong>.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A high-bay distribution warehouse with "drive-in" racking. Each lane is loaded from the front and filled to the back, pallet after pallet; you cannot pull out a pallet in the middle without unloading everything in front of it, so lanes are emptied and reassigned whole. Lanes in use need a dedicated loading crew (open resources), and every lane that holds partial stock needs an inventory record kept current (active resources). Receiving can ask the dock "slot this pallet anywhere in lane 12 and give me the slot number" — that lets ten trucks unload into the same lane in parallel without agreeing on order. A conventional SSD is, by contrast, a warehouse with a full-time re-shelving team that lets customers drop items anywhere and quietly reorganizes at night — convenient for customers, expensive for the warehouse.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What it hides.</strong> A zone is a range of <em>logical</em> blocks, not a physical aisle. The device maps a zone onto flash erase blocks however it likes, possibly striped across many dies. Zone size and zone capacity are separate numbers: the aisle may be painted 100 m long but only 80 m usable.</p>
+    <p><strong>Where it misleads.</strong> "Emptying the aisle" (Reset Zone) is not a physical erase you can time; the device may erase later or lazily. The forklift limit is not physical either — it is a promise about how many zones the device can keep in fast, partially-written state, and it is reported as a number you must respect. And unlike a warehouse, reading is unrestricted: you may read any written block of any zone in any order.</p>
+    <p><strong>Where it breaks.</strong> In a warehouse two workers putting boxes in the same aisle would see each other. In NVMe two WRITE commands to the same zone can be reordered anywhere between the application and the controller, and the second one to arrive fails. That is the problem Zone Append solves.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>A ZNS namespace looks like a normal namespace — LBA 0 to NSZE−1, READ works everywhere — but its LBAs are cut into equal-sized <strong><span class="g" data-term="zone">zones</span></strong>. If the zone size is 65,536 blocks, zone 0 is LBAs 0–65,535, zone 1 is 65,536–131,071, and so on.</p>
+  <p>Each zone has a <strong><span class="g" data-term="write-pointer">write pointer</span></strong>: the next LBA that may be written. A fresh (Empty) zone has its write pointer at its first LBA. Every WRITE to a zone must start exactly at the write pointer; the pointer then moves forward by the number of blocks written. When the pointer reaches the end of the zone's usable capacity, the zone is Full.</p>
+  <p>To reuse a zone you <strong>reset</strong> it: the data is discarded, the write pointer goes back to the start, and the zone is Empty again. There is no way to overwrite part of a zone.</p>
+  <p>Each zone is in a <strong>state</strong> — Empty, Opened (implicitly or explicitly), Closed, Full, Read Only or Offline. Only a limited number of zones may be Opened at once, and only a limited number may be "active" (Opened or Closed — partially written). The device tells you the limits.</p>
+  <p>Instead of WRITE, the host can use <strong>Zone Append</strong>: "write these blocks to zone N wherever the write pointer is, and tell me where they landed." Many appends to the same zone can be in flight at once.</p>
+  <p>Finally, the host asks the device for the state and write pointer of each zone with <strong>Zone Management Receive</strong> (a zone report), and changes zone states with <strong>Zone Management Send</strong> (open, close, finish, reset, offline).</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>Zone geometry: size, capacity, start LBA</h3>
+  <p>A <span class="g" data-term="zns">zoned namespace</span> has CSI <code>02h</code>. Its zone geometry is reported in the ZNS-specific Identify Namespace data structure (Identify CNS <code>05h</code> with CSI <code>02h</code>):</p>
+  <ul>
+    <li><strong>Zone Size (ZSZE)</strong> — in the <em>LBA Format Extension</em> entry that matches the namespace's LBA format: the number of logical blocks per zone, identical for every zone in the namespace.</li>
+    <li><strong><span class="g" data-term="zcap">Zone Capacity (ZCAP)</span></strong> — reported per zone in the zone descriptor: the number of writable blocks in that zone, ZCAP ≤ ZSZE. Blocks from ZSLBA + ZCAP to the next zone start are not writable. Capacity may differ between zones and may shrink over a device's life.</li>
+    <li><strong>Zone Start LBA (ZSLBA)</strong> — the first LBA of the zone: zone <var>n</var> starts at <var>n</var> × ZSZE.</li>
+  </ul>
+  <div class="formula">
+    <div class="eq"><var>zone</var> = ⌊ <var>LBA</var> / <var>ZSZE</var> ⌋ ,&nbsp;&nbsp; <var>ZSLBA</var> = <var>zone</var> × <var>ZSZE</var> ,&nbsp;&nbsp; <var>writable end</var> = <var>ZSLBA</var> + <var>ZCAP</var> − 1</div>
+    <dl class="vars">
+      <dt>LBA</dt><dd>any logical block address in the namespace</dd>
+      <dt>ZSZE</dt><dd>zone size in logical blocks (LBA Format Extension)</dd>
+      <dt>zone</dt><dd>zero-based zone index containing that LBA</dd>
+      <dt>ZSLBA</dt><dd>first LBA of the zone</dd>
+      <dt>ZCAP</dt><dd>zone capacity of that zone, in logical blocks, from its zone descriptor</dd>
+      <dt>writable end</dt><dd>last LBA that may ever be written in that zone</dd>
+    </dl>
+  </div>
+  <p>Why separate size from capacity? Zone size is chosen as a convenient power of two so hosts can compute zone numbers with a shift; capacity matches what the flash geometry really holds (for example, an integral number of erase-block stripes). The Linux block layer requires a power-of-two zone size, so a device with a natural 1,077 MiB stripe might expose a 2 GiB zone size and a 1,077 MiB capacity.</p>
+  <p><em>Synthetic example for teaching:</em> in this chapter, namespace 2 of the lab SSD is zoned with 4 KiB blocks, ZSZE = 0x1_0000 (65,536 blocks = 256 MiB), ZCAP = 0xD800 (55,296 blocks = 216 MiB) for every zone, so zone 3 starts at LBA 0x3_0000 and its last writable LBA is 0x3_D7FF.</p>
+
+  <h3>The write pointer and the sequential write requirement</h3>
+  <p>Every zone in an NVMe ZNS namespace has zone type <code>2h</code>, Sequential Write Required — unlike Shingled Magnetic Recording (SMR) hard drives, NVMe ZNS defines no "conventional" random-write zones. The rules, normative in the <cite class="spec">Zoned Namespace Command Set Specification 1.5 — Zoned Namespace Command Set model</cite>, are:</p>
+  <ul>
+    <li>A WRITE (or another command that writes, such as Write Zeroes) to a zone must have its starting LBA equal to the zone's write pointer. Otherwise the command fails with <strong>Zone Invalid Write</strong>.</li>
+    <li>A write must not cross a zone boundary. A command whose range spans two zones fails with <strong>Zone Boundary Error</strong>.</li>
+    <li>A write to a zone in the Full state fails with <strong>Zone Is Full</strong>; Read Only with <strong>Zone Is Read Only</strong>; Offline with <strong>Zone Is Offline</strong>.</li>
+    <li>On success the write pointer advances by the number of blocks written. When it reaches ZSLBA + ZCAP the zone becomes Full.</li>
+    <li>Reads are not restricted by the write pointer. Reading across a zone boundary is allowed only if the namespace reports Read Across Zone Boundaries support in its Optional Zoned Command Support (OZCS) field; otherwise it fails with Zone Boundary Error.</li>
+  </ul>
+  <table>
+    <caption>ZNS command-specific status codes (Status Code Type 1h). Values as encoded in the open-source libnvme library; confirm in the ZNS 1.5 status table.</caption>
+    <thead><tr><th>SC</th><th>Name</th><th>Typical cause</th></tr></thead>
+    <tbody>
+      <tr><td><code>B8h</code></td><td>Zone Boundary Error</td><td>Range crosses into the next zone</td></tr>
+      <tr><td><code>B9h</code></td><td>Zone Is Full</td><td>Write/append to a Full zone</td></tr>
+      <tr><td><code>BAh</code></td><td>Zone Is Read Only</td><td>Write to a Read Only zone</td></tr>
+      <tr><td><code>BBh</code></td><td>Zone Is Offline</td><td>Any access to an Offline zone</td></tr>
+      <tr><td><code>BCh</code></td><td>Zone Invalid Write</td><td>Write not at the write pointer</td></tr>
+      <tr><td><code>BDh</code></td><td>Too Many Active Zones</td><td>Would exceed Maximum Active Resources</td></tr>
+      <tr><td><code>BEh</code></td><td>Too Many Open Zones</td><td>Would exceed Maximum Open Resources</td></tr>
+      <tr><td><code>BFh</code></td><td>Invalid Zone State Transition</td><td>Zone Management Send action not allowed from the current state</td></tr>
+    </tbody>
+  </table>
+  <p>libnvme also defines B6h (Invalid Zone Operation Request) and B7h (ZRWA Resources Unavailable) for newer features; treat those as "look up in ZNS 1.5".</p>
+
+  <h3>Zone states</h3>
+  <p>Each zone is in exactly one state. The state is reported in the Zone State (ZS) field of its zone descriptor, bits 7:4 of byte 1:</p>
+  <table>
+    <caption>Zone states (ZNS 1.5). ZS encodings as in libnvme; confirm in the zone descriptor definition.</caption>
+    <thead><tr><th>State</th><th>Abbrev.</th><th>ZS</th><th>Write pointer</th><th>Counts against</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>Empty</td><td>ZSE</td><td><code>1h</code></td><td>= ZSLBA</td><td>—</td><td>No data written since last reset</td></tr>
+      <tr><td>Implicitly Opened</td><td>ZSIO</td><td><code>2h</code></td><td>valid</td><td>open + active</td><td>Opened by the controller because a write arrived</td></tr>
+      <tr><td>Explicitly Opened</td><td>ZSEO</td><td><code>3h</code></td><td>valid</td><td>open + active</td><td>Opened by the host with Open Zone</td></tr>
+      <tr><td>Closed</td><td>ZSC</td><td><code>4h</code></td><td>valid</td><td>active</td><td>Partially written, not currently open</td></tr>
+      <tr><td>Read Only</td><td>ZSRO</td><td><code>Dh</code></td><td>not valid</td><td>—</td><td>Controller has made the zone unwritable (media wear or failure); data readable</td></tr>
+      <tr><td>Full</td><td>ZSF</td><td><code>Eh</code></td><td>not valid</td><td>—</td><td>Written to capacity, or finished</td></tr>
+      <tr><td>Offline</td><td>ZSO</td><td><code>Fh</code></td><td>not valid</td><td>—</td><td>Neither readable nor writable</td></tr>
+    </tbody>
+  </table>
+  <p>"Write pointer not valid" means the descriptor's WP field must not be interpreted in that state. Hosts that compute "free space" from WP on Full zones get nonsense.</p>
+  <figure>
+    <div class="svg-diagram">
+      <svg viewBox="0 0 760 380" role="img" aria-label="Zone state machine">
+        <defs><marker id="zarrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+        <g fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="20" y="150" width="120" height="44" rx="10"/>
+          <rect x="250" y="40" width="160" height="44" rx="10"/>
+          <rect x="250" y="260" width="160" height="44" rx="10"/>
+          <rect x="520" y="150" width="110" height="44" rx="10"/>
+          <rect x="640" y="40" width="110" height="44" rx="10"/>
+          <rect x="520" y="300" width="110" height="40" rx="10"/>
+          <rect x="650" y="300" width="100" height="40" rx="10"/>
+        </g>
+        <g font-size="13" text-anchor="middle" fill="currentColor">
+          <text x="80" y="177">Empty (ZSE)</text>
+          <text x="330" y="60">Implicitly Opened</text><text x="330" y="76" class="muted" font-size="11">ZSIO</text>
+          <text x="330" y="280">Explicitly Opened</text><text x="330" y="296" class="muted" font-size="11">ZSEO</text>
+          <text x="575" y="177">Closed (ZSC)</text>
+          <text x="695" y="67">Full (ZSF)</text>
+          <text x="575" y="325">Read Only</text>
+          <text x="700" y="325">Offline</text>
+        </g>
+        <g fill="none" stroke="currentColor" stroke-width="1.2" marker-end="url(#zarrow)">
+          <path d="M140,160 L250,70"/>
+          <path d="M140,185 L250,275"/>
+          <path d="M410,60 L520,160"/>
+          <path d="M410,282 L520,185"/>
+          <path d="M520,150 C470,120 440,100 410,78"/>
+          <path d="M520,192 C470,230 440,250 410,268"/>
+          <path d="M410,50 L640,58"/>
+          <path d="M630,160 L690,84"/>
+          <path d="M330,84 L330,260" stroke-dasharray="4 3"/>
+          <path d="M630,320 L650,320"/>
+          <path d="M640,70 C400,10 150,60 85,150" stroke-dasharray="4 3"/>
+        </g>
+        <g font-size="11" fill="currentColor" class="mono">
+          <text x="150" y="100">write / append</text>
+          <text x="150" y="245">Open Zone</text>
+          <text x="440" y="100">Close / ctrl</text>
+          <text x="440" y="252">Close</text>
+          <text x="455" y="135">write</text>
+          <text x="455" y="215">Open Zone</text>
+          <text x="470" y="44">fills ZCAP / Finish</text>
+          <text x="640" y="125">Finish</text>
+          <text x="338" y="175">Open Zone</text>
+          <text x="300" y="22">Reset Zone (from any of Opened, Closed, Full)</text>
+          <text x="560" y="365">Offline Zone action</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>Simplified zone state machine. Dashed arrows: Open Zone on an implicitly opened zone makes it explicitly opened; Reset Zone returns opened, closed and full zones to Empty. Explicitly Opened → Full also occurs when the zone fills (not drawn). Read Only and Offline are entered by the controller (media failure); the host may move a Read Only zone to Offline. Confirm the complete transition table in ZNS 1.5.</figcaption>
+  </figure>
+  <p>Key transitions in words:</p>
+  <ul>
+    <li><strong>Empty → Implicitly Opened</strong>: the first write or Zone Append to the zone. The controller opens it for you.</li>
+    <li><strong>Empty/Closed → Explicitly Opened</strong>: Zone Management Send with the Open Zone action. An explicitly opened zone stays open until the host closes, finishes or resets it.</li>
+    <li><strong>Opened → Closed</strong>: Close Zone action. The controller may also close an <em>implicitly</em> opened zone on its own to free an open resource for another zone; it never does this to an explicitly opened zone. Closing a zone whose write pointer is still at ZSLBA returns it to Empty rather than Closed <span class="badge uncertain">Uncertain</span> — confirm in the Close Zone action description.</li>
+    <li><strong>Closed → Implicitly Opened</strong>: a write to the closed zone.</li>
+    <li><strong>Opened/Closed → Full</strong>: the write pointer reaches ZSLBA + ZCAP, or the host sends Finish Zone (which marks the rest of the zone unwritten but full). The controller can also finish a zone itself; the Zone Finished by Controller attribute in the descriptor says so.</li>
+    <li><strong>Opened/Closed/Full → Empty</strong>: Reset Zone. All data in the zone becomes deallocated; WP = ZSLBA.</li>
+    <li><strong>Any → Read Only → Offline</strong>: controller-initiated when media degrades; the host can move a Read Only zone to Offline with the Offline Zone action.</li>
+  </ul>
+  <p>Across a controller reset or power cycle, zones in the opened states transition to Closed <span class="badge uncertain">Uncertain</span> — the host must re-learn states from a zone report after any reset.</p>
+
+  <h3>Open and active resources</h3>
+  <p>A device keeps partially written zones in a special internal state: write buffers, parity accumulators, open erase blocks. That state is finite, so ZNS defines two limits in the ZNS Identify Namespace data structure:</p>
+  <ul>
+    <li><strong><span class="g" data-term="mor">Maximum Open Resources (MOR)</span></strong> — the maximum number of zones that may be in ZSIO or ZSEO at once.</li>
+    <li><strong><span class="g" data-term="mar">Maximum Active Resources (MAR)</span></strong> — the maximum number of zones in ZSIO, ZSEO or ZSC at once. Active ≥ open.</li>
+  </ul>
+  <p>Both are 0's based values, and an all-ones value (<code>FFFFFFFFh</code>) means no limit. So MOR = 13 means 14 open zones. <span class="badge uncertain">Uncertain</span> on the exact encoding — confirm in the ZNS Identify Namespace field definitions; nvme-cli prints these raw.</p>
+  <p>What happens at the limit:</p>
+  <ul>
+    <li>A write to an Empty or Closed zone when the open limit is reached: if any zone is <em>implicitly</em> opened, the controller closes one of those (its choice) and proceeds; if all open zones are explicitly opened, the write fails with <strong>Too Many Open Zones</strong>.</li>
+    <li>A write to an Empty zone (or Open Zone on an Empty zone) when the active limit is reached fails with <strong>Too Many Active Zones</strong>. The controller cannot fix this for you — only Finish or Reset releases an active resource.</li>
+    <li>Open Zone on a zone when the open limit is reached by explicitly opened zones fails with Too Many Open Zones.</li>
+  </ul>
+  <aside class="callout insight" data-title="Why active is the limit that bites"><p>Open-limit pressure is relieved silently by implicit closes. Active-limit pressure is not: every zone you touch and abandon stays active until you finish or reset it. File systems that leave half-filled zones around (for example, one per open file) hit Too Many Active Zones long after they stop seeing Too Many Open Zones. Track active zones in the host as a first-class resource.</p></aside>
+
+  <h3>Zone Append</h3>
+  <p><span class="g" data-term="zone-append">Zone Append</span> is I/O opcode <code>7Dh</code> in the ZNS command set. The host specifies the zone with its ZSLBA (Command Dwords 10–11) instead of the target LBA, and the number of blocks in CDW12 bits 15:0 (0's based). The controller writes the data at the current write pointer, advances it, and returns the <strong>LBA of the first written block in completion Dwords 0 and 1</strong> (a 64-bit value).</p>
+  <p>Why it exists: NVMe guarantees no ordering between commands, even in the same submission queue. Two WRITEs to the same zone submitted back-to-back can be fetched, processed or completed in either order, and over a fabric even the transport may reorder. With WRITE, the host must therefore keep at most one write per zone in flight (queue depth 1 per zone), which wastes the device's parallelism. With Zone Append, any number of appends to one zone can be in flight; each lands somewhere sequential, and the host learns where from the completion.</p>
+  <p>Constraints: ZSLBA must be the first LBA of a zone (otherwise <em>Invalid Field in Command</em>); the transfer size must not exceed the <span class="g" data-term="zasl">Zone Append Size Limit (ZASL)</span>, reported in the ZNS Identify Controller structure as a power of two in units of the minimum memory page size (CAP.MPSMIN), with 0 meaning "the Maximum Data Transfer Size (MDTS) applies"; the append must fit in the remaining zone capacity, otherwise <em>Zone Is Full</em> or a boundary error. Appends to a Full zone fail with Zone Is Full.</p>
+  <aside class="callout warn"><p>The consequence for host software: the data's address is known only after completion. File systems must record the returned LBA in their metadata, and the application-level order of appended records is the order of the returned LBAs, not the order of submission.</p></aside>
+
+  <h3>Zone Management Send</h3>
+  <p>Opcode <code>79h</code>. CDW10–11 carry the Starting LBA (the ZSLBA of the target zone). CDW13 carries the Zone Send Action (ZSA) in bits 7:0 and the Select All bit in bit 8 (apply the action to every zone in an eligible state; SLBA ignored).</p>
+  <table>
+    <caption>Zone Send Actions (values as in libnvme; confirm in ZNS 1.5)</caption>
+    <thead><tr><th>ZSA</th><th>Action</th><th>Effect</th><th>Select All applies to</th></tr></thead>
+    <tbody>
+      <tr><td><code>1h</code></td><td>Close Zone</td><td>Opened → Closed</td><td>all opened zones</td></tr>
+      <tr><td><code>2h</code></td><td>Finish Zone</td><td>Empty/Opened/Closed → Full</td><td>all opened and closed zones</td></tr>
+      <tr><td><code>3h</code></td><td>Open Zone</td><td>Empty/Closed/Implicitly Opened → Explicitly Opened</td><td>all closed zones</td></tr>
+      <tr><td><code>4h</code></td><td>Reset Zone</td><td>Opened/Closed/Full → Empty; data deallocated</td><td>all opened, closed and full zones</td></tr>
+      <tr><td><code>5h</code></td><td>Offline Zone</td><td>Read Only → Offline</td><td>all read-only zones</td></tr>
+      <tr><td><code>10h</code></td><td>Set Zone Descriptor Extension</td><td>Associate host data (the extension) with an Empty zone, which becomes Closed</td><td>—</td></tr>
+      <tr><td><code>11h</code></td><td>Flush (ZRWA)</td><td>Commit data in a Zone Random Write Area</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p>The "Select All applies to" column is a simplification from the action descriptions; confirm exact eligible states in the specification. An action requested on a zone in a state from which it is not permitted fails with <strong>Invalid Zone State Transition</strong>.</p>
+
+  <h3>Zone Management Receive and the zone report</h3>
+  <p>Opcode <code>7Ah</code>. CDW10–11: Starting LBA (report zones from the one containing this LBA). CDW12: Number of Dwords (NUMD, 0's based) in the host buffer. CDW13: Zone Receive Action (ZRA) bits 7:0 — <code>0h</code> Report Zones, <code>1h</code> Extended Report Zones (descriptors plus extensions); Zone Receive Action Specific field bits 15:8 — the filter: <code>0h</code> all zones, <code>1h</code> Empty, <code>2h</code> Implicitly Opened, <code>3h</code> Explicitly Opened, <code>4h</code> Closed, <code>5h</code> Full, <code>6h</code> Read Only, <code>7h</code> Offline (further values exist in newer revisions); bit 16 Partial Report.</p>
+  <p>The returned data is a 64-byte header followed by 64-byte zone descriptors:</p>
+  <table>
+    <caption>Report Zones data (field layout as in libnvme <code>struct nvme_zone_report</code> and <code>struct nvme_zns_desc</code>)</caption>
+    <thead><tr><th>Bytes</th><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td colspan="3"><strong>Header (64 bytes)</strong></td></tr>
+      <tr><td>07:00</td><td>Number of Zones</td><td>With Partial Report = 0: zones matching the filter from SLBA to the end of the namespace. With Partial Report = 1: descriptors actually returned in this buffer.</td></tr>
+      <tr><td>63:08</td><td>Reserved</td><td></td></tr>
+      <tr><td colspan="3"><strong>Each zone descriptor (64 bytes)</strong></td></tr>
+      <tr><td>00</td><td>Zone Type (bits 3:0)</td><td><code>2h</code> Sequential Write Required</td></tr>
+      <tr><td>01</td><td>Zone State (bits 7:4)</td><td>see state table</td></tr>
+      <tr><td>02</td><td>Zone Attributes</td><td>bit 0 Zone Finished by Controller; bit 1 Finish Zone Recommended; bit 2 Reset Zone Recommended; bit 3 ZRWA valid; bit 7 Zone Descriptor Extension Valid</td></tr>
+      <tr><td>03</td><td>Zone Attributes Information</td><td>newer revisions</td></tr>
+      <tr><td>15:08</td><td>Zone Capacity (ZCAP)</td><td>writable blocks</td></tr>
+      <tr><td>23:16</td><td>Zone Start LBA (ZSLBA)</td><td></td></tr>
+      <tr><td>31:24</td><td>Write Pointer (WP)</td><td>next writable LBA (valid only in ZSE/ZSIO/ZSEO/ZSC)</td></tr>
+      <tr><td>63:32</td><td>Reserved</td><td></td></tr>
+    </tbody>
+  </table>
+  <p>A 4 KiB buffer therefore holds the header plus 63 descriptors. A namespace with thousands of zones needs a loop: report from SLBA, advance SLBA to (last ZSLBA + ZSZE), repeat.</p>
+  <p>The Finish Zone Recommended and Reset Zone Recommended attributes are the device asking the host for help — typically because data in a long-open zone is aging or the device wants to reclaim. Reset Recommended Limit (RRL) and Finish Recommended Limit (FRL) in Identify bound how long the device waits before setting them. When zone attributes change, the device can raise a <em>Zone Descriptor Changed</em> asynchronous event and list affected zones in the Changed Zone List log page (libnvme: log identifier <code>BFh</code>).</p>
+
+  <h3>Zone Random Write Area and descriptor extensions</h3>
+  <p>Two optional features soften the sequential rule. A <strong>Zone Random Write Area (ZRWA)</strong> lets the host write randomly within a window just above the write pointer and commit it later with the Flush action (ZSA <code>11h</code>) or by writing beyond the window; the window size and flush granularity are reported in the ZNS Identify Namespace (ZRWASZ, ZRWAFG). A <strong>Zone Descriptor Extension</strong> lets the host attach a small block of its own metadata to a zone. Both are <span class="badge optional">Optional</span>; many deployed devices support neither. <span class="badge version">Version-dependent</span> ZRWA arrived in a ZNS revision after 1.0.</p>
+
+  <h3>Conventional namespace vs ZNS</h3>
+  <table>
+    <caption>Conventional (NVM Command Set) namespace compared with a zoned namespace</caption>
+    <thead><tr><th>Aspect</th><th>Conventional namespace</th><th>Zoned namespace</th></tr></thead>
+    <tbody>
+      <tr><td>Write rule</td><td>Any LBA, any order, overwrite allowed</td><td>Sequential at write pointer per zone; reset to rewrite</td></tr>
+      <tr><td>Device mapping table</td><td>Fine-grained (often ~1 byte DRAM per KiB of flash at 4 KiB mapping)</td><td>Coarse (per zone or per stripe); far less DRAM</td></tr>
+      <tr><td>Over-provisioning</td><td>Substantial, hidden</td><td>Minimal; garbage collection moved to host</td></tr>
+      <tr><td>Write amplification</td><td>Device-controlled, workload-dependent</td><td>Host-controlled; can approach 1 for well-behaved hosts</td></tr>
+      <tr><td>Host responsibility</td><td>None beyond trim</td><td>Track write pointers, open/active zones, choose zones, run host GC</td></tr>
+      <tr><td>Concurrency to one region</td><td>Unlimited</td><td>WRITE: queue depth 1 per zone; Zone Append: unlimited</td></tr>
+      <tr><td>New error classes</td><td>Few</td><td>Invalid write, boundary, full, too many open/active, invalid transition</td></tr>
+      <tr><td>Software that can use it directly</td><td>Everything</td><td>Zone-aware: F2FS, Btrfs zoned, zonefs, ZenFS, SPDK, custom</td></tr>
+    </tbody>
+  </table>
+  <p>The two can coexist on one device as separate namespaces — a small conventional namespace for metadata, a large zoned namespace for data — which is one way deployments avoid putting random-write metadata into zones.</p>
+
+  <h3>2026 context</h3>
+  <p>The current revision is <cite class="spec">NVM Express Zoned Namespace Command Set Specification, Revision 1.5</cite>, released with the NVMe 2.4 set on 2026-08-04. Press coverage lists "updated ZNS" among the 2026 changes, but this course does not state what changed at field level; see <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a> and the official Revision Changes document.</p>
+
+  <h3>The central concept on the ladder</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Warehouse aisles filled front to back, a flag marking the next spot, a limited number of forklifts, and "put it wherever the flag is and tell me" for parallel unloading.</p></div>
+    <div class="rung" data-rung="B"><p>A zoned namespace is a set of fixed-size LBA ranges, each with a write pointer and a state. Writes must land at the write pointer; zones are reset whole; at most MOR+1 zones may be open and MAR+1 active.</p></div>
+    <div class="rung" data-rung="C"><p>Inside the device each open zone owns write buffers, an open erase-block stripe and parity state; the mapping table points per zone (or per stripe) instead of per 4 KiB page. Reset marks the zone's blocks for erase; no GC copies are needed.</p></div>
+    <div class="rung" data-rung="D"><p>The ZNS Command Set 1.5 defines zone types and states, the write pointer rules, Zone Management Send (79h), Zone Management Receive (7Ah), Zone Append (7Dh), the ZNS Identify structures (MAR, MOR, ZASL, LBA Format Extension with ZSZE) and the B8h–BFh statuses.</p></div>
+    <div class="rung" data-rung="E"><p>Writes and appends are ordinary I/O SQEs on an I/O queue with NSID of the zoned namespace; data moves by device-issued Memory Reads; completions carry status or, for appends, the assigned LBA in DW0–DW1. Zone reports move by device-issued Memory Writes.</p></div>
+    <div class="rung" data-rung="F"><p>In a PCIe trace a ZNS failure looks perfect at the link level: SQE fetch, data fetch (or none), and a CQE whose Status Field holds SCT 1h with an SC between B8h and BFh. The data payload of a report shows descriptors with state nibbles 1, 2, 3, 4, D, E, F.</p></div>
+    <div class="rung" data-rung="G"><p>Debugging: Zone Invalid Write after a reorder, Too Many Active Zones from leaked partially written zones, stale write pointers after a reset, mis-sized appends against ZASL. The method: get a zone report, compare with the host's write-pointer cache, find which side is wrong.</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for "zone"</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>A fixed-size range of LBAs in a zoned namespace that is written sequentially through a write pointer and reset as a whole.</dd>
+    <dt>2. Why was it created?</dt><dd>To align the host interface with flash's program-in-order, erase-in-blocks physics and remove device-side GC cost.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Write amplification, over-provisioning cost, large DRAM mapping tables and unpredictable latency from device garbage collection.</dd>
+    <dt>4. What existed before it?</dt><dd>Conventional FTL SSDs; Open-Channel SSD proposals (host-managed flash geometry); SMR hard disks with ZBC/ZAC zones.</dd>
+    <dt>5. Why is the current design better?</dt><dd>It abstracts away flash geometry (unlike Open-Channel) while keeping the sequential contract, and reuses the zoned block device model already in Linux for SMR.</dd>
+    <dt>6. Who creates it?</dt><dd>The device defines zones when the zoned namespace is created; zone size is fixed per LBA format.</dd>
+    <dt>7. Who consumes it?</dt><dd>Zone-aware host software: file systems, key-value stores, user-space storage engines.</dd>
+    <dt>8. Where does it live?</dt><dd>As logical ranges in a namespace; physically on flash stripes chosen by the device.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>No controller registers; ZNS Identify Namespace/Controller structures, zone descriptors in report buffers, the write pointer state in controller memory, open-zone write buffers.</dd>
+    <dt>10. What happens before it?</dt><dd>A zoned namespace is created (CSI 02h) and attached; the host selects a command set profile that enables ZNS; the host reads ZNS Identify data.</dd>
+    <dt>11. What happens after it?</dt><dd>Writes/appends fill zones; host GC copies live data out and resets zones; zones may become Read Only/Offline as media ages.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Writes fail with zone statuses; data written by appends can be lost if the host ignores returned LBAs; resetting the wrong zone destroys data instantly.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>Opcodes 79h/7Ah/7Dh plus WRITE/READ to the zoned NSID; report payloads; CQE DW0–1 with appended LBAs; SCT 1h status codes B8h–BFh.</dd>
+    <dt>14. What does Linux show?</dt><dd><code>queue/zoned = host-managed</code>, <code>chunk_sectors</code>, <code>nr_zones</code>, <code>max_open_zones</code>, <code>max_active_zones</code>, <code>zone_append_max_bytes</code>; <code>blkzone report</code>; <code>nvme zns report-zones</code>.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>Every state transition and every invalid one; limits MOR/MAR exactly at and beyond; append concurrency and returned LBAs; ZASL boundaries; reset/power loss with open zones; Read Only/Offline injection; report filters and partial reports.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>Host write-pointer cache out of sync; reordering of WRITEs at QD &gt; 1 per zone; active-zone leaks; 0's-based off-by-one on MOR/MAR; zone capacity treated as zone size.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>ZNS changes nothing on the PCIe link and nothing in the controller registers. What it changes is inside the SSD controller and its firmware:</p>
+  <table>
+    <caption>Where ZNS state lives inside a typical device (implementation-dependent)</caption>
+    <thead><tr><th>Element</th><th>Conventional SSD</th><th>ZNS SSD</th></tr></thead>
+    <tbody>
+      <tr><td>Logical-to-physical map</td><td>Per 4 KiB entry; ~1 GiB DRAM per 1 TiB of flash is a common rule of thumb</td><td>Per zone or per stripe; a few MiB can suffice</td></tr>
+      <tr><td>Open write streams</td><td>A handful, chosen by firmware</td><td>One per open zone, limited by MOR; each needs a write buffer and parity state</td></tr>
+      <tr><td>Write buffer (DRAM/SRAM, power-loss protected)</td><td>Shared</td><td>Partitioned among open zones — the physical reason for the open limit</td></tr>
+      <tr><td>Active-zone metadata</td><td>—</td><td>Write pointer, partially programmed erase blocks — the physical reason for the active limit</td></tr>
+      <tr><td>Garbage collection</td><td>Device-internal, continuous</td><td>None for user data; host copies live data and resets zones</td></tr>
+      <tr><td>Over-provisioning</td><td>Large</td><td>Small, for bad-block replacement and internal metadata</td></tr>
+    </tbody>
+  </table>
+  <p>Zone capacity usually corresponds to a whole number of erase-block "superblocks" striped across dies, which is why it is not a power of two. A reset typically just marks those superblocks for erase; the erase happens later, so Reset Zone is fast but the zone's physical blocks are not immediately reusable — which is one reason a device can delay or refuse reuse under heavy reset churn.</p>
+  <p>Read Only and Offline states are how a ZNS device reports media wear-out: instead of silently remapping, it can shrink a zone's capacity (on reset) or take a zone read-only. A host must therefore read ZCAP from every zone report and never cache it forever.</p>
+  <aside class="callout hw"><p>Power-loss protection capacitors must cover the write buffers of every open zone. A device with more capacitance can afford a higher MOR. That is a concrete hardware cost behind an Identify field.</p></aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Zoned Namespace Command Set Specification, Revision 1.5</cite> — the zone model, zone types and states, write pointer rules, Zone Management Send/Receive, Zone Append, the ZNS Identify Namespace and Identify Controller data structures, the ZNS statuses, the Changed Zone List log and zone-related asynchronous events. Current as of the August 2026 release. <span class="badge normative">Normative</span></li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4</cite> — CSI, I/O command set selection, Identify CNS 05h/06h framework, the common command and completion formats. <span class="badge normative">Normative</span></li>
+    <li><cite class="spec">NVM Command Set Specification, Revision 1.3</cite> — the ZNS command set is built on the NVM command set: READ, WRITE, Write Zeroes, Flush and LBA formats are inherited, with ZNS adding restrictions. <span class="badge normative">Normative</span></li>
+  </ul>
+  <aside class="callout verified"><p>Opcodes Zone Management Send <code>79h</code>, Zone Management Receive <code>7Ah</code>, Zone Append <code>7Dh</code>; CSI <code>02h</code>; zone type <code>2h</code>; zone state encodings 1h/2h/3h/4h/Dh/Eh/Fh; Zone Send Actions 1h–5h, 10h; Zone Receive Actions 0h/1h; reporting filters 0h–7h; ZNS statuses B8h–BFh (SCT 1h); descriptor layout (ZCAP 15:08, ZSLBA 23:16, WP 31:24) — all agree with the libnvme definitions, which track the specifications.</p></aside>
+  <aside class="callout derived"><p>The physical reasons for the open and active limits, the per-zone QD1 consequence for WRITE, the DRAM savings and the "active limit bites harder" observation are reasoned from the model, not quoted.</p></aside>
+  <aside class="callout impl"><p>Zone size and capacity, MOR/MAR values, ZASL, whether the controller closes implicitly opened zones and which one it picks, when it sets Finish/Reset Recommended, how long Reset takes, whether ZRWA, descriptor extensions or cross-zone reads are supported — all <span class="badge impl">Implementation-dependent</span>.</p></aside>
+  <aside class="callout version"><p>Zoned namespaces were first ratified as a technical proposal in 2020 and published as the ZNS Command Set Specification 1.0 with the NVMe 2.0 family in 2021; later revisions added features such as ZRWA and additional report filters and attributes. Revision 1.5 is current with the 2026 set. Check the revision history in the ZNS specification for when each optional feature arrived, and <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a> for 2026 changes.</p></aside>
+  <aside class="callout notsaid">
+    <p>Check in the specification before relying on:</p>
+    <ul>
+      <li>the complete state transition table, including what Close, Open and Finish do from Empty, and which actions are no-ops versus errors;</li>
+      <li>the exact encoding of MAR/MOR (0's based, all-ones meaning unlimited) and ZASL units;</li>
+      <li>which status applies to a write extending beyond zone capacity but not beyond zone size;</li>
+      <li>what happens to opened zones across controller reset and power loss;</li>
+      <li>reporting filter values above 7h and Zone Attributes Information bits in 1.5.</li>
+    </ul>
+    <p>The specification does not say how zones map to flash, how a controller chooses which implicitly opened zone to close, or what "Reset Recommended" means about data age.</p>
+  </aside>
+  <aside class="callout warn"><p>Never assume zone capacity equals zone size, that WP is meaningful in Full or Read Only zones, that two WRITEs to a zone complete in submission order, that MOR/MAR are 1's based, or that a zone's capacity never changes.</p></aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>ZNS I/O commands at the protocol level</caption>
+    <thead><tr><th>Command</th><th>Opcode</th><th>Key fields</th><th>Data direction</th><th>Completion</th></tr></thead>
+    <tbody>
+      <tr><td>READ</td><td><code>02h</code></td><td>SLBA, NLB</td><td>Controller → host</td><td>Status</td></tr>
+      <tr><td>WRITE</td><td><code>01h</code></td><td>SLBA (= WP), NLB</td><td>Host → controller</td><td>Status</td></tr>
+      <tr><td>Zone Append</td><td><code>7Dh</code></td><td>ZSLBA (CDW10–11), NLB (CDW12 15:0)</td><td>Host → controller</td><td>DW0–DW1 = first LBA written</td></tr>
+      <tr><td>Zone Management Send</td><td><code>79h</code></td><td>SLBA (CDW10–11), ZSA (CDW13 7:0), Select All (CDW13 bit 8)</td><td>None (or extension data for ZSA 10h)</td><td>Status</td></tr>
+      <tr><td>Zone Management Receive</td><td><code>7Ah</code></td><td>SLBA, NUMD (CDW12), ZRA (CDW13 7:0), filter (15:8), Partial (bit 16)</td><td>Controller → host</td><td>Status</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <ol class="seq" data-actors="App thread A|App thread B|Host driver|Controller">
+      <li data-from="App thread A" data-to="Host driver">append 8 KiB to zone 3</li>
+      <li data-from="App thread B" data-to="Host driver">append 4 KiB to zone 3</li>
+      <li data-from="Host driver" data-to="Controller">SQ1: Zone Append ZSLBA=0x30000</li>
+      <li data-from="Host driver" data-to="Controller">SQ2: Zone Append ZSLBA=0x30000</li>
+      <li data-note="Controller">SQ2 arbitrated first</li>
+      <li data-from="Controller" data-to="Host driver" class="dashed">CQ2: DW0=0x30100 (WP→0x30101)</li>
+      <li data-from="Controller" data-to="Host driver" class="dashed">CQ1: DW0=0x30101 (WP→0x30103)</li>
+      <li data-from="Host driver" data-to="App thread B" class="dashed">your data is at 0x30100</li>
+      <li data-from="Host driver" data-to="App thread A" class="dashed">your data is at 0x30101</li>
+    </ol>
+    <figcaption>Conceptual sequence: concurrent Zone Appends to one zone from two submission queues. Both succeed; the controller chooses the order and reports it.</figcaption>
+  </figure>
+  <p><strong>Ordering.</strong> NVMe imposes no execution order among commands. For ZNS this means two WRITEs to one zone are only safe if the second is submitted after the first completes. Zone Append removes the requirement. Zone Management Send actions are also unordered with respect to in-flight I/O to the same zone: a Reset Zone racing a WRITE may make the WRITE fail with Zone Invalid Write (if the reset ran first and moved WP back to ZSLBA) or let it succeed only for its data to be discarded by the reset that follows. Hosts serialize management and I/O per zone.</p>
+  <p><strong>Errors and layer.</strong> Every ZNS error is an NVMe command status. A ZNS problem never causes a PCIe error; a PCIe error (poisoned TLP, completion timeout) during a ZNS write is a transport problem that leaves the zone's write pointer in a state the host must re-read.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic examples for teaching on the course lab system. Namespace 2 is zoned: 4 KiB LBAs, ZSZE = 0x1_0000, ZCAP = 0xD800, MOR and MAR as stated per trace. I/O SQ1 at IOVA 0x1_2340_0000, CQ1 at 0x1_2341_0000, SQ1 tail doorbell BAR0+0x1008, CQ1 head doorbell BAR0+0x100C. For trace 3, a second queue pair SQ2/CQ2 is at IOVA 0x1_2342_0000 / 0x1_2343_0000 with SQ2 tail doorbell BAR0+0x1010. Timings are illustrative.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 1 — normal: Zone Append of 8 KiB to zone 3, assigned LBA returned">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Len=1 Data=0x00000011</td><td>SQ1 tail = 0x11 (new SQE in slot 0x10)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>810</td><td>MRd64</td><td>Req=0x0100 Tag=0x40 Addr=0x1_2340_0400 Len=16</td><td>Fetch SQE slot 0x10 (0x10 × 64 = 0x400)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,450</td><td>CplD</td><td>Tag=0x40 Len=16</td><td>SQE: opc=7Dh CID=0x0101 NSID=2 PRP1=0x2_0000_0000 PRP2=0x2_0000_1000 CDW10=0x00030000 CDW11=0 CDW12=0x0001 (NLB 2 blocks)</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>2,100</td><td>MRd64</td><td>Tag=0x41 Addr=0x2_0000_0000 Len=128</td><td>Data fetch, 512 B (MRRS)</td></tr>
+        <tr class="note"><td colspan="6">Rows 5–51: fifteen more 512-byte MRds (Tags 0x42–0x50) and the 32 CplDs answering all sixteen reads (two 256-byte CplDs per read, MPS 256), covering 0x2_0000_0000–0x2_0000_1FFF. 8 KiB total.</td></tr>
+        <tr class="note"><td colspan="6">Controller programs data at zone 3's write pointer, 0x3_0100, and advances WP to 0x3_0102. ~22 µs of device-internal time (buffered write).</td></tr>
+        <tr class="dir-up"><td>52</td><td>Dev→Host</td><td>24,300</td><td>MWr64</td><td>Addr=0x1_2341_0100 Len=4</td><td>CQE slot 0x10: DW0=0x00030100 DW1=0x00000000 SQHD=0x11 SQID=1 CID=0x0101 P=1 Status=0</td></tr>
+        <tr class="dir-up"><td>53</td><td>Dev→Host</td><td>24,600</td><td>MWr32</td><td>Addr=0xFEE0_1000 Len=1 Data=0x0000_0041</td><td>MSI-X vector 1</td></tr>
+        <tr class="dir-down"><td>54</td><td>Host→Dev</td><td>27,900</td><td>MWr32</td><td>Addr=0xFE60_100C Data=0x00000011</td><td>CQ1 head = 0x11</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: on the wire, Zone Append looks like a WRITE except for the opcode and CDW10–11, which hold the <em>zone start</em> (0x3_0000), not the target. The only place the target LBA ever appears is the CQE's DW0–DW1 (0x3_0100). A trace tool that decodes CQEs as "DW0 = command-specific, ignore" will lose the most important fact about every append.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 2 — normal: Report Zones, partial, first 4 KiB">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000012</td><td>SQ1 tail = 0x12</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>790</td><td>MRd64</td><td>Tag=0x52 Addr=0x1_2340_0440 Len=16</td><td>Fetch SQE slot 0x11</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,420</td><td>CplD</td><td>Tag=0x52 Len=16</td><td>SQE: opc=7Ah CID=0x0102 NSID=2 PRP1=0x2_0000_4000 CDW10–11=0 CDW12=0x000003FF (NUMD: 1024 dwords) CDW13=0x00010000 (ZRA=0 Report Zones, filter=0 all, Partial=1)</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>9,800</td><td>MWr64</td><td>Addr=0x2_0000_4000 Len=64</td><td>First 256 bytes: header + descriptors 0–2</td></tr>
+        <tr class="note"><td colspan="6">Header: Number of Zones = 0x3F (63 descriptors in this buffer, because Partial=1).</td></tr>
+        <tr class="note"><td colspan="6">Desc 0 @+0x40: ZT=02 ZS=E0 (Full) ZA=00 ZCAP=0xD800 ZSLBA=0x0 WP=(not valid)</td></tr>
+        <tr class="note"><td colspan="6">Desc 1 @+0x80: ZT=02 ZS=20 (Implicitly Opened) ZCAP=0xD800 ZSLBA=0x1_0000 WP=0x1_4A00</td></tr>
+        <tr class="note"><td colspan="6">Desc 2 @+0xC0: ZT=02 ZS=40 (Closed) ZCAP=0xD800 ZSLBA=0x2_0000 WP=0x2_0800</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>9,900</td><td>MWr64</td><td>Addr=0x2_0000_4100 Len=64</td><td>Desc 3: ZS=20 ZSLBA=0x3_0000 WP=0x3_0102; desc 4: ZS=10 (Empty) ZSLBA=0x4_0000 WP=0x4_0000; …</td></tr>
+        <tr class="note"><td colspan="6">Rows 6–19: fourteen more 256-byte MWrs complete the 4096 bytes.</td></tr>
+        <tr class="dir-up"><td>20</td><td>Dev→Host</td><td>11,400</td><td>MWr64</td><td>Addr=0x1_2341_0110 Len=4</td><td>CQE: success</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the report is pure data — 64-byte header then 64-byte descriptors — moved by device-issued MWrs, so it is decodable directly from the trace payload. Desc 3's WP (0x3_0102) matches Trace 1's append of 2 blocks at 0x3_0100: a quick consistency check between commands that a trace tool can automate. Active zones here: 1, 2, 3 (Implicitly Opened, Closed, Implicitly Opened).</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 3 — abnormal: two WRITEs to zone 3 from two queues, reordered by arbitration">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000013</td><td>SQ1 tail (CPU 0): WRITE CID 0x0103 SLBA=0x3_0102 NLB=2 blocks</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>140</td><td>MWr32</td><td>Addr=0xFE60_1010 Data=0x00000008</td><td>SQ2 tail (CPU 1): WRITE CID 0x0040 SLBA=0x3_0104 NLB=1 block — assumes the first write already landed</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>700</td><td>MRd64</td><td>Tag=0x60 Addr=0x1_2342_01C0 Len=16</td><td>Controller arbitration fetches SQ2 first (slot 7)</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>1,320</td><td>CplD</td><td>Tag=0x60 Len=16</td><td>SQE: opc=01h CID=0x0040 NSID=2 SLBA=0x3_0104</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1,500</td><td>MRd64</td><td>Tag=0x61 Addr=0x1_2340_0480 Len=16</td><td>Fetch SQ1 slot 0x12</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>2,110</td><td>CplD</td><td>Tag=0x61 Len=16</td><td>SQE: opc=01h CID=0x0103 NSID=2 SLBA=0x3_0102</td></tr>
+        <tr class="abnormal"><td>7</td><td>Dev→Host</td><td>2,600</td><td>MWr64</td><td>Addr=0x1_2343_0070 Len=4</td><td>CQ2 CQE: CID=0x0040 DW3=0x83790040 → SCT=1h SC=BCh <strong>Zone Invalid Write</strong> (DNR=1 illustrative), no data was fetched</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>2,900</td><td>MRd64</td><td>Tag=0x62 Addr=0x2_0001_0000 Len=128</td><td>Data fetch for CID 0x0103 begins (WP was 0x3_0102: valid)</td></tr>
+        <tr class="note"><td colspan="6">Rows 9–55: the rest of the 8 KiB data fetch (fifteen more 512-byte MRds and 32 256-byte CplDs), then the controller programs the data …</td></tr>
+        <tr class="dir-up"><td>56</td><td>Dev→Host</td><td>25,100</td><td>MWr64</td><td>Addr=0x1_2341_0120 Len=4</td><td>CQ1 CQE: CID=0x0103 success; WP now 0x3_0104</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the first abnormal event is row 7. The decisive evidence is rows 3–6: the controller fetched the higher-LBA WRITE first, from a different SQ. At that moment WP was 0x3_0102, so a WRITE at 0x3_0104 was legitimately invalid; and no data phase occurred, which proves rejection at command validation. The controller is behaving correctly; the host violated the one-write-per-zone-in-flight rule. Fixes: serialize writes per zone in the host (Linux's zoned block layer does this), or use Zone Append. Retrying the failed WRITE now would succeed — which is exactly why this bug is intermittent.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 4 — abnormal: Too Many Active Zones on a new zone (MAR = 2, i.e. 3 active)">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">State before: zone 1 Implicitly Opened, zone 2 Closed, zone 3 Implicitly Opened (from Trace 2). Three active zones = the limit.</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000014</td><td>SQ1 tail</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>780</td><td>MRd64</td><td>Tag=0x63 Addr=0x1_2340_04C0 Len=16</td><td>Fetch SQE slot 0x13</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,400</td><td>CplD</td><td>Tag=0x63 Len=16</td><td>SQE: WRITE CID=0x0104 NSID=2 SLBA=0x4_0000 (Empty zone 4, at WP)</td></tr>
+        <tr class="abnormal"><td>4</td><td>Dev→Host</td><td>1,950</td><td>MWr64</td><td>Addr=0x1_2341_0130 Len=4</td><td>CQE: SCT=1h SC=BDh <strong>Too Many Active Zones</strong></td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the write was correctly positioned (SLBA = WP of an Empty zone), so the host's write-pointer logic is fine; the failure is resource accounting. The fix is to Finish or Reset one of zones 1–3 (Close does not help: Closed still counts as active). A host that responds by closing zones and retrying will loop forever — a classic.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Linux exposes a ZNS namespace as a <em>host-managed zoned block device</em>. The block layer and zone-aware file systems enforce the write rules. Read-only commands:</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Is this namespace zoned, and what are its limits?</span>
+cat /sys/block/nvme0n2/queue/zoned              <span class="cm"># host-managed | none</span>
+cat /sys/block/nvme0n2/queue/chunk_sectors      <span class="cm"># zone size in 512-byte sectors</span>
+cat /sys/block/nvme0n2/queue/nr_zones
+cat /sys/block/nvme0n2/queue/max_open_zones /sys/block/nvme0n2/queue/max_active_zones
+cat /sys/block/nvme0n2/queue/zone_append_max_bytes
+
+<span class="cm"># Raw ZNS Identify data (CSI 02h)</span>
+sudo nvme zns id-ctrl /dev/nvme0                <span class="cm"># ZASL</span>
+sudo nvme zns id-ns /dev/nvme0n2 -H             <span class="cm"># ZOC, OZCS, MAR, MOR, RRL, FRL, LBAFE (ZSZE)</span>
+
+<span class="cm"># Zone reports: state, write pointer, capacity</span>
+sudo nvme zns report-zones /dev/nvme0n2 -d 8
+sudo blkzone report -c 8 /dev/nvme0n2
+sudo nvme zns report-zones /dev/nvme0n2 --state=2   <span class="cm"># filter value as in the ZRAS table; check your nvme-cli's option names</span>
+
+<span class="cm"># Kernel messages about zoned devices and failed zoned writes</span>
+sudo dmesg | grep -iE 'zone|zns|nvme0n2'</code></pre>
+  <p>Destructive operations — <code>nvme zns reset-zone</code>, <code>nvme zns finish-zone</code>, <code>nvme zns zone-append</code>, <code>blkzone reset</code>, any write — belong in the lab, on an emulated device.</p>
+  <table>
+    <caption>Interpreting Linux ZNS output</caption>
+    <thead><tr><th>Observation</th><th>Proves</th><th>Does not prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>zoned</code> = host-managed</td><td>The kernel recognised the namespace as zoned and accepted its geometry</td><td>That every ZNS feature is used (ZRWA, extensions are not exposed)</td></tr>
+      <tr><td>Namespace absent as a block device but <code>/dev/ng0n2</code> exists</td><td>The kernel rejected it as a block device (for example, a non-power-of-two zone size) but exposed the generic character device</td><td>That the device is broken</td></tr>
+      <tr><td><code>max_active_zones</code> = 0</td><td>The kernel reports no limit</td><td>That the device has none (check <code>zns id-ns</code> MAR)</td></tr>
+      <tr><td>Report shows WP</td><td>WP at the moment of the report</td><td>WP now, if I/O is in flight</td></tr>
+      <tr><td>A write failed with EIO and a zone status in dmesg</td><td>The device rejected it</td><td>Whether the host or device was wrong — compare with a report</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout version"><p><span class="badge version">Version-dependent</span> Linux's NVMe driver has required a power-of-two zone size, and the block layer's handling of zoned writes changed significantly across kernels (zone write locking in I/O schedulers in older kernels; "zone write plugging" in the block layer from around kernel 6.10, which also emulates Zone Append for devices or drivers that lack it). Newer kernels may reject a misaligned zoned write <em>before</em> it reaches the device, so you will see an error in the application with no failing command in a PCIe trace. Check your kernel's <code>Documentation/block/</code> zoned-device notes.</p></aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>The simulator below implements the zone state machine, the write-pointer rule, Zone Append, the open and active limits and the management actions, and runs a scenario that triggers most ZNS statuses. It is a <em>simulation</em> for learning: where the specification leaves a choice to the controller (which implicitly opened zone to close, the order of checks) it makes one simple choice.</p>
+  <pre class="code" data-kind="simulation" data-lang="python" data-title="zns_sim.py"><code>#!/usr/bin/env python3
+"""Zoned namespace state-machine simulator (teaching model, not a device model).
+Statuses use the ZNS names; the hex values are the libnvme encodings."""
+
+EMPTY, IOPEN, EOPEN, CLOSED, FULL, RONLY, OFFLINE = "ZSE", "ZSIO", "ZSEO", "ZSC", "ZSF", "ZSRO", "ZSO"
+
+STATUS = {
+    "BOUNDARY":      (1, 0xB8, "Zone Boundary Error"),
+    "FULL":          (1, 0xB9, "Zone Is Full"),
+    "READ_ONLY":     (1, 0xBA, "Zone Is Read Only"),
+    "OFFLINE":       (1, 0xBB, "Zone Is Offline"),
+    "INVALID_WRITE": (1, 0xBC, "Zone Invalid Write"),
+    "TOO_MANY_ACT":  (1, 0xBD, "Too Many Active Zones"),
+    "TOO_MANY_OPEN": (1, 0xBE, "Too Many Open Zones"),
+    "BAD_TRANS":     (1, 0xBF, "Invalid Zone State Transition"),
+    "INVALID_FIELD": (0, 0x02, "Invalid Field in Command"),
+}
+
+class ZoneError(Exception):
+    def __init__(self, key):
+        self.sct, self.sc, self.name = STATUS[key]
+        super().__init__(f"SCT={self.sct}h SC={self.sc:02X}h {self.name}")
+
+class Zone:
+    def __init__(self, zslba, zcap):
+        self.zslba, self.zcap, self.wp, self.state = zslba, zcap, zslba, EMPTY
+
+class ZonedNamespace:
+    def __init__(self, nzones, zsze, zcap, mor, mar):
+        """mor/mar are 0's based, as reported in ZNS Identify Namespace."""
+        self.zsze = zsze
+        self.zones = [Zone(i * zsze, zcap) for i in range(nzones)]
+        self.max_open, self.max_active = mor + 1, mar + 1
+
+    def n_open(self):   return sum(z.state in (IOPEN, EOPEN) for z in self.zones)
+    def n_active(self): return sum(z.state in (IOPEN, EOPEN, CLOSED) for z in self.zones)
+
+    def zone(self, lba):
+        return self.zones[lba // self.zsze]
+
+    def _check_writable_state(self, z):
+        if z.state == FULL:    raise ZoneError("FULL")
+        if z.state == RONLY:   raise ZoneError("READ_ONLY")
+        if z.state == OFFLINE: raise ZoneError("OFFLINE")
+
+    def _acquire_open(self, z):
+        """Make room for z to become open; z is EMPTY or CLOSED."""
+        if z.state == EMPTY and self.n_active() &gt;= self.max_active:
+            raise ZoneError("TOO_MANY_ACT")
+        if self.n_open() &gt;= self.max_open:
+            victims = [v for v in self.zones if v.state == IOPEN]
+            if not victims:
+                raise ZoneError("TOO_MANY_OPEN")
+            v = victims[0]                     # controller's choice
+            v.state = CLOSED
+            print(f"    (controller implicitly closed zone at {v.zslba:#x})")
+
+    def _do_write(self, z, nlb):
+        if z.state in (EMPTY, CLOSED):
+            self._acquire_open(z)
+            z.state = IOPEN
+        start = z.wp
+        z.wp += nlb
+        if z.wp == z.zslba + z.zcap:
+            z.state = FULL
+        return start
+
+    def write(self, slba, nlb):
+        z = self.zone(slba)
+        if self.zone(slba + nlb - 1) is not z:
+            raise ZoneError("BOUNDARY")
+        self._check_writable_state(z)
+        if slba != z.wp:
+            raise ZoneError("INVALID_WRITE")
+        if z.wp + nlb &gt; z.zslba + z.zcap:      # past zone capacity (status: confirm in spec)
+            raise ZoneError("BOUNDARY")
+        return self._do_write(z, nlb)
+
+    def append(self, zslba, nlb):
+        if zslba % self.zsze:
+            raise ZoneError("INVALID_FIELD")
+        z = self.zone(zslba)
+        self._check_writable_state(z)
+        if z.wp + nlb &gt; z.zslba + z.zcap:
+            raise ZoneError("BOUNDARY")
+        return self._do_write(z, nlb)          # the LBA returned in CQE DW0-DW1
+
+    def open_zone(self, zslba):
+        z = self.zone(zslba)
+        if z.state in (EMPTY, CLOSED):
+            self._acquire_open(z)
+        elif z.state not in (IOPEN, EOPEN):
+            raise ZoneError("BAD_TRANS")
+        z.state = EOPEN
+
+    def close_zone(self, zslba):
+        z = self.zone(zslba)
+        if z.state in (IOPEN, EOPEN):
+            z.state = EMPTY if z.wp == z.zslba else CLOSED
+        elif z.state != CLOSED:
+            raise ZoneError("BAD_TRANS")
+
+    def finish_zone(self, zslba):
+        z = self.zone(zslba)
+        if z.state in (RONLY, OFFLINE):
+            raise ZoneError("BAD_TRANS")
+        z.state = FULL
+
+    def reset_zone(self, zslba):
+        z = self.zone(zslba)
+        if z.state in (RONLY, OFFLINE):
+            raise ZoneError("BAD_TRANS")
+        z.state, z.wp = EMPTY, z.zslba
+
+    def report(self):
+        print(f"  open={self.n_open()}/{self.max_open} active={self.n_active()}/{self.max_active}")
+        for i, z in enumerate(self.zones):
+            wp = f"{z.wp:#06x}" if z.state in (EMPTY, IOPEN, EOPEN, CLOSED) else "  n/a "
+            print(f"  zone {i}: ZSLBA={z.zslba:#06x} ZCAP={z.zcap} WP={wp} {z.state}")
+
+def run(label, fn, *args):
+    try:
+        r = fn(*args)
+        print(f"{label:40s} -&gt; OK" + (f", LBA {r:#x}" if isinstance(r, int) else ""))
+    except ZoneError as e:
+        print(f"{label:40s} -&gt; {e}")
+
+if __name__ == "__main__":
+    ns = ZonedNamespace(nzones=6, zsze=0x10, zcap=12, mor=1, mar=2)  # 2 open, 3 active
+    run("WRITE  slba=0x00 nlb=4", ns.write, 0x00, 4)
+    run("WRITE  slba=0x06 nlb=2 (not at WP)", ns.write, 0x06, 2)
+    run("APPEND zslba=0x00 nlb=2", ns.append, 0x00, 2)
+    run("APPEND zslba=0x00 nlb=2", ns.append, 0x00, 2)
+    run("APPEND zslba=0x03 nlb=1 (not zone start)", ns.append, 0x03, 1)
+    run("WRITE  slba=0x10 nlb=2 (zone 1)", ns.write, 0x10, 2)
+    run("WRITE  slba=0x20 nlb=1 (zone 2)", ns.write, 0x20, 1)
+    run("WRITE  slba=0x30 nlb=1 (zone 3)", ns.write, 0x30, 1)
+    run("FINISH zone 0", ns.finish_zone, 0x00)
+    run("WRITE  slba=0x30 nlb=1 (zone 3, retry)", ns.write, 0x30, 1)
+    run("WRITE  slba=0x12 nlb=20 (crosses zone)", ns.write, 0x12, 20)
+    run("APPEND zslba=0x00 nlb=1 (zone 0 full)", ns.append, 0x00, 1)
+    run("OPEN   zone 4 (explicit)", ns.open_zone, 0x40)
+    run("RESET  zone 0", ns.reset_zone, 0x00)
+    ns.report()</code></pre>
+  <p>Expected output when run with Python 3 (it is deterministic):</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>WRITE  slba=0x00 nlb=4                   -&gt; OK, LBA 0x0
+WRITE  slba=0x06 nlb=2 (not at WP)       -&gt; SCT=1h SC=BCh Zone Invalid Write
+APPEND zslba=0x00 nlb=2                  -&gt; OK, LBA 0x4
+APPEND zslba=0x00 nlb=2                  -&gt; OK, LBA 0x6
+APPEND zslba=0x03 nlb=1 (not zone start) -&gt; SCT=0h SC=02h Invalid Field in Command
+WRITE  slba=0x10 nlb=2 (zone 1)          -&gt; OK, LBA 0x10
+    (controller implicitly closed zone at 0x0)
+WRITE  slba=0x20 nlb=1 (zone 2)          -&gt; OK, LBA 0x20
+WRITE  slba=0x30 nlb=1 (zone 3)          -&gt; SCT=1h SC=BDh Too Many Active Zones
+FINISH zone 0                            -&gt; OK
+    (controller implicitly closed zone at 0x10)
+WRITE  slba=0x30 nlb=1 (zone 3, retry)   -&gt; OK, LBA 0x30
+WRITE  slba=0x12 nlb=20 (crosses zone)   -&gt; SCT=1h SC=B8h Zone Boundary Error
+APPEND zslba=0x00 nlb=1 (zone 0 full)    -&gt; SCT=1h SC=B9h Zone Is Full
+OPEN   zone 4 (explicit)                 -&gt; SCT=1h SC=BDh Too Many Active Zones
+RESET  zone 0                            -&gt; OK
+  open=2/2 active=3/3
+  zone 0: ZSLBA=0x0000 ZCAP=12 WP=0x0000 ZSE
+  zone 1: ZSLBA=0x0010 ZCAP=12 WP=0x0012 ZSC
+  zone 2: ZSLBA=0x0020 ZCAP=12 WP=0x0021 ZSIO
+  zone 3: ZSLBA=0x0030 ZCAP=12 WP=0x0031 ZSIO
+  zone 4: ZSLBA=0x0040 ZCAP=12 WP=0x0040 ZSE
+  zone 5: ZSLBA=0x0050 ZCAP=12 WP=0x0050 ZSE</code></pre>
+  <p>Read the run as a story: the first error is a host bug (wrong offset); the appends show the device choosing LBAs; the open limit is relieved silently by an implicit close; the active limit is not, until a Finish frees a resource. Notice the last report: zone 1 is Closed and still active — the leaked half-filled zone that will cause the next Too Many Active Zones.</p>
+
+  <p>A decoder for a raw report buffer (as saved by <code>nvme zns report-zones -b</code> or captured from a trace payload):</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="zone_report_decode.py"><code>import struct, sys
+
+STATES = {0x1: "Empty", 0x2: "Impl-Opened", 0x3: "Expl-Opened", 0x4: "Closed",
+          0xD: "Read-Only", 0xE: "Full", 0xF: "Offline"}
+
+def decode(buf, zsze=None):
+    (nz,) = struct.unpack_from("&lt;Q", buf, 0)
+    n = min(nz, (len(buf) - 64) // 64)
+    print(f"Number of Zones field = {nz}; decoding {n} descriptors")
+    for i in range(n):
+        o = 64 + 64 * i
+        zt, zs, za = buf[o] &amp; 0xF, buf[o + 1] &gt;&gt; 4, buf[o + 2]
+        zcap, zslba, wp = struct.unpack_from("&lt;QQQ", buf, o + 8)
+        st = STATES.get(zs, f"?{zs:x}")
+        wps = f"{wp:#x}" if zs in (1, 2, 3, 4) else "n/a"
+        used = f"{wp - zslba}/{zcap}" if zs in (1, 2, 3, 4) else ("full" if zs == 0xE else "-")
+        flags = [n for b, n in ((0, "ZFC"), (1, "FZR"), (2, "RZR"), (7, "ZDEV")) if za &gt;&gt; b &amp; 1]
+        warn = ""
+        if zt != 2: warn += " WARN:zone-type"
+        if zsze and zslba % zsze: warn += " WARN:misaligned-ZSLBA"
+        print(f"  ZSLBA={zslba:#x} {st:12s} WP={wps:10s} used={used:14s} {' '.join(flags)}{warn}")
+
+if __name__ == "__main__":
+    if len(sys.argv) &gt; 1:
+        decode(open(sys.argv[1], "rb").read())
+    else:   # synthetic buffer matching Trace 2
+        b = bytearray(64 + 5 * 64)
+        struct.pack_into("&lt;Q", b, 0, 5)
+        rows = [(0xE, 0x0, 0), (0x2, 0x10000, 0x14A00), (0x4, 0x20000, 0x20800),
+                (0x2, 0x30000, 0x30102), (0x1, 0x40000, 0x40000)]
+        for i, (zs, zslba, wp) in enumerate(rows):
+            o = 64 + 64 * i
+            b[o], b[o + 1] = 0x2, zs &lt;&lt; 4
+            struct.pack_into("&lt;QQQ", b, o + 8, 0xD800, zslba, wp)
+        decode(bytes(b), zsze=0x10000)</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Problem.</strong> A logging service writes 64 KiB records to the lab's zoned namespace 2 (4 KiB blocks, ZSZE = 0x1_0000 blocks = 256 MiB, ZCAP = 0xD800 blocks = 216 MiB). ZNS Identify reports MOR = 13, MAR = 13, ZASL = 5, and CAP.MPSMIN = 0 (4 KiB). The service runs 32 writer threads. Design the write path. <em>Synthetic example for teaching.</em></p>
+  <ol>
+    <li><strong>Limits.</strong> MOR = MAR = 13 (0's based) → at most 14 open and 14 active zones.</li>
+    <li><strong>Append size.</strong> ZASL = 5 → 2<sup>5</sup> × 4 KiB = 128 KiB maximum per Zone Append. A 64 KiB record = 16 blocks, NLB field = 15. Fits.</li>
+    <li><strong>WRITE vs Zone Append.</strong> With WRITE, each zone allows one write in flight; 14 zones → at most 14 writes in flight, and the 32 threads queue behind per-zone locks. With Zone Append, all 32 threads can target, say, 4 open zones with many appends each in flight.</li>
+    <li><strong>Records per zone.</strong> 216 MiB / 64 KiB = 3,456 records per zone exactly (0xD800 / 16 = 3,456). The last append fills the zone; it transitions to Full and further appends fail with Zone Is Full — the service must move to a new zone on that status <em>or</em> by tracking remaining capacity.</li>
+    <li><strong>Metadata.</strong> Each completion's DW0–DW1 gives the record's LBA; the service writes an index entry (record ID → LBA) to a separate conventional namespace.</li>
+    <li><strong>Garbage collection.</strong> When records expire, the service copies live records out of the oldest zone (Zone Append into a fresh zone), updates the index, then sends Reset Zone. Active-zone budget: 4 writing zones + 1 GC destination + spare = 6 of 14.</li>
+    <li><strong>Unused capacity per zone.</strong> 256 MiB − 216 MiB = 40 MiB of LBA space per zone is never written. Capacity math must use ZCAP, not ZSZE: a 1 TB-class namespace with N zones offers N × 216 MiB.</li>
+  </ol>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Using zone size as capacity.</strong> Writes beyond ZCAP fail; free-space math is wrong by 15% or more.</li>
+    <li><strong>Queue depth &gt; 1 WRITEs per zone.</strong> Works in testing (same CPU, same queue, idle device) and fails in production.</li>
+    <li><strong>Ignoring the Zone Append result.</strong> Data is written but nobody knows where.</li>
+    <li><strong>Closing zones to fix Too Many Active Zones.</strong> Closed is still active; finish or reset instead.</li>
+    <li><strong>Treating MOR/MAR as 1's based</strong> or as "0 means zero zones".</li>
+    <li><strong>Trusting a cached write pointer after a reset, error or power loss.</strong> Always re-report.</li>
+    <li><strong>Reading WP of Full/Read Only/Offline zones.</strong> It is not valid.</li>
+    <li><strong>Sending Zone Append larger than ZASL.</strong> Fails with Invalid Field even though the same size works for WRITE (MDTS).</li>
+    <li><strong>Assuming a ZNS namespace can be used by any file system.</strong> ext4 and XFS (as of this writing) need a zone-aware layer such as dm-zoned, which itself has requirements; check versions.</li>
+    <li><strong>Racing Reset Zone against in-flight I/O</strong> to the same zone.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>ZNS failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>Likely causes</th><th>First check</th><th>Disambiguating experiment</th></tr></thead>
+    <tbody>
+      <tr><td>Intermittent Zone Invalid Write (BCh)</td><td>Host reordering of WRITEs; stale WP cache after reset</td><td>Report the zone: is WP ahead of or behind the failed SLBA?</td><td>Force QD1 per zone; if errors stop, it is reordering</td></tr>
+      <tr><td>Too Many Active Zones (BDh) growing over time</td><td>Leaked partially written zones</td><td>Report with filter Closed (4h): how many and how old?</td><td>Finish the oldest; errors stop → leak in host zone allocator</td></tr>
+      <tr><td>Too Many Open Zones (BEh)</td><td>Host explicitly opened MOR+1 zones</td><td>Count explicitly opened zones (filter 3h)</td><td>Use implicit opens instead; controller can then close for you</td></tr>
+      <tr><td>Zone Is Full (B9h) on append</td><td>Append size not checked against remaining capacity</td><td>WP + NLB vs ZSLBA + ZCAP</td><td>Track remaining capacity per zone</td></tr>
+      <tr><td>Zone Boundary Error (B8h)</td><td>Range crosses zones; read across boundary without RAZB support</td><td>SLBA, NLB vs ZSLBA/ZSZE</td><td>Split the command at the boundary</td></tr>
+      <tr><td>Zone suddenly Read Only (BAh)</td><td>Media wear or failure</td><td>Zone report state; SMART log; ZCAP shrink history</td><td>Copy data out, offline the zone, plan capacity loss</td></tr>
+      <tr><td>Error in application, nothing in PCIe trace</td><td>Kernel rejected the write before submission (zone write plugging or file system)</td><td>dmesg, block tracepoints</td><td>blktrace / ftrace on the block layer to see the rejection</td></tr>
+    </tbody>
+  </table>
+  <p>The general method from <a href="ch47.html">Error Correlation</a> applies with one ZNS-specific step: <strong>always take a zone report at the moment of failure</strong>. Without the device's view of the write pointer, every hypothesis is a guess.</p>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight" data-title="ZNS moves a state machine across the interface">
+    <p>On a conventional SSD the host owns nothing but addresses; all state is inside the device. On ZNS, half of each zone's state machine — the write pointer, the open/active budget, the decision to finish or reset — must be mirrored in the host. Every ZNS bug is a disagreement between the two mirrors. Senior engineers therefore design for resynchronization: on any unexpected status, any reset, any timeout, the host re-reads the zone report and rebuilds its view before retrying.</p>
+    <p>A second insight: the open/active limits are the device's real parallelism budget. A host that uses fewer zones than MOR leaves bandwidth unused; one that uses more thrashes implicit closes. Treat MOR as a tuning parameter you measure against, not merely a limit you avoid.</p>
+    <p>Third: ZNS is valuable when the host software is already log-structured. Forcing a random-write workload onto ZNS through a translation layer usually rebuilds a worse FTL on the host. Ask "who will do garbage collection, and do they already?" before recommending ZNS.</p>
+  </aside>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 59 — Drive the zone state machine on an emulated ZNS namespace</h3>
+  <h4>Objective</h4>
+  <p>Create an emulated zoned namespace, observe every zone state and the write pointer, trigger Zone Invalid Write, Too Many Active Zones and Zone Is Full on purpose, and use Zone Append to see the device choose LBAs.</p>
+  <h4>Skills</h4>
+  <p>Reading ZNS Identify data; zone reports; reasoning from WP and state; mapping errors to the state machine; relating Linux sysfs to Identify fields.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge caution">Caution lab</span> Run entirely inside a QEMU virtual machine against an emulated ZNS namespace backed by a scratch image file. Every step that writes or resets zones destroys data on that namespace; never point these commands at a real device you care about.</p></aside>
+  <h4>Hardware required</h4>
+  <p>Any x86-64 Linux host able to run QEMU with KVM (or without, slowly).</p>
+  <h4>Software required</h4>
+  <p>QEMU with NVMe ZNS emulation (the <code>nvme-ns</code> device's <code>zoned</code> options); a Linux guest with <code>nvme-cli</code> and <code>util-linux</code> (<code>blkzone</code>); Python 3 with <code>zone_report_decode.py</code>.</p>
+  <h4>Input</h4>
+  <p>A 2 GiB raw image file; QEMU options such as (names version-dependent — check QEMU's NVMe documentation):</p>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code>qemu-img create -f raw zns.img 2G
+qemu-system-x86_64 ... \
+  -drive file=zns.img,id=zns0,format=raw,if=none \
+  -device nvme,serial=znslab01,id=nvme0 \
+  -device nvme-ns,drive=zns0,bus=nvme0,nsid=1,logical_block_size=4096,physical_block_size=4096,\
+zoned=true,zoned.zone_size=64M,zoned.zone_capacity=48M,zoned.max_open=4,zoned.max_active=6</code></pre>
+  <h4>Expected output</h4>
+  <p>A log of each step's command, status and the relevant zone descriptors before and after, plus a hand-drawn path through the state machine that every zone you touched followed.</p>
+  <h4>Background</h4>
+  <p>This chapter's engineering explanation and <code>zns_sim.py</code>. Note that QEMU's options take absolute counts, whereas Identify reports 0's based MOR/MAR — so expect <code>nvme zns id-ns</code> to print 3 and 5.</p>
+  <h4>Step 1 — identify</h4>
+  <p>In the guest: <code>sudo nvme zns id-ctrl /dev/nvme0</code>, <code>sudo nvme zns id-ns /dev/nvme0n1 -H</code>, and the sysfs attributes from the Linux view. Record ZSZE, ZCAP, MOR, MAR, ZASL, <code>chunk_sectors</code>, <code>max_open_zones</code>, <code>max_active_zones</code>. Reconcile: 64 MiB / 512 = 131,072 sectors.</p>
+  <h4>Step 2 — sequential writes and the write pointer</h4>
+  <p><code>sudo nvme zns report-zones /dev/nvme0n1 -d 4</code>. Then write 4 blocks at zone 0's start: <code>sudo nvme write /dev/nvme0n1 -s 0 -c 3 -z 16384 -d /dev/urandom</code> (NLB 0's based). Report again: zone 0 should be Implicitly Opened with WP = 4. Now write at LBA 10 (<code>-s 10</code>) and record the status. Write at LBA 4 and confirm success.</p>
+  <h4>Step 3 — Zone Append</h4>
+  <p>Run <code>sudo nvme zns zone-append /dev/nvme0n1 -s 0 -z 8192 -d /dev/urandom</code> three times; record the LBA each returns. Then try an append with <code>-s 3</code> (not a zone start) and record the status.</p>
+  <h4>Step 4 — limits</h4>
+  <p>Write one block at the start of zones 1, 2, 3, 4, 5 (zone <var>n</var> starts at <var>n</var> × 16,384 blocks for 64 MiB zones of 4 KiB). After each, report with filter for implicitly opened and closed zones. Observe the implicit closes when you exceed 4 open zones and the Too Many Active Zones status when you try a seventh zone. Finish zone 0 (<code>nvme zns finish-zone -s 0</code>) and retry.</p>
+  <h4>Step 5 — full and reset</h4>
+  <p>Append to zone 0 (now Full) and record the status. Reset zone 0 (<code>nvme zns reset-zone -s 0</code>) and confirm Empty with WP = ZSLBA. Finally <code>nvme zns reset-zone -a</code> to reset all.</p>
+  <h4>Observation</h4>
+  <p>Note the exact error strings nvme-cli prints and the matching SCT/SC; check dmesg for kernel messages (there may be none for passthrough commands).</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>What WP did the report show after the three appends, and does it equal 4 + 3 × 2?</li>
+    <li>Which zone did QEMU choose to implicitly close? Is that choice specified?</li>
+    <li>Why did Finish, not Close, cure Too Many Active Zones?</li>
+    <li>What is <code>zone_append_max_bytes</code> and how does it relate to ZASL and MDTS?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Mount the namespace with a zone-aware file system (F2FS needs a small conventional device for metadata; Btrfs supports zoned mode on its own in recent kernels), write files, and use zone reports to see how the file system uses zones. Then replicate Step 4's limits failure by analysing which zones the file system holds active.</p>
+  <h4>Hints</h4>
+  <details class="hint"><summary>Hint</summary><p>nvme-cli's <code>write</code> takes NLB 0's based via <code>-c</code> and a byte size via <code>-z</code>; they must agree with the 4 KiB block size. If the kernel refuses to create <code>/dev/nvme0n1</code>, check that the zone size is a power of two, and use <code>/dev/ng0n1</code> for passthrough commands.</p></details>
+  <h4>Solution</h4>
+  <details class="solution"><summary>Solution</summary>
+    <p>Step 2: the write at LBA 10 fails with Zone Invalid Write (SCT 1h / SC BCh); the write at 4 succeeds; WP becomes 8. Step 3: appends of 8 KiB (2 blocks) return 8, 10, 12; WP becomes 14 (the question's "4 + 3 × 2" omits the Step 2 write — 8 + 6 = 14). The append with <code>-s 3</code> fails with Invalid Field in Command. Step 4: with max_open=4, writing a fifth zone causes QEMU to close one implicitly opened zone (QEMU's choice; the specification leaves it to the controller); with max_active=6, the seventh distinct zone fails with Too Many Active Zones. Close would leave the zone active; Finish moves it to Full, freeing an active resource. Step 5: append to a Full zone fails with Zone Is Full; reset returns Empty, WP = ZSLBA.</p>
+    <p><code>zone_append_max_bytes</code> is the kernel's per-command limit for appends, derived from ZASL (2<sup>ZASL</sup> × minimum page size), capped by the controller's MDTS and the driver's own limits.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>Whether implicit closes happen exactly at MOR+1; whether QEMU (or a real device) returns DNR on zone errors, which tells the host whether retry is pointless; whether ZCAP is reported per zone consistently; whether a report taken during in-flight appends shows a WP between two completions.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>Set <code>zoned.zone_size</code> to a non-power-of-two value: the kernel refuses the block device; only <code>/dev/ng*</code> appears.</li>
+    <li>Set <code>zoned.zasl</code> small and append more than the limit: Invalid Field.</li>
+    <li>Explicitly open MOR+1 zones: Too Many Open Zones, because the controller may not close explicitly opened zones.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Capture the guest's NVMe commands with QEMU tracing (the <code>pci_nvme_*</code> trace events) and build a command-level trace equivalent to this chapter's Trace 1 and Trace 3.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>ZSZE = 0x8_0000, LBA = 0x2_3456_7890. Which zone, and what is its ZSLBA?</li>
+    <li>A zone has ZSLBA 0x40_0000, ZCAP 0x3_0000, WP 0x42_FFF0. What is the largest WRITE (in blocks) that can succeed, and what state results?</li>
+    <li>Decode a zone descriptor whose bytes 0–3 are <code>02 40 04 00</code>, bytes 8–15 are <code>00 D8 00 00 00 00 00 00</code>, bytes 16–23 are <code>00 00 03 00 00 00 00 00</code> and bytes 24–31 are <code>00 08 03 00 00 00 00 00</code>. What state is the zone in, and what does attribute value 04h ask of the host?</li>
+    <li>MOR = 7, MAR = 11. How many zones may be Closed while 8 are open?</li>
+    <li>Write CDW13 for Zone Management Receive: Extended Report Zones, filter Full zones, partial report.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p>1. 0x2_3456_7890 / 0x8_0000 = 0x468A (zone 18,058; the LBA shifted right by 19); ZSLBA = 0x468A × 0x8_0000 = 0x2_3450_0000.</p>
+    <p>2. Writable end = 0x40_0000 + 0x3_0000 − 1 = 0x42_FFFF; remaining = 0x43_0000 − 0x42_FFF0 = 0x10 = 16 blocks (NLB field 15). The zone becomes Full.</p>
+    <p>3. ZT = 2 (sequential write required); ZS byte 0x40 → state 4h Closed; ZA = 04h → bit 2 Reset Zone Recommended; ZCAP = 0xD800, ZSLBA = 0x3_0000, WP = 0x3_0800 (all little-endian), so 0x800 blocks are written. The device recommends the host reset this zone (after moving any live data out).</p>
+    <p>4. MOR = 7 → 8 open; MAR = 11 → 12 active. Open zones count as active, so 12 − 8 = 4 zones may be Closed.</p>
+    <p>5. ZRA = 1h (bits 7:0), filter = 5h (bits 15:8), Partial = bit 16 → 0x0001_0501.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>A WRITE starts two blocks past the write pointer of an Implicitly Opened zone. Status?</p>
+      <ul class="options" data-answer="2"><li>Zone Boundary Error</li><li>Zone Invalid Write</li><li>LBA Out of Range</li><li>Success; the gap is zero-filled</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Writes must start exactly at the write pointer; anything else is Zone Invalid Write (SCT 1h, SC BCh). Boundary errors are for crossing zones.</p></details></li>
+    <li><p>Which states count against Maximum Active Resources?</p>
+      <ul class="options" data-answer="3"><li>Implicitly and Explicitly Opened only</li><li>All except Empty</li><li>Implicitly Opened, Explicitly Opened and Closed</li><li>Closed and Full</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Active means partially written and holding device resources: the opened states plus Closed. Full, Empty, Read Only and Offline do not count.</p></details></li>
+    <li><p>Where does a successful Zone Append report where the data landed?</p>
+      <ul class="options" data-answer="1"><li>Completion Dwords 0 and 1</li><li>The Changed Zone List log</li><li>CDW10–11 of the SQE, overwritten by the controller</li><li>It does not; the host must issue a zone report</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The controller returns the 64-bit LBA of the first block written in DW0–DW1 of the CQE. The SQE is never modified by the controller.</p></details></li>
+    <li><p>A host hits Too Many Active Zones. Which action frees a resource?</p>
+      <ul class="options" data-answer="4"><li>Close Zone on an open zone</li><li>Open Zone on an empty zone</li><li>Report Zones</li><li>Finish Zone on a closed zone</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Finish moves a zone to Full, which is not active. Close only converts open to closed; still active.</p></details></li>
+    <li><p>Which of these can the controller do on its own, without a host command?</p>
+      <ul class="options" data-answer="2"><li>Move an explicitly opened zone to Closed</li><li>Move an implicitly opened zone to Closed</li><li>Reset a Full zone</li><li>Move a Closed zone to Empty</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>To free an open resource the controller may close an implicitly opened zone. It must not close explicitly opened zones, and it never discards data by resetting.</p></details></li>
+    <li><p>Zone size 2 GiB, zone capacity 1,077 MiB. Why might a device do this?</p>
+      <ul class="options" data-answer="3"><li>To reserve space for host metadata</li><li>Because the specification requires capacity ≤ half the size</li><li>So zone size is a power of two while capacity matches the flash stripe</li><li>To support conventional zones</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Hosts (and Linux) want power-of-two zone sizes for shift arithmetic; the physical stripe holds 1,077 MiB. The difference is unwritable LBA space.</p></details></li>
+    <li><p>Why does Zone Append exist if WRITE already works on zones?</p><details class="answer"><summary>Model answer</summary><p>Because NVMe does not order commands, two WRITEs to a zone can execute out of order and the second-to-arrive fails. Hosts must therefore keep one WRITE per zone in flight. Zone Append lets the controller pick the LBA at the write pointer and return it, so many appends to one zone can be in flight at once, restoring parallelism.</p></details></li>
+    <li><p>A trace shows a WRITE to the zoned namespace failing with SC BCh, and the zone report afterwards shows WP equal to the failed command's SLBA. What happened?</p><details class="answer"><summary>Model answer</summary><p>At the time the controller validated the WRITE, WP was different (behind, because an earlier write had not yet been processed, or ahead/behind because of a reset). By the time of the report, WP had moved to that SLBA — typically because a reordered earlier WRITE completed. Classic reordering; retry would now succeed, but the fix is per-zone serialization or Zone Append.</p></details></li>
+    <li><p>Name three things a validation engineer must test that do not exist for conventional namespaces.</p><details class="answer"><summary>Model answer</summary><p>Every legal and illegal zone state transition (including Select All); behaviour exactly at MOR+1 and MAR+1 with mixes of implicit and explicit opens; Zone Append concurrency with correct, unique, contiguous returned LBAs and ZASL limits; opened-zone handling across reset and power loss; Read Only/Offline transitions and ZCAP shrink; report filters and partial reports.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner.</strong> What is a zone and what is a write pointer?</p><details class="answer"><summary>Model answer</summary><p>A zone is a fixed-size LBA range in a zoned namespace that must be written sequentially and reset as a whole. The write pointer is the next LBA that may be written in that zone; it starts at the zone's first LBA and advances with each write.</p></details></li>
+    <li><p><strong>Beginner.</strong> Why can't you overwrite a block in a zone?</p><details class="answer"><summary>Model answer</summary><p>Because the model mirrors flash, which programs pages in order and erases whole blocks. The only way to make space reusable is to reset the whole zone, after which writing restarts at the beginning.</p></details></li>
+    <li><p><strong>Intermediate.</strong> Explain the difference between open and active zones and why both limits exist.</p><details class="answer"><summary>Model answer</summary><p>Open zones (implicitly or explicitly opened) are being written and need write buffers and parity state; active zones additionally include Closed zones, which are partially written and need metadata and partially programmed erase blocks. The device has finite buffer memory and power-loss protection (open limit) and finite partially-written-block tracking (active limit).</p></details></li>
+    <li><p><strong>Intermediate.</strong> How would you find, from a PCIe trace alone, where a Zone Append's data was written?</p><details class="answer"><summary>Model answer</summary><p>Find the SQE fetch (device MRd of 64 bytes) and decode opcode 7Dh and CID; then find the CQE MWr to the matching CQ with that CID; DW0–DW1 of the CQE hold the first LBA. The SQE alone only names the zone start.</p></details></li>
+    <li><p><strong>Advanced.</strong> A RocksDB-on-ZNS deployment sees throughput collapse after weeks. Where do you look?</p><details class="answer"><summary>Model answer</summary><p>Zone reports: count of Closed (active) zones, Finish/Reset Recommended attributes, ZCAP shrinkage, Read Only zones. Host side: GC efficiency (live data per zone at reset), whether the allocator leaks partially written zones, whether it hits the active limit and serializes. Device side: SMART and endurance. A common root cause is active-zone exhaustion forcing premature finishes and GC of mostly live zones.</p></details></li>
+    <li><p><strong>Senior.</strong> Should a cloud provider expose ZNS namespaces to tenant VMs?</p><details class="answer"><summary>Model answer</summary><p>Only to tenants with zone-aware software, and with careful resource partitioning: MOR/MAR are per namespace and a tenant can exhaust them; resets are instant data destruction; the tenant must handle ZNS statuses. Many providers instead use ZNS internally beneath a log-structured storage service and expose conventional block devices to tenants, capturing the cost benefit without exporting the complexity. FDP is a competing option that keeps the block interface.</p></details></li>
+    <li><p><strong>Senior.</strong> Compare ZNS with Flexible Data Placement.</p><details class="answer"><summary>Model answer</summary><p>ZNS changes the write contract: sequential writes, host-driven reset, new statuses, host GC. FDP keeps random writes and the conventional block interface but lets the host tag writes with placement handles so the device can segregate data with similar lifetimes, reducing write amplification without host GC. ZNS gives more control and the smallest device resources; FDP is far easier to adopt and degrades gracefully when hints are wrong.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> the warehouse aisles, the flag, the forklifts and "put it wherever the flag is."</li>
+    <li><strong>To a junior engineer:</strong> why two WRITEs to one zone can fail, and why Zone Append fixes it.</li>
+    <li><strong>To a senior engineer:</strong> how ZNS moves part of the FTL's state machine into the host, which failure modes that creates, and how you would make a host resilient to them.</li>
+  </ul>
+  <details class="answer"><summary>Model explanation for the junior engineer</summary><p>A zone only accepts a write at its write pointer. If you send two WRITEs — one at WP and one right after it — nothing in NVMe guarantees the controller handles them in the order you sent them; they might be in different queues or the controller might fetch them in any order. If the second one is checked first, it is not at WP yet, so it fails. You can avoid this by never having more than one WRITE to a zone in flight, but that is slow. Zone Append says "write this at whatever WP is when you get to it and tell me where" — so order no longer matters and you can send many at once.</p></details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>A zoned namespace (CSI 02h, ZNS Command Set 1.5) groups LBAs into fixed-size zones with per-zone capacity, a write pointer and a state: Empty, Implicitly Opened, Explicitly Opened, Closed, Full, Read Only, Offline. Writes must begin at the write pointer and stay inside the zone; zones are rewritten only after Reset Zone. Open and active zone counts are limited by MOR and MAR. Zone Append (7Dh) writes at the write pointer and returns the LBA in completion DW0–DW1, enabling concurrency that WRITE cannot safely have. Zone Management Send (79h) opens, closes, finishes, resets and offlines zones; Zone Management Receive (7Ah) reports them. ZNS errors are command statuses (SCT 1h, B8h–BFh) and are almost always disagreements between the host's mirror of zone state and the device's.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>compute a zone index, ZSLBA and writable end from an LBA, ZSZE and ZCAP</li>
+      <li>draw the zone state machine with every transition's cause</li>
+      <li>predict the status for any write given a zone report</li>
+      <li>explain Zone Append's purpose and find its returned LBA in a trace</li>
+      <li>decode a Zone Management Receive command and a zone descriptor</li>
+      <li>explain open vs active limits and which action frees which</li>
+      <li>find the first abnormal event in a reordered-write trace and name the root cause</li>
+      <li>inspect a zoned namespace in Linux and state what the output cannot prove</li>
+      <li>compare conventional, ZNS and FDP namespaces for a given workload</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Zoned Namespace Command Set Specification, Revision 1.5</cite> — "Zoned Namespace Command Set Model", "Zone State Machine", "Zone Append command", "Zone Management Send command", "Zone Management Receive command", "Identify Namespace data structure (Zoned Namespace Command Set specific)", and the status code tables.</li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4</cite> — "I/O Command Set selection" and CSI; <cite class="spec">NVM Express Revision Changes (2026-07-30)</cite> for 2026 ZNS changes, summarized in <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a>.</li>
+    <li>Linux: <code>Documentation/block/</code> zoned block device documentation; zonefs documentation; nvme-cli <code>nvme-zns</code> manual pages; the util-linux <code>blkzone</code> manual page; QEMU's NVMe emulation documentation for ZNS options.</li>
+    <li>Deeper in this course: the <a href="dd44.html">ZNS</a> deep-dive module and ZNS labs in <a href="me-feature-labs.html">Feature Labs</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch60.html">Key Value</a> — a command set that abandons LBAs altogether and addresses data by key.</p>
+</section>

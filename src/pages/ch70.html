@@ -1,0 +1,903 @@
+<p class="lead">Behind the PCIe function you inspected in Chapter 69 sits an NVMe controller with its own identity, its own logs and its own queues. This chapter teaches you to interrogate it from Linux with nvme-cli, the NVMe sysfs tree, the block layer's queue settings and the kernel's NVMe tracepoints, and to know exactly which of those commands are harmless questions and which ones change the drive.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>The PCIe view tells you the road is open. It does not tell you whether the librarian is awake, how big the library is, whether the shelves are wearing out, or which requests failed last night. Those answers come from the NVMe layer: Identify data structures, log pages, features and controller registers, all defined by the NVM Express specifications and all reachable from Linux.</p>
+  <p>Unlike <code>lspci</code>, most nvme-cli commands are not passive reads of config space. They send real <strong>NVMe admin commands</strong> (Identify, Get Log Page, Get Features) through the driver onto the controller's Admin Submission Queue. They are safe because those particular commands are defined to have no effect on stored data, not because "reading is always safe". The same tool, one subcommand away, can format, sanitize or reflash a drive. Knowing the difference is the first professional skill this chapter builds.</p>
+  <p>The second skill is cross-layer correlation. The kernel's NVMe tracepoints print the queue identifier (QID) and command identifier (CID) of every command; an analyzer shows the same CID inside the 64-byte Submission Queue Entry (SQE) and the 16-byte Completion Queue Entry (CQE). That shared key lets you join a Linux trace to a PCIe trace, which is the core technique of <a href="ch41.html">Chapter 41</a> and the trace-analysis parts of this course.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Map Linux device nodes (<code>/dev/nvme0</code>, <code>/dev/nvme0n1</code>, <code>/dev/ng0n1</code>) to NVMe controllers, namespaces and subsystems.</li>
+    <li>Run and interpret <code>nvme list</code>, <code>id-ctrl</code>, <code>id-ns</code>, <code>smart-log</code>, <code>error-log</code>, <code>fw-log</code>, <code>get-log</code>, <code>get-feature</code>, <code>show-regs</code> and <code>list-subsys</code>, naming the NVMe command each one sends.</li>
+    <li>Compute derived quantities: maximum data transfer size from MDTS, bytes from SMART data units, queue entry sizes from SQES/CQES, LBA size from the LBA Format.</li>
+    <li>Navigate <code>/sys/class/nvme</code>, <code>/sys/class/nvme-subsystem</code> and <code>/sys/block/nvmeXnY/queue/*</code>, and connect each value to the NVMe field it came from.</li>
+    <li>Trace commands with blktrace/blkparse and with the <code>nvme_setup_cmd</code> / <code>nvme_complete_rq</code> tracepoints via trace-cmd, ftrace and bpftrace.</li>
+    <li>Classify every nvme-cli subcommand into Safe, Caution or Expert, and practise all of it on a QEMU-emulated NVMe controller first.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>You need the controller and its registers (<a href="ch23.html">Chapter 23</a>, <a href="ch24.html">Chapter 24</a>), the admin queue and admin commands (<a href="ch26.html">Chapter 26</a>, <a href="ch30.html">Chapter 30</a>), queue and doorbell mechanics (<a href="ch25.html">Chapter 25</a>, <a href="ch28.html">Chapter 28</a>), the command structure (<a href="ch29.html">Chapter 29</a>), namespaces (<a href="ch58.html">Chapter 58</a>), SMART/health (<a href="ch57.html">Chapter 57</a>), NVMe status codes (<a href="ch44.html">Chapter 44</a>) and the PCIe inspection of <a href="ch69.html">Chapter 69</a>.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Chapter 69 let you read the name card on the library's door. Now you are allowed to talk to the librarian through a little window. You may ask polite questions: "Who are you? How many books do you hold? How tired are your shelves? What went wrong recently?" The librarian answers from her notebooks, and asking does not move a single book. But the same window also accepts orders such as "throw away every book" or "replace your brain with this new one". A good student only asks questions through the window unless the teacher is standing right there, with a spare library ready.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>Adult version: nvme-cli is the diagnostic port of a modern car (the On-Board Diagnostics connector). A scan tool can read the vehicle identification, live sensors, fault codes and freeze-frame data without affecting how the car drives. The same port, with the right software, can also clear codes, recalibrate the engine or flash new firmware. Mechanics separate "read codes" from "program module" by procedure, not by plug.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>Where the analogy breaks.</strong> (1) A car's diagnostic bus is separate from the driving controls; NVMe admin commands share the controller with I/O and consume admin queue slots, so a tight loop of queries can, in principle, compete with the driver's own admin work. (2) Reading a car's fault codes does not clear them; some NVMe log pages tied to asynchronous events are cleared or acknowledged when read without the Retain Asynchronous Event flag, and reading certain logs (for example a host-initiated telemetry log with "create") triggers new work inside the device. (3) The car has one controller; an NVMe subsystem can have several controllers and namespaces shared among hosts, so "the drive" is not always one thing.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>Linux creates several files for each NVMe device:</p>
+  <table>
+    <caption>Linux NVMe device nodes</caption>
+    <thead><tr><th>Node</th><th>Represents</th><th>Used for</th></tr></thead>
+    <tbody>
+      <tr><td><code>/dev/nvme0</code></td><td>A <strong>controller</strong> (character device)</td><td>Admin commands: Identify Controller, logs, features, firmware, format</td></tr>
+      <tr><td><code>/dev/nvme0n1</code></td><td>A <strong>namespace</strong> as a block device</td><td>Filesystems and normal I/O; namespace-scoped admin commands</td></tr>
+      <tr><td><code>/dev/nvme0n1p1</code></td><td>A partition of that block device</td><td>Filesystems</td></tr>
+      <tr><td><code>/dev/ng0n1</code></td><td>A namespace as a <strong>generic character device</strong> (newer kernels)</td><td>Passthrough I/O even for namespaces the block layer cannot expose (for example an unsupported command set)</td></tr>
+    </tbody>
+  </table>
+  <p>The tool is <span class="g" data-term="nvme-cli">nvme-cli</span>, installed as the <code>nvme</code> command. Each subcommand builds an NVMe command, passes it to the kernel driver with an ioctl, and decodes the data structure the controller returns.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo nvme list                       <span class="cm"># one line per namespace</span>
+sudo nvme id-ctrl /dev/nvme0 -H      <span class="cm"># who is this controller and what can it do</span>
+sudo nvme smart-log /dev/nvme0       <span class="cm"># health: temperature, wear, errors</span></code></pre>
+  <aside class="callout warn">
+    <p>Naming trap: with native NVMe multipath (the default in most distributions) the block device <code>nvme0n1</code> is named after the <strong>subsystem</strong> instance, while <code>nvme0</code> is a <strong>controller</strong> instance. On a system with several controllers, <code>nvme1n1</code> may live behind <code>nvme2</code>. Always confirm with <code>nvme list -v</code> or <code>nvme list-subsys</code> before running anything against a node. <span class="badge version">Kernel-configuration-dependent</span></p>
+  </aside>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>How a nvme-cli query reaches the controller</h3>
+  <figure>
+    <ol class="seq" data-actors="nvme-cli|nvme driver|Host memory|Controller">
+      <li data-from="nvme-cli" data-to="nvme driver">ioctl(ADMIN_CMD): opc 06h CNS 01h</li>
+      <li data-from="nvme driver" data-to="Host memory">write SQE in Admin SQ, 4 KiB buffer</li>
+      <li data-from="nvme driver" data-to="Controller">MWr: SQ0 tail doorbell (BAR0+1000h)</li>
+      <li data-from="Controller" data-to="Host memory">MRd: fetch 64-byte SQE</li>
+      <li data-from="Controller" data-to="Host memory">MWr: 4096 bytes Identify data</li>
+      <li data-from="Controller" data-to="Host memory">MWr: 16-byte CQE in Admin CQ</li>
+      <li data-from="Controller" data-to="nvme driver">MWr: MSI-X vector 0</li>
+      <li data-from="nvme driver" data-to="Controller">MWr: CQ0 head doorbell (BAR0+1004h)</li>
+      <li data-from="nvme driver" data-to="nvme-cli" class="dashed">ioctl returns status + data</li>
+    </ol>
+    <figcaption>Conceptual sequence of <code>nvme id-ctrl</code> on the reference system (Identify, opcode 06h, CNS 01h). Read requests and completions omitted for brevity.</figcaption>
+  </figure>
+  <p>This is a full NVMe command lifecycle, exactly like an I/O but on queue 0. Every nvme-cli query therefore appears on a PCIe analyzer as doorbell writes, an SQE fetch, a data transfer, a CQE write and an MSI-X write. The command identifier assigned by the driver is visible in the SQE on the wire and in the kernel's tracepoints.</p>
+  <aside class="callout impl">
+    <p>Kernel side detail: the driver checks passthrough commands against the controller's Commands Supported and Effects log where available and may freeze I/O around commands flagged as changing the namespace inventory or capabilities (for example Format NVM), then rescan afterwards. That is driver policy, not something the NVMe specification requires of the host.</p>
+  </aside>
+
+  <h3>nvme list and nvme list -v</h3>
+  <p><code>nvme list</code> walks the kernel's view of controllers and namespaces (sysfs) and issues Identify commands where it needs fields the kernel does not export. Synthetic example for teaching, Lab SSD:</p>
+  <pre class="code" data-kind="read-only" data-lang="text" data-title="Synthetic example for teaching: sudo nvme list"><code>Node                  Generic               SN                   Model                                    Namespace  Usage                      Format           FW Rev
+--------------------- --------------------- -------------------- ---------------------------------------- ---------- -------------------------- ---------------- --------
+/dev/nvme0n1          /dev/ng0n1            LAB0000000001        Lab Vendor Lab SSD 1TB                   0x1          1.00  TB /   1.00  TB    512   B +  0 B   LAB1.0</code></pre>
+  <ul>
+    <li><strong>Usage</strong> is Namespace Utilization (NUSE) and Namespace Size (NSZE) times the LBA size: 1,953,525,168 × 512 B ≈ 1.00 TB.</li>
+    <li><strong>Format</strong> <code>512 B + 0 B</code> is the LBA data size and metadata size of the LBA Format in use.</li>
+    <li><code>-v</code> (verbose) prints a subsystem → controller → namespace hierarchy with transport addresses (the PCI BDF for NVMe over PCIe). Column layout is <span class="badge version">version-dependent</span> across nvme-cli releases; use <code>-o json</code> for scripts.</li>
+  </ul>
+
+  <h3>nvme id-ctrl: Identify Controller</h3>
+  <p>Sends Identify (admin opcode 06h) with Controller or Namespace Structure (CNS) 01h and decodes the 4096-byte Identify Controller data structure. Add <code>-H</code> to decode bit fields in words, <code>-o json</code> for machine-readable output, <code>-b</code> for the raw binary. The fields that matter most in practice:</p>
+  <table>
+    <caption>Identify Controller fields every NVMe engineer reads (names as nvme-cli prints them)</caption>
+    <thead><tr><th>Field</th><th>Meaning</th><th>Why you care</th></tr></thead>
+    <tbody>
+      <tr><td><code>vid</code>, <code>ssvid</code></td><td>PCI Vendor ID and Subsystem Vendor ID</td><td>Must match lspci; mismatch hints at the wrong device node</td></tr>
+      <tr><td><code>sn</code>, <code>mn</code>, <code>fr</code></td><td>Serial number, model number, firmware revision (ASCII, space-padded)</td><td>Identify exactly what you are testing; firmware revision is the first line of every bug report</td></tr>
+      <tr><td><code>rab</code></td><td>Recommended Arbitration Burst</td><td>Arbitration tuning (<a href="ch25.html">Chapter 25</a>)</td></tr>
+      <tr><td><code>ieee</code></td><td>IEEE OUI of the vendor</td><td>Identity</td></tr>
+      <tr><td><code>cmic</code></td><td>Controller Multi-path I/O and Namespace Sharing Capabilities</td><td>Multiple ports/controllers? SR-IOV?</td></tr>
+      <tr><td><code>mdts</code></td><td>Maximum Data Transfer Size, as a power of two in units of the minimum memory page size (CAP.MPSMIN); 0 means no limit reported</td><td>Determines the largest single I/O; the kernel derives <code>max_hw_sectors_kb</code> from it</td></tr>
+      <tr><td><code>cntlid</code></td><td>Controller ID within the subsystem</td><td>Appears in error logs, reservations, multipath</td></tr>
+      <tr><td><code>ver</code></td><td>Version the controller claims (same encoding as the VS register)</td><td>e.g. 0x20000 = 2.0; features available depend on it</td></tr>
+      <tr><td><code>rtd3r</code>, <code>rtd3e</code></td><td>RTD3 resume and entry latency (µs)</td><td>Shutdown/resume timing; the driver's shutdown timeout</td></tr>
+      <tr><td><code>oaes</code></td><td>Optional Asynchronous Events Supported</td><td>Which Asynchronous Event Notifications (AEN) may arrive</td></tr>
+      <tr><td><code>ctratt</code></td><td>Controller Attributes</td><td>Optional capabilities such as 128-bit host ID, NVM Sets, Endurance Groups</td></tr>
+      <tr><td><code>oacs</code></td><td>Optional Admin Command Support</td><td>Security Send/Receive, Format NVM, Firmware Download/Commit, Namespace Management, Device Self-test, Directives, Virtualization Management, Doorbell Buffer Config…</td></tr>
+      <tr><td><code>acl</code>, <code>aerl</code></td><td>Abort Command Limit, Asynchronous Event Request Limit (both 0's-based)</td><td>How many Aborts / AERs may be outstanding</td></tr>
+      <tr><td><code>frmw</code></td><td>Firmware Updates: number of slots, slot 1 read-only, activation without reset</td><td>Firmware upgrade planning</td></tr>
+      <tr><td><code>lpa</code>, <code>elpe</code></td><td>Log Page Attributes; Error Log Page Entries (0's-based)</td><td>Which logs exist; how many error entries the controller keeps</td></tr>
+      <tr><td><code>npss</code>, <code>apsta</code></td><td>Number of Power States Support (0's-based); Autonomous Power State Transition support</td><td>Power management (<a href="ch50.html">Chapter 50</a>)</td></tr>
+      <tr><td><code>wctemp</code>, <code>cctemp</code></td><td>Warning and critical composite temperature thresholds, in kelvin</td><td>Compare with smart-log temperature</td></tr>
+      <tr><td><code>sqes</code>, <code>cqes</code></td><td>Required (low nibble) and maximum (high nibble) queue entry sizes, as powers of two</td><td>For NVM command set controllers: 0x66 (64-byte SQE) and 0x44 (16-byte CQE)</td></tr>
+      <tr><td><code>maxcmd</code></td><td>Maximum outstanding commands (mainly fabrics)</td><td>—</td></tr>
+      <tr><td><code>nn</code></td><td>Number of Namespaces (maximum valid NSID)</td><td>Namespace management limits</td></tr>
+      <tr><td><code>oncs</code></td><td>Optional NVM Command Support: Compare, Write Uncorrectable, Dataset Management, Write Zeroes, Save/Select in features, Reservations, Timestamp, Verify, Copy…</td><td>Whether Linux exposes discard (DSM) and write-zeroes</td></tr>
+      <tr><td><code>fna</code></td><td>Format NVM Attributes (format/secure erase applies to all namespaces?)</td><td>Blast radius of a format: critical safety information</td></tr>
+      <tr><td><code>vwc</code></td><td>Volatile Write Cache present</td><td>Whether Flush matters; Linux <code>queue/write_cache</code></td></tr>
+      <tr><td><code>awun</code>, <code>awupf</code></td><td>Atomic Write Unit Normal / Power Fail (0's-based, in LBAs)</td><td>Torn-write guarantees for databases</td></tr>
+      <tr><td><code>sgls</code></td><td>SGL Support</td><td>Whether the driver may use SGLs instead of PRPs (<a href="ch37.html">Chapter 37</a>)</td></tr>
+      <tr><td><code>subnqn</code></td><td>NVM Subsystem NVMe Qualified Name</td><td>Identity of the subsystem; key for multipath</td></tr>
+      <tr><td><code>ps 0..n</code></td><td>Power State Descriptors: max power, entry/exit latency, operational or not</td><td>APST tables; latency outliers</td></tr>
+    </tbody>
+  </table>
+  <div class="formula">
+    <div class="eq"><var>MaxXfer</var> = 2<sup><var>MDTS</var></sup> × 2<sup>(12 + <var>MPSMIN</var>)</sup> bytes</div>
+    <dl class="vars">
+      <dt>MaxXfer</dt><dd>largest data transfer a single command may describe</dd>
+      <dt>MDTS</dt><dd>the Identify Controller <code>mdts</code> field (0 = no limit reported)</dd>
+      <dt>MPSMIN</dt><dd>the CAP register's Memory Page Size Minimum field; 2<sup>(12 + MPSMIN)</sup> is the minimum page size in bytes (4 KiB when MPSMIN = 0)</dd>
+    </dl>
+  </div>
+  <p>Example: <code>mdts = 5</code> with MPSMIN = 0 gives 2<sup>5</sup> × 4 KiB = 128 KiB. Linux will split any larger request (see the worked example). <span class="badge derived">Derived</span></p>
+
+  <h3>nvme id-ns: Identify Namespace</h3>
+  <p>Sends Identify with CNS 00h and the namespace ID (NSID) of the node you name (<code>/dev/nvme0n1</code> → NSID 1, or <code>-n</code> explicitly on the controller node).</p>
+  <table>
+    <caption>Identify Namespace fields (NVM Command Set)</caption>
+    <thead><tr><th>Field</th><th>Meaning</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td><code>nsze</code></td><td>Namespace Size, in logical blocks</td><td>Total LBAs: valid LBAs are 0 … NSZE−1</td></tr>
+      <tr><td><code>ncap</code></td><td>Namespace Capacity, in logical blocks</td><td>Can be less than NSZE with thin provisioning</td></tr>
+      <tr><td><code>nuse</code></td><td>Namespace Utilization</td><td>Allocated blocks; changes with deallocation if supported</td></tr>
+      <tr><td><code>nsfeat</code></td><td>Namespace Features</td><td>Thin provisioning, deallocated-error reporting, optimal I/O fields valid…</td></tr>
+      <tr><td><code>nlbaf</code>, <code>flbas</code></td><td>Number of LBA Formats (0's-based); Formatted LBA Size (which format is in use, metadata placement)</td><td>The format in use is printed with <code>(in use)</code></td></tr>
+      <tr><td><code>mc</code>, <code>dpc</code>, <code>dps</code></td><td>Metadata Capabilities; End-to-end Data Protection Capabilities / Settings</td><td>Protection Information types (<a href="ch31.html">Chapter 31</a>)</td></tr>
+      <tr><td><code>nmic</code></td><td>Namespace Multi-path I/O and Sharing</td><td>Shared namespace?</td></tr>
+      <tr><td><code>dlfeat</code></td><td>Deallocate Logical Block Features</td><td>What reads of deallocated blocks return</td></tr>
+      <tr><td><code>nguid</code>, <code>eui64</code></td><td>Globally unique namespace identifiers</td><td>Stable identity for udev <code>/dev/disk/by-id</code></td></tr>
+      <tr><td><code>lbaf N : ms:M lbads:L rp:R</code></td><td>LBA Format N: metadata size, LBA data size as 2<sup>L</sup>, relative performance</td><td><code>lbads:9</code> = 512 B, <code>lbads:12</code> = 4096 B</td></tr>
+    </tbody>
+  </table>
+  <p>Related queries: <code>nvme list-ns /dev/nvme0</code> (Identify CNS 02h, active namespace list), <code>nvme ns-descs /dev/nvme0n1</code> (Identify CNS 03h, Namespace Identification Descriptor list: EUI64, NGUID, UUID, command set identifier). Newer command sets use I/O-command-set-specific Identify structures; check the NVMe Base 2.4 Identify command description for the CNS values in use.</p>
+
+  <h3>nvme smart-log: SMART / Health Information (Log Page 02h)</h3>
+  <p>Sends Get Log Page (admin opcode 02h) with Log Identifier 02h and NSID FFFFFFFFh (controller-wide) by default. Fields and how to read them:</p>
+  <table>
+    <caption>SMART / Health Information log, as nvme-cli prints it</caption>
+    <thead><tr><th>Field</th><th>Unit / meaning</th><th>What a senior engineer reads into it</th></tr></thead>
+    <tbody>
+      <tr><td><code>critical_warning</code></td><td>Bit field: available spare below threshold, temperature, reliability degraded, read-only mode, volatile memory backup failed, persistent memory region (bits vary by revision)</td><td>Any non-zero value is an incident</td></tr>
+      <tr><td><code>temperature</code></td><td>Composite temperature (reported in kelvin; nvme-cli also converts)</td><td>Compare with <code>wctemp</code>/<code>cctemp</code>; thermal throttling explains slowdowns</td></tr>
+      <tr><td><code>available_spare</code>, <code>available_spare_threshold</code></td><td>Percent</td><td>Spare falling toward threshold = wear or bad blocks</td></tr>
+      <tr><td><code>percentage_used</code></td><td>Vendor estimate of life used; may exceed 100</td><td>Endurance planning</td></tr>
+      <tr><td><code>data_units_read</code> / <code>written</code></td><td>Thousands of 512-byte units (1 unit = 512,000 bytes), rounded up</td><td>Workload volume; write amplification studies with vendor logs</td></tr>
+      <tr><td><code>host_read_commands</code> / <code>host_write_commands</code></td><td>Commands completed</td><td>Divide data by commands for average size</td></tr>
+      <tr><td><code>controller_busy_time</code></td><td>Minutes the controller was busy with I/O</td><td>Utilization trend</td></tr>
+      <tr><td><code>power_cycles</code>, <code>power_on_hours</code>, <code>unsafe_shutdowns</code></td><td>Counts / hours</td><td>Rising unsafe shutdowns = power loss without a clean shutdown notification; data-integrity risk</td></tr>
+      <tr><td><code>media_errors</code></td><td>Unrecovered data integrity errors</td><td>Non-zero is serious; correlate with error-log</td></tr>
+      <tr><td><code>num_err_log_entries</code></td><td>Lifetime count of Error Information log entries</td><td>Compare with <code>error-log</code></td></tr>
+      <tr><td><code>Warning/Critical Composite Temperature Time</code></td><td>Minutes above thresholds</td><td>Cooling problems</td></tr>
+      <tr><td><code>Temperature Sensor 1..8</code>, <code>Thermal Management T1/T2 Trans Count/Time</code></td><td>Optional</td><td>Throttling history</td></tr>
+    </tbody>
+  </table>
+  <div class="formula">
+    <div class="eq"><var>Bytes</var> ≈ <var>DU</var> × 1000 × 512</div>
+    <dl class="vars">
+      <dt>Bytes</dt><dd>approximate data volume</dd>
+      <dt>DU</dt><dd>the <code>data_units_read</code> or <code>data_units_written</code> value (rounded up by the controller)</dd>
+    </dl>
+  </div>
+  <p>The SMART log is a <strong>controller's</strong> summary. Some fields may be reported per namespace when the controller supports it (log page attribute); most drives report controller-wide values.</p>
+
+  <h3>nvme error-log: Error Information (Log Page 01h)</h3>
+  <p>Get Log Page with Log Identifier 01h. The controller keeps a ring of entries (<code>elpe</code> + 1 of them). Each entry contains:</p>
+  <ul>
+    <li><code>error_count</code>: a unique, incrementing identifier of the error (not a per-entry count). Zero means the entry is empty.</li>
+    <li><code>sqid</code>, <code>cmdid</code>: the queue and command that failed. These are the join keys to tracepoints and analyzer traces.</li>
+    <li><code>status_field</code>: the status of the failed command (Status Code Type, Status Code, More, Do Not Retry). nvme-cli shows the raw field; decode it with the status tables from <a href="ch44.html">Chapter 44</a>.</li>
+    <li><code>parm_error_location</code>: byte and bit in the command where a parameter error was found.</li>
+    <li><code>lba</code>, <code>nsid</code>: first LBA and namespace involved, when relevant.</li>
+    <li><code>vs</code>: vendor-specific information log page pointer; <code>trtype</code>, <code>cs</code>, <code>trtype_spec_info</code>: transport and command-specific information.</li>
+  </ul>
+  <aside class="callout warn">
+    <p>The error log is <strong>not</strong> a complete record of what Linux saw. Commands that timed out and were aborted or reset by the host may leave no entry, because from the controller's perspective they may never have completed with an error. Conversely, entries can exist for errors Linux handled silently (for example a retried command). And the ring overwrites old entries. Always cross-check with the kernel log (<a href="ch71.html">Chapter 71</a>).</p>
+  </aside>
+
+  <h3>nvme fw-log: Firmware Slot Information (Log Page 03h)</h3>
+  <p>Shows the active firmware slot (<code>afi</code>) and the revision in each slot (<code>frs1</code> … <code>frs7</code>), including which slot will be activated at the next reset. Read-only and safe. The commands that change these slots (<code>fw-download</code>, <code>fw-commit</code>) are Expert.</p>
+
+  <h3>nvme get-log: any log page by identifier</h3>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo nvme get-log /dev/nvme0 --log-id=0x02 --log-len=512     <span class="cm"># SMART/Health, raw hex</span>
+sudo nvme get-log /dev/nvme0 --log-id=0x05 --log-len=4096    <span class="cm"># Commands Supported and Effects</span>
+sudo nvme effects-log /dev/nvme0 -H                          <span class="cm"># same log, decoded</span></code></pre>
+  <p>Well-established identifiers: 01h Error Information, 02h SMART / Health Information, 03h Firmware Slot Information, 04h Changed Namespace List, 05h Commands Supported and Effects. Many more exist (device self-test, telemetry, endurance group, Asymmetric Namespace Access, persistent event log, feature-specific logs added in 2.x, including those for NVMe 2.4 features). For anything beyond the first five, look the identifier up in the NVMe Base Specification 2.4 log page table; do not guess. <span class="badge uncertain">Check the specification</span></p>
+  <aside class="callout warn" data-title="Reads that are not quite passive">
+    <p>Some log pages are tied to Asynchronous Event Notifications: reading them without the Retain Asynchronous Event (RAE) bit can clear the event condition the driver is waiting on (the Changed Namespace List is the classic example). Host-initiated telemetry with "create" asks the controller to capture a new snapshot. The Persistent Event Log uses a read context that must be established and released. These are <span class="badge caution">Caution lab</span> operations on a production system even though they move no user data.</p>
+  </aside>
+
+  <h3>nvme get-feature: current settings</h3>
+  <p>Sends Get Features (admin opcode 0Ah) with a Feature Identifier (FID). The <code>-s</code>/<code>--sel</code> option chooses current (0), default (1), saved (2) or supported capabilities (3). <code>-H</code> decodes.</p>
+  <table>
+    <caption>Commonly inspected features (well-established identifiers)</caption>
+    <thead><tr><th>FID</th><th>Feature</th><th>What the value tells you</th></tr></thead>
+    <tbody>
+      <tr><td>01h</td><td>Arbitration</td><td>Arbitration burst and weights for weighted round robin</td></tr>
+      <tr><td>02h</td><td>Power Management</td><td>Current power state (PS) and workload hint</td></tr>
+      <tr><td>04h</td><td>Temperature Threshold</td><td>Over/under thresholds that trigger warnings</td></tr>
+      <tr><td>05h</td><td>Error Recovery</td><td>Time-limited error recovery setting</td></tr>
+      <tr><td>06h</td><td>Volatile Write Cache</td><td>Whether the write cache is enabled now</td></tr>
+      <tr><td>07h</td><td>Number of Queues</td><td>I/O SQs and CQs allocated (0's-based) — compare with the driver's queue count</td></tr>
+      <tr><td>08h</td><td>Interrupt Coalescing</td><td>Aggregation threshold and time (latency vs CPU trade-off)</td></tr>
+      <tr><td>0Bh</td><td>Asynchronous Event Configuration</td><td>Which events will raise AENs</td></tr>
+      <tr><td>0Ch</td><td>Autonomous Power State Transition</td><td>APST table: idle time before moving to deeper power states</td></tr>
+    </tbody>
+  </table>
+  <p>Set Features (opcode 09h) changes these values; <code>nvme set-feature</code> is a <span class="badge caution">Caution lab</span> at best, and <span class="badge expert">Expert lab</span> when you use the "save" option, because the change persists across power cycles.</p>
+
+  <h3>nvme show-regs: the controller registers</h3>
+  <p><code>sudo nvme show-regs /dev/nvme0 -H</code> maps BAR0 (through the PCI <code>resource0</code> file) and reads the controller registers: CAP (00h), VS (08h), INTMS/INTMC (0Ch/10h), CC (14h), CSTS (1Ch), NSSR (20h), AQA (24h), ASQ (28h), ACQ (30h), and optional ones such as CMBLOC/CMBSZ and BPINFO. This is the only common nvme-cli command that is <em>not</em> an NVMe admin command: it is a set of PCIe memory reads (MRd) to BAR0. Fields to read:</p>
+  <ul>
+    <li><strong>CAP</strong>: MQES (maximum queue entries, 0's-based), CQR, TO (worst-case ready timeout in 500 ms units), DSTRD (doorbell stride), NSSRS, CSS, MPSMIN/MPSMAX, CMBS, PMRS.</li>
+    <li><strong>VS</strong>: the version the controller implements.</li>
+    <li><strong>CC</strong>: EN, CSS, MPS, AMS, SHN, IOSQES (6 → 64 bytes), IOCQES (4 → 16 bytes).</li>
+    <li><strong>CSTS</strong>: RDY, CFS (Controller Fatal Status), SHST (shutdown status), NSSRO, PP.</li>
+    <li><strong>AQA/ASQ/ACQ</strong>: admin queue sizes and base addresses (as I/O virtual addresses when an IOMMU is active).</li>
+  </ul>
+  <aside class="callout impl">
+    <p>show-regs needs root, and may fail on kernels that restrict mapping of BARs claimed by a driver (kernel lockdown, strict I/O memory policies) or on platforms where <code>resource0</code> cannot be mapped. It also does not work for fabrics controllers in the same way. Reading NVMe registers is benign by specification (reads of NSSR return 0, doorbells are not read), but it is a live MMIO access to a device in use: treat it as <span class="badge safe">Safe</span> on lab systems and as a deliberate act on production ones.</p>
+  </aside>
+
+  <h3>nvme list-subsys: subsystems, controllers, paths</h3>
+  <p>Synthetic example for teaching:</p>
+  <pre class="code" data-kind="read-only" data-lang="text" data-title="Synthetic example for teaching: nvme list-subsys"><code>nvme-subsys0 - NQN=nqn.2026-01.example.lab:nvme:labssd:LAB0000000001
+               hostnqn=nqn.2014-08.org.nvmexpress:uuid:00000000-0000-0000-0000-000000000000
+\
+ +- nvme0 pcie 0000:01:00.0 live</code></pre>
+  <p>This shows the subsystem NQN (from <code>subnqn</code>), each controller with its transport (<code>pcie</code>), its address (the PCI BDF, which ties this chapter to <a href="ch69.html">Chapter 69</a>) and its state (<code>live</code>, <code>resetting</code>, <code>connecting</code>, <code>deleting</code>, <code>dead</code>). With multipath and fabrics you will see several controllers and, where used, Asymmetric Namespace Access (ANA) states per path.</p>
+
+  <h3>The NVMe sysfs tree</h3>
+  <table>
+    <caption>/sys/class/nvme/nvme0/ and friends</caption>
+    <thead><tr><th>Path</th><th>Content</th><th>Source</th><th>Safety</th></tr></thead>
+    <tbody>
+      <tr><td><code>/sys/class/nvme/nvme0/model</code>, <code>serial</code>, <code>firmware_rev</code></td><td>Strings</td><td>Identify Controller (cached at probe; firmware_rev updated after activation)</td><td>read: safe</td></tr>
+      <tr><td><code>…/transport</code>, <code>address</code></td><td><code>pcie</code>, <code>0000:01:00.0</code></td><td>Driver</td><td>read: safe</td></tr>
+      <tr><td><code>…/state</code></td><td><code>live</code>, <code>resetting</code>, <code>connecting</code>, <code>deleting</code>, <code>dead</code>…</td><td>Driver's controller state machine</td><td>read: safe</td></tr>
+      <tr><td><code>…/cntlid</code>, <code>subsysnqn</code></td><td>Controller ID, NQN</td><td>Identify Controller</td><td>read: safe</td></tr>
+      <tr><td><code>…/queue_count</code>, <code>sqsize</code></td><td>Queues the driver created (including admin), queue size</td><td>Driver</td><td>read: safe</td></tr>
+      <tr><td><code>…/numa_node</code>, <code>device</code> (symlink to the PCI function)</td><td>—</td><td>Driver core</td><td>read: safe</td></tr>
+      <tr><td><code>…/reset_controller</code>, <code>rescan_controller</code></td><td>Write-only triggers</td><td>Driver</td><td><strong>caution</strong>: a controller reset aborts in-flight I/O and is visible to every user of the drive</td></tr>
+      <tr><td><code>/sys/class/nvme-subsystem/nvme-subsys0/</code></td><td><code>subsysnqn</code>, <code>model</code>, <code>iopolicy</code>, controllers, namespaces</td><td>Driver</td><td>read: safe; writing iopolicy: caution</td></tr>
+      <tr><td><code>/sys/block/nvme0n1/size</code></td><td>Capacity in 512-byte sectors (always 512, whatever the LBA size)</td><td>NSZE × LBA size</td><td>read: safe</td></tr>
+      <tr><td><code>/sys/block/nvme0n1/stat</code>, <code>inflight</code></td><td>I/O counters; reads/writes in flight</td><td>Block layer</td><td>read: safe</td></tr>
+      <tr><td><code>/sys/block/nvme0n1/mq/&lt;n&gt;/cpu_list</code>, <code>nr_tags</code></td><td>Which CPUs map to each hardware queue; tags (depth)</td><td>blk-mq</td><td>read: safe</td></tr>
+    </tbody>
+  </table>
+
+  <h3>/sys/block/nvmeXnY/queue/*: where NVMe fields become block-layer limits</h3>
+  <table>
+    <caption>Block queue attributes and the NVMe fields behind them</caption>
+    <thead><tr><th>Attribute</th><th>Typical value (reference SSD)</th><th>Derived from</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>logical_block_size</code></td><td>512</td><td>Identify Namespace LBA Format in use (lbads)</td><td>Smallest addressable unit</td></tr>
+      <tr><td><code>physical_block_size</code>, <code>minimum_io_size</code>, <code>optimal_io_size</code></td><td>512 / 4096 …</td><td>Namespace atomicity and optimal I/O fields when reported</td><td>Alignment hints for filesystems</td></tr>
+      <tr><td><code>max_hw_sectors_kb</code></td><td>e.g. 128 or larger</td><td>MDTS and driver limits</td><td>Largest request the device can take</td></tr>
+      <tr><td><code>max_sectors_kb</code></td><td>≤ max_hw_sectors_kb</td><td>Block layer policy (tunable)</td><td>Largest request the kernel will build</td></tr>
+      <tr><td><code>max_segments</code>, <code>max_segment_size</code></td><td>e.g. 127 / 4 GiB−1</td><td>Driver's PRP/SGL limits</td><td>Scatter-gather limits</td></tr>
+      <tr><td><code>nr_requests</code></td><td>e.g. 1023</td><td>I/O queue depth (driver parameter, MQES)</td><td>Tags per hardware queue</td></tr>
+      <tr><td><code>scheduler</code></td><td><code>[none] mq-deadline kyber</code></td><td>Distribution default</td><td>NVMe usually runs with <code>none</code></td></tr>
+      <tr><td><code>rotational</code></td><td>0</td><td>Driver</td><td>Not a spinning disk</td></tr>
+      <tr><td><code>write_cache</code></td><td><code>write back</code> / <code>write through</code></td><td>Identify Controller <code>vwc</code></td><td>Whether the kernel sends Flush for durability</td></tr>
+      <tr><td><code>discard_max_bytes</code>, <code>write_zeroes_max_bytes</code></td><td>non-zero if supported</td><td>ONCS (Dataset Management, Write Zeroes) and limits</td><td>Whether TRIM/deallocate and write-zeroes are offered</td></tr>
+      <tr><td><code>io_poll</code>, <code>io_poll_delay</code></td><td>0/1</td><td>Poll queues configured (<code>nvme.poll_queues</code>)</td><td>Polled completion support</td></tr>
+      <tr><td><code>zoned</code></td><td><code>none</code> / <code>host-managed</code></td><td>Command set (ZNS)</td><td><a href="ch59.html">Chapter 59</a></td></tr>
+    </tbody>
+  </table>
+  <p>Kernel module parameters are visible (read-only for you) under <code>/sys/module/nvme_core/parameters/</code> (<code>io_timeout</code>, default 30 seconds; <code>admin_timeout</code>, default 60 seconds; <code>default_ps_max_latency_us</code>; <code>multipath</code>) and <code>/sys/module/nvme/parameters/</code> (<code>io_queue_depth</code>, <code>poll_queues</code>, <code>write_queues</code>…). <span class="badge version">Names and defaults are kernel-version-dependent</span>. Interrupts appear in <code>/proc/interrupts</code> as <code>nvme0q0</code> (admin) and <code>nvme0q1…</code> (I/O).</p>
+</section>
+
+<section id="tracing">
+  <h2>Tracing NVMe commands from Linux</h2>
+  <p>Identify and logs describe the controller. Tracing shows what it is <em>doing</em>. Linux offers two complementary layers.</p>
+
+  <h3>Block layer: blktrace and blkparse</h3>
+  <p><span class="g" data-term="blktrace">blktrace</span> records block-layer events for a device; <code>blkparse</code> formats them. It observes requests above the NVMe driver, so it knows nothing of QIDs, CIDs or doorbells, but it shows queueing, merging, splitting and the time each request spent between issue to the driver (<code>D</code>) and completion (<code>C</code>).</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo blktrace -d /dev/nvme0n1 -w 10 -o - | blkparse -i - &gt; blk.txt   <span class="cm"># 10-second capture</span>
+btt -i nvme0n1.blktrace.0      <span class="cm"># (if saved to files) latency breakdown: Q2D, D2C, Q2C</span></code></pre>
+  <pre class="code" data-kind="read-only" data-lang="text" data-title="Synthetic example for teaching: blkparse output for one 4 KiB read"><code>259,0    3        1     0.000000000  4211  Q   R 2048 + 8 [fio]
+259,0    3        2     0.000001210  4211  G   R 2048 + 8 [fio]
+259,0    3        3     0.000002050  4211  D   R 2048 + 8 [fio]
+259,0    3        4     0.000089400     0  C   R 2048 + 8 [0]</code></pre>
+  <p>Columns: major,minor (259 is the extended block major used for NVMe namespaces), CPU, sequence, time in seconds, PID, <strong>action</strong>, RWBS flags, start sector + number of 512-byte sectors, process. Actions: <code>Q</code> queued, <code>G</code> request allocated, <code>I</code> inserted into a scheduler, <code>D</code> dispatched to the driver, <code>C</code> completed, <code>X</code> split, <code>M</code>/<code>F</code> merged. Here D→C = 87.35 µs: the device-plus-driver time. The sector numbers are always in 512-byte units even on a 4 KiB-LBA namespace.</p>
+
+  <h3>NVMe driver tracepoints</h3>
+  <p>The Linux NVMe driver defines <span class="g" data-term="tracepoint">tracepoints</span> in the <code>nvme</code> event group. The two you will use constantly:</p>
+  <ul>
+    <li><code>nvme:nvme_setup_cmd</code>: fires when the driver builds an SQE. Records controller, QID, CID, NSID, flags and a decoded view of the command (opcode and key command dwords).</li>
+    <li><code>nvme:nvme_complete_rq</code>: fires when the driver completes the request from a CQE. Records controller, QID, CID, the command-specific result, retries, flags and the <strong>status</strong> field.</li>
+  </ul>
+  <p>Others in the group include <code>nvme_async_event</code> (an AEN arrived) and <code>nvme_sq</code> (SQ head updates seen in completions). List them on your kernel with <code>ls /sys/kernel/tracing/events/nvme/</code> and read the exact field names in each event's <code>format</code> file. <span class="badge version">Field names and print format are kernel-version-dependent</span></p>
+  <pre class="code" data-kind="read-only" data-lang="sh" data-title="Three ways to enable the NVMe tracepoints (observability only; the device is not touched)"><code><span class="cm"># 1. trace-cmd (simplest)</span>
+sudo trace-cmd record -e nvme:nvme_setup_cmd -e nvme:nvme_complete_rq -- sleep 5
+trace-cmd report &gt; nvme-trace.txt
+
+<span class="cm"># 2. raw ftrace through tracefs</span>
+cd /sys/kernel/tracing
+echo 1 | sudo tee events/nvme/nvme_setup_cmd/enable events/nvme/nvme_complete_rq/enable
+sudo cat trace_pipe | head -50
+echo 0 | sudo tee events/nvme/enable
+
+<span class="cm"># 3. bpftrace: per-queue latency histogram, and print any non-zero status</span>
+sudo bpftrace -e '
+tracepoint:nvme:nvme_setup_cmd { @s[args-&gt;ctrl_id, args-&gt;qid, args-&gt;cid] = nsecs; }
+tracepoint:nvme:nvme_complete_rq /@s[args-&gt;ctrl_id, args-&gt;qid, args-&gt;cid]/ {
+  @lat_us[args-&gt;qid] = hist((nsecs - @s[args-&gt;ctrl_id, args-&gt;qid, args-&gt;cid]) / 1000);
+  if (args-&gt;status) { printf("ctrl %d qid %d cid %d status 0x%x\n",
+                             args-&gt;ctrl_id, args-&gt;qid, args-&gt;cid, args-&gt;status); }
+  delete(@s[args-&gt;ctrl_id, args-&gt;qid, args-&gt;cid]);
+}'</code></pre>
+  <aside class="callout version">
+    <p>Newer bpftrace releases prefer <code>args.qid</code> over <code>args-&gt;qid</code>; both are accepted in many versions. If a field name is rejected, check the event's <code>format</code> file. Tracing has overhead: at millions of IOPS, enabling every NVMe event measurably changes the system you are measuring. Filter (by <code>qid</code> or <code>ctrl_id</code>) or sample when you can.</p>
+  </aside>
+  <pre class="code" data-kind="read-only" data-lang="text" data-title="Synthetic example for teaching: trace-cmd report (abridged)"><code>   nvme-cli-5120  [002]  5011.903110: nvme_setup_cmd:       nvme0: qid=0, cmdid=12, nsid=0, flags=0x0, meta=0x0, cmd=(nvme_admin_identify cns=1, ctrlid=0)
+     &lt;idle&gt;-0     [000]  5011.903198: nvme_complete_rq:     nvme0: qid=0, cmdid=12, res=0x0, retries=0, flags=0x2, status=0x0
+        fio-4211  [003]  5012.000101: nvme_setup_cmd:       nvme0: disk=nvme0n1, qid=4, cmdid=37, nsid=1, flags=0x0, meta=0x0, cmd=(nvme_cmd_read slba=2048, len=7, ctrl=0x0, dsmgmt=0, reftag=0)
+     &lt;idle&gt;-0     [003]  5012.000188: nvme_complete_rq:     nvme0: disk=nvme0n1, qid=4, cmdid=37, res=0x0, retries=0, flags=0x0, status=0x0</code></pre>
+  <p>Read it like this: the read on QID 4 (the I/O queue mapped to CPU 3 on this synthetic system) has CID 37, starting LBA 2048 and <code>len=7</code>, which is the 0's-based Number of Logical Blocks field, so 8 blocks of 512 bytes = 4 KiB. It completed 87 µs later with status 0. The admin Identify on QID 0 completed in 88 µs. Note that the tracepoint timestamps are when the driver built the command and when it processed the completion, not when the doorbell write or the CQE crossed the link.</p>
+  <aside class="callout insight" data-title="The join key">
+    <p>QID + CID identify an outstanding command uniquely on one controller at one moment. The same CID is in DWORD 0 of the SQE the controller fetches and in the CQE it writes back, so it is visible on a PCIe analyzer that decodes NVMe. That is how you line up a kernel trace with a link trace. Caveat: Linux encodes a small generation counter in the upper bits of the CID on recent kernels to catch stale completions, so CIDs look larger than the tag number and are reused across time; always join on (controller, QID, CID) within a time window. <span class="badge impl">Driver-implementation-dependent</span></p>
+  </aside>
+</section>
+
+<section id="safety">
+  <h2>Safe, caution and expert: classifying nvme-cli</h2>
+  <p>nvme-cli does not separate read from write in its syntax. You must. This table is the course's policy; the tiers are defined in <a href="lab-environment.html">Lab Environment</a>.</p>
+  <table>
+    <caption>nvme-cli subcommands by safety tier</caption>
+    <thead><tr><th>Tier</th><th>Subcommands / actions</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><span class="badge safe">Safe lab</span></td><td><code>list</code>, <code>list-subsys</code>, <code>list-ns</code>, <code>ns-descs</code>, <code>id-ctrl</code>, <code>id-ns</code>, <code>smart-log</code>, <code>error-log</code>, <code>fw-log</code>, <code>effects-log</code>, <code>get-feature</code>, <code>show-regs</code>; reading sysfs; tracepoints and blktrace</td><td>Defined not to change stored data or settings; small device-side effects only (admin queue usage, MMIO reads)</td></tr>
+      <tr><td><span class="badge caution">Caution lab</span></td><td><code>get-log</code> of AEN-related or context-based logs without care for RAE; <code>telemetry-log</code> with create; <code>device-self-test</code> (short); <code>set-feature</code> without save (APST, temperature thresholds, write cache); <code>reset</code> (controller reset), writing <code>reset_controller</code>/<code>rescan_controller</code>; unbinding from <code>nvme</code> to <code>vfio-pci</code> or SPDK; reading LBAs with <code>nvme read</code></td><td>Change device state or disturb in-flight I/O; recoverable but visible to every user of the device</td></tr>
+      <tr><td><span class="badge expert">Expert lab</span></td><td><code>format</code>, <code>sanitize</code>, <code>write</code>, <code>write-zeroes</code>, <code>write-uncor</code>, <code>dsm</code> (deallocate), <code>ns-create</code>/<code>ns-delete</code>/<code>attach-ns</code>/<code>detach-ns</code>, <code>fw-download</code>/<code>fw-commit</code>, <code>security-send</code>, <code>set-feature --save</code>, <code>subsystem-reset</code>, <code>admin-passthru</code>/<code>io-passthru</code> with arbitrary opcodes, any 2.4 feature that restores manufacturing defaults or changes lockdown</td><td>Destroy data, change identity or firmware, affect every controller in the subsystem, or persist across power cycles. Only on a dedicated spare drive or an emulated device.</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout safety">
+    <p>Before any Caution or Expert command: confirm the target with <code>nvme list -v</code> (serial number, not just device name), confirm nothing is mounted (<code>findmnt</code>, <code>lsblk</code>), confirm it is not the boot disk, and write down the command and expected outcome. Use a QEMU emulated controller first. Never on production drives.</p>
+  </aside>
+
+  <h3>QEMU emulated NVMe: the safe practice target</h3>
+  <p>QEMU provides an NVMe controller model (<code>-device nvme</code>) that implements the NVMe register interface, admin and I/O queues and many optional features, backed by an ordinary image file. Everything in this chapter, including the Expert commands, can be practised against it with no risk to real hardware.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh" data-title="Minimal emulated NVMe for practice (host side; creates an image file only)"><code>qemu-img create -f raw nvme-lab.img 4G
+qemu-system-x86_64 -enable-kvm -m 4G -smp 4 \
+  -drive file=guest.qcow2,if=virtio \
+  -drive file=nvme-lab.img,if=none,id=nvm0,format=raw \
+  -device nvme,serial=LAB0000000001,drive=nvm0 \
+  -nographic</code></pre>
+  <p>Inside the guest, the controller appears in <code>lspci</code> with QEMU's IDs and class 0108, and as <code>/dev/nvme0</code> / <code>/dev/nvme0n1</code>. QEMU can also log its own NVMe model events with <code>--trace "pci_nvme_*"</code>, which gives you a "device-side" trace to compare with the guest's tracepoints. Full setup, including multiple namespaces and 4 KiB LBA formats, is in <a href="lab-environment.html">Lab Environment</a>.</p>
+  <aside class="callout breaks" data-title="What emulation does not teach">
+    <p>An emulated controller has no NAND, no thermal behaviour, no real link, no AER, no signal integrity and usually no realistic latency. Its SMART values are synthetic; its error log may be empty even when commands fail. Use it to learn commands, structures and safe procedure; use real hardware (a spare drive) for timing, power and link behaviour.</p>
+  </aside>
+</section>
+
+<section id="ladder">
+  <h2>The central concept on the ladder: asking the controller about itself</h2>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>You talk to the librarian through a window and ask polite questions. She reads answers from her notebooks. Some windows-requests could also make her throw books away, so you only use the question forms.</p></div>
+    <div class="rung" data-rung="B"><p>nvme-cli sends admin commands (Identify, Get Log Page, Get Features) through the kernel; the controller returns data structures that the tool decodes. sysfs and tracepoints add the kernel's own view.</p></div>
+    <div class="rung" data-rung="C"><p>Controller firmware serves admin commands, typically on a management path separate from the I/O fast path; it assembles Identify data from configuration tables and logs from counters kept in RAM and persisted to media. Registers (CAP, CC, CSTS) are hardware in the controller's PCIe front end.</p></div>
+    <div class="rung" data-rung="D"><p>The NVMe Base Specification 2.4 defines the Identify data structures, log pages and features, their fields and which are mandatory; the NVM Command Set Specification 1.3 defines the namespace fields for the NVM command set; the NVMe over PCIe Transport Specification 1.4 defines the register mapping and queue mechanics on PCIe.</p></div>
+    <div class="rung" data-rung="E"><p>Each query is an admin SQE (opcode 06h, 02h or 0Ah) placed in the Admin SQ, a doorbell write, a data transfer into a host buffer described by PRPs, a CQE and an MSI-X interrupt.</p></div>
+    <div class="rung" data-rung="F"><p>On an analyzer: MWr to BAR0+1000h, MRd of 64 bytes from the Admin SQ, MWr of the returned data (for Identify, 4096 bytes split into MPS-sized TLPs), MWr of 16 bytes to the Admin CQ, MWr to the MSI-X address, MWr to BAR0+1004h. In the kernel trace: <code>nvme_setup_cmd</code> qid=0 and <code>nvme_complete_rq</code> qid=0 with the same CID.</p></div>
+    <div class="rung" data-rung="G"><p>When a query fails or hangs, the failure is itself evidence: an Identify that times out says the admin path is stuck even if I/O appears fine; a SMART log with rising <code>media_errors</code> moves suspicion from the host to the media; an error-log entry's SQID/CID tells you exactly which command to find in the trace.</p></div>
+  </div>
+
+  <h3>The sixteen questions for "inspecting an NVMe controller from Linux"</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>Querying the controller's self-description (Identify), state (features, registers) and history (log pages), plus observing its commands in flight via tracing.</dd>
+    <dt>2. Why was it created?</dt><dd>So that one generic driver and tool can manage any vendor's controller and so that health and failures are reportable in a standard form.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Identity, capability discovery, health monitoring and first-level failure diagnosis without vendor tools.</dd>
+    <dt>4. What existed before?</dt><dd>ATA IDENTIFY DEVICE and ATA SMART attributes (vendor-defined attribute tables), SCSI INQUIRY / mode pages / log sense, and vendor utilities.</dd>
+    <dt>5. Why is the current design better?</dt><dd>Fixed, specified structures (a single SMART/Health layout), log pages with identifiers, a command effects log to tell hosts which commands are dangerous, and namespace-scoped identity.</dd>
+    <dt>6. Who creates it?</dt><dd>Controller firmware (data), the specification (layout), the Linux driver (sysfs, tracepoints), nvme-cli (decoding).</dd>
+    <dt>7. Who consumes it?</dt><dd>The driver at probe time (Identify, Number of Queues), udev (identifiers), monitoring agents (SMART), engineers.</dd>
+    <dt>8. Where does it live?</dt><dd>In controller firmware and media; in registers in BAR0; in kernel memory (cached Identify); in sysfs and the trace ring buffer.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>Admin SQ/CQ in host memory, a data buffer, SQ0/CQ0 doorbells, MSI-X vector 0, CAP/VS/CC/CSTS for show-regs.</dd>
+    <dt>10. What happens before?</dt><dd>PCIe enumeration and BAR mapping (<a href="ch69.html">Chapter 69</a>), controller enable (CC.EN=1, CSTS.RDY=1), admin queue creation.</dd>
+    <dt>11. What happens after?</dt><dd>You compare values with expectations, look for anomalies, and move to logs (<a href="ch71.html">Chapter 71</a>) or traces.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Wrong Identify data leads to wrong block-layer limits (oversized I/O rejected, missing discard); misreading SMART units misleads capacity planning; sending the wrong subcommand destroys data.</dd>
+    <dt>13. What does the analyzer show?</dt><dd>Admin command lifecycles on QID 0, with opcodes 06h, 02h, 0Ah and their data transfers.</dd>
+    <dt>14. What does Linux show?</dt><dd>nvme-cli output, sysfs attributes, block queue limits, tracepoints, kernel log messages.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>That Identify fields match the product specification and are consistent with each other (SQES/CQES, MDTS vs CAP), that log pages are well-formed and counters monotonic across power cycles, that features persist or not as specified, that error-log entries are produced for each injected error with correct SQID/CID/status.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>An admin path hang in firmware, a controller in a fatal state (CSTS.CFS=1), the wrong device node (multipath naming), a log read clearing an AEN, or an nvme-cli/kernel version mismatch decoding a newer structure.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>Inside an SSD controller, admin commands are usually handled by firmware running on an embedded processor core that is separate from, or shares time with, the cores that drive the I/O pipeline and the flash translation layer. Identify data is a mostly static image built at boot from configuration tables; SMART counters live in controller RAM and are written to flash periodically and at shutdown; the error log is a RAM ring that may or may not persist across power cycles. <span class="badge impl">Implementation-dependent</span></p>
+  <p>This has practical consequences. Admin commands are not on the fast path: a SMART query can take hundreds of microseconds to milliseconds, and some controllers pause internal work to service them. Monitoring agents that poll SMART every second across thousands of drives have, on some products, caused measurable latency outliers. The controller registers that <code>show-regs</code> reads, by contrast, are hardware in the PCIe/NVMe front end and answer in the time of a PCIe memory read.</p>
+  <p>The temperature in the SMART log is a "composite" chosen by firmware from several physical sensors. The thermal throttling behind <code>Thermal Management T1/T2</code> counters is a firmware policy acting on clock and NAND parallelism, which is why a hot drive's throughput drops long before anything is logged as an error.</p>
+  <aside class="callout hw">
+    <p>When the controller is in a fatal state (CSTS.CFS = 1) or hung, admin commands time out while register reads may still work, because registers are answered by hardware and commands need firmware. That asymmetry is a powerful diagnostic: "show-regs works, id-ctrl hangs" localizes the fault inside the controller.</p>
+  </aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>Sources: <cite class="spec">NVM Express Base Specification 2.4 — Identify command; Get Log Page command; Get Features and Set Features commands; Controller Registers</cite>; <cite class="spec">NVM Command Set Specification 1.3 — I/O Command Set specific Identify Namespace data structure</cite>; <cite class="spec">NVMe over PCIe Transport Specification 1.4 — register mapping and doorbells</cite>. nvme-cli and the Linux driver are implementations: their output names (<code>mdts</code>, <code>num_err_log_entries</code>) are their own labels for specification fields, close to but not always identical with the specification's field names.</p>
+  <aside class="callout verified">
+    <p>Verified, well-established: admin opcodes Get Log Page 02h, Identify 06h, Abort 08h, Set Features 09h, Get Features 0Ah; CNS 00h Identify Namespace, 01h Identify Controller, 02h Active Namespace ID list, 03h Namespace Identification Descriptor list; log identifiers 01h Error Information, 02h SMART / Health Information, 03h Firmware Slot Information, 04h Changed Namespace List, 05h Commands Supported and Effects; feature identifiers 01h Arbitration, 02h Power Management, 04h Temperature Threshold, 05h Error Recovery, 06h Volatile Write Cache, 07h Number of Queues, 08h Interrupt Coalescing, 0Bh Asynchronous Event Configuration, 0Ch Autonomous Power State Transition; registers CAP 00h, VS 08h, CC 14h, CSTS 1Ch, AQA 24h, ASQ 28h, ACQ 30h; 64-byte SQE and 16-byte CQE for the NVM command set; SMART data units are thousands of 512-byte units.</p>
+  </aside>
+  <aside class="callout derived">
+    <p>Derived: the kernel's <code>max_hw_sectors_kb</code> is bounded by MDTS × minimum page size; <code>write_cache</code> follows VWC; <code>discard_max_bytes</code> is non-zero only when ONCS reports Dataset Management. Therefore a block-queue attribute that disagrees with Identify data indicates a driver quirk or policy, which is worth investigating.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>Implementation-dependent: which optional fields and logs a controller fills; whether SMART is per namespace; error-log persistence; admin command latency; percentage_used estimation; composite temperature algorithm; the Linux CID encoding; the driver's queue count and depth.</p>
+  </aside>
+  <aside class="callout version">
+    <p>Version-dependent: many Identify fields were added in NVMe 1.3, 1.4, 2.0 and later (the 2.0 restructuring moved command-set-specific fields into the NVM Command Set specification); NVMe 2.4 adds features such as rate limiting, voltage monitoring and manufacturing-default restore with their own fields and logs (see <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a>; identifiers must be checked in the 2.4 documents). nvme-cli decodes only what its version knows; older tools print unknown fields raw or not at all.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p>The specification does not define nvme-cli, its option names, its output layout, the Linux sysfs attributes or tracepoints, or the kernel's timeouts. It does not say how often a host may poll logs, or what latency an admin command must have. Check in the specification: the exact bit layout of <code>critical_warning</code> for your revision, the Get Log Page dword layout (Log Specific Field width changed across revisions), the CNS values for command-set-specific Identify structures, and the log identifiers of any 2.x log you need.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume: that <code>nvme0n1</code> belongs to <code>nvme0</code>; that an empty error log means no failures; that <code>percentage_used</code> &lt; 100 means the drive is healthy; that SMART values update instantly; that QEMU's behaviour matches real hardware; that a "read-like" subcommand name (get-log) means no side effects.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>What crosses the PCIe link for the three query families, on the reference system (Admin SQ at IOVA 0x1_0000_0000, Admin CQ at 0x1_0000_1000, BAR0 at 0xFE60_0000, MPS 256 bytes):</p>
+  <table>
+    <caption>Admin query anatomy</caption>
+    <thead><tr><th>Query</th><th>SQE key fields</th><th>Data direction and size</th><th>CQE</th></tr></thead>
+    <tbody>
+      <tr><td>Identify Controller</td><td>CDW0 opcode 06h + CID; NSID 0; PRP1 → 4 KiB buffer; CDW10 CNS = 01h</td><td>Controller → host, 4096 bytes (16 MWr TLPs of 256 bytes)</td><td>DW3: status 0, phase tag, CID; DW2: SQ head pointer, SQ ID 0</td></tr>
+      <tr><td>Get Log Page (SMART)</td><td>opcode 02h; NSID FFFFFFFFh; CDW10 Log Page Identifier 02h, Number of Dwords Lower (0's-based) 127 for 512 bytes; RAE bit as chosen</td><td>Controller → host, 512 bytes (2 MWr)</td><td>status 0</td></tr>
+      <tr><td>Get Features (Number of Queues)</td><td>opcode 0Ah; CDW10 FID 07h, Select 0 (current)</td><td>None</td><td>DW0 (command specific): number of I/O SQs and CQs allocated, 0's-based</td></tr>
+      <tr><td>show-regs</td><td>No SQE</td><td>Host ← controller: MRd/CplD of 4 or 8 bytes at BAR0+00h, 08h, 14h, 1Ch, 24h…</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p>Ordering: the controller must write the data before it posts the CQE; on PCIe, posted memory writes from the same requester are ordered, so a host that sees the CQE (with the correct phase tag) can trust the data buffer (see <a href="ch14.html">Chapter 14</a>). The MSI-X write that follows is also a posted write and is ordered behind the CQE write.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Two synthetic traces on the reference system join kernel tracepoints (Dir = "Kernel") with PCIe traffic as an analyzer would show it. Requester ID 0x0100 is the SSD; "RC" is the root complex. All times are illustrative.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Normal: nvme id-ctrl /dev/nvme0 (Identify, CNS 01h), joined kernel + PCIe view">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td>1</td><td>Kernel</td><td>0.0</td><td>nvme_setup_cmd</td><td>nvme0 qid=0 cmdid=12 opc=0x06 cns=1</td><td>Driver built the admin SQE in slot 7 of the Admin SQ</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>0.4</td><td>MWr32</td><td>Req=RC Addr=0xFE601000 Len=1 Data=0x00000008</td><td>SQ0 tail doorbell = 8</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>1.2</td><td>MRd64</td><td>Req=0x0100 Tag=0x10 Addr=0x1_0000_01C0 Len=16</td><td>Fetch SQE at slot 7 (7 × 64 = 0x1C0)</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>1.9</td><td>CplD</td><td>Cpl=RC Req=0x0100 Tag=0x10 SC Len=16</td><td>SQE delivered: opcode 06h, CID 12, PRP1=0x1_0080_3000</td></tr>
+        <tr class="note"><td colspan="6">Firmware assembles the 4096-byte Identify Controller structure (management path; tens of µs).</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>61.0</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_0080_3000 Len=64 (256 B)</td><td>First of 16 data TLPs (MPS = 256 bytes)</td></tr>
+        <tr class="note"><td colspan="6">… 14 more MWr64 of 256 bytes at +0x100 increments …</td></tr>
+        <tr class="dir-up"><td>21</td><td>Dev→Host</td><td>80.6</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_0080_3F00 Len=64</td><td>Last data TLP</td></tr>
+        <tr class="dir-up"><td>22</td><td>Dev→Host</td><td>81.0</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_0000_1050 Len=4 Data: DW2=0x00000008 DW3=0x0001000C</td><td>CQE in Admin CQ slot 5: SQHD=8, SQID=0, CID=12, phase=1, status=0</td></tr>
+        <tr class="dir-up"><td>23</td><td>Dev→Host</td><td>81.3</td><td>MWr32</td><td>Req=0x0100 Addr=0xFEE0_0000 Len=1</td><td>MSI-X vector 0 (admin)</td></tr>
+        <tr class="note"><td>24</td><td>Kernel</td><td>84.0</td><td>nvme_complete_rq</td><td>nvme0 qid=0 cmdid=12 status=0x0</td><td>Driver consumed the CQE</td></tr>
+        <tr class="dir-down"><td>25</td><td>Host→Dev</td><td>84.6</td><td>MWr32</td><td>Req=RC Addr=0xFE601004 Len=1 Data=0x00000006</td><td>CQ0 head doorbell = 6</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning checks you should make on any such trace: the SQE fetch address equals ASQ base + slot × 64; the data lands in the PRP1 address from the SQE; the CQE carries the same CID (12) and SQID (0) as the tracepoint; the data writes precede the CQE write; the MSI-X follows the CQE; the CQ head doorbell follows the driver's processing. The kernel's "84 µs" is a little longer than the device's 81 µs because it includes interrupt delivery and handler scheduling.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: one READ never completes; the kernel aborts it after io_timeout">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td>1</td><td>Kernel</td><td>0.0 µs</td><td>nvme_setup_cmd</td><td>nvme0 qid=2 cmdid=0x1A3 read slba=0x3A2F00 len=255</td><td>128 KiB read (256 × 512 B)</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>0.5 µs</td><td>MWr32</td><td>Req=RC Addr=0xFE601010 Data=0x00000155</td><td>SQ2 tail doorbell</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>1.3 µs</td><td>MRd64</td><td>Req=0x0100 Tag=0x2E Len=16</td><td>SQE fetched: the controller has the command</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>2.0 µs</td><td>CplD</td><td>Tag=0x2E SC Len=16</td><td>SQE delivered</td></tr>
+        <tr class="abnormal"><td>5</td><td>—</td><td>~0.3 ms</td><td>(absence)</td><td>No data MWr and no CQE for CID 0x1A3, while other CIDs on QID 2 keep completing</td><td><strong>First abnormal event</strong>: one command stuck inside the controller</td></tr>
+        <tr class="note"><td colspan="6">29.99 s of normal traffic on all queues …</td></tr>
+        <tr class="note"><td>6</td><td>Kernel</td><td>30.000 s</td><td>(timeout handler)</td><td>io_timeout expired for qid 2 cid 0x1A3; CSTS read = 0x1 (RDY, no CFS)</td><td>Controller alive; driver chooses Abort, not reset</td></tr>
+        <tr class="note"><td>7</td><td>Kernel</td><td>30.000 s</td><td>nvme_setup_cmd</td><td>nvme0 qid=0 cmdid=13 opc=0x08 (Abort) cdw10: SQID=2 CID=0x1A3</td><td>Abort sent on the admin queue</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>30.000 2 s</td><td>MWr64</td><td>CQE Admin CQ: CID=13 status=0 DW0 bit0=0</td><td>Abort completed (bit 0 = 0 conventionally means "command aborted"; <span class="badge uncertain">confirm in the Abort command description</span>)</td></tr>
+        <tr class="dir-up"><td>9</td><td>Dev→Host</td><td>30.000 3 s</td><td>MWr64</td><td>CQE I/O CQ2: CID=0x1A3 SCT=0 SC=07h</td><td>Original READ completed with "Command Abort Requested"</td></tr>
+        <tr class="note"><td>10</td><td>Kernel</td><td>30.000 4 s</td><td>nvme_complete_rq</td><td>qid=2 cmdid=0x1A3 status=0x7 retries=0</td><td>Driver will retry the request (not marked Do Not Retry)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The first abnormal event is an <em>absence</em> (row 5), which only a correlated view reveals: the SQE was fetched, so the doorbell and queue memory were fine; other commands on the same queue completed, so the queue, the interrupt and the link were fine. The fault is localized to the controller's handling of one command, possibly a media read stuck in error recovery or a firmware bug for a specific LBA range. Next steps: check <code>nvme error-log</code> for an entry with SQID 2 / CMDID 0x1A3 (may be absent, since the command was host-aborted), check <code>media_errors</code> in <code>smart-log</code>, retry the same LBA range with a single read on a spare drive or in a lab, and check the kernel log for the matching timeout message (<a href="ch71.html">Chapter 71</a>). Confidence that the host is not at fault: high.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>A read-only collection script for a bug report. Everything here is <span class="badge safe">Safe lab</span>: admin queries, sysfs reads and a short trace.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh" data-title="nvme-collect.sh (read-only)"><code>C=/dev/nvme0; NS=/dev/nvme0n1; OUT=nvme-report-$(date +%Y%m%dT%H%M%S); mkdir -p "$OUT"
+nvme version                          &gt; "$OUT/nvme-cli-version.txt"
+uname -r                              &gt; "$OUT/kernel.txt"
+sudo nvme list -v                     &gt; "$OUT/list-v.txt"
+sudo nvme list-subsys                 &gt; "$OUT/list-subsys.txt"
+sudo nvme id-ctrl  $C -o json         &gt; "$OUT/id-ctrl.json"
+sudo nvme id-ns    $NS -o json        &gt; "$OUT/id-ns.json"
+sudo nvme smart-log $C -o json        &gt; "$OUT/smart.json"
+sudo nvme error-log $C -o json        &gt; "$OUT/error-log.json"
+sudo nvme fw-log   $C                 &gt; "$OUT/fw-log.txt"
+sudo nvme effects-log $C -H           &gt; "$OUT/effects.txt" 2&gt;&amp;1
+for f in 0x02 0x04 0x06 0x07 0x08 0x0c; do
+  sudo nvme get-feature $C -f $f -H   &gt;&gt; "$OUT/features.txt" 2&gt;&amp;1
+done
+sudo nvme show-regs $C -H             &gt; "$OUT/regs.txt" 2&gt;&amp;1
+grep -r . /sys/class/nvme/nvme0/{model,serial,firmware_rev,state,transport,address,queue_count,sqsize} \
+    2&gt;/dev/null                       &gt; "$OUT/sysfs-ctrl.txt"
+grep -r . /sys/block/nvme0n1/queue/   2&gt;/dev/null &gt; "$OUT/sysfs-queue.txt"
+grep -r . /sys/module/nvme_core/parameters/ /sys/module/nvme/parameters/ 2&gt;/dev/null &gt; "$OUT/params.txt"
+grep nvme /proc/interrupts            &gt; "$OUT/interrupts.txt"</code></pre>
+  <table>
+    <caption>What each source can and cannot prove</caption>
+    <thead><tr><th>Source</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>id-ctrl / id-ns</td><td>What the controller claims about itself now</td><td>That it behaves accordingly (claims are tested by validation, not by reading)</td></tr>
+      <tr><td>smart-log</td><td>Controller-maintained counters at read time</td><td>Exact timing of events; correctness of vendor estimates (percentage_used)</td></tr>
+      <tr><td>error-log</td><td>Errors the controller chose to log, with SQID/CID/status</td><td>Completeness; host-side timeouts and aborts</td></tr>
+      <tr><td>get-feature</td><td>Current (or default/saved) setting</td><td>Whether the controller honours it under load</td></tr>
+      <tr><td>show-regs</td><td>Register state at read time, independent of firmware command handling</td><td>History; queue contents</td></tr>
+      <tr><td>sysfs state</td><td>The driver's view of the controller (live, resetting, dead)</td><td>The controller's internal state</td></tr>
+      <tr><td>Tracepoints</td><td>When the driver submitted and completed each command, its status</td><td>When packets crossed the link; device-internal timing</td></tr>
+      <tr><td>blktrace</td><td>Block-layer timing, splits and merges</td><td>Which NVMe queue/CID carried the request</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>This script turns <code>trace-cmd report</code> text into per-queue latency statistics, decodes non-zero statuses, and lists commands that were submitted but never completed in the capture window (the "absence" of the abnormal trace above). It runs with no hardware: <code>--selftest</code> uses an embedded synthetic report. Standard library only.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="nvme_trace_latency.py"><code>#!/usr/bin/env python3
+"""Pair nvme_setup_cmd / nvme_complete_rq events from 'trace-cmd report' text.
+
+  python3 nvme_trace_latency.py --selftest
+  trace-cmd report | python3 nvme_trace_latency.py
+"""
+import re
+import statistics
+import sys
+
+EVENT = re.compile(r"\s(\d+\.\d+):\s+(nvme_setup_cmd|nvme_complete_rq):\s+(nvme\d+):"
+                   r".*?qid=(\d+), cmdid=(\d+)(.*)$")
+STATUS = re.compile(r"status=(0x[0-9a-fA-F]+)")
+GENERIC_SC = {0x00: "Successful Completion", 0x01: "Invalid Command Opcode",
+              0x02: "Invalid Field in Command", 0x04: "Data Transfer Error",
+              0x06: "Internal Error", 0x07: "Command Abort Requested",
+              0x08: "Command Aborted due to SQ Deletion", 0x80: "LBA Out of Range"}
+
+SAMPLE = """\
+nvme-cli-5120 [002] 5011.903110: nvme_setup_cmd: nvme0: qid=0, cmdid=12, nsid=0, flags=0x0, meta=0x0, cmd=(nvme_admin_identify cns=1, ctrlid=0)
+&lt;idle&gt;-0 [000] 5011.903198: nvme_complete_rq: nvme0: qid=0, cmdid=12, res=0x0, retries=0, flags=0x2, status=0x0
+fio-4211 [003] 5012.000101: nvme_setup_cmd: nvme0: disk=nvme0n1, qid=4, cmdid=37, nsid=1, flags=0x0, meta=0x0, cmd=(nvme_cmd_read slba=2048, len=7, ctrl=0x0, dsmgmt=0, reftag=0)
+fio-4211 [003] 5012.000110: nvme_setup_cmd: nvme0: disk=nvme0n1, qid=4, cmdid=38, nsid=1, flags=0x0, meta=0x0, cmd=(nvme_cmd_read slba=4096, len=7, ctrl=0x0, dsmgmt=0, reftag=0)
+fio-4212 [001] 5012.000120: nvme_setup_cmd: nvme0: disk=nvme0n1, qid=2, cmdid=419, nsid=1, flags=0x0, meta=0x0, cmd=(nvme_cmd_read slba=3813120, len=255, ctrl=0x0, dsmgmt=0, reftag=0)
+&lt;idle&gt;-0 [003] 5012.000188: nvme_complete_rq: nvme0: disk=nvme0n1, qid=4, cmdid=37, res=0x0, retries=0, flags=0x0, status=0x0
+&lt;idle&gt;-0 [003] 5012.000203: nvme_complete_rq: nvme0: disk=nvme0n1, qid=4, cmdid=38, res=0x0, retries=0, flags=0x0, status=0x0
+fio-4212 [001] 5012.000300: nvme_setup_cmd: nvme0: disk=nvme0n1, qid=2, cmdid=420, nsid=1, flags=0x0, meta=0x0, cmd=(nvme_cmd_read slba=0, len=7, ctrl=0x0, dsmgmt=0, reftag=0)
+&lt;idle&gt;-0 [001] 5012.000392: nvme_complete_rq: nvme0: disk=nvme0n1, qid=2, cmdid=420, res=0x0, retries=0, flags=0x0, status=0x0
+fio-4213 [002] 5012.000400: nvme_setup_cmd: nvme0: disk=nvme0n1, qid=3, cmdid=5, nsid=1, flags=0x0, meta=0x0, cmd=(nvme_cmd_read slba=1953525168, len=0, ctrl=0x0, dsmgmt=0, reftag=0)
+&lt;idle&gt;-0 [002] 5012.000431: nvme_complete_rq: nvme0: disk=nvme0n1, qid=3, cmdid=5, res=0x0, retries=0, flags=0x0, status=0x80
+"""
+
+
+def describe(status):
+    sct, sc = (status &gt;&gt; 8) &amp; 0x7, status &amp; 0xFF
+    dnr, more = bool(status &gt;&gt; 14 &amp; 1), bool(status &gt;&gt; 13 &amp; 1)
+    name = GENERIC_SC.get(sc, "see status tables") if sct == 0 else "see status tables"
+    return f"SCT={sct} SC=0x{sc:02x} ({name}){' DNR' if dnr else ''}{' MORE' if more else ''}"
+
+
+def analyse(lines):
+    pending, lat, errors, last_t = {}, {}, [], 0.0
+    for line in lines:
+        m = EVENT.search(line)
+        if not m:
+            continue
+        t, ev, ctrl, qid, cid, rest = (float(m.group(1)), m.group(2), m.group(3),
+                                       int(m.group(4)), int(m.group(5)), m.group(6))
+        last_t = max(last_t, t)
+        key = (ctrl, qid, cid)
+        if ev == "nvme_setup_cmd":
+            pending[key] = (t, rest.strip(", "))
+        elif key in pending:
+            t0, cmd = pending.pop(key)
+            lat.setdefault((ctrl, qid), []).append((t - t0) * 1e6)
+            s = STATUS.search(rest)
+            status = int(s.group(1), 16) if s else 0
+            if status:
+                errors.append((t, ctrl, qid, cid, status, cmd))
+    print("Per-queue completion latency (driver setup -&gt; driver completion), microseconds")
+    for (ctrl, qid), v in sorted(lat.items()):
+        print(f"  {ctrl} qid {qid:3d}: n={len(v):5d} min={min(v):8.1f} "
+              f"median={statistics.median(v):8.1f} max={max(v):8.1f}")
+    print("Non-zero completion status:")
+    for t, ctrl, qid, cid, st, cmd in errors or []:
+        print(f"  t={t:.6f} {ctrl} qid {qid} cid {cid}: status=0x{st:x} -&gt; {describe(st)}")
+        print(f"      command: {cmd[:90]}")
+    if not errors:
+        print("  none")
+    print("Submitted but not completed in this capture (age at end of capture):")
+    for (ctrl, qid, cid), (t0, cmd) in sorted(pending.items(), key=lambda kv: kv[1][0]):
+        print(f"  {ctrl} qid {qid} cid {cid}: {1e3 * (last_t - t0):.3f} ms  {cmd[:70]}")
+    if not pending:
+        print("  none")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) &gt; 1 and sys.argv[1] == "--selftest":
+        print("Synthetic example for teaching (embedded trace-cmd report):")
+        analyse(SAMPLE.splitlines())
+    else:
+        analyse(sys.stdin)</code></pre>
+  <p>Expected <code>--selftest</code> result: four queues with latencies (qid 0 ≈ 88 µs, qid 4 ≈ 87–93 µs, qid 2 ≈ 92 µs, and qid 3 ≈ 31 µs for the failed read); one error on qid 3, cid 5, status 0x80 decoded as LBA Out of Range (the synthetic read targets LBA 1,953,525,168, which equals NSZE and is therefore one past the last valid LBA); one command still pending: qid 2 cid 419. The status decoding assumes the tracepoint prints the 15-bit Status Field without the phase bit (SC in bits 7:0, SCT in bits 10:8, More bit 13, DNR bit 14), which is how Linux stores it; confirm on your kernel. <span class="badge impl">Kernel-dependent</span></p>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <h4>Symptom</h4>
+  <p>A storage application issues 1 MiB direct reads. blktrace shows each one split into eight pieces, and the team asks whether "the kernel is breaking our I/O".</p>
+  <h4>Evidence</h4>
+  <p>Synthetic example for teaching:</p>
+  <ul>
+    <li><code>nvme id-ctrl /dev/nvme0 | grep mdts</code> → <code>mdts : 5</code></li>
+    <li><code>nvme show-regs /dev/nvme0 -H</code> → CAP Memory Page Size Minimum = 4096 bytes (MPSMIN = 0)</li>
+    <li><code>cat /sys/block/nvme0n1/queue/max_hw_sectors_kb</code> → <code>128</code></li>
+    <li>blkparse shows <code>X</code> (split) actions: <code>R 2048 / 2304</code> … each piece 256 sectors.</li>
+  </ul>
+  <h4>Reasoning</h4>
+  <p>MaxXfer = 2<sup>5</sup> × 4 KiB = 128 KiB. The kernel must not send a command larger than the controller's MDTS, so it caps <code>max_hw_sectors_kb</code> at 128 and splits a 1 MiB request into 8 × 128 KiB commands. Each piece appears in the NVMe tracepoint as its own command with <code>len=255</code> (256 × 512-byte LBAs). <span class="badge derived">Derived</span></p>
+  <h4>Is it a problem?</h4>
+  <p>Usually not: the eight commands are issued back to back on the same queue and complete in parallel inside the drive. Throughput is generally governed by the drive's internal parallelism, not by the command size beyond about 128 KiB. Measure before "fixing". If a larger MDTS is needed, it is a device property (firmware); the host cannot raise it.</p>
+  <h4>What a careless engineer would do</h4>
+  <p>Try to raise <code>max_sectors_kb</code> above <code>max_hw_sectors_kb</code> (the kernel refuses) or blame the I/O scheduler (NVMe usually runs with <code>none</code>). The Identify data answered the question in one line.</p>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Running a command against the wrong node</strong> because <code>nvme1n1</code> is assumed to belong to <code>nvme1</code>.</li>
+    <li><strong>Reading <code>data_units_written</code> as bytes or as LBAs.</strong> It is thousands of 512-byte units.</li>
+    <li><strong>Forgetting 0's-based fields:</strong> <code>len=7</code> is 8 blocks; Number of Queues result 0x1F is 32 queues; <code>elpe</code> 63 is 64 entries.</li>
+    <li><strong>Treating error-log as the complete failure history.</strong></li>
+    <li><strong>Polling SMART aggressively in production</strong> and causing the latency outliers you are investigating.</li>
+    <li><strong>Assuming <code>get-log</code> is always passive</strong> (RAE, telemetry create, persistent event log context).</li>
+    <li><strong>Using tracepoint timestamps as wire timestamps.</strong> They are driver events.</li>
+    <li><strong>Copy-pasting a "format" or "sanitize" command from a forum</strong> onto anything other than a spare or emulated drive.</li>
+    <li><strong>Comparing outputs from different nvme-cli versions</strong> without noting that field names and decoding change.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>From an NVMe-layer observation to a hypothesis</caption>
+    <thead><tr><th>Observation</th><th>Likely layer</th><th>Next probe</th></tr></thead>
+    <tbody>
+      <tr><td><code>state</code> = <code>resetting</code> repeatedly, timeouts in log</td><td>Controller firmware or link</td><td>Kernel log sequence (<a href="ch71.html">Ch 71</a>); AER counters (<a href="ch69.html">Ch 69</a>)</td></tr>
+      <tr><td>show-regs works, id-ctrl times out</td><td>Controller firmware (admin path)</td><td>CSTS.CFS; vendor telemetry; firmware revision</td></tr>
+      <tr><td>show-regs returns all ones</td><td>PCIe link / device gone</td><td>lspci, root port, DPC</td></tr>
+      <tr><td><code>media_errors</code> increasing</td><td>NAND / media</td><td>error-log LBAs; workload; replace drive</td></tr>
+      <tr><td><code>critical_warning</code> temperature bit, low throughput</td><td>Thermal</td><td>Airflow, T1/T2 counters, APST settings</td></tr>
+      <tr><td>Number of Queues lower than CPUs</td><td>Controller limit or driver choice</td><td>Get Features 07h result vs <code>queue_count</code></td></tr>
+      <tr><td>Status 0x80 completions</td><td>Host software (LBA beyond NSZE)</td><td>id-ns NSZE vs the failing LBA; partition table; resized namespace</td></tr>
+      <tr><td>Commands outstanding but never completed</td><td>Controller (or lost interrupt)</td><td>Check CQ in trace; <code>/proc/interrupts</code> counts; analyzer</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight" data-title="Identify is a contract you can test">
+    <p>Seniors treat Identify data as claims to verify: is MDTS consistent with the largest transfer that actually works? Do SQES/CQES match what the driver programmed into CC? Does VWC match observed flush behaviour? Inconsistencies in Identify are among the cheapest firmware bugs to find and the most expensive to find late.</p>
+  </aside>
+  <aside class="callout insight" data-title="Three clocks">
+    <p>There are three timelines: the driver's (tracepoints, kernel log), the link's (analyzer), and the controller's (internal logs, telemetry, timestamp feature). They never agree exactly. Seniors align them on shared events (a CID, a doorbell value, a reset) and report offsets rather than pretending the clocks are one.</p>
+  </aside>
+  <aside class="callout insight" data-title="Ask before you act">
+    <p>The Commands Supported and Effects log tells the host which commands change the logical block content, the namespace inventory or the controller capabilities. Reading it before running an unfamiliar admin or vendor command is the professional equivalent of reading a label before mixing chemicals.</p>
+  </aside>
+</section>
+
+<section id="lab">
+  <h2>Lab: profiling an NVMe controller and tracing its commands</h2>
+  <h4>Objective</h4>
+  <p>Build a complete NVMe-layer profile of a controller and namespace, connect each block-layer limit to the Identify field behind it, and capture and analyse a command trace including one deliberately failed command, all on an emulated controller.</p>
+  <h4>Skills</h4>
+  <p>nvme-cli queries; units and 0's-based fields; sysfs mapping; tracepoints; correlating a failed command across the trace and the kernel log.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> in a QEMU guest with an emulated NVMe controller backed by an image file. Steps 1–4 are read-only and may also be run on a real system. Step 5 (an out-of-range read) is harmless to data but leaves an entry in a real drive's error statistics, so on real hardware treat it as <span class="badge caution">Caution lab</span> and use only a spare drive.</p></aside>
+  <h4>Hardware required</h4>
+  <p>A Linux host able to run QEMU/KVM, or any Linux machine with a spare NVMe SSD.</p>
+  <h4>Software required</h4>
+  <p>QEMU, a Linux guest image, nvme-cli, trace-cmd, blktrace, Python 3. Setup: <a href="lab-environment.html">Lab Environment</a>.</p>
+  <h4>Input</h4>
+  <p>The emulated controller (serial LAB0000000001, 4 GiB image).</p>
+  <h4>Expected output</h4>
+  <p>A table of Identify fields with derived values; a sysfs-to-Identify mapping table; a trace analysed with <code>nvme_trace_latency.py</code>; one failed command identified by QID/CID in the trace and in the kernel log.</p>
+  <h4>Background</h4>
+  <p>This chapter's engineering and tracing sections; <a href="ch44.html">Chapter 44</a> for status codes.</p>
+  <h4>Step 1: identify</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo nvme list -v
+sudo nvme id-ctrl /dev/nvme0 -H | less
+sudo nvme id-ns /dev/nvme0n1 -H | less
+sudo nvme show-regs /dev/nvme0 -H</code></pre>
+  <p>Record: vid, sn, mn, fr, ver, mdts, sqes, cqes, oncs, vwc, nn; nsze, flbas and the LBA format in use; CAP.MQES, CAP.MPSMIN, CAP.DSTRD, CC.IOSQES, CC.IOCQES.</p>
+  <h4>Step 2: logs and features</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo nvme smart-log /dev/nvme0
+sudo nvme error-log /dev/nvme0 -e 8
+sudo nvme fw-log /dev/nvme0
+sudo nvme get-feature /dev/nvme0 -f 0x07 -H
+sudo nvme get-feature /dev/nvme0 -f 0x06 -H</code></pre>
+  <h4>Step 3: sysfs mapping</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>grep -r . /sys/block/nvme0n1/queue/ | grep -E 'block_size|max_hw|max_sectors|write_cache|discard_max|nr_requests'
+cat /sys/class/nvme/nvme0/queue_count /sys/class/nvme/nvme0/sqsize
+cat /sys/block/nvme0n1/size</code></pre>
+  <h4>Step 4: trace normal I/O</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo trace-cmd record -e nvme:nvme_setup_cmd -e nvme:nvme_complete_rq \
+     -- dd if=/dev/nvme0n1 of=/dev/null bs=1M count=16 iflag=direct
+trace-cmd report &gt; t.txt
+python3 nvme_trace_latency.py &lt; t.txt</code></pre>
+  <h4>Step 5: one deliberate failure (emulated device)</h4>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code>NSZE=$(sudo nvme id-ns /dev/nvme0n1 -o json | python3 -c 'import json,sys; print(json.load(sys.stdin)["nsze"])')
+sudo trace-cmd record -e nvme:nvme_setup_cmd -e nvme:nvme_complete_rq -- \
+     nvme read /dev/nvme0n1 --start-block=$NSZE --block-count=0 --data-size=512
+trace-cmd report | python3 nvme_trace_latency.py
+sudo dmesg | tail -5
+sudo nvme error-log /dev/nvme0 -e 4</code></pre>
+  <p>Check the option spellings with <code>nvme help read</code> on your version. The read targets the first LBA past the end of the namespace.</p>
+  <h4>Observation</h4>
+  <p>Note the QID/CID of the failed read, its status in the tracepoint, the kernel log line (if your kernel logs I/O errors verbosely), and whether the emulated controller recorded an error-log entry.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Compute MaxXfer from mdts and MPSMIN. Does <code>max_hw_sectors_kb</code> match?</li>
+    <li>Explain SQES = 0x66 and CQES = 0x44, and show that CC.IOSQES/IOCQES agree.</li>
+    <li>Reconcile <code>/sys/block/nvme0n1/size</code> with NSZE and the LBA size.</li>
+    <li>How many I/O queues did the controller grant (feature 07h), and how many did the driver create (<code>queue_count</code>)?</li>
+    <li>In step 4, how many NVMe commands did 16 × 1 MiB reads become, and why?</li>
+    <li>In step 5, which status did you see, and what does each bit of the status field mean?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Without nvme-cli, find the namespace's LBA size and capacity using only sysfs, and explain which Identify fields the kernel used to compute them.</p>
+  <details class="hint"><summary>Hints</summary><p><code>logical_block_size</code> comes from the LBA Format's LBADS; <code>size</code> is NSZE × LBA size ÷ 512. For queue counts, remember both values may be 0's-based in one place and not in the other, and <code>queue_count</code> includes the admin queue.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>1: MaxXfer = 2<sup>mdts</sup> × 2<sup>(12+MPSMIN)</sup>; with the QEMU default mdts (commonly 7) and 4 KiB pages that is 512 KiB, and <code>max_hw_sectors_kb</code> should be at most that (the driver may impose a lower cap). Values depend on QEMU version and options. 2: SQES low nibble 6 = required 2<sup>6</sup> = 64 bytes, high nibble 6 = maximum 64; CQES 4/4 = 16 bytes; the driver programs CC.IOSQES = 6 and CC.IOCQES = 4. 3: size × 512 = NSZE × LBA size. 4: Get Features 07h returns NSQA and NCQA (0's-based) in completion DW0; <code>queue_count</code> = I/O queues created + 1 admin; the driver creates no more than min(granted, CPUs or module limits). 5: each 1 MiB read becomes ⌈1 MiB ÷ MaxXfer⌉ commands (2 with 512 KiB MaxXfer, 8 with 128 KiB), so 32 or 128 commands. 6: status 0x80 = SCT 0 (Generic Command Status), SC 80h LBA Out of Range; More and DNR bits are reported as the controller chose (a spec-compliant controller may set DNR since retrying cannot succeed).</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>Whether the emulated device's MDTS, queue count and VWC resemble production drives (if not, the lab's performance conclusions do not transfer); that tracepoint latencies include interrupt handling; that the failed command's CID can be found in three places (trace, kernel log, error log) and whether they agree.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li><code>show-regs</code> fails with a mapping error: kernel lockdown or the region is busy; read CAP/CSTS via the kernel log or skip.</li>
+    <li>trace-cmd reports no nvme events: tracefs not mounted, events not compiled in, or wrong event names for your kernel.</li>
+    <li>The error log is empty after step 5: the emulated controller may not record entries; the trace and dmesg remain your evidence.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Run QEMU with <code>--trace "pci_nvme_*"</code> and align QEMU's device-side events with the guest's tracepoints using the CID. You now have a two-sided trace without an analyzer.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>A SMART log reports <code>data_units_written : 1,500,000</code>. How many bytes is that approximately?</li>
+    <li>Identify Controller reports <code>elpe : 63</code>. How many error log entries can the controller hold?</li>
+    <li>Get Features 07h returns DW0 = 0x001F001F. How many I/O submission and completion queues were allocated?</li>
+    <li>A namespace has NSZE = 0x1D1C1116 with 4096-byte LBAs. What is <code>/sys/block/…/size</code>?</li>
+    <li>Write a bpftrace or trace-cmd filter that records only commands on QID 0 (admin).</li>
+    <li>Classify: <code>nvme sanitize</code>, <code>nvme get-feature -f 0x0c</code>, <code>nvme reset</code>, <code>nvme telemetry-log</code>, <code>nvme fw-commit</code>.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p>1: 1,500,000 × 512,000 ≈ 768 × 10⁹ bytes ≈ 768 GB. 2: 64 (0's-based). 3: NCQA and NSQA are each 0x1F → 32 I/O SQs and 32 I/O CQs. 4: 0x1D1C1116 = 488,378,646 LBAs × 4096 / 512 = 3,907,029,168 sectors (≈ 2 TB). 5: <code>trace-cmd record -e nvme:nvme_setup_cmd -f 'qid == 0' -e nvme:nvme_complete_rq -f 'qid == 0'</code> or a bpftrace predicate <code>/args-&gt;qid == 0/</code>. 6: sanitize Expert; get-feature 0Ch Safe; reset Caution; telemetry-log Caution (may create a snapshot, large transfer); fw-commit Expert.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>Which NVMe command does <code>nvme id-ctrl</code> send?</p>
+      <ul class="options" data-answer="2"><li>Get Log Page, LID 01h</li><li>Identify, CNS 01h</li><li>Identify, CNS 00h</li><li>Get Features, FID 07h</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Identify (opcode 06h) with CNS 01h returns the Identify Controller structure; CNS 00h is Identify Namespace.</p></details>
+    </li>
+    <li>
+      <p>Which nvme-cli command does not send an NVMe admin command at all?</p>
+      <ul class="options" data-answer="4"><li><code>smart-log</code></li><li><code>get-feature</code></li><li><code>fw-log</code></li><li><code>show-regs</code></li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>show-regs reads the controller registers through a BAR0 mapping: PCIe memory reads, no SQE.</p></details>
+    </li>
+    <li>
+      <p>In a tracepoint, <code>cmd=(nvme_cmd_read slba=2048, len=15 …)</code> on a 512-byte-LBA namespace transfers how much data?</p>
+      <ul class="options" data-answer="3"><li>7.5 KiB</li><li>15 KiB</li><li>8 KiB</li><li>16 KiB</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>NLB is 0's-based: 16 blocks × 512 B = 8 KiB.</p></details>
+    </li>
+    <li>
+      <p>Which statement about the Error Information log is correct?</p>
+      <ul class="options" data-answer="1"><li>It may not contain commands the host timed out and aborted</li><li>It records every failed I/O forever</li><li>It is maintained by the Linux driver</li><li>Its error_count field counts entries in the page</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The controller logs what it chooses; host-aborted commands may leave no entry; the ring overwrites; error_count is a unique incrementing identifier.</p></details>
+    </li>
+    <li>
+      <p>Why can <code>nvme0n1</code> belong to <code>nvme1</code>?</p>
+      <details class="answer"><summary>Model answer</summary><p>With native multipath, namespace block devices are named after the subsystem instance, while <code>nvmeN</code> are controller instances; they are numbered independently. Use <code>nvme list -v</code> or <code>list-subsys</code>.</p></details>
+    </li>
+    <li>
+      <p>MDTS = 6 and CAP.MPSMIN = 0. What is the maximum data transfer size?</p>
+      <ul class="options" data-answer="3"><li>64 KiB</li><li>128 KiB</li><li>256 KiB</li><li>6 × 4 KiB</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>2<sup>6</sup> × 4 KiB = 256 KiB.</p></details>
+    </li>
+    <li>
+      <p>Which source gives the time a command's SQE crossed the PCIe link?</p>
+      <ul class="options" data-answer="4"><li>nvme_setup_cmd</li><li>blktrace D action</li><li>nvme error-log</li><li>A PCIe analyzer (the MRd fetching the SQE)</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Kernel tracepoints and blktrace record driver/block-layer events; only the link view shows the fetch.</p></details>
+    </li>
+    <li>
+      <p>Name two nvme-cli subcommands that read data but can still change device state, and why.</p>
+      <details class="answer"><summary>Model answer</summary><p><code>get-log</code> on AEN-tied logs without RAE (clears the event, e.g. Changed Namespace List); <code>telemetry-log</code> with host-initiated create (captures a new snapshot); persistent event log reads need a context. They change state without changing user data.</p></details>
+    </li>
+    <li>
+      <p>Which file shows whether the kernel will issue Flush commands for durability?</p>
+      <ul class="options" data-answer="2"><li><code>queue/rotational</code></li><li><code>queue/write_cache</code></li><li><code>queue/scheduler</code></li><li><code>queue/nr_requests</code></li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p><code>write back</code> means a volatile write cache is present (Identify VWC), so the kernel sends Flush (or FUA) where durability is required.</p></details>
+    </li>
+    <li>
+      <p>show-regs succeeds, but every nvme-cli admin query times out. What does this localize?</p>
+      <details class="answer"><summary>Model answer</summary><p>The PCIe link and BAR decoding work (MMIO reads succeed). Admin command processing is stuck: firmware hang, controller fatal status (check CSTS.CFS), or an admin queue problem. The fault is inside the controller or in the admin queue setup, not the link.</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>(Beginner)</strong> What is the difference between <code>/dev/nvme0</code> and <code>/dev/nvme0n1</code>?</p>
+      <details class="answer"><summary>Model answer</summary><p>The first is the controller's character device for admin commands; the second is a namespace exposed as a block device for I/O and filesystems.</p></details></li>
+    <li><p><strong>(Beginner)</strong> Which fields of the SMART log would you watch to predict a drive's end of life?</p>
+      <details class="answer"><summary>Model answer</summary><p><code>percentage_used</code>, <code>available_spare</code> versus its threshold, <code>critical_warning</code>, <code>media_errors</code>, and trend of <code>data_units_written</code> against rated endurance.</p></details></li>
+    <li><p><strong>(Intermediate)</strong> How does Linux derive <code>max_hw_sectors_kb</code>, and why does it matter?</p>
+      <details class="answer"><summary>Model answer</summary><p>From MDTS × CAP.MPSMIN page size, capped by driver limits. It bounds request size; larger requests are split; sending larger would violate the controller's limit and fail with Invalid Field.</p></details></li>
+    <li><p><strong>(Intermediate)</strong> How would you measure per-command latency on a production server with minimal overhead?</p>
+      <details class="answer"><summary>Model answer</summary><p>bpftrace or a BPF tool on nvme_setup_cmd/nvme_complete_rq keyed by (ctrl, qid, cid), aggregating into in-kernel histograms rather than printing per event; filter by queue or sample; keep the capture short; note the overhead in the report.</p></details></li>
+    <li><p><strong>(Advanced)</strong> A command appears in nvme_setup_cmd but never in nvme_complete_rq. List the possibilities in order of how you would test them.</p>
+      <details class="answer"><summary>Model answer</summary><p>Still in flight (wait for timeout); the CQE was posted but the interrupt was lost (check <code>/proc/interrupts</code>, CQ contents, MSI-X masking); the controller never posted a CQE (firmware stuck on that command; check other commands on the same queue); the doorbell write never reached the device (link problem, analyzer); the capture ended or the trace buffer overflowed (check lost-event counts).</p></details></li>
+    <li><p><strong>(Advanced)</strong> Why might a SMART-polling agent cause latency spikes, and how would you prove it?</p>
+      <details class="answer"><summary>Model answer</summary><p>Admin commands are served by firmware that may contend with I/O processing or trigger internal housekeeping. Prove it by correlating the agent's polling times (admin QID 0 tracepoints) with the I/O latency outliers, then disabling or slowing the agent and repeating.</p></details></li>
+    <li><p><strong>(Senior)</strong> How would you design a cross-layer trace correlation between Linux and a PCIe analyzer?</p>
+      <details class="answer"><summary>Model answer</summary><p>Use (QID, CID) as the join key within time windows; anchor clocks with a distinctive event (an admin command with a unique CID or a doorbell value pattern); compute the offset and drift; handle CID reuse and the Linux generation bits; verify on a few hundred commands before trusting the join; report residual uncertainty.</p></details></li>
+    <li><p><strong>(Senior)</strong> A customer sends nvme-cli output from an old nvme-cli. What do you do before analysing it?</p>
+      <details class="answer"><summary>Model answer</summary><p>Ask for the nvme-cli and kernel versions and, ideally, raw binary dumps (<code>-b</code>) or JSON. Old tools may mis-decode or omit fields added in newer specification revisions. Re-decode raw data with current tools and the 2.4 specification.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain the difference between asking the librarian a question and giving her an order, using two nvme-cli examples.</li>
+    <li><strong>To a junior engineer:</strong> explain how <code>nvme id-ctrl</code> travels from the shell to the controller and back, naming the queue, doorbells, data transfer, CQE and interrupt.</li>
+    <li><strong>To a senior engineer:</strong> argue which three Linux-side sources you would combine to localize a stuck command without an analyzer, and how much confidence each adds.</li>
+  </ul>
+  <details class="answer"><summary>Model explanation for the senior engineer</summary><p>"Tracepoints give per-command submission and completion with QID/CID, so I can tell one stuck command from a stuck queue. show-regs (CSTS) distinguishes a controller in fatal state from a firmware path that is merely busy. /proc/interrupts and the kernel log show whether completions or interrupts stopped, and what the driver did about it. Together they localize to command, queue, interrupt or controller; only an analyzer can prove the doorbell or CQE crossed the link, so I state that limit."</p></details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>nvme-cli queries the controller with real admin commands: Identify (06h) for identity and capabilities, Get Log Page (02h) for health, errors and firmware, Get Features (0Ah) for settings; <code>show-regs</code> reads the registers directly. Linux exposes its own view in <code>/sys/class/nvme</code>, <code>/sys/class/nvme-subsystem</code> and <code>/sys/block/nvmeXnY/queue</code>, whose values come from Identify fields. blktrace shows the block layer; the <code>nvme_setup_cmd</code>/<code>nvme_complete_rq</code> tracepoints show each NVMe command with QID and CID, the key to joining Linux traces with analyzer traces. Every subcommand belongs to a safety tier; practise on QEMU.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>map device nodes to controllers, namespaces and subsystems, including the multipath naming trap</li>
+      <li>name the NVMe command, opcode and identifier behind each query subcommand</li>
+      <li>compute MaxXfer, SMART byte volumes and 0's-based counts correctly</li>
+      <li>connect five <code>queue/*</code> attributes to the Identify fields behind them</li>
+      <li>capture and pair tracepoints, and find a command that never completed</li>
+      <li>classify any nvme-cli subcommand as Safe, Caution or Expert and justify it</li>
+      <li>set up and use a QEMU emulated NVMe controller for risky practice</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification 2.4 — Identify; Get Log Page; Get Features / Set Features; Abort; Controller Registers</cite>.</li>
+    <li><cite class="spec">NVM Command Set Specification 1.3 — Identify Namespace data structure; Read command</cite>.</li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification 1.4</cite>.</li>
+    <li>nvme-cli manual pages (<code>man nvme-id-ctrl</code>, <code>nvme help &lt;command&gt;</code>) for your installed version.</li>
+    <li>Linux kernel documentation: block layer queue sysfs attributes (<code>Documentation/ABI/stable/sysfs-block</code>), the NVMe sysfs ABI, and ftrace / tracepoint documentation (<code>Documentation/trace/</code>); the <code>blktrace(8)</code>, <code>blkparse(1)</code>, <code>trace-cmd(1)</code> and <code>bpftrace(8)</code> manual pages.</li>
+    <li>QEMU documentation for the NVMe emulation device (<code>docs/system/devices/nvme.rst</code> in the QEMU source).</li>
+  </ul>
+  <p>Next: <a href="ch71.html">Chapter 71 — Kernel Logs</a> teaches you to read what Linux writes when things go wrong: timeouts, aborts, resets, AER, link down/up, DPC and IOMMU faults.</p>
+</section>

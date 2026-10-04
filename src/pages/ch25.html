@@ -1,0 +1,807 @@
+<p class="lead">NVM Express (NVMe) is, at its heart, a pair of circular queues in host memory and two tiny registers on the device. This chapter teaches you exactly who writes which index, how the host knows a completion is new without reading a single device register, when a queue is full or empty, and how one queue pair per CPU core lets an SSD scale to millions of operations per second.</p>
+
+<section id="why">
+<h2>Why this chapter exists</h2>
+<p>Every NVMe command you will ever trace — an Identify during boot, a 4 KiB random read under a database, a Flush before a power cut — travels through a queue. If you misunderstand queues, you will misread every trace that follows. If you understand them precisely, a protocol analyzer capture stops being a wall of packets and becomes a readable story: "the host published tail 8, the controller fetched three entries, posted three completions with phase 1, the host consumed them and published head 40."</p>
+<p>Queues are also where most driver and firmware bugs that look "random" actually live: a stale tail, an off-by-one on wrap, a phase tag that was not inverted, a Completion Queue (CQ) that overflowed because it was sized smaller than the commands it had to absorb. Those bugs produce hangs and timeouts far away from their cause. A senior engineer can find them because they hold the ownership rules in their head without effort. That is the goal of this chapter.</p>
+
+<h3>Learning objectives</h3>
+<p>By the end of this chapter you will be able to:</p>
+<ul>
+<li>Define a <span class="g" data-term="sq">Submission Queue (SQ)</span>, a <span class="g" data-term="cq">Completion Queue (CQ)</span>, the Admin queue pair and I/O queue pairs, and say where each lives.</li>
+<li>State, without hesitation, which agent owns each of the four indices: SQ tail, SQ head, CQ tail, CQ head — and how each is communicated to the other side.</li>
+<li>Explain the <span class="g" data-term="phase-tag">phase tag</span> and walk a completion queue through a wrap, step by step, predicting exactly which entries the host will treat as new.</li>
+<li>Apply the full and empty rules for a circular queue and explain why a queue of N slots holds at most N − 1 entries.</li>
+<li>Decode <span class="g" data-term="mqes">MQES</span> (Maximum Queue Entries Supported) as a 0's based value and explain CAP.CQR (Contiguous Queues Required) and its consequence for queue memory.</li>
+<li>Explain queue depth, queue pairs per CPU, and why several SQs may map to a single CQ while the reverse is not allowed.</li>
+<li>Describe the arbitration mechanisms — round robin and weighted round robin with an urgent priority class — and how the controller picks which SQ to fetch from next.</li>
+<li>Recognise the queue machinery in a synthetic PCI Express (PCIe) trace and in Linux.</li>
+</ul>
+
+<h3>Prerequisites</h3>
+<aside class="callout prereq">
+<p>You should be comfortable with: memory-mapped I/O (MMIO) and Base Address Registers (<a href="ch19.html">Chapter 19</a>); Direct Memory Access (DMA), where the device reads and writes host memory itself (<a href="ch20.html">Chapter 20</a>); posted versus non-posted PCIe transactions (<a href="ch12.html">Chapter 12</a>); the NVMe controller as an entity (<a href="ch23.html">Chapter 23</a>); and the controller registers CAP, CC, CSTS, AQA, ASQ and ACQ (<a href="ch24.html">Chapter 24</a>).</p>
+</aside>
+</section>
+
+<section id="story">
+<h2>The story</h2>
+<aside class="callout kid">
+<p>Imagine a toy shop with one very fast shopkeeper behind a counter. Children don't shout their orders. Each child writes an order on a card and puts it into a round tray that spins: there are eight slots in the tray. The children put cards in the next empty slot, and then ring a little bell and hold up a number: "the next empty slot is now number 5!"</p>
+<p>The shopkeeper hears the bell, takes cards out in order from where she last stopped, and fetches the toys. When a toy is ready, she puts a little answer card into a second spinning tray — the answer tray. Every answer card has a coloured sticker: on the first trip round the tray she uses <strong>green</strong> stickers; when she comes back round to slot 0 she switches to <strong>red</strong> stickers, then back to green on the next trip.</p>
+<p>The children never have to ask "is there a new answer?" They just look at the next answer slot. If its sticker is the colour they are expecting this time round, it's a new answer. If it's the old colour, it's last round's answer — nothing new yet.</p>
+</aside>
+
+<aside class="callout analogy" data-title="Real-world analogy: a supermarket with many checkouts">
+<p>A supermarket has a row of checkout lanes. Each lane has a conveyor belt (the Submission Queue): shoppers place items at the back end (the <em>tail</em>), and the cashier takes items from the front end (the <em>head</em>). Each lane prints receipts onto a shared receipt spool (the Completion Queue). The store manager (the arbitration logic) decides which lane's cashier gets the next scanning slot: plain turn-taking (round robin), or by priority — an express lane for urgent customers that is always served first, then high, medium and low lanes in proportion to their weights (weighted round robin).</p>
+<p>Two express lanes can print receipts onto one spool (several SQs share one CQ). A shopper standing at the belt does not walk round to the cashier to ask "have you scanned my stuff?" — they watch the receipt spool. And the conveyor belt is a loop: when the belt reaches the end, it comes back round to the start.</p>
+</aside>
+
+<aside class="callout breaks">
+<p><strong>What the analogies hide.</strong> In a real supermarket, the shopper and the cashier share the belt in the same room. In NVMe, the SQ and CQ live in <em>host</em> memory, while the "cashier" (the controller) is on the far side of a PCIe link and can only see host memory through DMA reads and writes. The "bell" is a 4-byte write to a device register, and the number held up with it is the new tail — not "one more item".</p>
+<p><strong>Where it misleads.</strong> (1) Receipts in NVMe do not come out in the order items went in: a controller may complete commands out of order, so the CQ order need not match SQ order. (2) The cashier never tells the shopper "I'm ready for more items" by ringing a bell; instead the controller reports how far it has consumed the SQ inside each completion (the <span class="g" data-term="sqhd">SQ Head Pointer</span> field). (3) Nobody watches the belt continuously: the controller only looks after the bell rings, and the host may learn about receipts by interrupt or by polling. (4) The coloured sticker is a single bit, not a colour; it flips on every wrap of the <em>completion</em> queue only — submission queues have no phase tag.</p>
+</aside>
+</section>
+
+<section id="beginner">
+<h2>Beginner explanation</h2>
+<p>The host (the CPU running the NVMe driver) and the NVMe controller (the logic inside the SSD) need to exchange two kinds of message: <em>requests</em> ("read these blocks into this buffer") and <em>results</em> ("done, it worked" or "failed, here is why"). NVMe uses two lists in host memory for this:</p>
+<ul>
+<li>A <strong>Submission Queue</strong>: an array of fixed-size slots. Each slot holds one 64-byte command, called a <span class="g" data-term="sqe">Submission Queue Entry (SQE)</span>. The host writes commands here; the controller reads them.</li>
+<li>A <strong>Completion Queue</strong>: an array of fixed-size slots. Each holds one 16-byte result, a <span class="g" data-term="cqe">Completion Queue Entry (CQE)</span>. The controller writes results here; the host reads them.</li>
+</ul>
+<p>Both arrays are <em>circular</em>: after the last slot comes slot 0 again. Each queue has two positions that move around the circle:</p>
+<ul>
+<li>The <strong>tail</strong> is where the <em>producer</em> will write the next entry.</li>
+<li>The <strong>head</strong> is where the <em>consumer</em> will read the next entry.</li>
+</ul>
+<p>For the SQ, the host is the producer and the controller is the consumer. For the CQ it is the other way round: the controller produces, the host consumes. That symmetry is the single most important idea in this chapter.</p>
+
+<div class="ring" data-label="A Submission Queue with 8 slots: three commands waiting" data-size="8" data-head="2" data-tail="5" data-head-label="SQ head (controller reads here)" data-tail-label="SQ tail (host writes here)"></div>
+
+<p>In the ring above, slots 2, 3 and 4 hold commands the controller has not fetched yet. The host's next command goes into slot 5. When the host has written it, it moves the tail to 6 and tells the controller by writing the number 6 into a device register called the <span class="g" data-term="doorbell">doorbell</span>.</p>
+
+<h3>Two kinds of queue pair</h3>
+<p>Every NVMe controller has exactly one <strong>Admin</strong> queue pair (queue identifier 0). It carries management commands: identify the device, create other queues, read logs, change features. Data commands — Read, Write, Flush and so on — travel on <strong>I/O queue pairs</strong> (queue identifiers 1 and up), which the driver creates by sending commands on the Admin queue. A modern SSD may support dozens or hundreds of I/O queues.</p>
+
+<h3>Why not just a register?</h3>
+<p>Older storage interfaces made the CPU talk to the disk controller through registers: write a command register, poll a status register. Each register access crosses the bus and stalls the CPU for a round trip. NVMe deliberately moves almost everything into host memory, where the CPU can write at memory speed, and leaves only one tiny register write — the doorbell — per batch of commands. The controller then pulls the commands itself with DMA. Completions arrive the same way: the controller pushes them into host memory, so the host can discover them by reading its own RAM, never by reading a device register.</p>
+
+<h3>How does the host know a completion is new?</h3>
+<p>Here is the clever part. The host never reads the CQ tail from the device (there is no register for it). Instead, each CQE contains a single bit called the <strong>phase tag</strong> (P). The controller writes P = 1 into every entry on its first trip around the CQ, P = 0 on its second trip, P = 1 on the third, and so on. The host remembers what value it expects. If the entry at its head position has the expected P, it is new. If not, it is left over from the previous trip, and nothing new has arrived. We will walk through this slowly with a table in the engineering section.</p>
+</section>
+
+<section id="engineering">
+<h2>Engineering explanation</h2>
+
+<h3>The four indices and who owns them</h3>
+<p>Each queue pair has four indices. Ownership means "only this agent ever advances it". The other agent learns its value through a defined channel.</p>
+<table>
+<caption>Index ownership in an NVMe queue pair (NVMe over PCIe)</caption>
+<thead><tr><th>Index</th><th>Owner (advances it)</th><th>How the other side learns it</th><th>Stored where</th><th>What breaks if wrong</th></tr></thead>
+<tbody>
+<tr><td>SQ tail</td><td>Host</td><td>Host writes it to the SQ y Tail Doorbell register (SQyTDBL) in the controller's BAR0 (Base Address Register 0) space</td><td>Host driver variable; latest published value held by controller</td><td>Controller fetches garbage (tail too far) or never fetches (tail not published)</td></tr>
+<tr><td>SQ head</td><td>Controller</td><td>Reported to the host in every CQE, in the SQ Head Pointer (SQHD) field</td><td>Controller internal state</td><td>Host overwrites SQEs the controller has not fetched yet, or believes the SQ is full forever</td></tr>
+<tr><td>CQ tail</td><td>Controller</td><td>Never transmitted as a number; the host infers it from phase tags</td><td>Controller internal state</td><td>Controller overwrites unconsumed CQEs</td></tr>
+<tr><td>CQ head</td><td>Host</td><td>Host writes it to the CQ y Head Doorbell register (CQyHDBL)</td><td>Host driver variable; latest published value held by controller</td><td>Controller thinks the CQ is full and stops posting, or posts over entries the host has not read</td></tr>
+</tbody>
+</table>
+<aside class="callout remember">
+<p><strong>Host owns: SQ tail and CQ head. Controller owns: SQ head and CQ tail.</strong> Each side owns the index of the queue it <em>produces into</em> for SQ (host) and the queue it <em>consumes from</em> for CQ (host). Say it as: "the host pushes commands and pulls completions; it owns the two ends it touches."</p>
+</aside>
+
+<h3>Producer and consumer</h3>
+<p>A circular queue with one producer and one consumer needs no lock, because each index has exactly one writer. The producer writes an entry, then advances the tail. The consumer reads the entry at the head, then advances the head. The only requirement is that the producer's entry is <em>visible</em> before the consumer learns the new tail. In NVMe over PCIe this becomes a memory-ordering requirement on the host (the SQE must reach memory before the doorbell write reaches the device) and an ordering guarantee on the device side (the CQE must not become visible before the data it describes). We deal with both in <a href="ch28.html">Chapter 28</a>.</p>
+
+<h3>Full and empty rules</h3>
+<p>With a queue of <var>N</var> slots, head <var>H</var> and tail <var>T</var>, both in the range 0 to N − 1:</p>
+<div class="formula">
+<div class="eq">empty ⇔ <var>H</var> = <var>T</var> &nbsp;&nbsp;&nbsp;&nbsp; full ⇔ (<var>T</var> + 1) mod <var>N</var> = <var>H</var> &nbsp;&nbsp;&nbsp;&nbsp; entries in use = (<var>T</var> − <var>H</var> + <var>N</var>) mod <var>N</var></div>
+<dl class="vars">
+<dt>N</dt><dd>queue size in entries (the 0's based size field in the creating command or AQA, plus one)</dd>
+<dt>H</dt><dd>head index: the next slot the consumer will read</dd>
+<dt>T</dt><dd>tail index: the next slot the producer will write</dd>
+</dl>
+</div>
+<p>Because "empty" is H = T, the queue cannot be allowed to fill every slot — a completely full queue would also have H = T and be indistinguishable from empty. So one slot is always left unused: a queue of N slots holds at most N − 1 entries. This is <span class="badge verified">Verified</span> as the NVMe definition of a full queue: the queue is full when the head equals one more than the tail, with wrap.</p>
+
+<div class="ring" data-label="Full SQ: 8 slots, 7 commands, one slot always empty" data-size="8" data-head="3" data-tail="2" data-head-label="head = 3" data-tail-label="tail = 2"></div>
+<div class="ring" data-label="Empty SQ: head = tail (the controller has fetched everything)" data-size="8" data-head="6" data-tail="6" data-head-label="head = 6" data-tail-label="tail = 6"></div>
+
+<aside class="callout derived">
+<p>Consequence: a queue created with size 2 (the minimum) can hold one outstanding entry. An Admin queue of 32 entries (as in the course's reference lab system) can hold 31 commands at once. An I/O queue of 1024 entries can hold 1023.</p>
+</aside>
+
+<h3>The phase tag, slowly</h3>
+<p>The CQE is 16 bytes, four Dwords (DW, 32-bit words). Dword 3 holds the Command Identifier (bits 15:00), the Phase Tag (bit 16) and the Status field (bits 31:17). Dword 2 holds the SQ Head Pointer (bits 15:00) and the SQ Identifier (bits 31:16). Dwords 0 and 1 are command specific.</p>
+<table class="packet">
+<caption>Completion Queue Entry, 16 bytes (common layout)</caption>
+<thead><tr><th class="row-label">DW</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+<tbody>
+<tr><td class="row-label">DW0</td><td colspan="32">Command Specific (for example, Number of Queues Allocated)</td></tr>
+<tr><td class="row-label">DW1</td><td colspan="32">Command Specific (reserved for most commands in older revisions)</td></tr>
+<tr><td class="row-label">DW2</td><td colspan="16" class="hl">SQ Identifier (SQID)</td><td colspan="16" class="hl">SQ Head Pointer (SQHD)</td></tr>
+<tr><td class="row-label">DW3</td><td colspan="15">Status (SCT, SC, CRD, More, DNR)</td><td colspan="1" class="hl">P</td><td colspan="16">Command Identifier (CID)</td></tr>
+</tbody>
+</table>
+<p>The rules, all <span class="badge normative">Normative</span> in the NVMe Base Specification (queueing model):</p>
+<ol>
+<li>When the host creates a CQ, the memory should be initialised so that every entry's phase tag is 0. (In practice drivers zero the whole CQ.)</li>
+<li>On the first pass through the CQ, the controller writes P = 1 into each entry it posts.</li>
+<li>Each time the controller's CQ tail wraps from the last slot to slot 0, it inverts the value it writes.</li>
+<li>The host keeps an "expected phase", initially 1. It reads the entry at its CQ head; if P equals the expected phase, the entry is new: process it and advance the head. When the host's head wraps to 0, it inverts its expected phase.</li>
+<li>The first entry whose P does not equal the expected phase marks the end of the new entries. The host then writes the new head to the CQ head doorbell to free those slots for the controller.</li>
+</ol>
+
+<h4>Step-by-step walk-through across a wrap</h4>
+<p>Here is a 4-entry CQ, starting from zeroed memory, with the controller posting completions and the host consuming them. The "P bits" column shows the phase tag currently stored in slots 0, 1, 2, 3. This is a synthetic example for teaching.</p>
+<table>
+<caption>Phase-tag walk-through: 4-entry CQ, one full wrap and a half</caption>
+<thead><tr><th>Step</th><th>Actor</th><th>Action</th><th>Ctrl CQ tail</th><th>Ctrl writes P</th><th>P bits [0 1 2 3]</th><th>Host head</th><th>Host expects P</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>—</td><td>CQ created, memory zeroed</td><td>0</td><td>1</td><td>0 0 0 0</td><td>0</td><td>1</td><td>Empty</td></tr>
+<tr><td>1</td><td>Controller</td><td>Posts CQE (CID 0x10) into slot 0</td><td>1</td><td>1</td><td>1 0 0 0</td><td>0</td><td>1</td><td>—</td></tr>
+<tr><td>2</td><td>Controller</td><td>Posts CQE (CID 0x11) into slot 1</td><td>2</td><td>1</td><td>1 1 0 0</td><td>0</td><td>1</td><td>—</td></tr>
+<tr><td>3</td><td>Host</td><td>Reads slot 0: P = 1 = expected</td><td>2</td><td>1</td><td>1 1 0 0</td><td>1</td><td>1</td><td>Consume 0x10</td></tr>
+<tr><td>4</td><td>Host</td><td>Reads slot 1: P = 1 = expected</td><td>2</td><td>1</td><td>1 1 0 0</td><td>2</td><td>1</td><td>Consume 0x11</td></tr>
+<tr><td>5</td><td>Host</td><td>Reads slot 2: P = 0 ≠ 1; stop. Writes CQ head doorbell = 2</td><td>2</td><td>1</td><td>1 1 0 0</td><td>2</td><td>1</td><td>No more new entries</td></tr>
+<tr><td>6</td><td>Controller</td><td>Posts CID 0x12 into slot 2</td><td>3</td><td>1</td><td>1 1 1 0</td><td>2</td><td>1</td><td>—</td></tr>
+<tr><td>7</td><td>Controller</td><td>Posts CID 0x13 into slot 3; tail wraps to 0; invert phase</td><td>0</td><td><strong>0</strong></td><td>1 1 1 1</td><td>2</td><td>1</td><td>—</td></tr>
+<tr><td>8</td><td>Controller</td><td>Checks full: (0 + 1) mod 4 = 1 ≠ head 2, so posts CID 0x14 into slot 0 with P = 0</td><td>1</td><td>0</td><td><strong>0</strong> 1 1 1</td><td>2</td><td>1</td><td>—</td></tr>
+<tr><td>9</td><td>Controller</td><td>Wants to post again: (1 + 1) mod 4 = 2 = head → CQ full; must wait</td><td>1</td><td>0</td><td>0 1 1 1</td><td>2</td><td>1</td><td>Controller stalls posting</td></tr>
+<tr><td>10</td><td>Host</td><td>Reads slot 2: P = 1 = expected</td><td>1</td><td>0</td><td>0 1 1 1</td><td>3</td><td>1</td><td>Consume 0x12</td></tr>
+<tr><td>11</td><td>Host</td><td>Reads slot 3: P = 1 = expected; head wraps to 0; invert expected phase</td><td>1</td><td>0</td><td>0 1 1 1</td><td>0</td><td><strong>0</strong></td><td>Consume 0x13</td></tr>
+<tr><td>12</td><td>Host</td><td>Reads slot 0: P = 0 = expected</td><td>1</td><td>0</td><td>0 1 1 1</td><td>1</td><td>0</td><td>Consume 0x14</td></tr>
+<tr><td>13</td><td>Host</td><td>Reads slot 1: P = 1 ≠ 0 — a stale entry from pass 1; stop. Doorbell = 1</td><td>1</td><td>0</td><td>0 1 1 1</td><td>1</td><td>0</td><td>Correctly ignored stale CID 0x11</td></tr>
+<tr><td>14</td><td>Controller</td><td>Posts CID 0x15 into slot 1 with P = 0</td><td>2</td><td>0</td><td>0 0 1 1</td><td>1</td><td>0</td><td>—</td></tr>
+<tr><td>15</td><td>Host</td><td>Reads slot 1: P = 0 = expected → consume; reads slot 2: P = 1 stale → stop. Doorbell = 2</td><td>2</td><td>0</td><td>0 0 1 1</td><td>2</td><td>0</td><td>Consume 0x15</td></tr>
+</tbody>
+</table>
+<p>Step 13 is the whole point. Slot 1 still contains a perfectly valid-looking CQE for CID 0x11 from the first pass. Without the phase tag, the host would have no way to tell it is old, short of reading a device register. With the phase tag, the host only needs one bit from memory it already owns.</p>
+<aside class="callout insight" data-title="Why the CQ, and not the SQ, has a phase tag">
+<p>The SQ's consumer is the controller, and the controller is told the tail explicitly by the doorbell. The CQ's consumer is the host, and the host is never told the CQ tail. The phase tag is what replaces the missing "CQ tail register". That asymmetry exists because reading a device register costs a full non-posted PCIe round trip (often around a microsecond), while reading host memory is a cache access.</p>
+</aside>
+
+<h3>Queue depth and queue size</h3>
+<p><strong>Queue size</strong> is the number of slots the queue was created with. <strong><span class="g" data-term="queue-depth">Queue depth</span></strong> is used two ways and you should always ask which one is meant:</p>
+<ul>
+<li>the configured maximum number of commands that can be outstanding on a queue (at most size − 1), or</li>
+<li>the number actually in flight at a given moment (what tools like <code>fio</code> call iodepth and what Little's Law calls <var>L</var>).</li>
+</ul>
+<p>Depth matters because an SSD is internally parallel: tens of NAND dies, each able to work on a different request. A single outstanding command keeps only one die busy. Deeper queues let the controller keep more of the media busy — up to the point where latency grows without any gain in throughput.</p>
+
+<h3>MQES: how large a queue may be</h3>
+<p>The controller advertises its limit in the <strong>CAP</strong> (Controller Capabilities) register at offset 00h, field <strong>MQES</strong>, bits 15:00. It is a <em>0's based</em> value: the number stored is one less than the real count. MQES = 03FFh means 1024 entries per queue. The minimum value the specification allows is 1h, meaning 2 entries. Because the field is 16 bits, the largest possible I/O queue is 65,536 entries.</p>
+<aside class="callout warn">
+<p>0's based values are a classic source of off-by-one bugs. MQES, the queue size fields in Create I/O Completion Queue and Create I/O Submission Queue, and the AQA sizes are all 0's based. A driver that writes 1024 into a 0's based size field asks for 1025 entries — and the controller should reject it if MQES is 03FFh.</p>
+</aside>
+
+<h3>Physically contiguous queues and PRP-list queues</h3>
+<p>A queue is a block of host memory. It can be described to the controller in two ways:</p>
+<ul>
+<li><strong>Physically contiguous</strong>: one base address; the queue occupies consecutive bytes. The Admin queues are always contiguous: ASQ and ACQ registers hold a single base address each.</li>
+<li><strong>Non-contiguous</strong>: for I/O queues, the creating command's PRP Entry 1 can point to a <span class="g" data-term="prp">Physical Region Page (PRP)</span> list — a page of pointers, each naming one memory page of the queue. This lets a driver build a large queue out of scattered pages.</li>
+</ul>
+<p>The <strong><span class="g" data-term="cqr">CAP.CQR</span></strong> bit (Contiguous Queues Required, bit 16) tells the host whether the controller supports the second form. If CQR = 1, every I/O queue must be physically contiguous, and the host must set the Physically Contiguous (PC) bit in Create I/O SQ and Create I/O CQ. Most controllers built for servers set CQR = 1, because walking a PRP list on every SQE fetch or CQE post costs extra DMA reads.</p>
+<p>The <span class="badge impl">Implementation-dependent</span> question is whether a given controller supports non-contiguous queues at all; that is exactly what CQR reports. A 1024-entry I/O SQ is 64 KiB — sixteen 4 KiB pages — which Linux can usually allocate contiguously through the DMA API; an IOMMU (Input/Output Memory Management Unit) can also make physically scattered pages look contiguous in I/O virtual address space.</p>
+
+<h3>Queue pairs per CPU</h3>
+<p>The design target for NVMe was many cores issuing I/O at once without locks. The standard approach, used by the Linux driver and others, is one I/O SQ (and usually one CQ) per CPU core, or per group of cores when the controller has fewer queues than the system has cores:</p>
+<figure>
+<pre class="diagram">  CPU 0 ──► SQ1 ──► CQ1 ──► MSI-X vector 1 ──► interrupt on CPU 0
+  CPU 1 ──► SQ2 ──► CQ2 ──► MSI-X vector 2 ──► interrupt on CPU 1
+  CPU 2 ──► SQ3 ──► CQ3 ──► MSI-X vector 3 ──► interrupt on CPU 2
+   …          …       …          …
+  (Admin)    SQ0 ──► CQ0 ──► MSI-X vector 0</pre>
+<figcaption>One queue pair per CPU: each core submits and completes on its own queues, so no lock is shared across cores. Conceptual.</figcaption>
+</figure>
+<p>Each core writes only its own SQ tail and its own CQ head, so there is no cross-core contention. The completion interrupt — a Message Signaled Interrupt eXtended (<span class="g" data-term="msi-x">MSI-X</span>) vector — is steered to the same core, so the completing code finds its data warm in cache.</p>
+
+<h3>SQ-to-CQ mapping: many to one, never one to many</h3>
+<p>When the driver creates an I/O SQ, it names the CQ that the SQ's completions go to (the CQ Identifier field). Several SQs may name the same CQ. One SQ cannot spread its completions over several CQs. The Admin SQ always completes into the Admin CQ.</p>
+<figure>
+<pre class="diagram">   SQ1 (urgent) ──┐
+                  ├──► CQ1 ──► vector 1
+   SQ2 (high)  ───┘
+   SQ3 (low)   ──────► CQ2 ──► vector 2
+
+   Allowed:   many SQs → one CQ
+   Forbidden: one SQ → many CQs</pre>
+<figcaption>Many-to-one SQ-to-CQ mapping. The SQ Identifier in each CQE (DW2) tells the host which SQ a completion belongs to.</figcaption>
+</figure>
+<p>Why would you share? To give different priority classes to different SQs without multiplying interrupt vectors; or because the controller supports more SQs than CQs. Because the CQE carries SQID and SQHD, the host can always tell which SQ, and how far that SQ has been consumed.</p>
+<aside class="callout derived">
+<p>Since a CQ shared by several SQs receives completions for all of them, it must be large enough to absorb the worst-case total of outstanding commands across all those SQs, or the controller will find the CQ full and stall. With a 1:1 pair and a driver that never allows more than size − 1 outstanding commands, the CQ can never overflow.</p>
+</aside>
+
+<h3>Arbitration: which SQ does the controller serve next?</h3>
+<p>With many SQs holding commands, the controller must choose which to fetch from. NVMe defines the arbitration mechanisms; the controller advertises them in CAP.AMS (Arbitration Mechanism Supported) and the host selects one in CC.AMS (Arbitration Mechanism Selected) before enabling the controller.</p>
+<ul>
+<li><strong>Round robin</strong> <span class="badge normative">Mandatory</span>: every SQ, including the Admin SQ, is treated as equal priority. The controller takes up to an Arbitration Burst of commands from one SQ, then moves to the next.</li>
+<li><strong><span class="g" data-term="wrr">Weighted round robin</span> with urgent priority class</strong> <span class="badge optional">Optional</span>: three strict priority levels. The Admin SQ is highest; then the Urgent class; then a weighted round robin among the High, Medium and Low classes, with weights set by the host through the Arbitration feature (Set Features). An SQ's class is set when it is created (the Queue Priority field in Create I/O SQ).</li>
+<li><strong>Vendor specific</strong> <span class="badge optional">Optional</span>: defined by the vendor.</li>
+</ul>
+<figure>
+<pre class="diagram">   Priority 1 (strict)  : Admin SQ
+   Priority 2 (strict)  : Urgent-class SQs        (round robin among them)
+   Priority 3 (weighted): ┌ High   (weight HPW+1) ┐
+                          │ Medium (weight MPW+1) ├ weighted round robin
+                          └ Low    (weight LPW+1) ┘
+                           (round robin within each class)</pre>
+<figcaption>Weighted round robin with urgent priority class (conceptual). Weights are configured with the Arbitration feature; field names as in the NVMe Base Specification.</figcaption>
+</figure>
+<aside class="callout notsaid">
+<p>Arbitration decides the order in which the controller <em>fetches</em> commands. The specification does not promise that commands complete in fetch order, nor that a high-priority command overtakes a low-priority command already being executed inside the device. Back-end scheduling is implementation-dependent. Linux, by default, does not enable weighted round robin.</p>
+</aside>
+
+<h3>The ladder for the central concept: the queue pair</h3>
+<div class="ladder">
+<div class="rung" data-rung="A"><p>Children put order cards in a spinning tray and ring a bell; the shopkeeper puts answer cards with coloured stickers into another spinning tray; the children read answers whose sticker is this round's colour.</p></div>
+<div class="rung" data-rung="B"><p>An SQ and a CQ are circular arrays in host memory. The host produces SQEs and advances the SQ tail; the controller consumes them and advances the SQ head. The controller produces CQEs and advances the CQ tail; the host consumes them and advances the CQ head. The phase tag marks fresh CQEs.</p></div>
+<div class="rung" data-rung="C"><p>The queues are DMA-able pages in DRAM. The controller holds per-queue state: base address, size, head, tail, phase, the associated CQ and interrupt vector. The doorbell registers are flops inside the controller's BAR0 region starting at offset 1000h; a write to one wakes the fetch engine.</p></div>
+<div class="rung" data-rung="D"><p>NVMe Base Specification: the queueing model defines SQ/CQ, full/empty, the phase tag and SQHD; the controller registers define CAP.MQES, CAP.CQR, CAP.AMS, CAP.DSTRD and the doorbells; the Admin command set defines Create/Delete I/O SQ and CQ. The NVMe over PCIe Transport Specification defines how these map onto PCIe memory transactions.</p></div>
+<div class="rung" data-rung="E"><p>On the link: host-to-device Memory Write TLPs (Transaction Layer Packets) to doorbells; device-to-host Memory Read TLPs to fetch SQEs, answered by Completion-with-Data TLPs from the root complex; device-to-host Memory Write TLPs to post CQEs; a device-to-host Memory Write to the MSI-X address for the interrupt.</p></div>
+<div class="rung" data-rung="F"><p>In an analyzer: MWr to BAR0+0x1008 Data=8 (SQ1 tail = 8); MRd from 01:00.0 to the SQ1 base + 0x140, 192 bytes; CplD back; data movement; MWr 16 bytes to CQ1 base + 0x250 with P = 1; MWr to 0xFEE0_xxxx; MWr to BAR0+0x100C Data=40 (CQ1 head = 40).</p></div>
+<div class="rung" data-rung="G"><p>Commands time out but the device is healthy? Check: was the SQ tail doorbell written at all, and with the right value? Did the controller ever fetch from the SQ base? Did a CQE arrive with a phase the host did not expect (host phase bug)? Did the controller stop posting because the CQ head doorbell was never written (CQ "full")?</p></div>
+</div>
+
+<h3>The sixteen questions: the NVMe queue pair</h3>
+<dl>
+<dt>1. What is it?</dt><dd>A Submission Queue and the Completion Queue it maps to: two circular arrays in host memory plus two doorbell registers in the controller.</dd>
+<dt>2. Why was it created?</dt><dd>To let many CPU cores submit storage commands in parallel at memory speed, with at most one register write per batch and no register reads on the fast path.</dd>
+<dt>3. What problem does it solve?</dt><dd>Register-based interfaces serialised work and stalled the CPU on uncached reads; a single shared command queue (as in AHCI, with 32 slots on one queue per port) created lock contention and limited parallelism.</dd>
+<dt>4. What existed before it?</dt><dd>AHCI (Advanced Host Controller Interface) for SATA: one command list of 32 slots per port, with command issue and status registers; SCSI host adapters with vendor-specific queue designs.</dd>
+<dt>5. Why is the current design better?</dt><dd>Up to 65,535 I/O queues of up to 65,536 entries each; per-core queues with no shared lock; the host discovers completions from memory; doorbells are posted writes that do not stall the CPU.</dd>
+<dt>6. Who creates it?</dt><dd>The host driver allocates the memory. The Admin pair is created by writing AQA/ASQ/ACQ before enabling the controller; I/O pairs by Create I/O CQ and Create I/O SQ commands on the Admin queue.</dd>
+<dt>7. Who consumes it?</dt><dd>The controller consumes SQEs; the host consumes CQEs.</dd>
+<dt>8. Where does it live?</dt><dd>In host memory for NVMe over PCIe (with the optional exception of queues placed in a Controller Memory Buffer, a version- and implementation-dependent feature). Doorbells live in the controller's BAR0 register space.</dd>
+<dt>9. What memory/registers are involved?</dt><dd>SQ and CQ memory; CAP (MQES, CQR, AMS, DSTRD); CC (IOSQES, IOCQES, AMS, MPS); AQA, ASQ, ACQ; SQyTDBL and CQyHDBL.</dd>
+<dt>10. What happens before it?</dt><dd>PCIe enumeration and BAR assignment, enabling bus mastering, controller reset and enable, Identify, and the Number of Queues negotiation.</dd>
+<dt>11. What happens after it?</dt><dd>Commands flow: SQE write, doorbell, fetch, execution with DMA, CQE post, interrupt, host reaps the CQE and writes the CQ head doorbell.</dd>
+<dt>12. What happens if it is wrong?</dt><dd>Hangs (no fetch), duplicated or lost completions, corrupted commands, timeouts and controller resets; possibly asynchronous error events for invalid doorbell writes.</dd>
+<dt>13. What does the protocol analyzer show?</dt><dd>Doorbell MWr TLPs, SQE-fetch MRd/CplD pairs, CQE MWr TLPs, MSI-X MWr TLPs. Never the SQE write by the CPU itself (that stays inside the host).</dd>
+<dt>14. What does Linux show?</dt><dd>Queue count in <code>/proc/interrupts</code> (nvme0q0, nvme0q1 …), blk-mq hardware contexts under <code>/sys/block/nvme0n1/mq/</code>, depth in <code>nr_tags</code>, and the Number of Queues feature through <code>nvme get-feature</code>.</dd>
+<dt>15. What would a validation engineer test?</dt><dd>Minimum and maximum queue sizes against MQES; wrap at every queue size; full CQ behaviour; phase inversion over many wraps; many-to-one mapping; arbitration fairness; invalid doorbell values; queue deletion with commands outstanding.</dd>
+<dt>16. What would a senior engineer suspect when it fails?</dt><dd>Ownership violations (host writing an index it does not own), 0's based off-by-one, missing memory barrier before the doorbell, phase not inverted on wrap, CQ undersized for a shared mapping, doorbell stride miscalculated, stale cached CQE reads.</dd>
+</dl>
+</section>
+
+<section id="hardware">
+<h2>Hardware view</h2>
+<p>Inside the controller, each queue is a small record in on-chip memory or registers. A plausible (implementation-dependent) set of per-queue state is:</p>
+<table>
+<caption>Typical controller-internal queue state (illustrative; layout is implementation-dependent)</caption>
+<thead><tr><th>State</th><th>Per SQ</th><th>Per CQ</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td>Base address or PRP list pointer</td><td>Yes</td><td>Yes</td><td>ASQ/ACQ registers, or PRP Entry 1 of the create command</td></tr>
+<tr><td>Size (entries)</td><td>Yes</td><td>Yes</td><td>AQA or the create command's Queue Size</td></tr>
+<tr><td>Head</td><td>Yes (owned)</td><td>Last doorbell value</td><td>Advanced by fetch / written by host doorbell</td></tr>
+<tr><td>Tail</td><td>Last doorbell value</td><td>Yes (owned)</td><td>Written by host doorbell / advanced by posting</td></tr>
+<tr><td>Phase</td><td>—</td><td>Yes</td><td>Starts at 1, inverts on wrap</td></tr>
+<tr><td>Target CQ</td><td>Yes</td><td>—</td><td>CQ Identifier in Create I/O SQ</td></tr>
+<tr><td>Priority class</td><td>Yes</td><td>—</td><td>Queue Priority in Create I/O SQ (used with WRR)</td></tr>
+<tr><td>Interrupt vector, interrupt enable</td><td>—</td><td>Yes</td><td>Create I/O CQ</td></tr>
+</tbody>
+</table>
+<p>Doorbell writes land in a small register block. The controller hardware typically compares the new SQ tail with its internal SQ head and, if they differ, queues work for a fetch engine. The fetch engine issues PCIe Memory Read requests for one or several SQEs at a time — a controller may read four SQEs (256 bytes) in one request if they are contiguous and within the Max Read Request Size. CQEs are posted by a separate engine that writes 16 bytes per entry, sometimes several entries in one write when they are consecutive.</p>
+<p>On the host side there is no special hardware: the queues are ordinary memory pages, made coherent with CPU caches by the platform. The device's reads of SQEs are snooped, so the device sees what the CPU wrote, provided the CPU's write has left the store buffer — which is why the driver needs a write memory barrier before the doorbell. The device's CQE writes invalidate cached copies, so the host's next read of the CQE sees new data.</p>
+<aside class="callout hw">
+<p>Each SQE fetch costs a full PCIe read round trip: the request goes up to the root complex, the root complex reads memory, and the completion comes back — often several hundred nanoseconds to around a microsecond on a real platform (<span class="badge impl">Implementation-dependent</span>). That is why controllers prefetch several SQEs at once and why an optional feature allows SQs to live in device memory (the Controller Memory Buffer), turning the host's SQE writes into posted writes across the link.</p>
+</aside>
+</section>
+
+<section id="spec">
+<h2>Specification view</h2>
+<p>Queue architecture is defined across two documents of the NVMe 2.4 specification set:</p>
+<ul>
+<li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Theory of Operation / queueing model, Controller Registers, Admin Command Set</cite>: SQ/CQ definitions, full/empty, the phase tag, CQE layout, arbitration, CAP/CC fields, Create/Delete I/O queue commands.</li>
+<li><cite class="spec">NVM Express over PCIe Transport Specification, Revision 1.4</cite>: the PCIe-specific mapping, including doorbell registers, queue memory in host memory, PRP-based queue description and interrupts.</li>
+</ul>
+<p>The queueing model is <span class="badge normative">Normative</span>. Descriptions of one queue per core, and figures showing it, are <span class="badge informative">Informative</span>: the specification allows it but does not require it.</p>
+
+<aside class="callout verified">
+<ul>
+<li>SQ entries are 64 bytes and CQ entries 16 bytes for the NVM Command Set (CC.IOSQES = 6, CC.IOCQES = 4 select 2<sup>6</sup> and 2<sup>4</sup> bytes).</li>
+<li>A queue is empty when head equals tail and full when head equals tail + 1 with wrap.</li>
+<li>CAP.MQES (bits 15:00) is 0's based, minimum 1h.</li>
+<li>CAP.CQR (bit 16) set to 1 means I/O queues must be physically contiguous.</li>
+<li>The CQE carries SQ Head Pointer, SQ Identifier, Command Identifier, Phase Tag and Status.</li>
+<li>Round robin arbitration is mandatory; weighted round robin with urgent priority class and vendor specific are optional and advertised in CAP.AMS.</li>
+<li>The Admin queue has identifier 0.</li>
+</ul>
+</aside>
+<aside class="callout derived">
+<ul>
+<li>A queue of N entries holds at most N − 1 outstanding entries (follows from the full rule).</li>
+<li>A host that never allows more outstanding commands than the CQ can hold can never be blocked by a full CQ.</li>
+<li>Commands submitted to different SQs have no ordering relationship at all; even within one SQ, completion order is not submission order.</li>
+</ul>
+</aside>
+<aside class="callout impl">
+<ul>
+<li>The number of I/O queues a controller supports (granted through the Number of Queues feature).</li>
+<li>Whether the controller supports non-contiguous queues (CQR = 0) and weighted round robin.</li>
+<li>How many SQEs the controller fetches per read, and when it decides to fetch.</li>
+<li>How quickly the controller notices a doorbell and the internal scheduling of commands after fetch.</li>
+<li>The host's choice of queue count, depth and CPU mapping (a driver policy, not a spec requirement).</li>
+</ul>
+</aside>
+<aside class="callout version">
+<p>The basic queue model has been stable since NVMe 1.0. Later revisions added features around it: the Controller Memory Buffer for queues (NVMe 1.2), the Doorbell Buffer Config command for shadow doorbells (NVMe 1.3), NVM Sets with an NVM Set Identifier in Create I/O SQ (NVMe 1.4), and the reorganisation into the Base plus Transport specifications (NVMe 2.0). In the 2.x documents the PCIe-specific queue details sit in the NVMe over PCIe Transport specification. Check the revision you are working against.</p>
+</aside>
+<aside class="callout notsaid">
+<ul>
+<li>The specification does not say how many queues a host should create or how they map to CPUs.</li>
+<li>It does not guarantee completion order relative to submission order.</li>
+<li>It does not define how long a controller may take to notice a doorbell write.</li>
+<li>Check in the specification: the exact maximum Admin queue size and its interaction with MQES for your revision; whether the CQ memory must be zeroed by the host or merely have phase tags of 0.</li>
+</ul>
+</aside>
+<aside class="callout warn">
+<ul>
+<li>Never assume completions arrive in submission order.</li>
+<li>Never assume an SQ slot is reusable just because you sent the command; it is reusable when an SQHD value has moved past it.</li>
+<li>Never assume MQES is the count; add one.</li>
+<li>Never assume a controller supports weighted round robin or non-contiguous queues; read CAP.</li>
+</ul>
+</aside>
+</section>
+
+<section id="protocol">
+<h2>Protocol view</h2>
+<p>From the PCIe link's point of view, NVMe queues produce four kinds of traffic. Nothing about queues is visible on the link except these:</p>
+<table>
+<caption>Queue-related traffic on the PCIe link (NVMe over PCIe)</caption>
+<thead><tr><th>Event</th><th>Direction</th><th>TLP</th><th>Posted?</th><th>Target address</th><th>Payload</th></tr></thead>
+<tbody>
+<tr><td>SQ tail doorbell</td><td>Host → Device</td><td>Memory Write (MWr)</td><td>Posted</td><td>BAR0 + SQyTDBL offset</td><td>1 DW: new tail in bits 15:00</td></tr>
+<tr><td>SQE fetch</td><td>Device → Host</td><td>Memory Read (MRd), answered by Completion with Data (CplD) from the root complex</td><td>Non-posted</td><td>SQ base + head × 64</td><td>64 bytes per SQE (possibly several)</td></tr>
+<tr><td>CQE post</td><td>Device → Host</td><td>MWr</td><td>Posted</td><td>CQ base + tail × 16</td><td>16 bytes per CQE</td></tr>
+<tr><td>Interrupt</td><td>Device → Host</td><td>MWr to the MSI-X message address</td><td>Posted</td><td>Platform interrupt window (for example 0xFEE0_xxxx on x86)</td><td>1 DW message data</td></tr>
+<tr><td>CQ head doorbell</td><td>Host → Device</td><td>MWr</td><td>Posted</td><td>BAR0 + CQyHDBL offset</td><td>1 DW: new head in bits 15:00</td></tr>
+</tbody>
+</table>
+<figure>
+<ol class="seq" data-actors="CPU / driver|Host memory|NVMe controller">
+<li data-from="CPU / driver" data-to="Host memory">store SQE into SQ1 slot 5 (not on link)</li>
+<li data-note="CPU / driver">wmb(): SQE visible before doorbell</li>
+<li data-from="CPU / driver" data-to="NVMe controller" data-t="0 ns">MWr SQ1TDBL = 6</li>
+<li data-from="NVMe controller" data-to="Host memory" data-t="700 ns">MRd SQ1 base + 0x140, 64 B</li>
+<li data-from="Host memory" data-to="NVMe controller" class="dashed" data-t="1.4 µs">CplD 64 B (the SQE)</li>
+<li data-note="NVMe controller">execute; SQ head = 6</li>
+<li data-from="NVMe controller" data-to="Host memory" data-t="60 µs">MWr CQE: SQHD=6, CID, P=1</li>
+<li data-from="NVMe controller" data-to="CPU / driver" data-t="60.1 µs">MWr MSI-X vector 1</li>
+<li data-note="CPU / driver">reap CQE with expected phase</li>
+<li data-from="CPU / driver" data-to="NVMe controller" data-t="63 µs">MWr CQ1HDBL = new head</li>
+</ol>
+<figcaption>One command's queue traffic. Timestamps are synthetic and illustrative; data movement omitted for clarity.</figcaption>
+</figure>
+<p>Ordering ties this together. PCIe guarantees that posted writes from the same requester are not reordered with each other (unless the Relaxed Ordering attribute permits it), so the controller's data writes for a Read command, then the CQE write, then the MSI-X write arrive in host memory in that order. When the host's interrupt handler runs, the CQE — and the data it describes — are already in memory. See <a href="ch14.html">Chapter 14</a> for the ordering rules themselves.</p>
+</section>
+
+<section id="trace">
+<h2>Trace view</h2>
+<p>Both traces use the course's reference lab system: Lab SSD at 01:00.0 (Requester ID 0x0100), BAR0 at 0xFE60_0000, CAP.DSTRD = 0, SQ1 base 0x1_2340_0000 (1024 entries), CQ1 base 0x1_2341_0000. Synthetic example for teaching.</p>
+
+<div class="trace" data-kind="synthetic" data-title="Normal: three reads batched on SQ1, completing out of order">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Before #1 the driver stored three SQEs into SQ1 slots 5, 6, 7 (CID 0x0041, 0x0042, 0x0043). CPU stores to host memory are not on the link.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Len=1 Data=0x0000_0008</td><td>SQ1 tail doorbell = 8 (one doorbell for three commands)</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>760</td><td>MRd64</td><td>Req=0x0100 Tag=0x10 Addr=0x1_2340_0140 Len=48 DW</td><td>Fetch slots 5–7 (3 × 64 B = 192 B) in one read</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,420</td><td>CplD</td><td>Cpl=RC Req=0x0100 Tag=0x10 Status=SC ByteCount=192 Len=32 DW</td><td>First 128 B of the three SQEs</td></tr>
+<tr class="dir-down"><td>4</td><td>Host→Dev</td><td>1,450</td><td>CplD</td><td>Cpl=RC Req=0x0100 Tag=0x10 Status=SC ByteCount=64 Len=16 DW</td><td>Last 64 B; read complete. Controller's SQ head is now 8</td></tr>
+<tr class="note"><td colspan="6">Data DMA writes for the three reads omitted (see the command-vs-packet lab for full traffic).</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>58,300</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_2341_0250 Len=4 DW DW2=0x0001_0008 DW3=0x0001_0043</td><td>CQE in CQ1 slot 37: SQID 1, SQHD 8, P=1, Status 0, CID 0x0043 — the <em>third</em> command finished first</td></tr>
+<tr class="dir-up"><td>6</td><td>Dev→Host</td><td>58,310</td><td>MWr32</td><td>Req=0x0100 Addr=0xFEE0_1000 Len=1 Data=0x0000_0041</td><td>MSI-X vector 1 interrupt</td></tr>
+<tr class="dir-up"><td>7</td><td>Dev→Host</td><td>61,900</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_2341_0260 Len=8 DW</td><td>Two CQEs in slots 38–39: CID 0x0041 and 0x0042, each P=1, SQHD 8</td></tr>
+<tr class="dir-up"><td>8</td><td>Dev→Host</td><td>61,910</td><td>MWr32</td><td>Req=0x0100 Addr=0xFEE0_1000 Len=1 Data=0x0000_0041</td><td>MSI-X vector 1 again</td></tr>
+<tr class="dir-down"><td>9</td><td>Host→Dev</td><td>64,800</td><td>MWr32</td><td>Req=RC Addr=0xFE60_100C Len=1 Data=0x0000_0028</td><td>CQ1 head doorbell = 40 (0x28): slots 37–39 consumed</td></tr>
+</tbody>
+</table>
+<p>Reasoning: the doorbell value 8 at offset 0x1008 identifies SQ1 (0x1000 + 2 × 1 × 4). The read address 0x140 = 5 × 64 means the controller's head was at 5. The CQE address 0x250 = 37 × 16, and 0x260 = 38 × 16. The CQ head doorbell value 40 is consistent with three CQEs consumed starting at 37. Completion order (0x43 before 0x41/0x42) is legal.</p>
+</div>
+
+<div class="trace" data-kind="synthetic" data-title="Abnormal: controller stops posting because the CQ head was never published">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Test driver with a 16-entry SQ2/CQ2 pair (synthetic). SQ2 base 0x1_2342_0000, CQ2 base 0x1_2343_0000. A bug in the reap loop forgets to write the CQ head doorbell.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_1010 Data=0x0000_000F</td><td>SQ2 tail = 15: 15 commands (the maximum for 16 slots)</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.8</td><td>MRd64</td><td>Addr=0x1_2342_0000 Len=128 DW Tag=0x20</td><td>Fetch 8 SQEs (512 B, the MRRS)</td></tr>
+<tr class="dir-up"><td>3</td><td>Dev→Host</td><td>0.8</td><td>MRd64</td><td>Addr=0x1_2342_0200 Len=112 DW Tag=0x21</td><td>Fetch remaining 7 SQEs</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>70–95</td><td>MWr64 ×15</td><td>Addr=0x1_2343_0000 … 0x1_2343_00E0, each Len=4 DW, P=1</td><td>15 CQEs posted in slots 0–14; host reaps them all</td></tr>
+<tr class="dir-down"><td>5</td><td>Host→Dev</td><td>110.0</td><td>MWr32</td><td>Addr=0xFE60_1010 Data=0x0000_000E</td><td>SQ2 tail = 14 (wrapped: 15 more commands in slots 15, 0–13)</td></tr>
+<tr class="dir-up"><td>6</td><td>Dev→Host</td><td>110.8</td><td>MRd64 ×2</td><td>Addr=0x1_2342_03C0 … </td><td>Fetches all 15 new SQEs</td></tr>
+<tr class="abnormal"><td>7</td><td>—</td><td>110.8 → 30 s</td><td>(silence)</td><td>No CQE MWr to 0x1_2343_00F0 ever appears</td><td>First abnormal event: controller has 15 results ready but CQ2 head (as last published) is 0 and its tail is 15 — the CQ is full</td></tr>
+<tr class="dir-down"><td>8</td><td>Host→Dev</td><td>30 s</td><td>MWr32</td><td>Addr=0xFE60_0014 (CC)</td><td>Host times out and resets the controller</td></tr>
+</tbody>
+</table>
+<p>Reasoning: the controller's view of CQ2 head is the last value written to CQ2HDBL (BAR0 + 0x1014). No write to 0x1014 appears anywhere. The controller's tail is 15 after the first batch; (15 + 1) mod 16 = 0 = head, so the CQ is full. The controller is <em>right</em> to stop. A naive reading blames the SSD ("it fetched the commands but never answered"). The evidence that clears the SSD is the <em>absence</em> of a CQ head doorbell write, which you can only see if your analyzer filter includes host-to-device writes to the doorbell range.</p>
+</div>
+<aside class="callout trace">
+<p>What a trace <strong>cannot</strong> show: the SQE stores by the CPU, the host's reads of CQEs (cache hits), and the controller's internal head/tail state. You infer the internal state from the addresses the controller reads and writes.</p>
+</aside>
+</section>
+
+<section id="linux">
+<h2>Linux view</h2>
+<p>All commands below are read-only inspection. Some need root. Output varies by kernel, driver and device, so none is reproduced here as if it were authoritative.</p>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Queue interrupts: one line per queue that has a vector (nvme0q0 is the Admin queue)</span>
+grep nvme /proc/interrupts
+
+<span class="cm"># blk-mq hardware contexts: one directory per I/O queue the block layer uses</span>
+ls /sys/block/nvme0n1/mq/
+cat /sys/block/nvme0n1/mq/0/cpu_list     <span class="cm"># which CPUs submit through hardware queue 0</span>
+cat /sys/block/nvme0n1/mq/0/nr_tags      <span class="cm"># tags = maximum outstanding commands on that queue</span>
+
+<span class="cm"># Driver parameters that shape the queues</span>
+cat /sys/module/nvme/parameters/io_queue_depth
+cat /sys/module/nvme/parameters/poll_queues /sys/module/nvme/parameters/write_queues
+
+<span class="cm"># Controller capabilities: MQES, CQR, AMS, DSTRD (nvme-cli reads BAR0)</span>
+sudo nvme show-regs /dev/nvme0 -H | head -40
+
+<span class="cm"># Number of Queues feature (Feature Identifier 07h): queues allocated by the controller</span>
+sudo nvme get-feature /dev/nvme0 -f 0x07 -H</code></pre>
+<table>
+<caption>What each output can and cannot prove</caption>
+<thead><tr><th>Source</th><th>Can show</th><th>Cannot show</th></tr></thead>
+<tbody>
+<tr><td><code>/proc/interrupts</code></td><td>How many queues have vectors; which CPUs take their interrupts; interrupt counts over time</td><td>Queue sizes; poll queues (which have no interrupt); doorbell activity</td></tr>
+<tr><td><code>mq/*/nr_tags</code></td><td>The block layer's per-queue depth limit (usually queue size − 1 or less)</td><td>What the controller was told at creation, directly</td></tr>
+<tr><td><code>nvme show-regs</code></td><td>CAP.MQES, CAP.CQR, CAP.AMS, CAP.DSTRD, CC, AQA, ASQ, ACQ</td><td>I/O queue base addresses or current head/tail values</td></tr>
+<tr><td><code>get-feature 0x07</code></td><td>Number of I/O SQs and CQs allocated (0's based)</td><td>How many the driver actually created</td></tr>
+</tbody>
+</table>
+<aside class="callout linux">
+<p>The Linux driver keeps one blk-mq hardware context per I/O queue, uses a 32-entry Admin queue, and defaults to an I/O queue depth of 1024 entries (bounded by MQES + 1). These are driver choices that change across kernel versions <span class="badge version">Version-dependent</span>; read the values on your system rather than memorising them.</p>
+</aside>
+</section>
+
+<section id="code">
+<h2>Code / pseudocode</h2>
+<p>The driver-side queue logic, reduced to essentials. This is not a real driver: it ignores locking, error handling and timeouts.</p>
+<pre class="code" data-kind="pseudocode" data-lang="c" data-title="queue_pair.c (teaching sketch)"><code>struct nvme_cqe { uint32_t dw0, dw1, dw2, dw3; };   <span class="cm">/* 16 bytes */</span>
+
+struct queue_pair {
+    uint8_t          *sq;          <span class="cm">/* SQ base, size * 64 bytes   */</span>
+    struct nvme_cqe  *cq;          <span class="cm">/* CQ base, size * 16 bytes   */</span>
+    uint16_t size;                 <span class="cm">/* entries (NOT 0's based)    */</span>
+    uint16_t sq_tail;              <span class="cm">/* host-owned                 */</span>
+    uint16_t sq_head;              <span class="cm">/* host's copy, from SQHD     */</span>
+    uint16_t cq_head;              <span class="cm">/* host-owned                 */</span>
+    uint8_t  cq_phase;             <span class="cm">/* expected phase, starts 1   */</span>
+    volatile uint32_t *sq_db, *cq_db;  <span class="cm">/* doorbell MMIO pointers   */</span>
+};
+
+bool sq_full(struct queue_pair *q) {
+    return (uint16_t)((q-&gt;sq_tail + 1) % q-&gt;size) == q-&gt;sq_head;
+}
+
+int submit(struct queue_pair *q, const void *sqe64) {
+    if (sq_full(q)) return -EBUSY;
+    memcpy(q-&gt;sq + q-&gt;sq_tail * 64, sqe64, 64);
+    q-&gt;sq_tail = (q-&gt;sq_tail + 1) % q-&gt;size;
+    wmb();                          <span class="cm">/* SQE must be in memory before the doorbell */</span>
+    writel(q-&gt;sq_tail, q-&gt;sq_db);   <span class="cm">/* posted MWr to SQyTDBL */</span>
+    return 0;
+}
+
+int reap(struct queue_pair *q) {
+    int n = 0;
+    for (;;) {
+        struct nvme_cqe *e = &amp;q-&gt;cq[q-&gt;cq_head];
+        uint32_t dw3 = READ_ONCE(e-&gt;dw3);
+        if (((dw3 &gt;&gt; 16) &amp; 1) != q-&gt;cq_phase) break;   <span class="cm">/* not new */</span>
+        rmb();                      <span class="cm">/* read the rest only after seeing P */</span>
+        q-&gt;sq_head = e-&gt;dw2 &amp; 0xFFFF;                  <span class="cm">/* SQHD frees SQ slots */</span>
+        complete_command(dw3 &amp; 0xFFFF, dw3 &gt;&gt; 17, e-&gt;dw0);
+        if (++q-&gt;cq_head == q-&gt;size) { q-&gt;cq_head = 0; q-&gt;cq_phase ^= 1; }
+        n++;
+    }
+    if (n) writel(q-&gt;cq_head, q-&gt;cq_db);              <span class="cm">/* posted MWr to CQyHDBL */</span>
+    return n;
+}</code></pre>
+<p>Note the <code>rmb()</code> after checking the phase tag: on weakly ordered CPUs the host must not read the CQE's other Dwords before confirming the phase, or it could combine a fresh phase bit with stale contents. On x86 this is a compiler barrier only; on Arm it is a real barrier.</p>
+</section>
+
+<section id="worked">
+<h2>Worked example</h2>
+<p><strong>Problem.</strong> A variant of the Lab SSD (not the canonical CAP from Chapter 24) reports CAP = 0x0000_0020_2803_03FF. The driver creates I/O CQ1 and SQ1 with Queue Size = 3FFh, maps SQ1 to CQ1 with interrupt vector 1, and submits commands. At some moment the host's view is: SQ1 tail = 1020, last SQHD seen = 1018; CQ1 head = 1022, expected phase = 1. The controller then posts four CQEs. Answer: (a) how many entries do the queues have; (b) is SQ1 full; (c) where do the four CQEs land and with which phase; (d) what will the host write to CQ1HDBL after reaping all four?</p>
+<p><strong>(a)</strong> CAP.MQES = bits 15:00 = 03FFh, 0's based → 1024 entries maximum. Queue Size 3FFh → 1024 entries each. CAP bit 16 (CQR) = 1 → the queues must be contiguous, so PC = 1 in both create commands. CAP bits 18:17 (AMS) = 01b → weighted round robin with urgent priority class is supported. CAP bits 31:24 (TO) = 28h. DSTRD (bits 35:32) = 0.</p>
+<p><strong>(b)</strong> Entries in use from the host's view = (1020 − 1018 + 1024) mod 1024 = 2. Full would need (1020 + 1) mod 1024 = 1018 — false. The SQ has 1021 free slots (1023 usable − 2).</p>
+<p><strong>(c)</strong> The controller's tail matches the host's head at 1022 (the host had consumed everything). The four CQEs go to slots 1022, 1023, 0, 1. Slots 1022 and 1023 are written with the current phase; the tail then wraps and the phase inverts. What is the current phase? The host expects 1 at 1022, so the controller writes P = 1 into 1022 and 1023, then P = 0 into slots 0 and 1. Addresses: 0x1_2341_0000 + 1022 × 16 = 0x1_2341_3FE0, then 0x3FF0, then 0x0000, then 0x0010.</p>
+<p><strong>(d)</strong> The host consumes 1022 (P = 1 ✓), 1023 (P = 1 ✓, head wraps to 0, expected phase becomes 0), slot 0 (P = 0 ✓), slot 1 (P = 0 ✓), then slot 2 has P = 1 from the previous pass — stop. Head = 2, so the host writes 0x0000_0002 to CQ1HDBL at BAR0 + 0x100C.</p>
+</section>
+
+<section id="mistakes">
+<h2>Common mistakes</h2>
+<table>
+<caption>Queue mistakes and how they show up</caption>
+<thead><tr><th>Mistake</th><th>Symptom</th><th>Evidence</th></tr></thead>
+<tbody>
+<tr><td>Treating MQES or a Queue Size field as a count (forgetting 0's based)</td><td>Create command fails with Invalid Queue Size, or the host overruns queue memory by one slot</td><td>CQE status of the create command; the slot beyond the allocation being written</td></tr>
+<tr><td>Not inverting the expected phase when the host's head wraps</td><td>After the first wrap the host sees nothing new; commands "time out" while CQEs sit in memory</td><td>CQE MWr TLPs present on the link with P = 0; no CQ head doorbell afterwards</td></tr>
+<tr><td>Not zeroing CQ memory before creation</td><td>Phantom completions on the first pass (old entries with P = 1)</td><td>Host reaps CIDs it never submitted, before any CQE MWr appears on the link</td></tr>
+<tr><td>Reusing an SQ slot as soon as the command was sent</td><td>Corrupted commands; controller fetches half-overwritten SQEs</td><td>SQE fetch payload differs from what the driver logged for that CID</td></tr>
+<tr><td>Assuming completion order = submission order</td><td>Wrong buffer completed; data integrity "bugs"</td><td>CQE CID sequence out of order relative to submission</td></tr>
+<tr><td>Sizing a shared CQ by one SQ's depth</td><td>Throughput collapse and stalls under load</td><td>Gaps where SQ doorbells continue but CQE posts pause until a CQ head doorbell appears</td></tr>
+<tr><td>Ignoring SQHD and computing SQ space from submitted − completed</td><td>Works until the controller fetches ahead; then overestimates or underestimates free space</td><td>SQHD values in CQEs not matching the driver's internal head</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="debugging">
+<h2>Debugging connection</h2>
+<p>Most queue bugs reduce to one question: <em>which side's view of which index is wrong?</em> A disciplined approach:</p>
+<ol>
+<li><strong>Reconstruct each index from evidence.</strong> SQ tail: last value written to SQyTDBL. SQ head: highest SQE address fetched, or the latest SQHD in a CQE. CQ tail: address of the latest CQE written. CQ head: last value written to CQyHDBL.</li>
+<li><strong>Check them against the full/empty rules.</strong> Is the controller's CQ full given the last published head? Has the SQ tail moved past the head by more than size − 1?</li>
+<li><strong>Check the phase.</strong> Decode bit 16 of DW3 in each CQE write. Does it invert exactly when the CQE address wraps back to the CQ base?</li>
+<li><strong>Check ownership.</strong> Any host write to a doorbell offset belonging to a queue that does not exist? Any CQE written outside the CQ's memory?</li>
+</ol>
+<aside class="callout debug">
+<p>The "stuck after exactly one queue's worth of I/O" symptom almost always points to a wrap bug: phase not inverted, head not published, or modulo arithmetic done with the 0's based size. Count the completions before the hang; if the count equals the queue size or size − 1, look at wrap handling first.</p>
+</aside>
+</section>
+
+<section id="senior">
+<h2>Senior engineer insight</h2>
+<ul>
+<li><strong>The queue is a contract about ownership, not a data structure.</strong> When reviewing a driver or firmware change, ask for every write: "does this agent own this index?" Most queue bugs violate that rule.</li>
+<li><strong>The CQ is the backpressure point.</strong> A controller can always fetch; it cannot always post. If a design shares CQs, compute the worst case explicitly.</li>
+<li><strong>SQHD is the only truth about SQ space.</strong> Drivers that infer free space from their own bookkeeping work until a controller fetches ahead of execution — which good controllers do.</li>
+<li><strong>Arbitration is about fetch, not service.</strong> Customers who enable weighted round robin and expect strict latency isolation are often disappointed: once commands are fetched, the back end decides.</li>
+<li><strong>Per-core queues are a scalability tool with a cost.</strong> Each queue consumes controller resources and an interrupt vector; on a 256-core host with a device offering 64 queues, the driver shares queues among cores, and that mapping affects tail latency.</li>
+<li><strong>The phase tag is also a coherency test.</strong> If your platform does not keep device writes coherent with CPU caches (some embedded systems), the host may read a stale P forever. That looks like a device hang.</li>
+</ul>
+</section>
+
+<section id="lab">
+<h2>Lab</h2>
+<h3>Lab: Simulate a queue pair across wraps and break it on purpose</h3>
+<aside class="callout safety"><p><span class="badge safe">Safe lab</span> Pure software simulation. No device access.</p></aside>
+<h4>Objective</h4>
+<p>Watch the four indices and the phase tag evolve across several wraps, then introduce classic bugs and observe the symptoms.</p>
+<h4>Skills</h4>
+<p>Circular-queue arithmetic; phase-tag reasoning; ownership discipline; reading index state from evidence.</p>
+<h4>Hardware required</h4>
+<p>None.</p>
+<h4>Software required</h4>
+<p>Python 3.8 or later, standard library only.</p>
+<h4>Input</h4>
+<p>A queue pair of 4 entries; rounds of "host submits as many as fit, rings the doorbell; controller posts up to 2 completions; host reaps".</p>
+<h4>Expected output</h4>
+<p>One line per action showing SQ head/tail, CQ head/tail, the P bits of the four CQ slots, and the host's expected phase.</p>
+<h4>Background</h4>
+<p>Everything in the engineering explanation: ownership, full rule, phase tag, SQHD.</p>
+<h4>Step 1 — Run the simulator</h4>
+<pre class="code" data-kind="executable" data-lang="python" data-title="queue_ring_sim.py"><code>#!/usr/bin/env python3
+"""Synthetic NVMe queue-pair simulator for teaching (not a driver).
+
+Models one SQ and one CQ with N entries each, the four indices
+(SQ tail/CQ head owned by the host, SQ head/CQ tail owned by the
+controller), and the CQE phase tag.
+"""
+
+class QueuePair:
+    def __init__(self, entries):
+        self.n = entries
+        self.sq = [None] * entries          # SQ slots (command ids)
+        self.cq = [(0, None)] * entries      # CQ slots: (phase, cid); memory zeroed
+        self.sq_tail = 0      # host-owned, published through the SQ tail doorbell
+        self.sq_head = 0      # controller-owned, reported back in CQE SQHD
+        self.cq_tail = 0      # controller-owned, never visible as a register
+        self.cq_head = 0      # host-owned, published through the CQ head doorbell
+        self.ctrl_phase = 1   # phase the controller writes on this pass
+        self.host_phase = 1   # phase the host expects for a new entry
+        self.host_sq_head = 0 # host's latest knowledge of SQ head (from SQHD)
+        self.doorbell_sq = 0  # last value written to SQ tail doorbell
+        self.doorbell_cq = 0  # last value written to CQ head doorbell
+
+    # ---------------- host side
+    def sq_full(self):
+        return (self.sq_tail + 1) % self.n == self.host_sq_head
+
+    def submit(self, cid):
+        if self.sq_full():
+            return False
+        self.sq[self.sq_tail] = cid
+        self.sq_tail = (self.sq_tail + 1) % self.n
+        return True
+
+    def ring_sq_doorbell(self):
+        self.doorbell_sq = self.sq_tail
+
+    def reap(self):
+        """Consume every new CQE; return list of (slot, cid, sqhd)."""
+        done = []
+        while True:
+            phase, entry = self.cq[self.cq_head]
+            if phase != self.host_phase:
+                break
+            cid, sqhd = entry
+            done.append((self.cq_head, cid, sqhd))
+            self.host_sq_head = sqhd
+            self.cq_head = (self.cq_head + 1) % self.n
+            if self.cq_head == 0:
+                self.host_phase ^= 1
+        if done:
+            self.doorbell_cq = self.cq_head
+        return done
+
+    # ---------------- controller side
+    def fetch_and_complete(self, max_cmds):
+        posted = 0
+        while self.sq_head != self.doorbell_sq and posted &lt; max_cmds:
+            if (self.cq_tail + 1) % self.n == self.doorbell_cq:
+                break                         # CQ full: must not post
+            cid = self.sq[self.sq_head]
+            self.sq_head = (self.sq_head + 1) % self.n
+            self.cq[self.cq_tail] = (self.ctrl_phase, (cid, self.sq_head))
+            self.cq_tail = (self.cq_tail + 1) % self.n
+            if self.cq_tail == 0:
+                self.ctrl_phase ^= 1
+            posted += 1
+        return posted
+
+    def show(self, note):
+        bits = "".join(str(p) for p, _ in self.cq)
+        print(f"{note:&lt;34} SQ h/t={self.sq_head}/{self.sq_tail} "
+              f"CQ h/t={self.cq_head}/{self.cq_tail} CQ P-bits={bits} "
+              f"host expects P={self.host_phase}")
+
+
+if __name__ == "__main__":
+    qp = QueuePair(4)
+    qp.show("start (memory zeroed)")
+    cid = 0x10
+    for rnd in range(1, 5):
+        sent = 0
+        while qp.submit(cid):
+            cid += 1
+            sent += 1
+        qp.ring_sq_doorbell()
+        qp.show(f"round {rnd}: submitted {sent}, doorbell")
+        qp.fetch_and_complete(2)
+        qp.show(f"round {rnd}: controller posted CQEs")
+        got = qp.reap()
+        qp.show(f"round {rnd}: host reaped {[hex(c) for _, c, _ in got]}")</code></pre>
+<p>The first lines of output should read (illustrative of this script's deterministic behaviour):</p>
+<pre class="code" data-kind="simulation" data-lang="text"><code>start (memory zeroed)              SQ h/t=0/0 CQ h/t=0/0 CQ P-bits=0000 host expects P=1
+round 1: submitted 3, doorbell     SQ h/t=0/3 CQ h/t=0/0 CQ P-bits=0000 host expects P=1
+round 1: controller posted CQEs    SQ h/t=2/3 CQ h/t=0/2 CQ P-bits=1100 host expects P=1
+round 1: host reaped ['0x10', '0x11'] SQ h/t=2/3 CQ h/t=2/2 CQ P-bits=1100 host expects P=1
+round 2: submitted 2, doorbell     SQ h/t=2/1 CQ h/t=2/2 CQ P-bits=1100 host expects P=1
+round 2: controller posted CQEs    SQ h/t=0/1 CQ h/t=2/0 CQ P-bits=1111 host expects P=1
+round 2: host reaped ['0x12', '0x13'] SQ h/t=0/1 CQ h/t=0/0 CQ P-bits=1111 host expects P=0</code></pre>
+<h4>Step 2 — Break the phase inversion</h4>
+<p>In <code>reap()</code>, delete the line <code>self.host_phase ^= 1</code>. Run again. Record the round in which the host stops reaping and what the P bits look like at that moment.</p>
+<h4>Step 3 — Break the CQ head doorbell</h4>
+<p>Restore the phase line. In <code>reap()</code>, delete <code>self.doorbell_cq = self.cq_head</code>. Run again and record how many completions the controller manages to post before it refuses.</p>
+<h4>Observation</h4>
+<p>Write down, for each broken variant, the index values at the moment progress stops, and which side "looks guilty" from the outside.</p>
+<h4>Questions</h4>
+<ol>
+<li>Why does round 1 submit only 3 commands into a 4-entry SQ?</li>
+<li>In round 2, why can the host submit 2 more commands even though only 2 of the first 3 have completed?</li>
+<li>In Step 2, which CIDs are sitting in the CQ unconsumed when progress stops?</li>
+<li>In Step 3, how many completions are posted in total, and why that number?</li>
+</ol>
+<h4>Challenge</h4>
+<p>Change the controller to post completions in reverse order of the fetched batch (out-of-order completion). Does anything in the host logic break? What must the host use, instead of slot position, to find the command each CQE belongs to?</p>
+<details class="hint"><summary>Hints</summary><p>For question 2, look at what <code>host_sq_head</code> is set to from SQHD. For Step 3, compute the CQ full condition with the doorbell value stuck at 0.</p></details>
+<details class="solution"><summary>Solution</summary>
+<p><strong>Q1.</strong> The full rule leaves one slot empty: with head 0, the host can fill slots 0, 1, 2; writing slot 3 would make tail 0 = head, indistinguishable from empty.</p>
+<p><strong>Q2.</strong> The controller fetched up to its head 2 but posted only two CQEs, each carrying SQHD = 1 then 2. The host sets its SQ-head copy to 2, so slots 0 and 1 are free — even though the third command (slot 2) has not completed. SQ space is freed by <em>fetch</em> (SQHD), not by completion. In this simulation fetch and completion happen together, so SQHD reflects that; in a real controller SQHD can run ahead of completions.</p>
+<p><strong>Step 2.</strong> The host reaps 0x10–0x13 in rounds 1–2. In round 3 the controller posts 0x14 and 0x15 into slots 0 and 1 with P = 0, but the host still expects P = 1, sees 0, and stops. P bits become 0011, host expects 1 — nothing is ever reaped again. From outside, the device "looks guilty" (commands never complete), but a trace would show the CQE writes. CIDs 0x14 and 0x15 sit unconsumed.</p>
+<p><strong>Step 3.</strong> The controller's view of the CQ head stays 0. It posts slots 0, 1, 2 (three CQEs); posting slot 3 would make (3 + 1) mod 4 = 0 = head — full. Three completions in total, then the controller correctly refuses to post. The SQ also stalls, because the host never sees SQHD advance past 3.</p>
+<p><strong>Challenge.</strong> Nothing in the phase logic breaks: the phase depends on CQ slot position, not on which command completed. The host must use the CID (and SQID for shared CQs) to find the command, never the slot number.</p>
+</details>
+<h4>What a senior engineer notices</h4>
+<p>Both bugs produce the same outward symptom — a hang after about one queue's worth of I/O — but opposite evidence: the phase bug shows CQE writes with no CQ head doorbell; the doorbell bug shows the controller going silent after exactly size − 1 CQEs. One analyzer filter (CQ base range plus doorbell range) separates them in seconds.</p>
+<h4>Failure variants</h4>
+<ul>
+<li>Do modulo arithmetic with the 0's based size (e.g. <code>% 3</code> for a 4-entry queue): the last slot is never used and the phase flips one slot early.</li>
+<li>Initialise <code>host_phase = 0</code>: the host immediately reaps every zeroed slot as a completion.</li>
+<li>Skip zeroing of CQ memory (initialise slots with P = 1): phantom completions on the first pass.</li>
+</ul>
+<h4>Extension</h4>
+<p>Add a second SQ that maps to the same CQ. Give the CQ 4 entries and each SQ 4 entries. Find a submission pattern that fills the CQ and stalls the controller even though neither SQ is full. Then size the CQ so that it can never happen.</p>
+</section>
+
+<section id="exercises">
+<h2>Exercises</h2>
+<ol>
+<li>A CQ has 8 entries. The host's head is 6 and it expects P = 0. Slots 6, 7, 0, 1 contain P = 0, 0, 1, 1. How many new entries are there, and what is the host's expected phase after consuming them? <details class="answer"><summary>Answer</summary><p>Slots 6 and 7 are new (P = 0). Head wraps to 0 and the expected phase becomes 1. Slots 0 and 1 have P = 1 — they are also new (the controller has wrapped too). Slot 2 must be checked: if it has P = 0, stop. So at least 4 new entries, and after consuming them the expected phase is 1 with head at 2 (or further).</p></details></li>
+<li>CAP.MQES = 003Fh. What is the largest Queue Size value the host may put in Create I/O SQ, and how many commands can that queue hold at once? <details class="answer"><summary>Answer</summary><p>MQES 3Fh → 64 entries. Queue Size field 3Fh (0's based, 64 entries). It holds at most 63 commands simultaneously.</p></details></li>
+<li>Explain in two sentences why there is no "CQ tail doorbell". <details class="answer"><summary>Answer</summary><p>The CQ tail is owned by the controller, and the host learns about new entries from the phase tag in memory. A doorbell is how the host tells the controller about indices the host owns, so only the SQ tail and CQ head have doorbells.</p></details></li>
+<li>Three SQs (each 256 entries) share one CQ. What minimum CQ size guarantees that the controller can never find the CQ full, assuming the host never has more commands outstanding than the SQ full rule permits? <details class="answer"><summary>Answer</summary><p>If the driver caps each SQ at 255 outstanding commands (the most a 256-slot SQ can hold), up to 765 completions can be pending at once. A CQ holds N − 1 entries, so it needs at least 766 slots. Careful: because SQHD frees SQ slots at fetch time, a driver could in principle have more commands outstanding than its SQ holds; the real bound is the driver's own limit on outstanding commands (its tag count), and the CQ must be sized from that.</p></details></li>
+<li>A driver uses weighted round robin and puts its latency-sensitive queue in the Urgent class. List two reasons why latency might still be poor. <details class="answer"><summary>Answer</summary><p>Arbitration governs fetch only — commands already inside the controller from other queues still compete for media; and the Arbitration Burst may let a low-priority queue fetch several commands in a burst once selected. Also the controller may not prioritise internally, and host-side queuing (blk-mq) happens before the SQ.</p></details></li>
+</ol>
+</section>
+
+<section id="quiz">
+<h2>Quiz</h2>
+<ol class="quiz">
+<li><p>Which agent owns the SQ head?</p>
+<ul class="options" data-answer="2"><li>The host driver</li><li>The NVMe controller</li><li>The root complex</li><li>Whichever wrote the last doorbell</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The controller consumes the SQ, so it advances the SQ head, and reports it in the SQHD field of each CQE.</p></details></li>
+<li><p>A queue has 16 slots, head 9, tail 8. It is:</p>
+<ul class="options" data-answer="3"><li>Empty</li><li>Holding 1 entry</li><li>Full</li><li>Invalid</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>(8 + 1) mod 16 = 9 = head → full, with 15 entries in use.</p></details></li>
+<li><p>CAP.MQES = 07FFh means each I/O queue may have at most:</p>
+<ul class="options" data-answer="2"><li>2047 entries</li><li>2048 entries</li><li>2049 entries</li><li>4096 entries</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>0's based: 7FFh + 1 = 2048.</p></details></li>
+<li><p>The host finds the CQE at its head has P = 0 but it expects P = 1. What does this mean?</p>
+<ul class="options" data-answer="1"><li>No new completion is there yet</li><li>The command failed</li><li>The controller reset</li><li>The CQ is full</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>A mismatching phase means the entry is from the previous pass (or zeroed memory). Status is a separate field.</p></details></li>
+<li><p>Which mapping is permitted?</p>
+<ul class="options" data-answer="1"><li>SQ1 and SQ2 both complete into CQ1</li><li>SQ1 completes into both CQ1 and CQ2</li><li>The Admin SQ completes into CQ1</li><li>An I/O SQ completes into the Admin CQ</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Many SQs may share one CQ. One SQ has exactly one CQ. The Admin SQ and Admin CQ are a fixed pair.</p></details></li>
+<li><p>CAP.CQR = 1. What must the host do?</p>
+<ul class="options" data-answer="3"><li>Use PRP lists for every queue</li><li>Use 32-entry queues</li><li>Create I/O queues as physically contiguous (PC = 1)</li><li>Disable weighted round robin</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Contiguous Queues Required means the controller does not accept PRP-list-described I/O queues.</p></details></li>
+<li><p>Which arbitration mechanism must every controller support?</p>
+<ul class="options" data-answer="1"><li>Round robin</li><li>Weighted round robin with urgent priority class</li><li>Vendor specific</li><li>Strict priority by queue identifier</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Round robin is mandatory; the others are optional and reported in CAP.AMS.</p></details></li>
+<li><p>Why does a CQE carry SQHD?</p><details class="answer"><summary>Model answer</summary><p>Because the SQ head is owned by the controller and there is no register the host can cheaply read for it. Reporting it in every CQE lets the host know which SQ slots the controller has fetched and may be reused, without any MMIO read.</p></details></li>
+<li><p>On the PCIe link, which queue-related actions are visible, and which are not?</p><details class="answer"><summary>Model answer</summary><p>Visible: doorbell writes (host→device MWr), SQE fetches (device MRd plus root-complex CplD), CQE posts (device MWr), MSI-X interrupts (device MWr). Not visible: the CPU writing SQEs into host memory, the host reading CQEs, and internal head/tail state.</p></details></li>
+<li><p>Explain why a 4-entry CQ that has wrapped twice can be read correctly by a host that never zeroes it again.</p><details class="answer"><summary>Model answer</summary><p>After the first wrap, every slot contains P = 1 from pass 1; the controller writes P = 0 on pass 2 and the host expects 0. After the second wrap, slots contain 0 and the controller writes 1 while the host expects 1. In every pass, the stale value differs from the expected value, so zeroing is only needed once, at creation.</p></details></li>
+</ol>
+</section>
+
+<section id="interview">
+<h2>Interview questions</h2>
+<ol>
+<li><strong>Beginner:</strong> What are the SQ and CQ, and where do they live? <details class="answer"><summary>Model answer</summary><p>Circular arrays in host memory. The SQ holds 64-byte commands written by the host and fetched by the controller; the CQ holds 16-byte completions written by the controller and read by the host. Only the doorbells live in the device.</p></details></li>
+<li><strong>Beginner:</strong> Why is one slot always empty? <details class="answer"><summary>Model answer</summary><p>Because empty is defined as head = tail; a completely full queue would also have head = tail. Leaving one slot unused makes full distinguishable: (tail + 1) mod N = head.</p></details></li>
+<li><strong>Intermediate:</strong> Walk me through the phase tag. <details class="answer"><summary>Model answer</summary><p>CQ memory starts with phase 0. The controller writes P = 1 on the first pass and inverts on every wrap. The host expects 1 initially and inverts its expectation when its head wraps. An entry whose P matches the expectation is new; the first mismatch ends the batch. It replaces a CQ tail register the host would otherwise have to read over PCIe.</p></details></li>
+<li><strong>Intermediate:</strong> How does the host know it may reuse an SQ slot? <details class="answer"><summary>Model answer</summary><p>From the SQHD field of CQEs: the controller reports how far it has fetched. Slots before SQHD are free. Using completion counts instead is wrong when the controller fetches ahead.</p></details></li>
+<li><strong>Advanced:</strong> Why might you map several SQs to one CQ, and what is the risk? <details class="answer"><summary>Model answer</summary><p>To use separate priority classes or more SQs than interrupt vectors/CQs while keeping a single completion path. The risk is CQ overflow pressure: the CQ must absorb the combined outstanding commands of every SQ, or the controller stalls posting and all SQs suffer.</p></details></li>
+<li><strong>Advanced:</strong> A customer says enabling WRR with an urgent queue did not reduce p99 latency. What do you tell them? <details class="answer"><summary>Model answer</summary><p>Arbitration selects which SQ to fetch from; it does not preempt work already fetched or scheduled to media. If background queues are deep, the device back end is saturated and fetch priority helps little. Measure fetch-to-completion versus doorbell-to-fetch latency in a trace to see where time goes; consider limiting background queue depth.</p></details></li>
+<li><strong>Senior:</strong> Design a test plan for queue wrap correctness on a new controller. <details class="answer"><summary>Model answer</summary><p>For queue sizes 2, 3, a power of two, a non-power of two, and MQES+1: run many wraps with mixed batch sizes; vary CQ head doorbell timing (immediate, lazy, near-full); verify phase inversion exactly at slot 0; verify SQHD monotonic modulo size; test shared CQ near full; inject invalid doorbell values and confirm the controller's response; include delete/recreate between runs with non-zeroed memory to catch phase initialisation errors; cross-check every CQE with an analyzer.</p></details></li>
+<li><strong>Senior:</strong> The host hangs after exactly 1023 completions on a 1024-entry queue. Give your top three hypotheses and the one trace filter that separates them. <details class="answer"><summary>Model answer</summary><p>(1) Host does not invert phase on wrap; (2) host never writes CQ head doorbell, so the controller sees a full CQ; (3) host SQ-full logic never learns SQHD and stops submitting. Filter: host→device MWr to the doorbell range plus device→host MWr into the CQ address range. Hypothesis 1 shows CQEs after the wrap with flipped P; 2 shows no CQ head doorbell and CQE posts stop at 1023; 3 shows no new SQ tail doorbells.</p></details></li>
+</ol>
+</section>
+
+<section id="teachback">
+<h2>Teach-back challenge</h2>
+<p>Explain the queue pair three times, out loud or in writing:</p>
+<ul>
+<li><strong>To a child:</strong> the spinning trays, the bell, the coloured stickers that change every time round.</li>
+<li><strong>To a junior engineer:</strong> the four indices and their owners, the full/empty rule, the phase tag, SQHD — in under two minutes, with a ring diagram.</li>
+<li><strong>To a senior engineer:</strong> why the design needs no register reads on the fast path, where backpressure lives (the CQ), and what a trace can and cannot prove about queue state.</li>
+</ul>
+<details class="answer"><summary>Model explanation for the senior engineer</summary><p>NVMe's queue pair is a single-producer/single-consumer ring in each direction, with ownership split so that each side only writes indices it owns. The host publishes its two indices with posted MMIO writes; the controller publishes its SQ head in-band in CQEs and its CQ tail implicitly through the phase tag. No non-posted MMIO read is needed on the I/O path. Backpressure lives in the CQ: the controller can always fetch but must not post into a full CQ, so CQ sizing and timely head doorbells bound throughput. A trace shows published indices (doorbell values) and controller actions (fetch and post addresses) but never host memory accesses; you reconstruct state, you don't observe it.</p></details>
+</section>
+
+<section id="summary">
+<h2>Chapter summary</h2>
+<p>NVMe communicates through circular Submission and Completion Queues in host memory. The host owns the SQ tail and CQ head and publishes them through doorbell writes; the controller owns the SQ head (reported in CQE SQHD) and CQ tail (implied by the phase tag). A queue is empty when head = tail and full when tail + 1 = head with wrap, so N slots hold N − 1 entries. MQES gives the maximum queue size as a 0's based value; CQR says whether I/O queues must be contiguous. Queues are usually created per CPU; several SQs may share one CQ; arbitration (round robin, optionally weighted round robin with an urgent class) chooses which SQ to fetch from. On the link, queues appear only as doorbell writes, SQE fetches, CQE posts and interrupts.</p>
+<aside class="callout mastery">
+<p>Do not move on until you can:</p>
+<ul class="checklist">
+<li>state the owner of each of the four indices and how the other side learns it</li>
+<li>apply the full and empty rules and compute entries in use for any head/tail pair</li>
+<li>walk a CQ through two wraps with the phase tag without notes</li>
+<li>decode MQES and CQR from a CAP value</li>
+<li>explain many-to-one SQ-to-CQ mapping and its sizing consequence</li>
+<li>describe round robin and weighted round robin with urgent priority class, and what arbitration does not control</li>
+<li>identify doorbell, fetch, CQE and interrupt TLPs in a synthetic trace and reconstruct queue state from them</li>
+</ul>
+</aside>
+</section>
+
+<section id="next">
+<h2>Further reading and next chapter</h2>
+<ul>
+<li><cite class="spec">NVM Express Base Specification, Revision 2.4 — queueing model, Controller Registers (CAP, CC), Admin Command Set (Create/Delete I/O queues, Set Features Arbitration and Number of Queues)</cite></li>
+<li><cite class="spec">NVM Express over PCIe Transport Specification, Revision 1.4 — queue memory and doorbell mapping</cite></li>
+<li>Linux kernel source: <code>drivers/nvme/host/pci.c</code> (queue allocation, phase handling, doorbells) and the block layer's blk-mq documentation (<code>Documentation/block/blk-mq.rst</code>).</li>
+<li>Deeper: <a href="dd25.html">Module 25 — Admin Queues</a>, <a href="dd26.html">Module 26 — I/O Queues</a>, and the <a href="tool-queue-sim.html">Submission/Completion Queue Simulator</a>.</li>
+</ul>
+<p><strong>Next:</strong> <a href="ch26.html">Chapter 26 — Admin Queue</a>, where you build the first queue pair from nothing but three registers.</p>
+</section>

@@ -1,0 +1,688 @@
+<p class="lead">This module takes NVMe over Remote Direct Memory Access (NVMe/RDMA) past the happy path. <a href="ch67.html">Chapter 67</a> taught the objects (queue pairs, memory regions, keys) and the basic read and write flows. Here you study the queue pair as a <em>failure domain</em>: its state machine, the limits that throttle it (receive credits, RDMA READ depth, memory-region pools), the network behaviour that starves it, and the races between host timeouts and late remote access. Every trace on this page is new, and every lab is harder than the chapter's.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p>Chapter 67 answered "how does an NVMe command travel over RDMA?" This module answers "why did a perfectly correct NVMe/RDMA setup stall, slow down or reconnect, and how do you prove which layer did it?" You will follow one Reliable Connected (RC) queue pair (QP) through its whole life, from Connection Manager exchange to error state and back; quantify how RDMA READ depth caps write throughput; read congestion signals (Explicit Congestion Notification (ECN), Congestion Notification Packets (CNPs) and Priority Flow Control (PFC) pauses) as performance evidence; and untangle the most dangerous ambiguity in the transport: a host that gave up on a command while the target was still about to touch its buffer.</p>
+  <aside class="callout prereq">
+    <ul>
+      <li><a href="ch67.html">NVMe/RDMA</a>: queue pairs, memory registration, keyed SGL descriptors (40h and 4Fh), SEND with Invalidate, RDMA_CM private data, the Soft-RoCE lab. This module assumes all of it.</li>
+      <li><a href="ch65.html">NVMe-oF Mental Model</a>: capsules, the Connect command, association.</li>
+      <li><a href="ch37.html">Scatter Gather Lists</a>: Segment and Last Segment descriptors, which you will decode inside a capsule.</li>
+      <li><a href="dd50.html">NVMe/TCP module</a>: the companion transport module; we contrast loss recovery and flow control with it.</li>
+      <li><a href="ch16.html">PCIe Flow Control</a>: credit-based flow control, the comparison point for RDMA receive credits.</li>
+    </ul>
+  </aside>
+  <p>Where it goes next: <a href="ch68.html">Fabric Architecture</a> zooms out to discovery, multipathing and keep alive, which decide what the host <em>does</em> after the QP failures you learn to diagnose here. <a href="dd53.html">Performance Engineering</a> generalises the bandwidth-delay arithmetic you apply to RDMA READ.</p>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives by level</caption>
+    <thead><tr><th>Level</th><th>You can…</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Name the RC QP states and say which ones can carry NVMe traffic; explain why one QP error affects every command on that NVMe queue.</td></tr>
+      <tr><td>Intermediate</td><td>Decode a capsule whose SGL is a Last Segment descriptor pointing to several Keyed SGL Data Block descriptors, and check the total against the command's data length and the controller's Maximum SGL Data Block Descriptors (MSDBD).</td></tr>
+      <tr><td>Advanced</td><td>Compute the write throughput ceiling set by RDMA READ depth (initiator depth and responder resources) and round-trip time, and recognise it in a capture.</td></tr>
+      <tr><td>Senior</td><td>Explain the timeout/invalidation race, decide whether a remote access error was caused by the host or the target, and specify the host behaviour that makes the race safe.</td></tr>
+      <tr><td>Trace analysis</td><td>Follow Packet Sequence Numbers (PSNs), acknowledgements and NAKs across a capture; separate the RDMA transport timeline from the NVMe timeline; find the first abnormal event when the symptom is a reconnect minutes later.</td></tr>
+      <tr><td>Debugging</td><td>Classify a failure by its work-completion status (remote access, retry exceeded, RNR retry exceeded, flush) and pick the first and second check for each.</td></tr>
+      <tr><td>Validation</td><td>Design tests for queue-pair error containment, memory-region exhaustion, congestion and loss, and late-access-after-timeout, with observable pass/fail criteria.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>Two castles stand on opposite hills, joined by a zip line. Each castle has a signal tower. When the left castle wants something, a messenger writes a note and clips it to the zip line. The right castle has a row of baskets ready to catch notes; each basket catches one note. If no basket is ready, the note bounces back and the messenger must wait and try again.</p>
+    <p>Every note gets a number: 1, 2, 3. The catcher shouts back "got up to 5!" If the catcher sees note 7 arrive after note 5, she shouts "I missed 6!" and the sender re-sends everything from 6, even notes that arrived fine.</p>
+    <p>Some notes are special: "Bring me the treasure from chest 12, here is the chest's secret word." The right castle's crane swings over and lifts the treasure out of chest 12 itself. But the crane can only carry four loads at once, so a huge treasure takes many trips.</p>
+    <p>And if anyone ever sends a wrong secret word, the zip line is cut. Every note on it is lost, and the castles must build a new line before they can talk again.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <aside class="callout breaks">
+    <p><strong>What it represents.</strong> The zip line is one RC queue pair. The catching baskets are posted receive buffers; a bounced note is a Receiver Not Ready (RNR) NAK. Numbered notes and "I missed 6" are PSNs and go-back-N retransmission. The crane is the target's RDMA READ engine, limited in how many reads it may have outstanding. The secret word is the remote key (rkey). Cutting the line is the QP entering the Error state, flushing all outstanding work.</p>
+    <p><strong>What it hides.</strong> The two castles each have their <em>own</em> crane limits, negotiated when the line is built (initiator depth on one side must fit responder resources on the other). Notes are not just messages: the NVMe completion rides inside one. The castle's guards (the host RNIC) check every crane load against the secret word, its bounds and its permissions, not just the word. And the hills are not alone: many zip lines share the same valley wind (switch buffers), so one castle's traffic can slow another's.</p>
+    <p><strong>Where it misleads.</strong> Cutting the line sounds like a dramatic, rare event. In practice a QP error is the transport's <em>normal</em> way of reporting any fatal problem, including a host bug that has nothing to do with the network. The story also suggests that a lost note is noticed immediately; in RoCE v2 a lost final packet is only noticed when a timer expires, which is where long latency spikes come from. Finally, a cut line in the story loses notes; in RDMA the data the crane already delivered stays delivered, even if no completion ever arrives. That last point is the root of the hardest ambiguity in this module.</p>
+  </aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <p>Terms from Chapter 67 (QP, MR, rkey, SEND, RDMA READ/WRITE, RDMA_CM) are assumed. These are the terms this module adds.</p>
+  <table>
+    <caption>Module vocabulary</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship to adjacent terms</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="qp-state">QP state</span></td><td>Whether the line is usable</td><td>The verbs QP state machine: Reset, Init, Ready to Receive (RTR), Ready to Send (RTS), Send Queue Drained (SQD), Send Queue Error (SQE), Error</td><td>NVMe traffic needs RTS on both sides; RDMA_CM drives the transitions</td><td>"SQE" here is a QP state, not an NVMe Submission Queue Entry</td></tr>
+      <tr><td><span class="g" data-term="psn">PSN</span></td><td>Note number</td><td>24-bit Packet Sequence Number in the Base Transport Header (BTH), per QP and direction</td><td>ACKs and NAKs name a PSN; go-back-N restarts from it</td><td>Not an NVMe Command Identifier (CID); one command spans several PSNs</td></tr>
+            <tr><td>Local ACK timeout, retry count, RNR retry</td><td>How long to wait, and how many tries</td><td>QP attributes: the timer after which unacknowledged requests are retransmitted, and the budgets for transport and RNR retries; exhaustion moves the QP to Error</td><td>Exhaustion yields "retry exceeded" or "RNR retry exceeded" work-completion statuses</td><td>In verbs, an RNR retry value of 7 is commonly documented as "retry forever" <span class="badge uncertain">Uncertain</span>: confirm in your verbs documentation</td></tr>
+      <tr><td><span class="g" data-term="rdma-read-depth">Initiator depth / responder resources</span></td><td>How many crane loads at once</td><td>Maximum RDMA READs one side may have outstanding (initiator depth, ORD) and may serve concurrently (responder resources, IRD); negotiated in RDMA_CM</td><td>Caps NVMe/RDMA write throughput through the bandwidth-delay product</td><td>Unrelated to NVMe queue depth; a QD of 128 can still have only a few READs in flight</td></tr>
+      <tr><td><span class="g" data-term="srq">Shared Receive Queue (SRQ)</span></td><td>One pile of baskets for many lines</td><td>A receive-buffer pool shared by many QPs on the target</td><td>Saves memory; starvation hits every QP at once</td><td>An SRQ does not change the NVMe queue sizes the host was promised</td></tr>
+      <tr><td><span class="g" data-term="frwr">Fast registration (FRWR)</span></td><td>Unlocking one shelf per job</td><td>Fast Registration Work Request: maps a request's scatterlist into a pre-allocated MR with a fresh key, posted on the send queue</td><td>Paired with Local Invalidate or remote invalidation</td><td>A failed registration is a local error; the target never sees it</td></tr>
+            <tr><td><span class="g" data-term="msdbd">MSDBD</span></td><td>How many shelf addresses per note</td><td>Identify Controller field: Maximum SGL Data Block Descriptors the controller accepts per command</td><td>Limits multi-descriptor keyed SGLs; 0 or 1 forces a single key per command</td><td>Not a byte limit; Maximum Data Transfer Size (MDTS) limits bytes</td></tr>
+      <tr><td>IOCCSZ / IORCSZ</td><td>Size of the note and of the reply</td><td>Identify Controller fields: I/O Queue Command Capsule Supported Size and I/O Queue Response Capsule Supported Size, in 16-byte units</td><td>IOCCSZ − 4 (the 64-byte SQE) leaves room for in-capsule data or in-capsule SGL lists</td><td>Receive buffers must be at least this large or SENDs fail locally at the target</td></tr>
+      <tr><td><span class="g" data-term="pfc">PFC</span></td><td>"Stop sending this colour for a moment"</td><td>Priority Flow Control (IEEE 802.1Qbb): per-priority pause frames that make one Ethernet traffic class lossless</td><td>Prevents the loss that RoCE handles badly; can spread congestion</td><td>A link-level hop-by-hop mechanism, not end-to-end</td></tr>
+      <tr><td><span class="g" data-term="ecn">ECN</span> / <span class="g" data-term="cnp">CNP</span></td><td>"Slow down, it's getting crowded"</td><td>Switches mark IP ECN bits; the receiving RNIC returns Congestion Notification Packets to the sender, which lowers its rate</td><td>Basis of rate-control algorithms such as Data Center Quantized Congestion Notification (<span class="g" data-term="dcqcn">DCQCN</span>), implemented in RNICs with vendor-specific parameters</td><td>A CNP is not an error; rising CNPs are a performance signal</td></tr>
+                            </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <p>The architecture of one NVMe/RDMA I/O queue, with every resource that can run out drawn as a box. Synthetic example for teaching; addresses and QP numbers continue Chapter 67 (host 192.0.2.10, host QPN 0x00011A; target 192.0.2.20, target QPN 0x000233).</p>
+  <figure>
+    <pre class="diagram">
+ HOST (nvme-rdma)                                         TARGET (nvmet-rdma or array firmware)
+ +-----------------------------------------+              +------------------------------------------+
+ | NVMe queue 1: depth 128 (HSQSIZE)       |              | receive buffers: CRQSIZE capsules        |
+ | MR pool: 128 MRs, max 256 pages each    |              |   (per QP, or from an SRQ shared by QPs) |
+ | response receives: HRQSIZE buffers      |              | RDMA READ engine: initiator depth = 16   |
+ | send queue: SEND + FRWR + LOCAL_INV WRs |              | staging buffers / CMB for write data     |
+ +--------------------+--------------------+              +--------------------+---------------------+
+                      | verbs                                                  | verbs
+ +--------------------v--------------------+   RoCE v2    +--------------------v---------------------+
+ | host RNIC: QP 0x00011A  state RTS       |&lt;------------&gt;| target RNIC: QP 0x000233  state RTS      |
+ |  responder resources (IRD) = 16         |  PSNs, ACK,  |  local ACK timeout, retry count,         |
+ |  MR table: rkey -&gt; IOVA, bounds, rights |  NAK, CNP    |  RNR retry, path MTU 4096               |
+ +--------------------+--------------------+              +--------------------+---------------------+
+                      | PCIe (IOVA via IOMMU)                                  | PCIe
+              host memory buffers                              Lab SSD 0000:01:00.0 (local NVMe/PCIe)
+                                     |                                   |
+                       switch port: PFC on priority 3, ECN marking, shared buffer
+    </pre>
+    <figcaption>Every box labelled with a number is a finite resource. Synthetic example; queue sizes, pool sizes and depths are illustrative and implementation-dependent.</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture inventory for one NVMe/RDMA queue</caption>
+    <thead><tr><th>Aspect</th><th>Host side</th><th>Target side</th><th>Network</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>Block requests (scatterlists), NVMe commands</td><td>Command capsules (SEND payloads)</td><td>Ethernet/IP frames, RoCE v2 on UDP 4791</td></tr>
+      <tr><td>Outputs</td><td>Completed requests with status</td><td>Response capsules, data placed or fetched</td><td>Delivered packets, ACK/NAK, CNP, pause frames</td></tr>
+      <tr><td>Actors</td><td>nvme-rdma driver, host RNIC, IOMMU</td><td>NVMe target software or firmware, target RNIC, back-end SSDs</td><td>Switches, their buffers and queueing policies</td></tr>
+      <tr><td>State</td><td>QP state, outstanding commands, MR ownership per command, invalidation status</td><td>QP state, received-but-unexecuted commands, READs in flight</td><td>Per-priority queue occupancy, pause state</td></tr>
+      <tr><td>Memory</td><td>I/O buffers (pinned, registered), capsule and response buffers</td><td>Receive buffers, staging buffers or Controller Memory Buffer (CMB)</td><td>Switch packet buffers</td></tr>
+      <tr><td>Registers</td><td>RNIC doorbells (vendor-specific BAR offsets), MR and QP context in RNIC memory</td><td>Same, plus the back-end SSD's NVMe registers (CAP, CC, CSTS, doorbells from BAR0 + 0x1000)</td><td>Switch configuration (priority maps, thresholds)</td></tr>
+      <tr><td>Interfaces</td><td>Verbs to RNIC; PCIe to host memory</td><td>Verbs; PCIe to RNIC and SSD</td><td>Ethernet ports</td></tr>
+      <tr><td>Dependencies</td><td>IOMMU mappings, MR pool, receive reposting in completion context</td><td>Receive reposting, RDMA READ depth, back-end latency</td><td>Correct Differentiated Services Code Point (DSCP)/priority mapping end to end</td></tr>
+    </tbody>
+  </table>
+  <p>Six resources decide most NVMe/RDMA incidents: target receive buffers (CRQSIZE), host response receives (HRQSIZE), the host MR pool, RDMA READ depth, the transport retry budget, and switch buffer per priority. The first two produce RNR NAKs when exhausted; the MR pool and READ depth produce silent stalls with no error on the wire; the retry budget and switch buffers produce retransmissions and, eventually, QP errors.</p>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>One 256 KiB NVMe Write on queue 1, through a target that limits itself to 16 outstanding RDMA READs, with a host that describes the buffer with two keyed descriptors because the scatterlist does not fit one MR. Synthetic example for teaching.</p>
+  <table>
+    <caption>Step by step: who acts, what changes, where, and the evidence</caption>
+    <thead><tr><th>#</th><th>Who acts</th><th>What changes</th><th>Where</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>nvme-rdma</td><td>DMA-maps a 96-segment, 256 KiB scatterlist</td><td>IOMMU page tables</td><td>None on the wire</td></tr>
+      <tr><td>2</td><td>nvme-rdma</td><td>Posts two fast-registration WRs: rkeys 0x0002A100, 0x0002A201</td><td>Host RNIC MR table</td><td>RNIC descriptor fetches on host PCIe; MR counts</td></tr>
+      <tr><td>3</td><td>nvme-rdma</td><td>Builds the SQE: opcode 01h, SGL1 = Last Segment (31h) pointing at two keyed descriptors after the SQE</td><td>Capsule buffer</td><td>SEND payload: 64 + 32 bytes</td></tr>
+      <tr><td>4</td><td>Host RNIC → target RNIC</td><td>SEND Only, PSN 0x0A2000; target consumes a receive and ACKs</td><td>Wire; target receive buffer</td><td>Send and ACK frames</td></tr>
+      <tr><td>5</td><td>Target</td><td>Checks count ≤ MSDBD and total = 256 KiB; allocates staging</td><td>Target memory</td><td>Target logs only</td></tr>
+      <tr><td>6</td><td>Target RNIC</td><td>Issues 16 RDMA READs of 16 KiB (its depth limit)</td><td>Wire</td><td>Read Request frames with RETH</td></tr>
+      <tr><td>7</td><td>Host RNIC</td><td>Checks key, bounds, rights; reads host memory; streams responses</td><td>Host PCIe; wire</td><td>RNIC MRd/CplD TLPs; Read Response frames</td></tr>
+      <tr><td>8</td><td>Target, Lab SSD</td><td>Local NVMe Write to the back end</td><td>Target PCIe</td><td>Doorbell MWr32 to 0xFE60_1008, CQE MWr64, MSI-X MWr32</td></tr>
+      <tr><td>9</td><td>Target RNIC</td><td>SEND with Invalidate naming one key, carrying the CQE</td><td>Wire</td><td>IETH R_key 0x0002A100</td></tr>
+      <tr><td>10</td><td>nvme-rdma</td><td>Locally invalidates 0x0002A201, waits, reposts the receive, unmaps, completes</td><td>Host RNIC, IOMMU</td><td>Verbs completions; block-layer completion</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <ol class="seq" data-actors="nvme-rdma|Host RNIC|Target RNIC|Target|Lab SSD">
+      <li data-from="nvme-rdma" data-to="Host RNIC">FRWR ×2 (rkeys A100, A201)</li>
+      <li data-from="nvme-rdma" data-to="Host RNIC">SEND WR: capsule + 2 keyed desc</li>
+      <li data-from="Host RNIC" data-to="Target RNIC" data-t="0 µs">RC Send Only PSN 0A2000</li>
+      <li data-from="Target RNIC" data-to="Host RNIC" class="dashed">ACK</li>
+      <li data-from="Target RNIC" data-to="Target">recv completion: capsule</li>
+      <li data-from="Target" data-to="Target RNIC">post 16 RDMA READ WRs</li>
+      <li data-from="Target RNIC" data-to="Host RNIC" data-t="3 µs">READ Req ×16 (RETH)</li>
+      <li data-note="Host RNIC">check key, bounds, rights</li>
+      <li data-from="Host RNIC" data-to="Target RNIC" class="dashed">READ Responses (256 KiB)</li>
+      <li data-from="Target" data-to="Lab SSD" data-t="95 µs">NVMe Write via doorbell</li>
+      <li data-from="Lab SSD" data-to="Target" class="dashed">CQE + MSI-X</li>
+      <li data-from="Target RNIC" data-to="Host RNIC" data-t="130 µs">Send w/ Invalidate (key A100)</li>
+      <li data-from="nvme-rdma" data-to="Host RNIC">LOCAL_INV key A201, wait</li>
+      <li data-note="nvme-rdma">complete request</li>
+    </ol>
+    <figcaption>256 KiB write with two keyed descriptors. Synthetic timeline for teaching; real times are implementation- and platform-dependent.</figcaption>
+  </figure>
+  <aside class="callout insight" data-title="Why step 13 matters more than it looks">
+    <p>SEND with Invalidate carries one key in its Invalidate Extended Transport Header (IETH). A command with two keys therefore always needs at least one local invalidation, and the host must not complete the request until that local invalidation itself has completed. A driver that completes on the response capsule and invalidates "in the background" has a window in which a buggy or delayed target could still write into a buffer the application now owns. <span class="badge derived">Derived</span> from the one-key IETH and verbs completion semantics.</p>
+  </aside>
+
+  <h3>The QP state machine as NVMe sees it</h3>
+  <p>A verbs QP moves Reset → Init → Ready to Receive (RTR) → Ready to Send (RTS) during connection setup; RDMA_CM drives these transitions, and the target posts its capsule receives while the QP is in Init, before sending the CM REP. Only RTS carries NVMe I/O. Any fatal transport or protection error moves the QP to Error, where nothing is sent or received and every outstanding work request completes with a flush status. Send Queue Drained (SQD) and Send Queue Error (SQE) also exist; the latter is a QP state, not an NVMe Submission Queue Entry. <span class="badge informative">Informative</span>: transition rules belong to the InfiniBand Architecture Specification and the verbs API.</p>
+
+  <h3>The central concept on the ladder: the queue pair as a failure domain</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>One zip line between two castles. If anyone sends a wrong secret word, the line is cut and every note on it is lost until a new line is built.</p></div>
+    <div class="rung" data-rung="B"><p>An RC QP carries one NVMe queue pair's commands, data operations and responses. Any fatal event on that QP (protection error, retries exhausted) moves it to Error, and every work request still outstanding on it completes with a flush status.</p></div>
+    <div class="rung" data-rung="C"><p>The QP is a hardware context in each RNIC: PSNs, retry counters, timers, the remote QPN. Errors are detected by the responder's checks (key, bounds, rights, sequence) or by the requester's timers, and the context is marked Error in RNIC memory.</p></div>
+    <div class="rung" data-rung="D"><p>NVMe over RDMA Transport 1.3 binds each NVMe queue to one RC QP. Recovery from a QP failure is not defined as a per-command retry by the transport; hosts recover by re-establishing queues (and usually the association), as Base 2.4's fabrics model allows. <span class="badge derived">Derived</span>: confirm the transport specification's wording about queue failure.</p></div>
+    <div class="rung" data-rung="E"><p>On the wire: a NAK (Remote Access Error, Remote Operational Error, Invalid Request) or the silence that triggers retry exhaustion; then CM DREQ/DREP or simply no further traffic on that QP; then a fresh CM REQ/REP/RTU and NVMe Connect.</p></div>
+    <div class="rung" data-rung="F"><p>In a capture: the last ACKed PSN, the first NAK or the first retransmission burst, and then the absence of response capsules for every CID that was outstanding. In host logs: one real error status followed by many flush statuses.</p></div>
+    <div class="rung" data-rung="G"><p>Count the CIDs that failed together. If they span exactly one queue, the cause is per-QP; if they span every queue to one target, suspect the network path or the target; if one CID failed alone with an NVMe status, it was not a transport failure at all.</p></div>
+  </div>
+
+  <h3>The sixteen questions, for the QP as a failure domain</h3>
+  <table>
+    <caption>Queue-pair failure domain through the sixteen questions</caption>
+    <thead><tr><th>#</th><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>What is it?</td><td>The set of NVMe commands whose fate is tied because they share one RC QP.</td></tr>
+      <tr><td>2</td><td>Why was it created?</td><td>It falls out of RC semantics: in-order, exactly-once delivery cannot skip a gap or a protection failure.</td></tr>
+      <tr><td>3</td><td>What problem does it solve?</td><td>Simple, hardware-fast transport state: no per-message recovery, just stop and rebuild.</td></tr>
+      <tr><td>4</td><td>What existed before it?</td><td>On PCIe, errors are per TLP or per command; on TCP, loss is recovered in software.</td></tr>
+      <tr><td>5</td><td>Why is it better?</td><td>For CPU cost and throughput, yes; for blast radius, no. A trade-off.</td></tr>
+      <tr><td>6</td><td>Who creates it?</td><td>Host and target drivers via RDMA_CM, one QP per NVMe queue.</td></tr>
+      <tr><td>7</td><td>Who consumes it?</td><td>Every command placed on that NVMe queue.</td></tr>
+      <tr><td>8</td><td>Where does it live?</td><td>QP contexts in both RNICs plus driver bookkeeping.</td></tr>
+      <tr><td>9</td><td>Memory/registers?</td><td>RNIC QP context, work queues in host memory, MR tables, RNIC doorbells.</td></tr>
+      <tr><td>10</td><td>Before it?</td><td>CM exchange and NVMe Connect bring it to RTS.</td></tr>
+      <tr><td>11</td><td>After it fails?</td><td>Flush completions, host recovery, reconnect, resubmission or failover.</td></tr>
+      <tr><td>12</td><td>If it is wrong?</td><td>Treating flushes as independent failures loses the root cause.</td></tr>
+      <tr><td>13</td><td>Analyzer shows?</td><td>A NAK or retransmission storm, then silence for all outstanding CIDs, then new CM traffic.</td></tr>
+      <tr><td>14</td><td>Linux shows?</td><td>QP or connection errors, reconnects, controller state changes, RNIC counters.</td></tr>
+      <tr><td>15</td><td>Validation tests?</td><td>One bad key on a busy queue: other queues unaffected, each command failed or retried once, no corruption, bounded recovery.</td></tr>
+      <tr><td>16</td><td>Senior suspects?</td><td>The first error, not the flushes: registration bugs, timeout races, lossy priority mapping.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <p>Applicable documents and revisions (2026 baseline): <cite class="spec">NVMe over RDMA Transport Specification, Revision 1.3</cite>; <cite class="spec">NVM Express Base Specification, Revision 2.4 — SGL descriptors, capsules, Fabrics commands, Identify Controller (IOCCSZ, IORCSZ, MSDBD)</cite>; <cite class="spec">InfiniBand Architecture Specification, Volume 1, and its RoCE v2 annex (IBTA)</cite>; <cite class="spec">IETF RFC 5040 (RDMAP), RFC 5041 (DDP), RFC 5044 (MPA)</cite> for iWARP; IEEE 802.1Qbb for PFC.</p>
+  <table>
+    <caption>Classifying what this module relies on</caption>
+    <thead><tr><th>Behaviour</th><th>Class</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>One RC QP per NVMe queue; capsules by SEND; keyed SGL descriptors for host buffers</td><td><span class="badge normative">Normative</span></td><td>RDMA Transport 1.3</td></tr>
+      <tr><td>Keyed SGL Data Block descriptor format (type 4h; subtype Fh Invalidate Key)</td><td><span class="badge normative">Normative</span></td><td>Base 2.4</td></tr>
+      <tr><td>Last Segment descriptor with an in-capsule list of keyed descriptors, bounded by MSDBD</td><td><span class="badge normative">Normative</span> where supported; field reference points <span class="badge uncertain">Uncertain</span></td><td>Base 2.4 (confirm the offset reference point for in-capsule segments)</td></tr>
+      <tr><td>RDMA_CM private data (QID, HRQSIZE, HSQSIZE, CRQSIZE)</td><td><span class="badge normative">Normative</span></td><td>RDMA Transport 1.3</td></tr>
+      <tr><td>PSNs, ACK/NAK types, RNR, retry semantics, QP states</td><td>Normative in IBTA, <span class="badge informative">Informative</span> for NVMe</td><td>IBTA Volume 1 / RoCE v2 annex</td></tr>
+      <tr><td>Remote invalidation requested by the host</td><td><span class="badge optional">Optional</span> (host choice)</td><td>Base 2.4 SGL subtype; RNIC support</td></tr>
+      <tr><td>In-capsule data size; SRQ use; MR pool sizes; RDMA READ depth values</td><td><span class="badge impl">Implementation-dependent</span></td><td>Target and host configuration</td></tr>
+      <tr><td>PFC, ECN, DCQCN parameters</td><td><span class="badge impl">Implementation-dependent</span></td><td>Switch and RNIC vendors; IEEE for PFC</td></tr>
+      <tr><td>New fields in CM private data across transport revisions</td><td><span class="badge version">Version-dependent</span></td><td>Compare RDMA Transport revisions</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout notsaid">
+    <ul>
+      <li>NVMe specifications do not set RDMA READ depth, local ACK timeout, retry counts or RNR timer values.</li>
+      <li>They do not say how a host must handle a command timeout with respect to invalidating keys; that safety property is the host implementation's job.</li>
+      <li>They do not require PFC, ECN or any congestion-control algorithm.</li>
+      <li>They do not define what an RNIC counter is called or exposes.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume that a missing response means "not executed"; never assume a flush status is a separate failure; never assume RDMA READ depth equals NVMe queue depth; never assume the IBTA and NVMe documents use "SQE" for the same thing.</p>
+  </aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Participation and observability</caption>
+    <thead><tr><th>Category</th><th>Items</th></tr></thead>
+    <tbody>
+      <tr><td>Must participate</td><td>Host RNIC and target RNIC (QP contexts, MR tables, retransmission timers); host memory and IOMMU; the Ethernet/IP or InfiniBand path; the target's back-end storage.</td></tr>
+      <tr><td>May participate</td><td>Switches with PFC and ECN; a target SRQ; a CMB or peer-to-peer DMA path between target RNIC and SSD; RNIC on-chip caches for MR and QP contexts; a second path for multipathing.</td></tr>
+      <tr><td>Observable</td><td>Packets on a tap or mirror port; RNIC and switch counters (retransmits, out-of-sequence, RNR, CNPs sent/handled, pause frames); PCIe TLPs between each RNIC and its host's memory; host driver logs.</td></tr>
+      <tr><td>Internal, generally unobservable</td><td>RNIC scheduling between QPs; MR and QP context cache misses; exact retransmission timer values in effect; the target's decision when to issue each RDMA READ; switch buffer occupancy except through counters.</td></tr>
+    </tbody>
+  </table>
+  <h3>Context caches: a hidden performance cliff</h3>
+  <p>RNICs keep QP and MR contexts in host memory and cache active ones on chip. When the working set (hosts × queues, plus MRs) exceeds the cache, packets trigger extra RNIC PCIe reads for context: MRd TLPs that are not data. Cache sizes are <span class="badge impl">Implementation-dependent</span>; count QPs in design reviews and watch RNIC read traffic in captures.</p>
+  <h3>The host PCIe link during an RDMA READ</h3>
+  <p>When the target issues an RDMA READ for 16 KiB of write data, the host RNIC issues PCIe Memory Read requests into host memory and receives Completions with Data, just as the Lab SSD does for a local write in <a href="ch40.html">End-to-End Write</a>. Every limit you learned there applies to the RNIC too: Max Read Request Size (MRRS), Read Completion Boundary (RCB), tags and completion buffer space. An RNIC in a slot with MRRS = 512 bytes needs 32 MRd TLPs per 16 KiB READ response. Two flow-control systems are therefore stacked: RDMA READ depth across the network, and PCIe outstanding reads inside the host.</p>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>Beyond Chapter 67's flows, three relationships matter for diagnosis. A transport ACK of a command SEND proves delivery into a target receive buffer, not execution. RDMA READ responses act as the READ's acknowledgement and consume PSN space, so a READ for 16 KiB at path MTU 4096 reserves four PSNs. An ECN mark produces a CNP from receiver to sender and a rate decrease, never a retransmission.</p>
+  <h3>Ordering rules that matter for diagnosis</h3>
+  <ul>
+    <li>Within an RC QP, the responder executes requests in PSN order. An RDMA WRITE ACKed before a SEND is visible in host memory before that SEND's receive completion. <span class="badge informative">Informative</span> for NVMe, normative in IBTA.</li>
+    <li>RDMA READ responses can be outstanding while later SENDs are transmitted; the target must wait for its READ completions before using the data and before sending the response capsule.</li>
+    <li>A NAK names the PSN where the problem was detected. For go-back-N, every packet from that PSN onwards is retransmitted, including packets the responder had already received out of order and discarded.</li>
+    <li>Across QPs there is no ordering, as across NVMe queues on PCIe.</li>
+  </ul>
+  <h3>Completion and errors, layer by layer</h3>
+  <table>
+    <caption>Where each failure is reported</caption>
+    <thead><tr><th>Layer</th><th>Error</th><th>Reported as</th><th>Blast radius</th></tr></thead>
+    <tbody>
+      <tr><td>NVMe command</td><td>LBA out of range, invalid field, media error</td><td>NVMe status in the response capsule's CQE</td><td>One command</td></tr>
+      <tr><td>NVMe fabrics</td><td>Connect rejected, keep-alive timeout</td><td>Connect response status, or host-detected timeout</td><td>Queue or association</td></tr>
+      <tr><td>RDMA transport (responder)</td><td>Remote access, remote operational, invalid request</td><td>NAK; requester WC error; QP Error</td><td>Whole QP</td></tr>
+      <tr><td>RDMA transport (requester)</td><td>Retries or RNR retries exhausted</td><td>WC error on the requester; QP Error</td><td>Whole QP</td></tr>
+      <tr><td>Local verbs</td><td>Local protection or length error (bad lkey, receive too small)</td><td>Local WC error</td><td>Whole QP</td></tr>
+      <tr><td>Network</td><td>Drops, pauses, ECN marks</td><td>Counters; retransmissions; CNPs</td><td>Every flow on the path</td></tr>
+      <tr><td>PCIe inside a host</td><td>IOMMU fault, poisoned completion for RNIC DMA</td><td>IOMMU or AER logs; may surface as a local or remote WC error</td><td>RNIC-dependent</td></tr>
+    </tbody>
+  </table>
+  <p>The libibverbs enumeration names for the transport errors are, for example, <code>IBV_WC_REM_ACCESS_ERR</code>, <code>IBV_WC_RETRY_EXC_ERR</code>, <code>IBV_WC_RNR_RETRY_EXC_ERR</code>, <code>IBV_WC_LOC_PROT_ERR</code>, <code>IBV_WC_LOC_LEN_ERR</code> and <code>IBV_WC_WR_FLUSH_ERR</code>; the kernel uses equivalent <code>IB_WC_*</code> names. They are API names, not wire values.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>All four traces are synthetic examples for teaching, captured (in the story) from a switch mirror port. RoCE v2 over IPv4, host 192.0.2.10 (QPN 0x00011A), target 192.0.2.20 (QPN 0x000233), 100 Gb/s Ethernet, path MTU 4096. Frame lengths exclude the Frame Check Sequence: 58 bytes of Ethernet, IPv4, UDP, BTH and Invariant CRC (ICRC), plus extended headers and payload. Times are illustrative.</p>
+
+  <h3>Normal: 256 KiB write with two keys and sixteen RDMA READs</h3>
+  <div class="trace" data-kind="synthetic" data-title="NVMe/RDMA 256 KiB write, RDMA READ depth 16, 100 GbE">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time (µs)</th><th>Source</th><th>Destination</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>0.0</td><td>192.0.2.10</td><td>192.0.2.20</td><td>RC Send Only, dQP 0x000233, PSN 0x0A2000, len 154; NVMe Write CID 0x0101 SLBA 0x8000 NLB 511; SGL1 Last Segment (31h) offset 0 len 32</td><td>Capsule = 64-byte SQE + two keyed descriptors in capsule</td></tr>
+        <tr class="dir-up"><td>2</td><td>1.5</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC Acknowledge, PSN 0x0A2000</td><td>Delivered to a target receive buffer</td></tr>
+        <tr class="dir-up"><td>3</td><td>3.1</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC RDMA Read Request, PSN 0x5C4000, RETH VA 0x2_0010_0000 R_key 0x0002A100 len 16384</td><td>First 16 KiB of descriptor 1</td></tr>
+        <tr class="dir-up"><td>4–18</td><td>3.1–3.4</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC RDMA Read Request ×15, PSN 0x5C4004 … 0x5C403C (step 4); keys 0x0002A100 (8 total) then 0x0002A201 (8)</td><td>Each READ reserves 4 PSNs for its 4 response packets; 16 outstanding = whole command</td></tr>
+        <tr class="dir-down"><td>19</td><td>4.6</td><td>192.0.2.10</td><td>192.0.2.20</td><td>RC RDMA Read Response First, PSN 0x5C4000, AETH, len 4158</td><td>Host RNIC serves from host memory, no host CPU</td></tr>
+        <tr class="dir-down"><td>20–82</td><td>4.9–26.0</td><td>192.0.2.10</td><td>192.0.2.20</td><td>Read Response Middle/Last … PSN 0x5C4001 … 0x5C403F</td><td>64 packets × 4 KiB at line rate ≈ 21 µs</td></tr>
+        <tr class="note"><td colspan="6">Target writes 256 KiB to the Lab SSD over its local PCIe link (doorbell MWr32 to 0xFE60_1008, data via MRd64/CplD, CQE MWr64, MSI-X MWr32 to 0xFEE0_1000). Not visible here.</td></tr>
+        <tr class="dir-up"><td>83</td><td>118.7</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC Send Only with Invalidate, PSN 0x5C4040, IETH R_key 0x0002A100; NVMe CQE CID 0x0101 SQHD 0x0012 Success</td><td>Response; only the first key is remotely invalidated</td></tr>
+        <tr class="dir-down"><td>84</td><td>120.0</td><td>192.0.2.10</td><td>192.0.2.20</td><td>RC Acknowledge, PSN 0x5C4040</td><td>Host RNIC ACK</td></tr>
+      </tbody>
+    </table>
+    <p>Reading it: the data phase (rows 3–82) takes about 23 µs; about 92 µs is the back end. The IETH names only 0x0002A100, so the host must locally invalidate 0x0002A201 before completing. Decoders may show the in-capsule descriptor list as opaque bytes. Whether a host uses one key or several is <span class="badge impl">Implementation-dependent</span>.</p>
+  </div>
+
+  <h3>Slow: RDMA READ depth of 2 across a 30 µs round trip</h3>
+  <div class="trace" data-kind="synthetic" data-title="Same 256 KiB write, negotiated RDMA READ depth 2, RTT 30 µs">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time (µs)</th><th>Source</th><th>Destination</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Earlier, at connection setup: CM REQ from host carries Responder Resources 2; CM REP from target carries Initiator Depth 2. Path crosses three switches; base round trip about 30 µs.</td></tr>
+        <tr class="dir-down"><td>1</td><td>0.0</td><td>192.0.2.10</td><td>192.0.2.20</td><td>RC Send Only, PSN 0x0A3000; NVMe Write CID 0x0107 NLB 511; two keyed descriptors</td><td>Same command shape</td></tr>
+        <tr class="dir-up"><td>2</td><td>16.2</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC RDMA Read Request, PSN 0x5C5000, R_key 0x0002A50C len 16384</td><td>READ 1</td></tr>
+        <tr class="dir-up"><td>3</td><td>16.3</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC RDMA Read Request, PSN 0x5C5004, len 16384</td><td>READ 2: depth now full</td></tr>
+        <tr class="dir-down"><td>4–7</td><td>31.0–32.3</td><td>192.0.2.10</td><td>192.0.2.20</td><td>Read Response First…Last, PSN 0x5C5000–0x5C5003</td><td>Data for READ 1</td></tr>
+        <tr class="abnormal"><td>8</td><td>16.4–47.6</td><td>—</td><td>—</td><td>No RDMA Read Request on this QP between READ 2 and READ 3 (≈ 31 µs, one round trip) while READ 1's data travels back</td><td><strong>First abnormal event</strong>: the target is idle for a round trip with 224 KiB still to fetch</td></tr>
+        <tr class="dir-up"><td>9</td><td>47.6</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC RDMA Read Request, PSN 0x5C5008</td><td>READ 3 issued only after READ 1 completed at the target</td></tr>
+        <tr class="note"><td colspan="6">The pattern repeats eight times. Response capsule at about 360 µs; effective data rate ≈ 1.0 GB/s on a 12.5 GB/s link. No NAKs, no retransmissions, no CNPs.</td></tr>
+      </tbody>
+    </table>
+    <p>Analysis. There is no error to search for; the evidence is the <em>shape</em>: never more than two READs outstanding, each new one a round trip after a completion. 2 × 16 KiB / (30 + 2.6) µs ≈ 1.0 GB/s matches. Root cause: READ depth left at 2, harmless on the lab's 6 µs path (≈ 4.4 GB/s) but crippling at 30 µs. Fix: raise depth on both sides; regression-test throughput across the production round trip.</p>
+  </div>
+
+  <h3>Failed: loss on a priority without PFC ends in retry exhaustion</h3>
+  <div class="trace" data-kind="synthetic" data-title="Read data lost during incast; go-back-N; retries exhausted">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time</th><th>Source</th><th>Destination</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>0.0 µs</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC RDMA Write First, PSN 0x5C6000, R_key 0x0002B011 len 65536, DSCP 26 ECN ECT(0)</td><td>Read data for CID 0x0120 (64 KiB = 16 packets)</td></tr>
+        <tr class="dir-up"><td>2</td><td>0.3 µs</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC RDMA Write Middle, PSN 0x5C6001</td><td>Mirror port sees it leave the target's switch port</td></tr>
+        <tr class="abnormal"><td>3</td><td>0.9 µs</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC RDMA Write Middle, PSN 0x5C6003 (host-side mirror: 0x5C6002 never arrives)</td><td><strong>First abnormal event</strong>: a PSN gap at the host's edge; the switch dropped 0x5C6002 during an incast burst</td></tr>
+        <tr class="dir-down"><td>4</td><td>1.6 µs</td><td>192.0.2.10</td><td>192.0.2.20</td><td>RC Acknowledge, AETH NAK PSN Sequence Error, PSN 0x5C6002</td><td>Host RNIC asks for go-back-N from 0x5C6002</td></tr>
+        <tr class="dir-up"><td>5</td><td>3.0 µs</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC RDMA Write Middle, PSN 0x5C6002 … retransmission of 14 packets</td><td>Every packet from the gap onward is resent</td></tr>
+        <tr class="note"><td colspan="6">Incast continues: 12 hosts read from the same target port group. Switch counters on the egress port to the host: drops on the priority carrying RoCE rising; PFC pause frames sent on that priority: zero.</td></tr>
+        <tr class="dir-up"><td>6</td><td>4.1 µs</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC RDMA Write Last, PSN 0x5C600F (retransmitted) — dropped</td><td>The last packet is lost; no later packet reveals a gap</td></tr>
+        <tr class="dir-up"><td>7</td><td>~0.5 ms</td><td>192.0.2.20</td><td>192.0.2.10</td><td>Retransmission from PSN 0x5C600F after local ACK timeout</td><td>Tail loss is only detected by timer; a timeout-length latency spike</td></tr>
+        <tr class="note"><td colspan="6">Rows 7-like repeat: each retransmission collides with the ongoing burst. Retry counter exhausts.</td></tr>
+        <tr class="dir-up"><td>8</td><td>~3.6 ms</td><td>192.0.2.20</td><td>192.0.2.10</td><td>CM DREQ</td><td>Target QP in Error (transport retry exceeded); all its work flushed</td></tr>
+        <tr class="note"><td colspan="6">Host (illustrative paraphrase): nvme-rdma reports a connection error on queue 1, starts error recovery, and reconnects all queues of the controller about a second later. Responses for 37 outstanding CIDs on queue 1 never arrive; they are retried after reconnect.</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning. The first abnormal event is the drop, not the reconnect or the flush errors. Drops on the RoCE priority with zero pauses sent mean PFC was not protecting the class the traffic used; the DSCP in row 1 (26) is what to compare with the switches' lossless mapping. Go-back-N plus timer-driven tail recovery turns a small drop rate into timeout-length spikes and finally retry exhaustion. Likely conclusion (high confidence once counters confirm): DSCP-to-priority mismatch. Fix the mapping or add ECN-based congestion control; validate with an N-host incast test asserting zero drops on the priority.</p>
+  </div>
+
+  <h3>Ambiguous: a late RDMA WRITE meets an invalidated key</h3>
+  <div class="trace" data-kind="synthetic" data-title="Capture filtered to one QP pair; NAK Remote Access Error near an I/O timeout">
+    <table class="trace-table">
+      <thead><tr><th>No.</th><th>Time</th><th>Source</th><th>Destination</th><th>Info</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Capture filter: only QPNs 0x00011A/0x000233 (the I/O queue) were stored. Trigger: any NAK, 10 ms pre-trigger. Analyzer and host clocks are not aligned (offset unknown, ±5 ms).</td></tr>
+        <tr class="dir-down"><td>1</td><td>T − 29.80 s</td><td>192.0.2.10</td><td>192.0.2.20</td><td>RC Send Only, PSN 0x0A4410; NVMe Read CID 0x0150 NLB 7; SGL Keyed 4Fh VA 0x2_0040_0000 len 4096 key 0x0002B300</td><td>(from a second, earlier segment of the buffer)</td></tr>
+        <tr class="dir-up"><td>2</td><td>T − 29.80 s</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC Acknowledge, PSN 0x0A4410</td><td>Delivered</td></tr>
+        <tr class="note"><td colspan="6">For 29.8 s, other CIDs on this QP complete normally (about 410 000 responses). CID 0x0150 does not.</td></tr>
+        <tr class="dir-up"><td>3</td><td>T</td><td>192.0.2.20</td><td>192.0.2.10</td><td>RC RDMA Write Only, PSN 0x5D9A00, RETH VA 0x2_0040_0000 R_key 0x0002B300 len 4096</td><td>Target finally returns CID 0x0150's data</td></tr>
+        <tr class="abnormal"><td>4</td><td>T + 1.3 µs</td><td>192.0.2.10</td><td>192.0.2.20</td><td>RC Acknowledge, AETH NAK Remote Access Error, PSN 0x5D9A00</td><td><strong>First abnormal event in this capture</strong>: host RNIC no longer accepts key 0x0002B300</td></tr>
+        <tr class="dir-up"><td>5</td><td>T + 0.3 ms</td><td>192.0.2.20</td><td>192.0.2.10</td><td>CM DREQ</td><td>Target QP in Error; it tears down</td></tr>
+        <tr class="note"><td colspan="6">Host log (illustrative paraphrase): an I/O timeout for CID 0x0150 on queue 1, and a QP/connection error on queue 1, within a few milliseconds of each other, followed by controller reconnect.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Why it is ambiguous.</strong> <em>H1 (host first)</em>: the 30-second I/O timeout expired, recovery invalidated the MR, and the late write hit a dead key; the NAK is a consequence and the root cause is a 29.8 s back end. <em>H2 (target first)</em>: the key was already invalid for another reason (target key reuse, or a host invalidating early), the QP died, and the timeout message is the host's view of the same event. The deciding evidence (an admin-queue Abort or property read, or host-initiated teardown on other queues before row 3) travels on other QPs, which the capture filter removed.</p>
+    <p><strong>Disambiguating experiments.</strong> Re-capture without the QP filter; align clocks with a marker I/O; read the target's back-end latency for CID 0x0150 (29.8 s supports H1); confirm the host moves QPs to Error before releasing MRs and completing requests. Likely conclusion: H1, medium-to-high confidence. The host behaved <em>safely</em>; the bug is the back-end stall, and the regression test is "response delayed past host timeout, no late data in application memory".</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> for every command in this block: they only read state. Output formats differ between rdma-core and iproute2 versions and between RNIC drivers, so no output is reproduced here.</p></aside>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># QPs, their state and owning process/kernel module (one per NVMe queue)</span>
+rdma resource show qp
+<span class="cm"># Connection-manager identifiers: which QP belongs to which IP/port pair</span>
+rdma resource show cm_id
+<span class="cm"># Registered MRs (counts tell you about pool use during a stall)</span>
+rdma resource show mr
+<span class="cm"># Per-port and per-QP hardware counters (names are driver-specific)</span>
+rdma statistic show
+<span class="cm"># Ethernet-level counters, including per-priority pause and drop counters on many drivers</span>
+ethtool -S eth0 | grep -iE 'pause|prio|discard|drop|cnp|ecn|out_of_seq|retrans'
+<span class="cm"># NVMe controllers, transport and state (live, connecting, resetting, deleting)</span>
+for c in /sys/class/nvme/nvme*; do echo "$c $(cat $c/transport) $(cat $c/state)"; done
+nvme list-subsys
+<span class="cm"># nvme-rdma module parameters in effect (names vary by kernel version)</span>
+grep -H . /sys/module/nvme_rdma/parameters/* 2&gt;/dev/null
+<span class="cm"># Kernel messages around a reconnect</span>
+journalctl -k --since "10 min ago" | grep -iE 'nvme|rdma|mlx|rxe'</code></pre>
+  <table>
+    <caption>What each output can and cannot prove</caption>
+    <thead><tr><th>Output category</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>QP list with states</td><td>Which QPs exist and whether any are in Error now</td><td>Which one failed first, or why</td></tr>
+      <tr><td>cm_id list</td><td>Mapping of QPs to IP endpoints and NVMe queues</td><td>The private data that was exchanged</td></tr>
+      <tr><td>MR counts during a stall</td><td>Whether the MR pool is near its configured size</td><td>That MR exhaustion caused latency (correlate with throughput)</td></tr>
+      <tr><td>Retransmission and out-of-sequence counters rising</td><td>Loss or reordering affected RDMA traffic on this port</td><td>Where in the network the loss happened</td></tr>
+      <tr><td>Per-priority pause counters</td><td>PFC is active on a priority and pauses are being sent or received</td><td>That RoCE traffic actually uses that priority (check DSCP/PCP marking)</td></tr>
+      <tr><td>CNP counters</td><td>ECN marking happens and congestion control is reacting</td><td>That the reaction is tuned well</td></tr>
+      <tr><td>Controller state "connecting" or "resetting"</td><td>Recovery is in progress now</td><td>The first error that triggered it (read the earliest kernel message)</td></tr>
+      <tr><td>Kernel messages</td><td>Timing and order as the host saw it; WC status names when logged</td><td>Anything on the target or in the network; analyzer time</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+
+  <h3>Beginner lab: decode a multi-descriptor capsule</h3>
+  <p><strong>Objective.</strong> Decode a Write capsule whose SGL1 is a Last Segment descriptor pointing to keyed descriptors, and decide whether it describes the right number of bytes. <span class="badge safe">Safe lab</span></p>
+  <p><strong>Prerequisites.</strong> SGL descriptor types (<a href="ch37.html">Chapter 37</a>), the keyed descriptor (<a href="ch67.html">Chapter 67</a>), Python 3.8+.</p>
+  <p><strong>Setup.</strong> Save and run the program; it builds two synthetic capsules (standard library only).</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="capsule_sgl.py"><code>#!/usr/bin/env python3
+"""capsule_sgl.py - check the SGL of a synthetic NVMe/RDMA Write capsule (simulation)."""
+import struct
+
+def keyed(addr, length, key, inval=False):          # Keyed SGL Data Block, 40h or 4Fh
+    return (struct.pack("&lt;Q", addr) + length.to_bytes(3, "little")
+            + struct.pack("&lt;I", key) + bytes([0x4F if inval else 0x40]))
+
+def build_write(cid, nlb, descs):
+    seg = b"".join(descs)
+    sqe = bytearray(64)
+    struct.pack_into("&lt;BBHI", sqe, 0, 0x01, 0x40, cid, 1)        # Write, PSDT=01b, NSID 1
+    sqe[24:40] = struct.pack("&lt;QI", 0, len(seg)) + bytes(3) + b"\x31"  # Last Segment, offset 0
+    struct.pack_into("&lt;H", sqe, 48, nlb - 1)                      # NLB is zero-based
+    return bytes(sqe) + seg
+
+def check(cap, lba=512, msdbd=16):
+    cid = struct.unpack_from("&lt;H", cap, 2)[0]
+    want = (struct.unpack_from("&lt;H", cap, 48)[0] + 1) * lba
+    ident = cap[39]
+    off, seglen = struct.unpack_from("&lt;QI", cap, 24)
+    print(f"CID 0x{cid:04X}: SGL1 id {ident:02X}h, list at offset {off}, {seglen} bytes; need {want} bytes")
+    seg = cap[64 + off:64 + off + seglen]
+    total, problems = 0, []
+    for n in range(0, len(seg), 16):
+        d = seg[n:n + 16]
+        addr, length, key = struct.unpack_from("&lt;Q", d)[0], int.from_bytes(d[8:11], "little"), struct.unpack_from("&lt;I", d, 11)[0]
+        print(f"  desc {n // 16 + 1}: id {d[15]:02X}h VA 0x{addr:X} len {length} key 0x{key:08X}")
+        total += length
+    if len(seg) // 16 &gt; msdbd:
+        problems.append(f"{len(seg) // 16} descriptors exceed MSDBD {msdbd}")
+    if total != want:
+        problems.append(f"SGL describes {total} bytes, command needs {want}")
+    print("  RESULT:", "; ".join(problems) or "OK")
+
+if __name__ == "__main__":
+    check(build_write(0x0101, 512, [keyed(0x2_0010_0000, 0x20000, 0x0002A100, True),
+                                    keyed(0x2_0030_0000, 0x20000, 0x0002A201)]))
+    check(build_write(0x0102, 512, [keyed(0x2_0050_0000, 0x20000, 0x0002A302, True),
+                                    keyed(0x2_0070_0000, 0x10000, 0x0002A403)]))</code></pre>
+  <p><strong>Procedure.</strong> (1) Run it. (2) Map the bytes of SGL1 to Address (offset), Length and Identifier. (3) Set <code>msdbd=1</code> and rerun. (4) Mark the second descriptor 4Fh as well and ask what the target can do with two "please invalidate" requests.</p>
+  <p><strong>Observations.</strong> Expected output from the program as written:</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>CID 0x0101: SGL1 id 31h, list at offset 0, 32 bytes; need 262144 bytes
+  desc 1: id 4Fh VA 0x200100000 len 131072 key 0x0002A100
+  desc 2: id 40h VA 0x200300000 len 131072 key 0x0002A201
+  RESULT: OK
+CID 0x0102: SGL1 id 31h, list at offset 0, 32 bytes; need 262144 bytes
+  desc 1: id 4Fh VA 0x200500000 len 131072 key 0x0002A302
+  desc 2: id 40h VA 0x200700000 len 65536 key 0x0002A403
+  RESULT: SGL describes 196608 bytes, command needs 262144</code></pre>
+  <p><strong>Questions.</strong> (a) Why is the list 32 bytes? (b) What should a target do with CID 0x0102? (c) With MSDBD = 1, what must the host do instead?</p>
+  <p><strong>Expected reasoning.</strong> Count descriptors and bytes before thinking about the network: the capsule alone shows the bug.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(a) Two 16-byte keyed descriptors. (b) Reject the command with an SGL length-related NVMe status (Base 2.4 defines statuses such as Data SGL Length Invalid; confirm the name and value there) and issue no RDMA READ beyond the described lengths. (c) Describe the whole buffer with one MR and one key, or split the I/O. Two 4Fh descriptors do not help: one SEND with Invalidate names one key, so the host still invalidates the other locally. Where the offset is measured from (start of in-capsule data) should be confirmed in Base 2.4 <span class="badge uncertain">Uncertain</span>.</p>
+  </details>
+  <p><strong>Extension.</strong> Add an in-capsule Data Block (offset subtype, 01h) and check its length against IOCCSZ × 16 − 64.</p>
+
+  <h3>Intermediate lab: inject loss into Soft-RoCE and read the counters</h3>
+  <p><strong>Objective.</strong> See go-back-N retransmission and its latency cost, and learn which counters move. <span class="badge caution">Caution lab</span>: root on disposable VMs; injected loss affects every flow on that interface.</p>
+  <p><strong>Prerequisites.</strong> The <a href="ch67.html#lab">Chapter 67 Soft-RoCE lab</a>, rebuilt on two VMs (host 192.0.2.10, target 192.0.2.20, file-backed namespace); fio, tc, tcpdump.</p>
+  <p><strong>Setup.</strong> Connect the host to the target with <code>nvme connect -t rdma</code> as in Chapter 67.</p>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code><span class="cm"># Caution: disposable VMs only. TARGET VM:</span>
+rdma statistic show &gt; /var/tmp/before.txt
+tc qdisc add dev eth0 root netem loss 0.5%
+<span class="cm"># HOST VM: read-only random reads for 30 s</span>
+fio --name=rr --filename=/dev/nvme1n1 --readonly --direct=1 --ioengine=io_uring     --rw=randread --bs=64k --iodepth=16 --runtime=30 --time_based --percentile_list=50:99:99.9
+<span class="cm"># TARGET VM afterwards:</span>
+rdma statistic show &gt; /var/tmp/after.txt; tc qdisc del dev eth0 root
+diff /var/tmp/before.txt /var/tmp/after.txt</code></pre>
+  <p><strong>Procedure and observations.</strong> Run once without loss and once with. Compare p50 and p99.9. Find counters whose names suggest retransmission or sequence errors (driver-specific names). In a tcpdump of UDP 4791 during the lossy run, find a PSN Sequence Error NAK and the retransmitted range.</p>
+  <p><strong>Questions.</strong> (a) Why does 0.5% packet loss hurt 64 KiB reads more than 0.5%? (b) Why does p99.9 move far more than p50? (c) Which loss produces a timer-driven retransmission instead of a NAK?</p>
+  <p><strong>Expected reasoning.</strong> Count packets per I/O (16 at path MTU 4096; 64 at 1024, common on rxe) and ask which packet was lost.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(a) The chance an I/O loses at least one packet is 1 − 0.995<sup>16</sup> ≈ 7.7% (≈ 27% at 64 packets), and go-back-N resends everything after the gap. (b) Most I/Os see no loss; unlucky ones pay a NAK round trip or a local ACK timeout, so only the tail moves. (c) Loss of the last packet or of its ACK: no later packet reveals the gap. Soft-RoCE timings are not representative of hardware RNICs.</p>
+  </details>
+  <p><strong>Extension.</strong> Repeat with NVMe/TCP (<a href="dd50.html">NVMe/TCP module</a>) under identical loss and compare tails.</p>
+
+  <h3>Advanced lab: model RDMA READ depth</h3>
+  <p><strong>Objective.</strong> Predict write throughput from READ depth, chunk size and round-trip time, and compare with a simulation. <span class="badge safe">Safe lab</span></p>
+  <p><strong>Prerequisites.</strong> Bandwidth-delay product (<a href="performance.html">Performance Engineering</a>); the slow trace above. <strong>Setup.</strong> Python 3.8+.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="read_depth.py"><code>#!/usr/bin/env python3
+"""read_depth.py - simulate how RDMA READ depth and round-trip time cap NVMe/RDMA write throughput.
+Simulation: one QP, one 1 MiB write fetched in 16 KiB RDMA READs, 100 Gb/s link, path MTU 4096."""
+
+LINK_BYTES_PER_US = 100e9 / 8 / 1e6          # 12 500 bytes per microsecond
+EFF = 4096 / 4158                             # payload share of a full RoCE v2 packet (headers + ICRC)
+
+def simulate(total, chunk, depth, rtt_us):
+    serialize = chunk / (LINK_BYTES_PER_US * EFF)   # time one READ response occupies the link
+    link_free, t_done, issued, inflight = 0.0, 0.0, 0, []
+    while issued &lt; total // chunk and len(inflight) &lt; depth:   # initial burst of requests
+        inflight.append(0.0); issued += 1
+    finished = 0
+    while inflight:
+        t_issue = inflight.pop(0)
+        start = max(t_issue + rtt_us, link_free)
+        link_free = start + serialize
+        t_done = link_free
+        finished += 1
+        if issued &lt; total // chunk:                  # completion frees a slot: issue the next READ
+            inflight.append(t_done); issued += 1
+            inflight.sort()
+    return total / t_done / 1e3                      # bytes per us -&gt; GB/s
+
+def model(chunk, depth, rtt_us):
+    serialize = chunk / (LINK_BYTES_PER_US * EFF)
+    return min(LINK_BYTES_PER_US * EFF, depth * chunk / (rtt_us + serialize)) / 1e3
+
+if __name__ == "__main__":
+    total, chunk = 1 &lt;&lt; 20, 16 &lt;&lt; 10
+    print(f"{'depth':&gt;5} {'RTT us':&gt;7} {'sim GB/s':&gt;9} {'model GB/s':&gt;11}")
+    for rtt in (6, 30):
+        for depth in (1, 2, 4, 8, 16):
+            print(f"{depth:&gt;5} {rtt:&gt;7} {simulate(total, chunk, depth, rtt):&gt;9.2f} {model(chunk, depth, rtt):&gt;11.2f}")</code></pre>
+  <div class="formula">
+    <div class="eq"><var>B</var> = min( <var>R</var>, <var>D</var> × <var>C</var> / (<var>T</var><sub>rt</sub> + <var>C</var>/<var>R</var>) )</div>
+    <dl class="vars">
+      <dt>B</dt><dd>sustained write-data throughput on one QP, bytes per second</dd>
+      <dt>R</dt><dd>payload rate of the link, bytes per second</dd>
+      <dt>D</dt><dd>RDMA READ depth: the smaller of initiator depth and responder resources</dd>
+      <dt>C</dt><dd>bytes requested per RDMA READ</dd>
+      <dt>T<sub>rt</sub></dt><dd>time from issuing a READ request to the first response byte arriving, seconds</dd>
+    </dl>
+  </div>
+  <p><strong>Procedure.</strong> Run it; then compute the depth needed for line rate at 30 µs and the chunk size that would let depth 4 reach it.</p>
+  <p><strong>Observations.</strong> Expected output:</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>depth  RTT us  sim GB/s  model GB/s
+    1       6      2.24        2.24
+    2       6      4.44        4.47
+    4       6      8.65        8.94
+    8       6     11.50       12.31
+   16       6     11.50       12.31
+    1      30      0.52        0.52
+    2      30      1.04        1.05
+    4      30      2.08        2.09
+    8      30      4.03        4.18
+   16      30      7.22        8.37</code></pre>
+  <p><strong>Questions.</strong> (a) Why does the simulation fall below the model at high depth? (b) Does a deeper NVMe queue fix low READ depth? (c) Why might a target keep READ depth low on purpose?</p>
+  <p><strong>Expected reasoning.</strong> Separate steady state from start-up, and per-QP limits from per-host limits.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>Line rate at 30 µs needs D × 16 KiB ≥ 12.31 GB/s × 31.3 µs ≈ 385 KB, so D ≥ 24; with D = 4, C ≈ 125 KB, so 128 KiB READs. (a) A 1 MiB write is 64 chunks, and its first round trip is never amortised. (b) No: all commands on the QP share its READ depth; more NVMe queues (more QPs) raise the aggregate. (c) Each outstanding READ costs responder resources in the host RNIC and staging memory in the target. <span class="badge impl">Implementation-dependent</span>.</p>
+  </details>
+  <p><strong>Extension.</strong> Add a second QP sharing the link and show that two QPs at depth 8 match one QP at depth 16.</p>
+
+  <h3>Senior forensic lab: the reconnect storm on one rack</h3>
+  <p><strong>Objective.</strong> From mixed evidence, find the first abnormal event and root cause of periodic reconnects that affect only one rack. <span class="badge safe">Safe lab</span> (paper exercise).</p>
+  <p><strong>Prerequisites.</strong> The traces on this page; <a href="debug-method.html">Debugging Methodology</a>.</p>
+  <p><strong>Setup: evidence bundle (synthetic).</strong></p>
+  <ul>
+    <li>Rack B hosts see NVMe/RDMA controllers reconnect every few minutes during nightly backups; rack A, same software image, does not.</li>
+    <li>Rack B host logs (illustrative paraphrase): transport retry-exceeded errors on I/O queues, then reconnects; no remote access errors.</li>
+    <li>RNIC counters: rack B retransmissions rise in backup windows, CNPs received zero; rack A CNPs in the thousands per minute, retransmissions near zero.</li>
+    <li>Rack B top-of-rack switch: ECN marking off on the RoCE priority's egress queue and PFC headroom reduced, both since a configuration push two weeks ago; drops on that priority during backups. Rack A's switch received a newer template that kept ECN.</li>
+    <li>Mirror-port capture in rack B: PSN Sequence Error NAKs in backup bursts; one QP retransmitting every local ACK timeout for 3 ms, then DREQ.</li>
+  </ul>
+  <p><strong>Procedure.</strong> Build a timeline; classify each item as cause, mechanism or consequence; state the first abnormal event; write a primary and a competing hypothesis with predictions.</p>
+  <p><strong>Observations.</strong> Which signal is absent in rack B but present in rack A? Which shows loss rather than protection failure?</p>
+  <p><strong>Questions.</strong> (a) First abnormal event? (b) Why only during backups? (c) Which experiment confirms the cause without waiting a night?</p>
+  <p><strong>Expected reasoning.</strong> Work forward from the change log and backward from the symptom until they meet.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(a) Historically, the configuration push; per incident, a drop on the RoCE priority (PSN gap and NAK). Reconnects are consequences. (b) Backups create incast; without ECN senders never slow (zero CNPs), and reduced headroom lets PFC fail to absorb the burst. (c) Re-enable ECN on one rack-B switch, or run a synthetic incast against both racks: CNPs appear, drops and retry errors vanish. Competing hypothesis: RNIC firmware differences in rack B; prediction: the problem follows hosts moved to rack A (it does not here). Confidence high after the A/B experiment.</p>
+  </details>
+  <p><strong>Extension.</strong> Write the regression test: N-host incast; pass if zero drops on the RoCE priority, no QP errors and p99.9 within bound; rerun after every switch configuration change.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <p>Six failure patterns beyond <a href="ch67.html#debugging">Chapter 67's table</a>. Confidence is for the scenario as described.</p>
+  <table>
+    <caption>NVMe/RDMA failure patterns, part 1: what you see</caption>
+    <thead><tr><th>Pattern</th><th>Symptom</th><th>Possible causes</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>1. Write plateau on long paths</td><td>Writes far below link rate in production, fine in the lab; reads fine</td><td>Low RDMA READ depth; small READ chunks; target staging limits</td><td>Few READs outstanding, each a round trip after a completion; no errors</td></tr>
+      <tr><td>2. MR pool exhaustion</td><td>Throughput collapse at high QD with large fragmented I/O; no network errors</td><td>Too few MRs; scatterlists exceeding one MR; slow MR recycling</td><td>MR count at the pool limit; delay between submission and SEND; no NAKs</td></tr>
+      <tr><td>3. Retry exceeded under incast</td><td>QP errors and reconnects only during bursts</td><td>PFC off or mis-mapped; too little headroom; ECN off</td><td>Sequence-error NAKs, retransmissions, retry-exceeded WC; switch drops on the priority</td></tr>
+      <tr><td>4. Connect fails from some hosts</td><td><code>nvme connect -t rdma</code> times out</td><td>GID type (RoCE v1 vs v2), VLAN/subnet, path MTU, UDP 4791 filtered</td><td>No CM REQ on the wire, or REQ without REP</td></tr>
+      <tr><td>5. Late write after timeout</td><td>Remote access NAKs coinciding with I/O timeouts</td><td>Back end slower than host timeout; early host invalidation; target key reuse</td><td>RETH key equals a key issued tens of seconds earlier</td></tr>
+      <tr><td>6. SRQ starvation</td><td>RNR NAKs from the target on many QPs at once</td><td>Shared receive pool smaller than the sum of promises; slow reposting</td><td>Target is the NAKing side; several hosts hit together</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>NVMe/RDMA failure patterns, part 2: how you decide</caption>
+    <thead><tr><th>Pattern</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Likely conclusion (confidence)</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Initiator depth and responder resources in CM REQ/REP</td><td>RDMA round-trip time on the path (ping is not enough)</td><td>Same test on a short path: throughput scaling with 1/RTT means READ depth</td><td>Depth too low for the bandwidth-delay product (High)</td></tr>
+      <tr><td>2</td><td><code>rdma resource show mr</code> during the stall vs pool size</td><td>Host tracing: request arrival to SEND posting</td><td>Repeat with huge-page (contiguous) buffers</td><td>Host registration resources (Medium; driver-version-dependent)</td></tr>
+      <tr><td>3</td><td>Per-priority drop and pause counters on every hop</td><td>DSCP/PCP in a capture vs the lossless mapping</td><td>Controlled incast with and without ECN/PFC on one switch</td><td>Network QoS misconfiguration (High)</td></tr>
+      <tr><td>4</td><td>Host capture: CM REQ sent? UDP 4791 or EtherType 0x8915?</td><td>GID table types on the failing host</td><td>RDMA ping-pong test with an explicit GID index</td><td>Addressing or encapsulation mismatch (Medium–High)</td></tr>
+      <tr><td>5</td><td>SEND-to-late-write interval vs host timeout</td><td>Unfiltered capture or host tracing: who acted first</td><td>Inject a back-end delay just above the timeout on a lab target</td><td>Slow back end, defensively correct host (Medium until reproduced)</td></tr>
+      <tr><td>6</td><td>Sum of CRQSIZE promises vs SRQ size</td><td>Target CPU in the receive path</td><td>Per-QP receives instead of SRQ on a lab target</td><td>Receive over-subscription (Medium)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>Why does one bad rkey fail many NVMe commands?</p><details class="answer"><summary>Model answer</summary><p>Because all commands on an NVMe queue share one RC QP, and a remote access error moves that QP to the Error state, flushing every outstanding work request. The host must rebuild the queue (usually the whole association).</p></details></li>
+    <li><p>What is a PSN?</p><details class="answer"><summary>Model answer</summary><p>The 24-bit Packet Sequence Number in each BTH, per QP and direction. Receivers use it to detect gaps and duplicates; ACKs and NAKs refer to it.</p></details></li>
+    <li><p>Who issues RDMA READ in NVMe/RDMA, and for what?</p><details class="answer"><summary>Model answer</summary><p>The target, to fetch write data from the host's registered buffer described by a keyed SGL descriptor.</p></details></li>
+    <li><p>What is a flush error?</p><details class="answer"><summary>Model answer</summary><p>The status given to work requests that were outstanding when their QP entered Error. It reports collateral damage, not a root cause.</p></details></li>
+    <li><p>Is a CNP an error?</p><details class="answer"><summary>Model answer</summary><p>No. A Congestion Notification Packet tells a sender that ECN-marked packets arrived, so it should reduce its rate. It is a performance signal.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>How can a command use more than one keyed descriptor?</p><details class="answer"><summary>Model answer</summary><p>SGL1 is a Last Segment descriptor that points to a list of keyed descriptors carried in the capsule after the SQE; the count is limited by MSDBD in Identify Controller and the capsule size by IOCCSZ.</p></details></li>
+    <li><p>Why does a multi-key command always need local invalidation?</p><details class="answer"><summary>Model answer</summary><p>SEND with Invalidate names one rkey in its IETH. Any additional keys must be invalidated by the host with Local Invalidate before it completes the request.</p></details></li>
+    <li><p>Explain initiator depth and responder resources.</p><details class="answer"><summary>Model answer</summary><p>Initiator depth is how many RDMA READs a requester may have outstanding; responder resources is how many the responder can serve at once. They are negotiated in the CM exchange; the effective depth is bounded by both.</p></details></li>
+    <li><p>Why is tail loss worse than mid-message loss on RoCE?</p><details class="answer"><summary>Model answer</summary><p>Mid-message loss is revealed by the next packet's PSN gap and answered quickly by a NAK. Loss of the final packet (or its ACK) is only detected when the local ACK timer expires, adding a timeout-length delay.</p></details></li>
+    <li><p>What does an RNR NAK from the target indicate?</p><details class="answer"><summary>Model answer</summary><p>The target had no receive buffer posted for an incoming SEND: a host exceeding CRQSIZE, a target SRQ over-subscribed, or slow receive reposting on the target.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>Write throughput is 1 GB/s on a 100 GbE path with a 30 µs round trip. How do you prove READ depth is the cause?</p><details class="answer"><summary>Model answer</summary><p>Capture: count outstanding READ requests over time (never above D) and check that new requests follow completions by one RTT. Compute D × C / RTT and compare. Change RTT (short path) and see throughput scale inversely. Read the CM REQ/REP depth fields.</p></details></li>
+    <li><p>How do you tell a host registration bug from a target bounds bug after a remote access error?</p><details class="answer"><summary>Model answer</summary><p>Compare the RETH (VA, key, length) with the SQE's keyed descriptors. If the target stayed within the advertised range and key, the host's MR did not cover what it advertised (host bug). If the target exceeded the advertised range or used another key, the target is wrong.</p></details></li>
+    <li><p>Why can RDMA READ throughput depend on the host's PCIe settings?</p><details class="answer"><summary>Model answer</summary><p>The host RNIC serves READs by issuing PCIe memory reads; MRRS, completion sizes, tags and completion buffering limit how fast it can fetch, adding a second bandwidth-delay limit inside the host.</p></details></li>
+    <li><p>What makes the timeout/invalidation race dangerous, and what makes it safe?</p><details class="answer"><summary>Model answer</summary><p>Danger: completing a timed-out request and reusing its buffer while the target still holds a valid key. Safety: ensure the key is invalidated (or the QP is in Error, which stops all remote access) before releasing the buffer or completing the request.</p></details></li>
+    <li><p>Why does an MR-context cache miss show up on the host's PCIe link?</p><details class="answer"><summary>Model answer</summary><p>The RNIC must fetch the missing context from host memory with PCIe reads before processing the packet, adding RNIC-originated MRd traffic and latency.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>Design a validation plan for QP error containment.</p><details class="answer"><summary>Model answer</summary><p>Inject faults per QP (bad key, induced retry exhaustion, RNR exhaustion) under load on multiple queues. Pass criteria: only the affected queue's commands fail or are retried, exactly once; no data corruption (pattern verification); recovery time bounded; no leaked MRs or QPs after 1 000 cycles; other hosts unaffected. Record first-error WC statuses.</p></details></li>
+    <li><p>A customer says "RDMA is unstable, switch to TCP." How do you respond?</p><details class="answer"><summary>Model answer</summary><p>Ask for the first-error evidence: WC statuses, NAK types, switch counters. If the failures are retry-exceeded with drops on the RoCE priority, the network is lossy for RoCE; fix QoS or choose TCP/iWARP knowingly. If they are remote access errors, switching transport hides a host or target bug. Decide on evidence.</p></details></li>
+    <li><p>How would you size target receive buffers with an SRQ for 200 hosts?</p><details class="answer"><summary>Model answer</summary><p>The target promised CRQSIZE per QP; worst case is the sum of promises. An SRQ smaller than that is a bet on statistical multiplexing; quantify it with measured concurrency, add headroom, monitor RNR NAKs from the target, and bound promises if memory is limited.</p></details></li>
+    <li><p>What evidence survives a reconnect, and how do you preserve it?</p><details class="answer"><summary>Model answer</summary><p>Kernel logs with the first WC error, RNIC and switch counters (if snapshotted), and analyzer captures with triggers on NAKs or DREQ. Configure triggers and periodic counter snapshots before the incident; QP state itself is destroyed by recovery.</p></details></li>
+    <li><p>When is per-command remote invalidation not worth it?</p><details class="answer"><summary>Model answer</summary><p>When the target does not support it reliably or when a host registers long-lived buffers deliberately (with a security review). Otherwise it is cheap: it saves a local work request and closes the exposure window at completion.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>Which QP state is required for NVMe I/O?</p>
+      <ul class="options" data-answer="3"><li>Init</li><li>RTR</li><li>RTS</li><li>SQD</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Ready to Send: both send and receive work are processed. RTR can receive only.</p></details></li>
+    <li><p>SGL1 identifier 31h in a capsule means:</p>
+      <ul class="options" data-answer="2"><li>Keyed Data Block, address</li><li>Last Segment, offset (list in capsule)</li><li>Data Block, offset</li><li>Segment, address</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Type 3h (Last Segment), subtype 1h (Offset): the descriptor list is inside the capsule.</p></details></li>
+    <li><p>Two keyed descriptors, response is SEND with Invalidate naming the first. The host must:</p>
+      <ul class="options" data-answer="1"><li>Locally invalidate the second key before completing</li><li>Complete immediately</li><li>Ask the target to resend</li><li>Reset the QP</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Only one key per IETH; the other needs Local Invalidate, and completion must wait for it.</p></details></li>
+    <li><p>Write throughput scales inversely with round-trip time and shows no errors. Most likely limit:</p>
+      <ul class="options" data-answer="4"><li>MDTS</li><li>PFC</li><li>NVMe queue depth</li><li>RDMA READ depth</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>A fixed number of outstanding READs over a round trip gives D × C / RTT.</p></details></li>
+    <li><p>Drops on the RoCE priority with zero PFC pauses sent suggest:</p>
+      <ul class="options" data-answer="2"><li>A host driver bug</li><li>RoCE traffic not mapped to the lossless priority, or PFC off</li><li>Remote access errors</li><li>Normal operation</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>PFC would pause rather than drop on a correctly configured lossless priority.</p></details></li>
+    <li><p>Which status is collateral damage rather than a root cause?</p>
+      <ul class="options" data-answer="3"><li>Remote access error</li><li>Retry exceeded</li><li>Work request flush error</li><li>Local protection error</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Flush errors are assigned to work outstanding when the QP entered Error.</p></details></li>
+    <li><p>Which loss is detected by timer rather than by NAK?</p>
+      <ul class="options" data-answer="1"><li>The last packet of a message</li><li>A middle packet</li><li>The first packet when more follow</li><li>None; all loss is NAKed</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>No later packet reveals the gap, so the requester's local ACK timeout must expire.</p></details></li>
+    <li><p>Open: why does the ambiguous trace need an unfiltered capture?</p>
+      <details class="answer"><summary>Model answer</summary><p>The evidence of who acted first (an admin-queue Abort, a property read, host-initiated teardown on other queues) travels on other QPs, which the capture filter removed.</p></details></li>
+    <li><p>Open: name two finite resources on the host and one on the target that can each stall NVMe/RDMA without any error on the wire.</p>
+      <details class="answer"><summary>Model answer</summary><p>Host: MR pool, response receives (if reposting lags it produces RNR, which is visible but not an error), responder resources. Target: RDMA READ depth or staging memory. Each shows as gaps in time rather than error packets.</p></details></li>
+    <li><p>Open: a host's I/O timeout is 30 s and the target's back end sometimes takes 35 s. Describe what a safe host does and what the wire shows.</p>
+      <details class="answer"><summary>Model answer</summary><p>At 30 s the host stops trusting the command: it moves the QP to Error or invalidates the key before releasing the buffer, then recovers. At 35 s the target's RDMA WRITE (or READ) meets an invalid key and is NAKed with Remote Access Error, killing the target's QP if it still exists. No late data reaches application memory.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <ol>
+    <li><p><strong>To a child:</strong> explain why sending one wrong secret word cuts the whole zip line, and why that is safer than letting the crane open the wrong chest.</p>
+      <details class="answer"><summary>Model explanation</summary><p>"If someone sends a wrong secret word, maybe something has gone wrong in the castle. The safest thing is to stop everything on that line straight away, so no treasure goes into the wrong chest. Then the castles build a fresh line and start again carefully."</p></details></li>
+    <li><p><strong>To a junior engineer:</strong> walk through a 256 KiB write with two keys and READ depth 16, naming who issues each operation and when the host may complete the request.</p>
+      <details class="answer"><summary>Model explanation</summary><p>"The host fast-registers two MRs, builds an SQE whose SGL1 is a Last Segment pointing at two keyed descriptors in the capsule, and SENDs it. The target RNIC ACKs, the target issues sixteen 16 KiB RDMA READs using those keys, the host RNIC serves them from memory. The target writes to its SSD, then SENDs the CQE with Invalidate for one key. The host locally invalidates the other key and only then completes the request."</p></details></li>
+    <li><p><strong>To a senior engineer:</strong> argue which evidence you would collect, before an incident, to make the next NVMe/RDMA reconnect diagnosable within an hour.</p>
+      <details class="answer"><summary>Model explanation</summary><p>"Persistent kernel logs with WC statuses; periodic snapshots of RNIC counters (retransmits, out-of-sequence, RNR, CNPs) and switch per-priority drops and pauses; an analyzer or mirror-port capture armed with a trigger on NAKs and DREQ with a large pre-trigger window and no QP filter; clock alignment via marker I/O; and a record of CM parameters per connection (depths, queue sizes). With that, the first error and its layer are visible immediately."</p></details></li>
+  </ol>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain the QP as a failure domain and why flush errors follow one real error</li>
+      <li>diagram a multi-key NVMe/RDMA write including READ depth and local invalidation</li>
+      <li>identify in a trace: a PSN gap, a NAK type, READ-depth throttling and timer-driven retransmission</li>
+      <li>debug the six patterns on this page, naming first and second checks for each</li>
+      <li>distinguish NVMe/RDMA from neighbouring concepts: <a href="dd50.html">NVMe/TCP</a> (software loss recovery, R2T), <a href="ch16.html">PCIe flow control</a> (credits, no NAK-driven retries at the transaction layer), <a href="ch37.html">SGLs over PCIe</a> (no keys), and <a href="ch68.html">fabric multipathing</a> (what happens after the QP dies)</li>
+      <li>cite the applicable sources: NVMe over RDMA Transport 1.3, NVMe Base 2.4 (SGL, Identify Controller), IBTA Volume 1 with the RoCE v2 annex, IETF RFC 5040/5041/5044, IEEE 802.1Qbb</li>
+    </ul>
+  </aside>
+  <p>Next module: <a href="dd52.html">SR-IOV</a>.</p>
+</section>

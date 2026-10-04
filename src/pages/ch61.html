@@ -1,0 +1,774 @@
+<p class="lead">The Computational Programs Command Set lets a host run programs inside an NVMe subsystem, next to the data, instead of dragging every byte across PCI Express to the CPU. This chapter explains computational storage, compute namespaces, device-defined and downloaded programs, memory range sets, the role of Subsystem Local Memory, how execution works, and when moving compute toward data actually helps.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>Every chapter so far has assumed the same division of labour: the storage device stores and moves bytes, the host CPU computes. For a scan that keeps 1% of 1 TB, that means moving 1 TB across the PCI Express (PCIe) link, through the root complex and memory controller, into host DRAM, through CPU caches — and then throwing 99% of it away. Link bandwidth, host memory bandwidth, CPU cycles and energy are all spent on data that never mattered.</p>
+  <p><strong><span class="g" data-term="computational-storage">Computational storage</span></strong> moves some of the compute to the device. The NVM Express (NVMe) organisation standardised it as two command sets released together: <a href="ch62.html"><span class="g" data-term="slm">Subsystem Local Memory (SLM)</span></a>, which gives the subsystem byte-addressable memory the host can manage, and <strong>Computational Programs</strong>, which runs programs that read and write that memory. Together they let a host say: "copy these blocks into device memory, run the filter program over them, and give me only the matches."</p>
+  <p>As an engineer you need this chapter for three reasons. First, it introduces a new class of namespace — the <em>compute namespace</em> — and a new class of long-running, data-dependent commands whose latency has nothing to do with media. Second, it changes trace analysis: large amounts of data can move inside the device with almost no PCIe traffic, so "the trace is quiet" no longer means "nothing is happening". Third, it raises new architectural and security questions — who may load code into a storage device, what memory may it touch, and how is a runaway program stopped.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Define computational storage and explain the data-locality argument with a quantitative model.</li>
+    <li>Describe compute namespaces, compute engines, programs and program indexes.</li>
+    <li>Distinguish device-defined (preloaded) programs from downloadable programs, and explain loading and activation.</li>
+    <li>Explain memory namespaces, memory ranges and memory range sets, and how they bound what a program can access.</li>
+    <li>Walk through an Execute Program flow end to end, including the SLM copy steps.</li>
+    <li>Explain the relationship between Computational Programs and Subsystem Local Memory, and map the NVMe terms to the SNIA Computational Storage architecture.</li>
+    <li>Identify computational-storage activity — and its near-absence — in a synthetic PCIe trace, and find the first abnormal event in a hung program.</li>
+    <li>State what must be checked in the Computational Programs 1.3 specification before writing code.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>Namespaces and Command Set Identifiers from <a href="ch58.html">Namespaces</a>; the KV chapter's lesson that a namespace's contents can be anything (<a href="ch60.html">Key Value</a>); admin and I/O command flow from <a href="ch26.html">Admin Queue</a> and <a href="ch27.html">I/O Queues</a>; DMA from <a href="ch20.html">DMA</a>; command timeouts and abort from <a href="ch44.html">NVMe Errors</a> and <a href="ch48.html">NVMe Reset</a>. <a href="ch62.html">Subsystem Local Memory</a> comes next and complements this chapter; you may read them in either order.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Imagine a toy factory with a huge warehouse of parts. Every morning, a lorry drives all the parts from the warehouse to a workshop in town, where workers pick out the red pieces and throw the rest away. Then the lorry drives the rubbish back. Most of what the lorry carries is useless.</p>
+    <p>Someone has an idea: put a small workbench <em>inside</em> the warehouse. Now a worker at the warehouse picks out the red pieces right there, and the lorry only carries the red pieces to town. The workbench needs a table to lay parts on (that is the <strong>memory</strong>), a list of jobs the worker knows how to do (the <strong>programs</strong>), and rules about which tables the worker is allowed to use (the <strong>memory range set</strong>).</p>
+    <p>Some jobs the worker already knows from the factory (built-in programs). For new jobs, the town office can post instructions to the warehouse (downloading a program) and then say "this one is approved, you may use it" (activation).</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A modern factory with an on-site quality-control cell. Raw castings arrive in the factory's own stores (the NVM namespace). Instead of shipping every casting to the head-office lab, the factory moves a pallet onto a staging bench (copy into Subsystem Local Memory), and a robot cell (the compute engine) runs an inspection routine (a program) — either one the robot shipped with or one head office uploaded and certified. The cell may only reach the benches it has been assigned (the memory range set). It writes a short report onto an output bench, and head office collects only the report. If an uploaded routine loops forever, a supervisor must be able to stop the cell without shutting the whole factory.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What it hides.</strong> The "workbench" is a small embedded processor or accelerator inside the SSD controller, typically much less powerful than a host CPU. If the job is compute-heavy rather than data-heavy, the warehouse bench is slower than town. The analogy also hides that data must still be <em>copied</em> from storage into device memory before the program can see it; programs do not usually read the NVM namespace directly.</p>
+    <p><strong>Where it misleads.</strong> A factory robot cannot corrupt head-office records. A buggy or malicious program in a storage device sits inside the trust boundary of every host using that device. Program loading, activation and memory range sets exist precisely to keep that risk contained, and administrators will often lock program download down entirely.</p>
+    <p><strong>Where it breaks.</strong> The lorry in the story is the bottleneck; in reality the bottleneck may be the device's internal flash bandwidth, its compute engine, or the host's CPU. Whether computational storage helps is an arithmetic question, not a slogan.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p><strong>Computational storage</strong> means a storage device that can run computations on data it holds. In NVMe, this is organised with three kinds of namespace working together:</p>
+  <ul>
+    <li>an ordinary <strong>NVM namespace</strong> holding the data (blocks);</li>
+    <li>a <strong>memory namespace</strong> — Subsystem Local Memory, byte-addressable memory inside the subsystem;</li>
+    <li>a <strong>compute namespace</strong> — the namespace through which programs are managed and executed.</li>
+  </ul>
+  <p>A <strong>program</strong> is a piece of code the device can run. Some programs come with the device (<em>device-defined</em> or preloaded); others the host can download into an empty program slot (<em>downloadable</em>). Programs are identified by a <strong>program index</strong>. Before a program can run, it must be <strong>active</strong>.</p>
+  <p>A program cannot touch arbitrary device memory. The host first creates a <strong>memory range set</strong>: a list of memory ranges (offset and length inside memory namespaces) that a program run may use. When the host executes a program, it names the program index, the memory range set and some parameters.</p>
+  <p>A typical job looks like this:</p>
+  <ol>
+    <li>Copy data from the NVM namespace into a memory namespace (inside the device).</li>
+    <li>Execute the program on that memory range set.</li>
+    <li>The program writes its results into another range.</li>
+    <li>Read just the results back to host memory.</li>
+  </ol>
+  <p>Only step 4 (and the small commands themselves) crosses PCIe. That is the whole point.</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>Computational storage and data locality</h3>
+  <p>Data locality means doing work where the data already is. Its benefit depends on the <strong>data reduction</strong> a computation achieves (selectivity of a filter, compression ratio, aggregation) and on where the bottleneck lies. A streaming scan through a pipeline runs at the speed of its slowest stage:</p>
+  <div class="formula">
+    <div class="eq"><var>T</var><sub>host</sub> = <var>D</var> / min(<var>B</var><sub>link</sub>, <var>B</var><sub>media</sub>, <var>C</var><sub>host</sub>) &nbsp;&nbsp;&nbsp; <var>T</var><sub>dev</sub> = max( <var>D</var>/<var>B</var><sub>media</sub>, <var>D</var>/<var>C</var><sub>dev</sub>, <var>s</var>·<var>D</var>/<var>B</var><sub>link</sub> )</div>
+    <dl class="vars">
+      <dt>D</dt><dd>bytes of input data to process</dd>
+      <dt>B<sub>link</sub></dt><dd>usable host–device link bandwidth in bytes per second (for example, about 7 GB/s for PCIe Gen4 x4 after protocol overhead — illustrative)</dd>
+      <dt>B<sub>media</sub></dt><dd>bandwidth at which the device can read its own media internally, bytes per second</dd>
+      <dt>C<sub>host</sub></dt><dd>rate at which the host CPU can process the data, bytes per second</dd>
+      <dt>C<sub>dev</sub></dt><dd>rate at which the device's compute engine can process the data, bytes per second</dd>
+      <dt>s</dt><dd>selectivity: fraction of input bytes that must be returned to the host (0 to 1)</dd>
+      <dt>T<sub>host</sub>, T<sub>dev</sub></dt><dd>time for the host-side path and the in-device path, in seconds</dd>
+    </dl>
+  </div>
+  <p>The model is deliberately simple (it ignores setup, copy and command overheads) but it already shows the rules: computational storage helps when <var>s</var> is small <em>and</em> <var>C</var><sub>dev</sub> is not the bottleneck <em>and</em> the device's internal media bandwidth exceeds the link. It does nothing when the host's link is not the bottleneck, and it hurts when the device's compute engine is slower than the link. Aggregated across many drives the argument strengthens: 24 drives behind a host have 24 internal media paths but share one CPU socket's memory bandwidth.</p>
+  <p>Other benefits beyond throughput: lower host CPU utilisation (cycles freed for other work), lower energy per byte processed (no long-distance data movement), and lower latency for small result sets. Costs: programming model complexity, portability, debuggability and security.</p>
+
+  <h3>The architecture: three kinds of namespace</h3>
+  <figure>
+    <pre class="diagram">
+  Host                                     NVM subsystem
+ +-----------+   PCIe   +--------------------------------------------------------------+
+ | app       |  (small  |  Controller (I/O queues, admin queue)                        |
+ | driver    |  commands|                                                              |
+ | buffers   |  + small |   NVM namespace (NSID 1)        Memory namespace (NSID 5)    |
+ +-----------+  results)|   blocks on NAND        --copy-->  SLM bytes (device DRAM)   |
+                        |                                   [range A: input ]          |
+                        |                                   [range B: output]          |
+                        |                                        ^      |              |
+                        |                    memory range set 7 = {A, B}               |
+                        |                                        |      v              |
+                        |   Compute namespace (NSID 6)  ---- compute engine runs       |
+                        |   program index 0: device-defined filter                     |
+                        |   program index 1: downloaded, active                        |
+                        +--------------------------------------------------------------+</pre>
+    <figcaption>Conceptual relationship between an NVM namespace, a memory namespace and a compute namespace. NSIDs are a synthetic example for teaching.</figcaption>
+  </figure>
+  <p>The open-source libnvme library, which tracks the Base specification, encodes the Command Set Identifiers as <code>03h</code> for Subsystem Local Memory and <code>04h</code> for Computational Programs. Confirm in the Base 2.4 CSI definition.</p>
+  <table>
+    <caption>Computational storage entities in NVMe</caption>
+    <thead><tr><th>Entity</th><th>Defined in</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="compute-namespace">Compute namespace</span></td><td>Computational Programs 1.3</td><td>A namespace using the Computational Programs command set; holds programs and is the target of Execute Program</td></tr>
+      <tr><td>Compute engine</td><td>Computational Programs 1.3</td><td>The execution resource (embedded cores, FPGA, accelerator) that runs programs; reported by the device and associated with compute namespaces</td></tr>
+      <tr><td><span class="g" data-term="computational-program">Program</span></td><td>Computational Programs 1.3</td><td>Executable code at a program index in a compute namespace; device-defined or downloadable; of a reported program type</td></tr>
+      <tr><td><span class="g" data-term="memory-namespace">Memory namespace</span></td><td>SLM 1.3</td><td>Byte-addressable Subsystem Local Memory exposed as a namespace</td></tr>
+      <tr><td><span class="g" data-term="memory-range-set">Memory range set</span></td><td>Computational Programs 1.3</td><td>A set of (memory namespace, offset, length) ranges that a program execution may access</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Programs: device-defined and downloadable</h3>
+  <p><strong>Device-defined programs</strong> (often called preloaded or fixed programs) ship with the device: compression, decompression, encryption, checksum, filter or search functions the vendor implemented and validated. They occupy program indexes the host cannot overwrite. Their behaviour is described by vendor documentation or by a standardised program identifier; their implementation may be hardware.</p>
+  <p><strong>Downloadable programs</strong> are loaded by the host into a program index with the <strong>Load Program</strong> command. The program has a <em>program type</em> that the device must support — the device reports which types it accepts. Extended Berkeley Packet Filter (eBPF) bytecode is the most widely discussed portable type for computational storage, because it has a verifier, a well-defined instruction set and existing toolchains; vendor-specific native binaries are another. <span class="badge uncertain">Uncertain</span> which program types Computational Programs 1.3 standardises versus leaves vendor-specific; read the program type definitions.</p>
+  <p>Program lifecycle:</p>
+  <ol>
+    <li><strong>Discover</strong> — the host reads Identify and log data to learn the compute namespace's program slots, which hold device-defined programs, and which program types are downloadable.</li>
+    <li><strong>Load</strong> (downloadable only) — Load Program transfers the program image from host memory into a program index. Large images may be transferred in pieces.</li>
+    <li><strong>Activate</strong> — <strong>Program Activation Management</strong> activates (or deactivates) the program at an index. Only active programs can execute. Activation is where a device can verify, compile or install the program.</li>
+    <li><strong>Execute</strong> — <strong>Execute Program</strong> runs it.</li>
+    <li><strong>Deactivate / unload</strong> — when no longer needed.</li>
+  </ol>
+  <p>libnvme encodes Load Program as admin opcode <code>85h</code>, Program Activation Management as <code>88h</code> and Memory Range Set Management as <code>89h</code>; it does not list Execute Program, which is an I/O command sent to the compute namespace. This course does not state the Execute Program opcode — read it from the Computational Programs 1.3 command table.</p>
+
+  <h3>Memory ranges and memory range sets</h3>
+  <p>A program's view of the world is deliberately narrow. Before execution, the host uses <strong>Memory Range Set Management</strong> to create a memory range set: an identifier plus a list of memory ranges, each naming a memory namespace, a starting byte offset and a length. When the host executes a program, it names one memory range set; the program may access those ranges and nothing else.</p>
+  <p>This is the containment boundary of computational storage. It means:</p>
+  <ul>
+    <li>a program cannot read another tenant's data unless the host placed it in one of the program's ranges;</li>
+    <li>a program cannot write outside its output ranges, protecting other data in SLM;</li>
+    <li>the same program can be run concurrently on different range sets, like a function called with different buffers;</li>
+    <li>the device can validate ranges once at creation, not on every memory access.</li>
+  </ul>
+  <p>The convention of "range 0 is input, range 1 is output" is not a specification rule; it is an interface the program defines, the way a C function defines its arguments. <span class="badge impl">Implementation-dependent</span> — the program's documentation (or, for downloaded programs, your own code) defines the meaning of each range and each parameter.</p>
+
+  <h3>Executing a program</h3>
+  <p>Execute Program is an I/O command submitted to the compute namespace. It identifies the program (by index), the memory range set, and parameters for the program, passed in command dwords and/or a parameter data buffer. The controller dispatches the program to a compute engine; when the program finishes, the controller posts a completion. The completion reports success or failure of the execution and can carry a program-defined result value. <span class="badge uncertain">Uncertain</span> on how parameters are encoded, the size of the inline parameter area and which completion dwords carry the program result — check the Execute Program command definition.</p>
+  <p>Execution time depends on the program and the data, not on the media. A filter over 4 GiB of SLM may take a second; a bad program may never finish. Hosts must set timeouts appropriate to the program (often far longer than the default I/O timeout) and must be able to abort. Execution failures inside a program (for example, a divide-by-zero in eBPF, or an access outside the range set) are reported as command statuses defined by the command set.</p>
+
+  <h3>The relationship with Subsystem Local Memory</h3>
+  <p>Computational Programs does not define where data lives during computation; Subsystem Local Memory does. SLM provides memory namespaces and commands to read and write them from the host and to copy data between NVM namespaces and memory namespaces inside the subsystem (taught in <a href="ch62.html">Subsystem Local Memory</a>). The two specifications were designed together and are meant to be used together:</p>
+  <table>
+    <caption>Division of responsibilities</caption>
+    <thead><tr><th>Need</th><th>Specification</th></tr></thead>
+    <tbody>
+      <tr><td>Byte-addressable working memory in the device</td><td>SLM (memory namespaces)</td></tr>
+      <tr><td>Move data NVM namespace ↔ memory namespace without crossing PCIe</td><td>SLM (and the NVM Command Set's copy facilities — check which)</td></tr>
+      <tr><td>Host reads/writes memory namespace contents</td><td>SLM read/write commands</td></tr>
+      <tr><td>Define which memory a program may access</td><td>Computational Programs (memory range sets)</td></tr>
+      <tr><td>Load, activate and execute programs</td><td>Computational Programs</td></tr>
+    </tbody>
+  </table>
+  <p>SLM is useful without computation (for example, as device-side staging memory), but Computational Programs is not useful without SLM: programs need somewhere to read and write.</p>
+
+  <h3>Mapping to the SNIA Computational Storage architecture</h3>
+  <p>The Storage Networking Industry Association (SNIA) publishes the <cite class="spec">SNIA Computational Storage Architecture and Programming Model</cite> and a Computational Storage API. Its vocabulary appears in papers and products, so it helps to map it:</p>
+  <table>
+    <caption>SNIA terms and their NVMe counterparts (approximate mapping)</caption>
+    <thead><tr><th>SNIA term</th><th>Meaning</th><th>Closest NVMe concept</th></tr></thead>
+    <tbody>
+      <tr><td>Computational Storage Device (CSx)</td><td>A device providing computational storage services</td><td>An NVM subsystem with compute and memory namespaces</td></tr>
+      <tr><td>Computational Storage Engine (CSE)</td><td>Resource that executes functions</td><td>Compute engine</td></tr>
+      <tr><td>Computational Storage Function (CSF)</td><td>A specific operation</td><td>Program</td></tr>
+      <tr><td>Function Data Memory (FDM)</td><td>Device memory used by functions</td><td>Subsystem Local Memory (memory namespace)</td></tr>
+      <tr><td>Allocated FDM (AFDM)</td><td>FDM allocated for a function's use</td><td>Memory ranges / memory range set</td></tr>
+    </tbody>
+  </table>
+  <p>The mapping is conceptual. When precision matters, use the NVMe specification's own terms and definitions.</p>
+
+  <h3>Security and control</h3>
+  <ul>
+    <li><strong>Who may load code.</strong> Load Program and Program Activation Management are administrative operations. The Base specification's <em>Command and Feature Lockdown</em> mechanism lets an administrator prohibit specific commands, which is how a platform can forbid program download entirely.</li>
+    <li><strong>What code may touch.</strong> Memory range sets bound memory access; a device must enforce them. Programs should not have direct access to NVM namespaces or to other tenants' SLM.</li>
+    <li><strong>What code may do.</strong> A portable, verifiable program type (such as eBPF with a verifier) lets a device reject unsafe programs at activation.</li>
+    <li><strong>Stopping code.</strong> Hosts need Abort, and as a last resort controller reset, to recover from a runaway execution.</li>
+  </ul>
+  <aside class="callout warn"><p>A storage device that runs downloaded code is a new execution environment inside the server. Treat program download like loading a kernel module: privileged, audited, and disabled unless needed.</p></aside>
+
+  <h3>2026 context</h3>
+  <p>Computational Programs and SLM were first published in 2024. The current revision is <cite class="spec">NVM Express Computational Programs Command Set Specification, Revision 1.3</cite>, released with the NVMe 2.4 set on 2026-08-04 alongside <cite class="spec">NVM Express Subsystem Local Memory Command Set Specification, Revision 1.3</cite>. Press coverage lists "updated Computational Programs" among the 2026 changes; this chapter does not describe field-level changes — see <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a> and the official Revision Changes document.</p>
+
+  <h3>The central concept on the ladder</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Put a workbench in the warehouse, give the worker a list of jobs and a set of tables they may use, and send only the finished results to town.</p></div>
+    <div class="rung" data-rung="B"><p>A compute namespace holds programs; a memory namespace holds working data; a memory range set says which memory a program run may use; Execute Program runs a program on that memory with parameters, returning a result.</p></div>
+    <div class="rung" data-rung="C"><p>Inside the controller: embedded cores or accelerators (compute engines), device DRAM partitioned into SLM, a program store, a loader/verifier, a dispatcher, and internal data paths from flash to SLM that never touch PCIe.</p></div>
+    <div class="rung" data-rung="D"><p>Computational Programs 1.3 defines compute namespaces, programs, program types, Load Program, Program Activation Management, Memory Range Set Management and Execute Program; SLM 1.3 defines memory namespaces and their data movement; Base 2.4 defines CSI, queues and lockdown.</p></div>
+    <div class="rung" data-rung="E"><p>Admin commands to set up ranges and programs; SLM I/O commands to copy data in (no data over PCIe) and read results out (device MWr); an Execute Program I/O command whose completion may arrive seconds later with a program result.</p></div>
+    <div class="rung" data-rung="F"><p>In a trace: a burst of small setup traffic, a long quiet period with outstanding commands and no data TLPs, then a small result transfer. The quiet period is the work.</p></div>
+    <div class="rung" data-rung="G"><p>Debugging: is the program active, is the range set valid and large enough, did the copy finish before execution, is the host timeout long enough, is the program looping? Distinguish a slow program from a hung one by device-side status and timing, not by link silence.</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for "Execute Program"</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>An I/O command to a compute namespace that runs an active program against a memory range set with parameters.</dd>
+    <dt>2. Why was it created?</dt><dd>To give a standard, transport-independent way to invoke computation inside NVMe subsystems.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Moving and processing data that could be reduced at the source; host CPU and link saturation for data-heavy, compute-light work.</dd>
+    <dt>4. What existed before it?</dt><dd>Vendor-specific computational storage devices with proprietary commands, FPGA cards with their own drivers, and host-side processing.</dd>
+    <dt>5. Why is the current design better?</dt><dd>It reuses NVMe queues, transports, namespaces and management, separates memory (SLM) from compute, and provides a containment model via range sets.</dd>
+    <dt>6. Who creates it?</dt><dd>Host software — an application through a computational storage library and the driver's pass-through path.</dd>
+    <dt>7. Who consumes it?</dt><dd>The controller's program dispatcher and a compute engine.</dd>
+    <dt>8. Where does it live?</dt><dd>An SQE in an I/O submission queue associated with the compute namespace; program code in the device; data in SLM.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>SQ tail doorbell, SQE, optional parameter buffer in host memory, SLM ranges, CQE.</dd>
+    <dt>10. What happens before it?</dt><dd>Program loaded (if downloadable) and activated; memory range set created; input copied into SLM.</dd>
+    <dt>11. What happens after it?</dt><dd>Host reads results from SLM output ranges; may chain another program; eventually deletes the range set.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Status errors (inactive program, invalid range set, program fault), wrong results from wrong ranges or parameters, or a hang requiring abort or reset.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>One SQE fetch, possibly a parameter buffer read, a long gap, and a CQE — with any bulk data movement invisible because it is internal.</dd>
+    <dt>14. What does Linux show?</dt><dd>A generic character device for the compute namespace (<code>/dev/ngXnY</code>), its CSI in the descriptor list, and the result of pass-through commands; no block device.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>Program lifecycle transitions; range enforcement (every out-of-range access must fault, not corrupt); concurrency of executions; abort and reset during execution; lockdown of Load Program; behaviour under SLM exhaustion; result correctness against a host reference implementation.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>Ordering between the SLM copy and Execute Program, timeouts sized for media rather than computation, range-set lifetime bugs, and the device compute engine being the actual bottleneck.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>On PCIe, a computational storage device is still a single NVMe function with the same BARs, doorbells and MSI-X vectors. The new hardware is behind the controller front end:</p>
+  <table>
+    <caption>Hardware that participates in a program execution (implementation-dependent)</caption>
+    <thead><tr><th>Element</th><th>Typical realisation</th><th>Observable from host?</th></tr></thead>
+    <tbody>
+      <tr><td>Compute engine</td><td>Embedded Arm or RISC-V cores, a fixed-function accelerator (compression, crypto, regex), or FPGA fabric</td><td>Only through Identify/log reports and timing</td></tr>
+      <tr><td>Subsystem Local Memory</td><td>A partition of the controller's DRAM, sometimes dedicated DRAM</td><td>Through memory namespace commands</td></tr>
+      <tr><td>Internal data movers</td><td>DMA engines from the flash back end to DRAM</td><td>No — internal copies generate no PCIe traffic</td></tr>
+      <tr><td>Program store</td><td>Firmware-managed region holding device-defined and downloaded programs</td><td>Through program lists</td></tr>
+      <tr><td>Loader / verifier / runtime</td><td>Firmware: eBPF verifier and JIT or interpreter, or a native loader with sandboxing</td><td>Indirectly, through activation success or failure</td></tr>
+      <tr><td>Range checker</td><td>MMU/MPU or software bounds checks enforcing memory range sets</td><td>Only when it faults</td></tr>
+    </tbody>
+  </table>
+  <p>Two hardware facts dominate performance. First, internal flash bandwidth across all channels often exceeds the PCIe link: a 16-channel controller may read flash internally faster than a Gen4 x4 link can carry. That surplus is what computational storage harvests. Second, embedded compute is modest: a few low-power cores may process data at a few GB/s or less for general code, while a fixed-function accelerator may run at line rate for its one job. The <var>C</var><sub>dev</sub> term in the model is therefore highly program-dependent.</p>
+  <p>Power and thermal limits matter too. A device running its cores flat out draws more power; it may throttle (see <a href="ch50.html">Power Management</a>), and a throttled compute engine changes a program's execution time without any protocol-visible event.</p>
+  <aside class="callout hw"><p>Because the bulk data path is internal, a PCIe analyzer on the link sees almost nothing during a large computation. Hardware debug of computational storage therefore leans on device telemetry and vendor logs rather than link traces.</p></aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Computational Programs Command Set Specification, Revision 1.3</cite> — compute namespaces, compute engines, programs and program types, Load Program, Program Activation Management, Memory Range Set Management, Execute Program, related Identify and log structures, statuses. Current in the August 2026 release. <span class="badge normative">Normative</span></li>
+    <li><cite class="spec">NVM Express Subsystem Local Memory Command Set Specification, Revision 1.3</cite> — memory namespaces and the commands that read, write and copy them. <span class="badge normative">Normative</span></li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4</cite> — CSI values, command set selection, namespace management, Command and Feature Lockdown, Abort and reset. <span class="badge normative">Normative</span></li>
+    <li><cite class="spec">SNIA Computational Storage Architecture and Programming Model</cite> — an architecture document from another standards body, useful context. <span class="badge informative">Informative</span> for NVMe purposes.</li>
+  </ul>
+  <aside class="callout verified"><p>CSI <code>03h</code> (SLM) and <code>04h</code> (Computational Programs); Load Program <code>85h</code>, Program Activation Management <code>88h</code>, Memory Range Set Management <code>89h</code> as admin opcodes; the names of the programs/range-set concepts — all as encoded in libnvme, which tracks the specifications. Generic status <code>07h</code> Command Abort Requested and Abort command opcode <code>08h</code> come from the Base specification.</p></aside>
+  <aside class="callout derived"><p>The cost model, the observation that internal copies are invisible on PCIe, the analogy with kernel modules for security, and the guidance on timeouts are reasoned, not quoted.</p></aside>
+  <aside class="callout impl"><p>Which device-defined programs exist, which program types are downloadable, compute engine type and speed, SLM size, maximum concurrent executions, whether a running program can be aborted, and how faults inside programs are detected are <span class="badge impl">Implementation-dependent</span>.</p></aside>
+  <aside class="callout version"><p>Computational Programs and SLM were first published in 2024 and are at revision 1.3 in the 2026 set. They are young specifications: expect field additions between revisions and check the revision a device claims. 2026 changes: see <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a>.</p></aside>
+  <aside class="callout notsaid">
+    <p>Check in the specifications before relying on:</p>
+    <ul>
+      <li>the Execute Program opcode, parameter encoding and the completion fields carrying a program result;</li>
+      <li>whether Load Program, Program Activation Management and Memory Range Set Management are admin commands in every case and which NSID they take;</li>
+      <li>the memory range descriptor format, alignment rules and maximum number of ranges per set;</li>
+      <li>the standardised program types and program identifiers, if any, in revision 1.3;</li>
+      <li>the status codes for inactive programs, invalid range sets and program faults;</li>
+      <li>the exact SLM commands for copying between NVM namespaces and memory namespaces (see <a href="ch62.html">Subsystem Local Memory</a>).</li>
+    </ul>
+    <p>The specifications do not say how fast programs run, how a device sandboxes code, or what a device-defined program computes beyond what the vendor documents.</p>
+  </aside>
+  <aside class="callout warn"><p>Never assume a program can read an NVM namespace directly, that execution time resembles I/O latency, that Abort can stop a running program, that a downloaded program survives a reset or firmware activation, or that two devices support the same program types.</p></aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <figure>
+    <ol class="seq" data-actors="Host|Controller|SLM (memory ns)|Compute engine">
+      <li data-from="Host" data-to="Controller">Admin 89h: create range set 7</li>
+      <li data-from="Controller" data-to="Host" class="dashed">CQE: success</li>
+      <li data-from="Host" data-to="Controller">SLM copy: NVM ns 1 → memory ns 5</li>
+      <li data-from="Controller" data-to="SLM (memory ns)">internal copy (no PCIe data)</li>
+      <li data-from="Controller" data-to="Host" class="dashed">CQE: copy done</li>
+      <li data-from="Host" data-to="Controller">Execute Program: idx 0, set 7</li>
+      <li data-from="Controller" data-to="Compute engine">dispatch</li>
+      <li data-from="Compute engine" data-to="SLM (memory ns)">read range A, write range B</li>
+      <li data-from="Compute engine" data-to="Controller" class="dashed">done, result = n</li>
+      <li data-from="Controller" data-to="Host" class="dashed">CQE: success, result</li>
+      <li data-from="Host" data-to="Controller">SLM read: range B</li>
+      <li data-from="Controller" data-to="Host" class="dashed">MWr: results only</li>
+    </ol>
+    <figcaption>Conceptual sequence of a computational storage job. Only the commands, completions and final results cross PCIe.</figcaption>
+  </figure>
+  <p><strong>Ordering.</strong> NVMe does not order commands. The host must wait for the copy's completion before submitting Execute Program, and for Execute Program's completion before reading results. Submitting them together and hoping is a correctness bug that will pass in testing (when the copy is fast) and fail in production.</p>
+  <p><strong>Direction and size.</strong> Setup commands move small descriptor buffers host → device. The copy moves nothing over PCIe. Execute Program may read a small parameter buffer. The result read moves result bytes device → host. Everything else is internal.</p>
+  <p><strong>Errors and layer.</strong> Program faults, invalid ranges and inactive programs are NVMe command statuses on the relevant command. A hung program produces no status at all — the first abnormal event is the <em>absence</em> of a completion, detected by a host timeout. PCIe errors during the small transfers are ordinary transport faults.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic examples for teaching on the course lab system. For this chapter the subsystem has NVM namespace 1 (512-byte LBAs), memory namespace 5 and compute namespace 6. Admin queues and I/O SQ1/CQ1 as in the lab system. SLM and Execute Program opcodes are shown by name only. Timings are illustrative; real execution times are implementation- and program-dependent.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 1 — normal: filter 4 GiB inside the device, return 300 KB">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 ns</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x0000000B</td><td>Admin SQ tail</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.8 µs</td><td>MRd64</td><td>Tag=0x80 Addr=0x1_0000_0280 Len=16</td><td>Fetch admin SQE slot 10</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.4 µs</td><td>CplD</td><td>Tag=0x80 Len=16</td><td>SQE: opc=89h (Memory Range Set Management) CID=0x0030 NSID=6, create; PRP1=0x2_0000_8000</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>2.1 µs</td><td>MRd64</td><td>Tag=0x81 Addr=0x2_0000_8000 Len=16</td><td>Fetch range descriptors (two ranges: memory ns 5 offset 0 len 4 GiB; offset 4 GiB len 64 MiB)</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2.7 µs</td><td>CplD</td><td>Tag=0x81 Len=16</td><td>Descriptors</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>35 µs</td><td>MWr64</td><td>Addr=0x1_0000_10A0 Len=4</td><td>Admin CQE: success (range set 7)</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>60 µs</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000031</td><td>SQ1 tail</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>61 µs</td><td>MRd64</td><td>Tag=0x82 Addr=0x1_2340_0C00 Len=16</td><td>Fetch SQE slot 0x30</td></tr>
+        <tr class="dir-down"><td>9</td><td>Host→Dev</td><td>61.6 µs</td><td>CplD</td><td>Tag=0x82 Len=16</td><td>SQE: SLM copy, NSID=5, source NVM ns 1 LBA 0 for 8,388,608 LBAs (4 GiB) → offset 0</td></tr>
+        <tr class="note"><td colspan="6">0.06 s – 0.42 s: <strong>no TLPs</strong> for this command. 4 GiB moves from flash to SLM inside the device (~12 GB/s internal, illustrative).</td></tr>
+        <tr class="dir-up"><td>10</td><td>Dev→Host</td><td>0.42 s</td><td>MWr64</td><td>Addr=0x1_2341_0300 Len=4</td><td>CQE: copy success</td></tr>
+        <tr class="dir-down"><td>11</td><td>Host→Dev</td><td>0.42 s + 4 µs</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000032</td><td>SQ1 tail</td></tr>
+        <tr class="dir-up"><td>12</td><td>Dev→Host</td><td>+0.8 µs</td><td>MRd64</td><td>Tag=0x83 Addr=0x1_2340_0C40 Len=16</td><td>Fetch SQE slot 0x31</td></tr>
+        <tr class="dir-down"><td>13</td><td>Host→Dev</td><td>+0.6 µs</td><td>CplD</td><td>Tag=0x83 Len=16</td><td>SQE: Execute Program, NSID=6, program index 0, range set 7, parameter threshold=990</td></tr>
+        <tr class="note"><td colspan="6">0.42 s – 0.96 s: <strong>no TLPs</strong>. The compute engine scans 4 GiB in SLM (~8 GB/s, illustrative) and writes matches to range B.</td></tr>
+        <tr class="dir-up"><td>14</td><td>Dev→Host</td><td>0.96 s</td><td>MWr64</td><td>Addr=0x1_2341_0310 Len=4</td><td>CQE: success; program result = 76,864 matches (307,456 bytes of output)</td></tr>
+        <tr class="dir-down"><td>15</td><td>Host→Dev</td><td>0.96 s + 5 µs</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000033</td><td>SQ1 tail</td></tr>
+        <tr class="dir-up"><td>16</td><td>Dev→Host</td><td>+0.8 µs</td><td>MRd64</td><td>Tag=0x84 Addr=0x1_2340_0C80 Len=16</td><td>Fetch SQE slot 0x32</td></tr>
+        <tr class="dir-down"><td>16a</td><td>Host→Dev</td><td>+1.4 µs</td><td>CplD</td><td>Tag=0x84 Len=16</td><td>SQE: SLM read, NSID=5, offset 4 GiB, length 307,456 → host buffer 0x2_0010_0000 (PRP list)</td></tr>
+        <tr class="dir-up"><td>17</td><td>Dev→Host</td><td>+3 µs</td><td>MWr64</td><td>Addr=0x2_0010_0000 Len=64</td><td>First 256 bytes of results</td></tr>
+        <tr class="note"><td colspan="6">Rows 18–1218: the remaining 1,200 MWr TLPs of 256 bytes (1,201 in total including row 17: 307,456 / 256), plus PRP list fetches (not numbered individually). ~45 µs at Gen4 x4.</td></tr>
+        <tr class="dir-up"><td>1219</td><td>Dev→Host</td><td>0.96 s + 60 µs</td><td>MWr64</td><td>Addr=0x1_2341_0320 Len=4</td><td>CQE: read success</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: across almost one second of work, the link carried a few hundred bytes of commands and 300 KB of results; the 4 GiB stayed inside. If you had looked only at link utilisation, you would have concluded the device was idle. The completion timestamps (rows 10, 14) are the only external markers of the internal phases. Note that row 14's program result tells the host how much to read in row 16 — a dependency the host must respect.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 2 — abnormal: a downloaded program that never finishes">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 s</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000035</td><td>SQ1 tail</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.8 µs</td><td>MRd64</td><td>Tag=0x90 Addr=0x1_2340_0D00 Len=16</td><td>Fetch SQE slot 0x34</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.4 µs</td><td>CplD</td><td>Tag=0x90 Len=16</td><td>SQE: Execute Program, CID=0x0035, NSID=6, program index 1 (downloaded), range set 7</td></tr>
+        <tr class="note"><td colspan="6">Other I/O to namespace 1 continues to complete normally on SQ1/CQ1 — the controller is alive.</td></tr>
+        <tr class="abnormal"><td>4</td><td>—</td><td>30 s</td><td>(none)</td><td>No CQE for CID 0x0035</td><td><strong>First abnormal event: missing completion at the host timeout</strong> (Linux default I/O timeout is 30 s; tunable)</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>30 s</td><td>MWr32</td><td>Addr=0xFE60_1000</td><td>Admin SQ tail: Abort (08h) SQID=1 CID=0x0035</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>30 s + 40 µs</td><td>MWr64</td><td>Addr=0x1_0000_10B0 Len=4</td><td>Abort CQE: success, DW0 bit 0 = 1 → command <em>not</em> aborted (device cannot interrupt the running program)</td></tr>
+        <tr class="note"><td colspan="6">Host waits for the abort to take effect; no CQE for 0x0035 arrives.</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>60 s</td><td>MWr32</td><td>Addr=0xFE60_0014 Data=CC with EN=0</td><td>Controller reset (escalation)</td></tr>
+        <tr class="note"><td colspan="6">All outstanding commands on all queues are lost and must be retried by the host after re-initialisation; SLM contents and program activation state after reset must be checked against the specifications and the device.</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the link is healthy (other I/O completes), so this is not a transport failure. The first abnormal event is an absence (row 4), which no analyzer trigger will catch unless you configure a timeout trigger on a specific CID. Hypotheses: the program loops; the range set is so large the program is merely slow; the compute engine is throttled. Evidence to separate them: device telemetry of compute engine utilisation, execution of the same program on a small range set, and the program's own progress counters if it writes any to SLM. Root cause in this synthetic case: a loop bound read from an uninitialised parameter. Corrective action: validate parameters in the program, size host timeouts per program, and prefer program types with a verifier that rejects unbounded loops. Regression test: execute with every parameter at boundary values under a watchdog.</p>
+    <p>On Abort semantics: the Base specification defines Abort as best effort; whether a running program can be aborted is <span class="badge impl">Implementation-dependent</span>. Confirm the meaning of the Abort completion's Dword 0 in the Base specification revision you use.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 3 — abnormal: executing a downloaded program that was never activated">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MWr64</td><td>Addr=0x1_0000_10C0 Len=4</td><td>Admin CQE: Load Program (85h) into index 1 — success</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>4,000</td><td>MWr32</td><td>Addr=0xFE60_1008</td><td>SQ1 tail: Execute Program index 1 (no Program Activation Management sent)</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>4,800</td><td>MRd64</td><td>Len=16</td><td>Fetch SQE</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>5,400</td><td>CplD</td><td>Len=16</td><td>SQE: Execute Program, NSID=6, program index 1</td></tr>
+        <tr class="abnormal"><td>5</td><td>Dev→Host</td><td>6,100</td><td>MWr64</td><td>Addr=0x1_2341_0350 Len=4</td><td>CQE: error status — the Computational Programs status for "program not active" (exact SCT/SC not asserted here; see CP 1.3)</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: the controller rejected the command 700 ns after fetching it, with no compute time, which points at validation rather than execution. The management workflow skipped activation. The fix is procedural; the lesson is that Load and Activate are separate steps for a reason — activation is where a device can verify and install code.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Linux does not drive compute or memory namespaces as block devices. As with KV, each active namespace still gets a generic character device <code>/dev/ng&lt;ctrl&gt;n&lt;ns&gt;</code> (kernel 5.13 and later), and user space issues commands through pass-through ioctls or io_uring pass-through, usually via a computational storage library. <span class="badge version">Version-dependent</span></p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Which I/O command sets does the controller support?</span>
+sudo nvme id-iocs /dev/nvme0                 <span class="cm"># if supported by your nvme-cli</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -iE 'oacs|ctratt|command set'
+
+<span class="cm"># Which namespaces exist and what command set does each use?</span>
+sudo nvme list-ns /dev/nvme0
+for n in /dev/ng0n*; do echo "$n"; sudo nvme ns-descs "$n" 2&gt;/dev/null | grep -i csi; done
+<span class="cm"># csi 3 = Subsystem Local Memory (memory namespace), csi 4 = Computational Programs (compute namespace)</span>
+
+<span class="cm"># Is program download locked down? (Command and Feature Lockdown log, if supported)</span>
+sudo nvme supported-log-pages /dev/nvme0 | grep -i lockdown</code></pre>
+  <table>
+    <caption>What Linux observations prove</caption>
+    <thead><tr><th>Observation</th><th>Proves</th><th>Does not prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>ns-descs</code> CSI = 4 on <code>/dev/ng0n6</code></td><td>Namespace 6 is a compute namespace</td><td>Which programs exist or are active</td></tr>
+      <tr><td>No <code>/dev/nvme0n6</code> block device</td><td>Expected for a compute namespace</td><td>A problem</td></tr>
+      <tr><td>A pass-through Execute returns status 0</td><td>The controller reports successful execution</td><td>That the program computed the right answer — validate against a host reference</td></tr>
+      <tr><td>The Linux NVMe driver logs a timeout and resets the controller</td><td>A command exceeded the timeout</td><td>That the device is broken — a long program with a default timeout looks identical</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout linux"><p>Pass-through commands submitted by user space are subject to the driver's timeout handling. For long-running Execute Program commands, set an explicit timeout in the pass-through request rather than relying on the default I/O timeout, or the driver will reset a healthy controller.</p></aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>A behavioural model of the computational storage entities — memory namespace, memory range sets, device-defined and downloadable programs, activation and execution with access confined to the range set — plus the bottleneck cost model from the Engineering explanation. It deliberately contains no opcodes or status values.</p>
+  <pre class="code" data-kind="simulation" data-lang="python" data-title="cp_sim.py"><code>#!/usr/bin/env python3
+"""Computational Programs teaching model: a compute namespace, a memory
+namespace (Subsystem Local Memory), memory range sets and programs.
+Names follow the NVMe concepts; there are no opcodes or status values here
+on purpose -- read those from the Computational Programs 1.3 and SLM 1.3
+specifications. Also prints a simple data-movement cost model."""
+import struct
+
+class CPError(Exception):
+    pass
+
+class MemoryNamespace:                       # SLM: byte-addressable device memory
+    def __init__(self, size):
+        self.mem = bytearray(size)
+
+class MemoryRangeSet:
+    def __init__(self, ranges):              # list of (memory namespace, offset, length)
+        self.ranges = ranges
+
+    def view(self, i):
+        ns, off, length = self.ranges[i]
+        return memoryview(ns.mem)[off:off + length]
+
+class ComputeNamespace:
+    def __init__(self):
+        self.programs = {}                   # program index -&gt; dict
+        self.range_sets = {}                 # range set id -&gt; MemoryRangeSet
+
+    # --- device-defined (preloaded) and downloadable programs ---
+    def preload(self, index, fn, name):
+        self.programs[index] = {"fn": fn, "name": name, "active": True, "downloaded": False}
+
+    def load_program(self, index, fn, name):          # models "Load Program"
+        if index in self.programs and not self.programs[index]["downloaded"]:
+            raise CPError(f"program index {index} holds a device-defined program")
+        self.programs[index] = {"fn": fn, "name": name, "active": False, "downloaded": True}
+
+    def activate(self, index, on=True):               # models "Program Activation Management"
+        if index not in self.programs:
+            raise CPError(f"no program at index {index}")
+        self.programs[index]["active"] = on
+
+    def create_range_set(self, rsid, ranges):         # models "Memory Range Set Management"
+        for ns, off, length in ranges:
+            if off + length &gt; len(ns.mem):
+                raise CPError("range exceeds memory namespace")
+        self.range_sets[rsid] = MemoryRangeSet(ranges)
+
+    def execute(self, index, rsid, params):           # models "Execute Program"
+        p = self.programs.get(index)
+        if p is None:          raise CPError(f"no program at index {index}")
+        if not p["active"]:    raise CPError(f"program {index} ({p['name']}) is not active")
+        rs = self.range_sets.get(rsid)
+        if rs is None:         raise CPError(f"memory range set {rsid} does not exist")
+        return p["fn"](rs, params)                    # program sees ONLY its range set
+
+def filter_gt(rs, params):
+    """Range 0: input array of uint32; range 1: output array; params: threshold.
+    Returns the number of matches (a small result for the completion)."""
+    src, dst = rs.view(0), rs.view(1)
+    n_in = len(src) // 4
+    out = 0
+    for i in range(n_in):
+        (v,) = struct.unpack_from("&lt;I", src, 4 * i)
+        if v &gt; params["threshold"]:
+            if 4 * (out + 1) &gt; len(dst):
+                raise CPError("output range too small")
+            struct.pack_into("&lt;I", dst, 4 * out, v)
+            out += 1
+    return out
+
+def sum_u32(rs, params):
+    src = rs.view(0)
+    return sum(struct.unpack_from(f"&lt;{len(src)//4}I", src, 0))
+
+def cost_model(data_bytes, selectivity, link_gbs, media_gbs, host_gbs, dev_gbs):
+    """Seconds for a streaming scan, each path limited by its slowest stage
+    (stages overlap, so time = data / bottleneck bandwidth)."""
+    host = data_bytes / (min(link_gbs, media_gbs, host_gbs) * 1e9)
+    dev = max(data_bytes / (media_gbs * 1e9),               # internal media read
+              data_bytes / (dev_gbs * 1e9),                 # compute engine
+              data_bytes * selectivity / (link_gbs * 1e9))  # results over the link
+    return host, dev
+
+if __name__ == "__main__":
+    slm = MemoryNamespace(64 * 1024)
+    cns = ComputeNamespace()
+    cns.preload(0, filter_gt, "filter_gt (device-defined)")
+
+    # Host would use an SLM copy from an NVM namespace; here we fill the input directly.
+    values = [(i * 2654435761) % 1000 for i in range(4096)]
+    struct.pack_into(f"&lt;{len(values)}I", slm.mem, 0, *values)        # input at 0..16 KiB
+    cns.create_range_set(7, [(slm, 0, 16384), (slm, 16384, 16384)])  # input, output
+
+    for label, call in [
+        ("Execute program 0, range set 7", lambda: cns.execute(0, 7, {"threshold": 990})),
+        ("Execute program 1 (not loaded)", lambda: cns.execute(1, 7, {})),
+        ("Load program 1 (sum_u32)",       lambda: cns.load_program(1, sum_u32, "sum_u32 (downloaded)")),
+        ("Execute program 1 (inactive)",   lambda: cns.execute(1, 7, {})),
+        ("Activate program 1",             lambda: cns.activate(1)),
+        ("Execute program 1, range set 7", lambda: cns.execute(1, 7, {})),
+        ("Execute program 0, range set 9", lambda: cns.execute(0, 9, {"threshold": 1})),
+        ("Create range set 8 beyond SLM",  lambda: cns.create_range_set(8, [(slm, 60000, 8192)])),
+    ]:
+        try:
+            r = call()
+            print(f"{label:34s} -&gt; ok" + (f", result={r}" if r is not None else ""))
+        except CPError as e:
+            print(f"{label:34s} -&gt; ERROR: {e}")
+
+    n = cns.execute(0, 7, {"threshold": 990})
+    out = struct.unpack_from(f"&lt;{n}I", slm.mem, 16384)
+    print(f"host reads back {4*n} bytes of results (first 5: {list(out[:5])}) instead of 16384 bytes of input")
+
+    print("\nScan of 1 TB, bottleneck model (illustrative numbers, not measurements):")
+    print("  link 7 GB/s, internal media 24 GB/s, host compute 20 GB/s")
+    for dev in (4.0, 10.0, 30.0):
+        for sel in (1.0, 0.01):
+            h, d = cost_model(1e12, sel, link_gbs=7.0, media_gbs=24.0, host_gbs=20.0, dev_gbs=dev)
+            print(f"  device compute {dev:4.0f} GB/s, selectivity {sel:4.2f}: "
+                  f"host path {h:6.1f} s, in-device path {d:6.1f} s")</code></pre>
+  <p>Expected output (deterministic):</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>Execute program 0, range set 7     -&gt; ok, result=36
+Execute program 1 (not loaded)     -&gt; ERROR: no program at index 1
+Load program 1 (sum_u32)           -&gt; ok
+Execute program 1 (inactive)       -&gt; ERROR: program 1 (sum_u32 (downloaded)) is not active
+Activate program 1                 -&gt; ok
+Execute program 1, range set 7     -&gt; ok, result=2045160
+Execute program 0, range set 9     -&gt; ERROR: memory range set 9 does not exist
+Create range set 8 beyond SLM      -&gt; ERROR: range exceeds memory namespace
+host reads back 144 bytes of results (first 5: [993, 999, 992, 998, 991]) instead of 16384 bytes of input
+
+Scan of 1 TB, bottleneck model (illustrative numbers, not measurements):
+  link 7 GB/s, internal media 24 GB/s, host compute 20 GB/s
+  device compute    4 GB/s, selectivity 1.00: host path  142.9 s, in-device path  250.0 s
+  device compute    4 GB/s, selectivity 0.01: host path  142.9 s, in-device path  250.0 s
+  device compute   10 GB/s, selectivity 1.00: host path  142.9 s, in-device path  142.9 s
+  device compute   10 GB/s, selectivity 0.01: host path  142.9 s, in-device path  100.0 s
+  device compute   30 GB/s, selectivity 1.00: host path  142.9 s, in-device path  142.9 s
+  device compute   30 GB/s, selectivity 0.01: host path  142.9 s, in-device path   41.7 s</code></pre>
+  <p>Read the last block carefully: with a slow compute engine the in-device path is <em>slower</em>; with a matched engine it only wins when selectivity is low; with a fast engine and low selectivity it is bounded by internal media bandwidth. That table is the whole business case for computational storage in six lines.</p>
+
+  <p>Pseudocode for a host-side job runner, showing the dependencies the host must enforce:</p>
+  <pre class="code" data-kind="pseudocode" data-lang="c" data-title="run_filter_job (pseudocode)"><code>int run_filter_job(dev, nvm_nsid, mem_nsid, cmp_nsid, slba, nlb, threshold, out_buf)
+{
+    /* 1. Discover: program index of the device-defined filter, SLM size, limits */
+    idx = find_program(dev, cmp_nsid, "filter_gt");            /* from program list */
+    if (idx &lt; 0) return -ENOTSUP;
+
+    /* 2. Memory range set: input + output in the memory namespace */
+    in_len  = nlb * lba_size(dev, nvm_nsid);
+    out_len = in_len / 8;                                       /* sized from expected selectivity */
+    rs = mrs_create(dev, cmp_nsid, { {mem_nsid, 0, in_len}, {mem_nsid, in_len, out_len} });
+    if (rs &lt; 0) return rs;
+
+    /* 3. Copy NVM -&gt; SLM inside the device; WAIT for completion */
+    st = slm_copy_from_nvm(dev, mem_nsid, /*dst*/0, nvm_nsid, slba, nlb);
+    if (st) goto out;
+
+    /* 4. Execute; timeout sized for computation, not for I/O */
+    st = execute_program(dev, cmp_nsid, idx, rs, params(threshold),
+                         &amp;result, timeout = estimate(in_len) * 4);
+    if (st == -ETIMEDOUT) { abort_or_reset(dev); goto out; }
+    if (st) goto out;
+
+    /* 5. Read back only the results the program reported */
+    n_bytes = result * 4;
+    if (n_bytes &gt; out_len) { st = -EOVERFLOW; goto out; }      /* never trust blindly */
+    st = slm_read(dev, mem_nsid, in_len, n_bytes, out_buf);
+out:
+    mrs_delete(dev, cmp_nsid, rs);                              /* do not leak range sets */
+    return st;
+}</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Problem.</strong> A log-analytics service scans 2 TB of compressed logs per hour on one server with 8 lab SSDs (Gen4 x4 each). Each device advertises a device-defined decompress-and-grep program; vendor data says it processes 3 GB/s per device; internal media bandwidth is 10 GB/s per device; selectivity is 0.5%. The host CPU can decompress-and-grep at 12 GB/s total across its cores. Should the service use the device program? <em>Synthetic example for teaching; numbers illustrative.</em></p>
+  <ol>
+    <li><strong>Host path.</strong> Link: 8 × 7 GB/s = 56 GB/s; media is not the bottleneck at 8 × 10 GB/s; host compute 12 GB/s is. <var>T</var><sub>host</sub> = 2 × 10<sup>12</sup> / 12 × 10<sup>9</sup> ≈ 167 s.</li>
+    <li><strong>Device path.</strong> Each device holds 250 GB. Per device: media 250 GB / 10 GB/s = 25 s; compute 250 GB / 3 GB/s ≈ 83 s; results 0.005 × 250 GB / 7 GB/s ≈ 0.18 s. Bottleneck: compute, 83 s. All eight run in parallel: <var>T</var><sub>dev</sub> ≈ 83 s.</li>
+    <li><strong>Overheads.</strong> The copy into SLM is part of the media stage if pipelined; if not pipelined (copy all, then execute), per-device time ≈ 25 + 83 = 108 s, still faster than the host path. SLM capacity limits chunk size: with 4 GiB of SLM, the job is a pipeline of ~60 chunks per device, so copy and execute should overlap using two range sets (double buffering).</li>
+    <li><strong>Host CPU freed.</strong> The host path consumes the CPU fully for 167 s; the device path consumes almost none.</li>
+    <li><strong>Verdict.</strong> Use the device program, with double buffering, explicit timeouts and a host-side reference check on a sample of chunks. Revisit if the host gains accelerators or if the device's compute engine throttles under sustained load (measure!).</li>
+  </ol>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Assuming computational storage is always faster.</strong> Run the bottleneck model; a slow compute engine loses.</li>
+    <li><strong>Submitting copy, execute and read together</strong> without waiting for completions.</li>
+    <li><strong>Default I/O timeouts on Execute Program</strong>, causing spurious controller resets.</li>
+    <li><strong>Forgetting activation</strong> after Load Program.</li>
+    <li><strong>Leaking memory range sets</strong> and running out of SLM or range-set slots.</li>
+    <li><strong>Trusting the program result as a length</strong> without bounds-checking against the output range.</li>
+    <li><strong>Leaving program download enabled</strong> in production without a security review.</li>
+    <li><strong>Using link traces to measure computational work.</strong> The work is invisible on the link.</li>
+    <li><strong>Assuming programs read NVM namespaces directly.</strong> Data is staged in SLM.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>Computational storage failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Likely conclusion</th></tr></thead>
+    <tbody>
+      <tr><td>Execute returns error immediately</td><td>Program not active; invalid range set; bad parameters</td><td>Program list and activation state</td><td>Range set existence and bounds</td><td>Management workflow bug</td></tr>
+      <tr><td>Execute never completes</td><td>Program loop; huge input; throttling</td><td>Device compute telemetry</td><td>Same program on tiny input</td><td>Program bug or timeout too short</td></tr>
+      <tr><td>Wrong results</td><td>Copy not finished before execute; wrong range order; stale SLM</td><td>Trace: copy CQE before execute SQE fetch?</td><td>Zero output range before run</td><td>Ordering bug in host</td></tr>
+      <tr><td>Throughput lower than host path</td><td>Compute engine bottleneck; no copy/execute overlap</td><td>Per-phase completion timestamps</td><td>Bottleneck model with measured rates</td><td>Wrong workload for offload</td></tr>
+      <tr><td>Controller resets during jobs</td><td>Driver timeout on long Execute</td><td>Kernel log timeout messages</td><td>Pass-through timeout values</td><td>Host timeout configuration</td></tr>
+      <tr><td>Load Program rejected</td><td>Lockdown; unsupported program type; image too large</td><td>Lockdown log; supported program types</td><td>Image size vs limits</td><td>Policy or compatibility</td></tr>
+    </tbody>
+  </table>
+  <p>Use the timeline method of <a href="ch47.html">Error Correlation</a>: put each command's submission and completion on one line, mark the internal phases between them, and look for the first event that does not fit the expected dependency chain.</p>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight" data-title="Offload is a placement decision with a security bill">
+    <p>Computational storage succeeds in narrow, well-measured cases: high data reduction, a compute engine (often fixed-function) that keeps up, many drives per host, and a software stack willing to manage SLM staging. It fails when chosen as an architectural fashion. Senior engineers insist on the bottleneck model with <em>measured</em> numbers before any design review.</p>
+    <p>They also treat downloadable programs as a security architecture topic, not a feature: who signs programs, which program types are allowed, whether lockdown is on, how program state behaves across firmware activation and migration, and what telemetry exists to prove a program did only what it should. In a multi-tenant system, memory range sets are the isolation boundary — validation must try hard to break them.</p>
+    <p>Finally, debugging moves off the link. A senior engineer asks for device-side telemetry and per-command timestamps early, because a PCIe trace of a computational job is mostly silence.</p>
+  </aside>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 61 — Model a computational storage job and find the bottleneck</h3>
+  <h4>Objective</h4>
+  <p>Use the behavioural model to exercise the program lifecycle and range-set containment, then use the bottleneck model to decide when offload helps, and reconcile the result with a synthetic trace.</p>
+  <h4>Skills</h4>
+  <p>Program lifecycle reasoning; memory range set design; quantitative offload analysis; reading quiet traces.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Simulation and read-only Linux commands only. Do not load programs onto real hardware without the device owner's approval and a security review.</p></aside>
+  <h4>Hardware required</h4>
+  <p>Any computer with Python 3. Optional: a Linux system with an NVMe controller for the read-only checks.</p>
+  <h4>Software required</h4>
+  <p>Python 3, <code>cp_sim.py</code>; optionally <code>nvme-cli</code>.</p>
+  <h4>Input</h4>
+  <p>The model and the parameters in the steps below.</p>
+  <h4>Expected output</h4>
+  <p>Lifecycle log with predicted vs observed outcomes; a containment test; a table of host vs device times for your parameters; a one-paragraph recommendation.</p>
+  <h4>Background</h4>
+  <p>Engineering explanation (data locality, programs, range sets) and Trace 1.</p>
+  <h4>Step 1 — lifecycle</h4>
+  <p>Run <code>python3 cp_sim.py</code>. For each lifecycle line, explain which real NVMe command it models and what status class you would expect from a real device.</p>
+  <h4>Step 2 — containment</h4>
+  <p>Write a malicious program <code>peek(rs, params)</code> that tries to read beyond its range (for example <code>rs.view(0)[len(rs.view(0))]</code>) and another that tries to reach the whole memory namespace through the range object. Observe what the model allows. Then modify <code>MemoryRangeSet</code> so programs receive only memoryviews, never the namespace object, and explain how that mirrors a device's range enforcement.</p>
+  <h4>Step 3 — bottleneck</h4>
+  <p>Call <code>cost_model</code> for your own scenario: link 7 GB/s (Gen4 x4) or 14 GB/s (Gen5 x4, say so), media 8–30 GB/s, host compute 5–40 GB/s, device compute 1–30 GB/s, selectivity 1.0 down to 0.001. Produce a table and identify the crossover selectivity for each device compute rate.</p>
+  <h4>Step 4 — reconcile with a trace</h4>
+  <p>From Trace 1, compute: total bytes on the link for data; ratio of input bytes to link data bytes; internal copy and execute rates implied by the completion timestamps.</p>
+  <h4>Observation</h4>
+  <p>Record when the in-device path loses and why.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Why must the host wait for the copy completion before executing?</li>
+    <li>What is the smallest selectivity at which offload stops helping if <var>C</var><sub>dev</sub> = <var>B</var><sub>link</sub>?</li>
+    <li>Which trace evidence would distinguish a slow program from a hung one?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Extend the model with SLM capacity and double buffering: process a 64 GiB input through a 4 GiB SLM in chunks, overlapping copy of chunk <var>k</var>+1 with execution of chunk <var>k</var>, and compare total time with the non-overlapped version.</p>
+  <h4>Hints</h4>
+  <details class="hint"><summary>Hint</summary><p>For Question 2, set <var>C</var><sub>dev</sub> = <var>B</var><sub>link</sub> in the formulas: the device path is never faster than <var>D</var>/<var>C</var><sub>dev</sub> = <var>D</var>/<var>B</var><sub>link</sub>, which equals the host path when the link is the host bottleneck — regardless of selectivity.</p></details>
+  <h4>Solution</h4>
+  <details class="solution"><summary>Solution</summary>
+    <p>Step 1: create range set ↔ Memory Range Set Management; load ↔ Load Program; activate ↔ Program Activation Management; execute ↔ Execute Program; errors would be command statuses defined in CP 1.3 (not stated here).</p>
+    <p>Step 2: in the unmodified model, indexing past a memoryview raises <code>IndexError</code> (Python enforces the bound), but a program that receives a <code>MemoryRangeSet</code> can reach <code>rs.ranges[i][0].mem</code> — the whole namespace. Passing only views closes that hole, mirroring a device that maps only the range set into the program's address space.</p>
+    <p>Step 3: with link 7 GB/s, media 24 GB/s and host compute 20 GB/s, the host path is always <var>D</var>/7. Device compute 4 GB/s: the device path is at least <var>D</var>/4, so it never wins. Device compute 10 GB/s: the device path is <var>D</var>/10 while <var>s</var> ≤ 0.7 and <var>s</var>·<var>D</var>/7 above that, so it wins for every <var>s</var> &lt; 1 by up to 30%, and ties at <var>s</var> = 1. Device compute 30 GB/s: the device path is media-bound at <var>D</var>/24 for <var>s</var> ≤ 7/24 ≈ 0.29 (3.4× faster than the host), then limited by result transfer above that.</p>
+    <p>Step 4: link data ≈ 307,456 bytes vs 4,294,967,296 input bytes — about 1:14,000. Implied copy rate: 4 GiB / 0.36 s ≈ 11.9 GB/s; execute rate: 4 GiB / 0.54 s ≈ 8 GB/s.</p>
+    <p>Questions: 1 — NVMe does not order commands; Execute could run on partially copied data. 2 — none: with <var>C</var><sub>dev</sub> = <var>B</var><sub>link</sub>, the device path is never faster than the link-bound host path. 3 — device telemetry or progress counters, behaviour on a tiny input, and whether Abort succeeds; the link trace alone cannot distinguish them.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>That the model's containment was only as strong as its interfaces — exactly the property to probe in a real device — and that the business case rests on <var>C</var><sub>dev</sub>, the least documented number.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>Execute before activate → immediate error.</li>
+    <li>Range set larger than SLM → creation fails.</li>
+    <li>Output range too small → program fault.</li>
+    <li>Execute with no copy → program runs on stale or zero data and "succeeds".</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Write the same filter as an eBPF program with a host-side eBPF toolchain and run it in a user-space eBPF interpreter, to experience the verifier constraints a device-side runtime would impose.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Define device-defined and downloadable programs and give one advantage of each.</li>
+    <li>Using the formula, compute <var>T</var><sub>host</sub> and <var>T</var><sub>dev</sub> for <var>D</var> = 500 GB, <var>B</var><sub>link</sub> = 14 GB/s, <var>B</var><sub>media</sub> = 20 GB/s, <var>C</var><sub>host</sub> = 30 GB/s, <var>C</var><sub>dev</sub> = 16 GB/s, <var>s</var> = 0.02.</li>
+    <li>Design memory range sets for running a decompress program on two inputs concurrently with one SLM namespace of 8 GiB.</li>
+    <li>List the commands, in order, to run a newly downloaded program once and clean up.</li>
+    <li>Why does Trace 1 contain no TLPs between rows 9 and 10?</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p>1. Device-defined: shipped and validated by the vendor, can be hardware-accelerated, no download risk. Downloadable: flexible, application-specific, portable if the program type is standard (e.g. eBPF).</p>
+    <p>2. <var>T</var><sub>host</sub> = 500 / min(14, 20, 30) = 500 / 14 ≈ 35.7 s. <var>T</var><sub>dev</sub> = max(500/20 = 25, 500/16 = 31.25, 0.02 × 500 / 14 ≈ 0.71) = 31.25 s. Modest gain, compute-bound.</p>
+    <p>3. Two sets, each with an input range and an output range sized for the decompressed data: set A {in 0–1 GiB, out 1–4 GiB}, set B {in 4–5 GiB, out 5–8 GiB}. Ranges must not overlap between sets that run concurrently.</p>
+    <p>4. Load Program → Program Activation Management (activate) → Memory Range Set Management (create) → SLM copy in → Execute Program → SLM read out → Memory Range Set Management (delete) → Program Activation Management (deactivate) → (optionally unload, per CP 1.3).</p>
+    <p>5. The copy happens entirely inside the subsystem, from the NVM namespace's media into SLM; nothing crosses the PCIe link until the completion.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>What does a memory range set control?</p>
+      <ul class="options" data-answer="3"><li>Which LBAs a WRITE may target</li><li>Which host memory pages the device may DMA to</li><li>Which Subsystem Local Memory ranges a program execution may access</li><li>Which controllers a namespace is attached to</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>A memory range set lists ranges in memory namespaces; an Execute Program names one and the program is confined to it.</p></details></li>
+    <li><p>Where does a program normally get its input data?</p>
+      <ul class="options" data-answer="2"><li>Directly from host memory by DMA</li><li>From memory namespace ranges, after the data is copied there</li><li>From the Submission Queue Entry</li><li>From the NVM namespace's LBAs directly</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Data is staged in Subsystem Local Memory, usually by an internal copy from an NVM namespace.</p></details></li>
+    <li><p>After Load Program succeeds, what must happen before Execute Program can run that program?</p>
+      <ul class="options" data-answer="1"><li>Program Activation Management must activate it</li><li>A controller reset</li><li>A Format NVM of the compute namespace</li><li>Nothing</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Only active programs execute; activation is a separate step where the device can verify and install the program.</p></details></li>
+    <li><p>Which statement about computational storage performance is correct?</p>
+      <ul class="options" data-answer="4"><li>It always helps because PCIe is slow</li><li>It only helps on Gen3 links</li><li>It never helps if selectivity is below 1%</li><li>It helps when data reduction is high and the device's compute engine is not the bottleneck</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The bottleneck model shows both conditions are required; a slow compute engine can make offload slower than the host path.</p></details></li>
+    <li><p>What is the first abnormal event when a program hangs?</p>
+      <ul class="options" data-answer="2"><li>A PCIe completion timeout</li><li>The absence of the Execute Program completion by the host's deadline</li><li>An AER uncorrectable error</li><li>An MSI-X with no CQE</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>A hung program produces no event at all; the host detects a missing completion at its timeout.</p></details></li>
+    <li><p>Which CSI values does libnvme give for SLM and Computational Programs?</p>
+      <ul class="options" data-answer="3"><li>01h and 02h</li><li>02h and 03h</li><li>03h and 04h</li><li>04h and 05h</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>NVM 00h, KV 01h, ZNS 02h, SLM 03h, Computational Programs 04h (confirm in Base 2.4).</p></details></li>
+    <li><p>Explain why a PCIe trace of a large computational job is mostly silent, and what you use instead.</p><details class="answer"><summary>Model answer</summary><p>The bulk data movement (NVM → SLM copy) and the computation happen inside the device. Only small commands, completions and results cross the link. Instead, use per-command submission/completion timestamps, device telemetry, program progress indicators and host-side logs.</p></details></li>
+    <li><p>Why should program download be treated like kernel module loading?</p><details class="answer"><summary>Model answer</summary><p>Because downloaded code executes inside a device that holds data for possibly many hosts and tenants; a malicious or buggy program could leak or corrupt data or deny service. It should be privileged, audited, restricted to verifiable program types, and disabled via lockdown when not needed.</p></details></li>
+    <li><p>What does SLM provide that Computational Programs needs?</p><details class="answer"><summary>Model answer</summary><p>Byte-addressable device memory organised as memory namespaces, plus commands to move data into and out of it (from NVM namespaces internally and from/to the host). Programs read and write only that memory, through memory range sets.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner.</strong> What is computational storage?</p><details class="answer"><summary>Model answer</summary><p>Running computation inside or next to a storage device so that data is processed where it lives and only results travel to the host.</p></details></li>
+    <li><p><strong>Beginner.</strong> What is a compute namespace?</p><details class="answer"><summary>Model answer</summary><p>A namespace using the Computational Programs command set; it holds programs at program indexes and is the target of Execute Program.</p></details></li>
+    <li><p><strong>Intermediate.</strong> Walk through running a filter on 10 GB of blocks with NVMe computational storage.</p><details class="answer"><summary>Model answer</summary><p>Find the program (device-defined or load and activate a downloaded one); create a memory range set with input and output ranges in a memory namespace; copy the blocks from the NVM namespace into the input range (SLM, internal); wait; Execute Program with the range set and parameters; wait with an appropriate timeout; read the output range back by the reported length; delete the range set. Chunk if SLM is smaller than 10 GB, ideally double-buffered.</p></details></li>
+    <li><p><strong>Intermediate.</strong> How do Computational Programs and SLM relate?</p><details class="answer"><summary>Model answer</summary><p>SLM provides the memory (memory namespaces) and data movement; Computational Programs provides programs, range sets and execution. Programs operate on SLM through range sets. SLM is usable alone; Computational Programs depends on SLM.</p></details></li>
+    <li><p><strong>Advanced.</strong> Execute Program commands occasionally time out and the Linux driver resets the controller, failing unrelated I/O. What do you do?</p><details class="answer"><summary>Model answer</summary><p>Separate the cases: if executions are legitimately long, set explicit per-command pass-through timeouts sized to the program and input; if programs hang, find why (parameters, input size, throttling) with device telemetry and small-input reproductions. Mitigate blast radius: dedicated queues for compute commands, Abort before reset, and admission control on input size. Validate whether the device can abort running programs.</p></details></li>
+    <li><p><strong>Senior.</strong> Should your platform enable downloadable programs?</p><details class="answer"><summary>Model answer</summary><p>Only with a clear use case that device-defined programs cannot serve, and with controls: signed programs, a verifiable program type, lockdown policy, tenant isolation via range sets that validation has tried to break, telemetry and incident response. Otherwise keep download locked and use device-defined programs.</p></details></li>
+    <li><p><strong>Senior.</strong> How would you validate range-set isolation?</p><details class="answer"><summary>Model answer</summary><p>Adversarial programs that read/write one byte beyond each range, use overlapping and adjacent ranges, race range-set deletion against execution, reuse freed SLM, run concurrently on neighbouring sets, and attempt to observe other tenants' data; plus reset and firmware activation during execution. Every violation must fault deterministically without corrupting other ranges.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> the workbench in the warehouse, the list of jobs and the tables the worker may use.</li>
+    <li><strong>To a junior engineer:</strong> the four-step job (copy in, execute, read results, clean up) and why each step must wait for the previous one.</li>
+    <li><strong>To a senior engineer:</strong> the bottleneck model, the security model, and why debugging moves off the PCIe link.</li>
+  </ul>
+  <details class="answer"><summary>Model explanation for the child</summary><p>Instead of bringing every toy part from the big warehouse to town just to throw most away, we put a little workbench in the warehouse. The worker there only knows certain jobs, and new jobs need the boss's OK. The worker may only use the tables we give him. He sorts the parts there, and we only bring the good ones to town. It's quicker if the worker is fast — but if he is very slow, it might be quicker to bring everything to town after all.</p></details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>The Computational Programs Command Set (revision 1.3, CSI 04h in libnvme) adds compute namespaces holding programs — device-defined or downloaded with Load Program and enabled with Program Activation Management — and executes them with Execute Program against memory range sets created with Memory Range Set Management. Programs operate on Subsystem Local Memory (SLM 1.3, CSI 03h), into which data is copied from NVM namespaces inside the device. Moving compute toward data helps when data reduction is high and the device's compute engine and internal media bandwidth outpace the link and host; it hurts when the compute engine is slow. Most of the work is invisible on PCIe, so debugging relies on completion timing and device telemetry. Downloadable programs are a security boundary and should be locked down unless needed.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>explain computational storage and the data-locality argument with the bottleneck formula</li>
+      <li>describe compute namespaces, compute engines, programs and program indexes</li>
+      <li>distinguish device-defined and downloadable programs, and explain load vs activate</li>
+      <li>design memory range sets and explain how they contain a program</li>
+      <li>sequence a full job and name the dependency at each step</li>
+      <li>explain how SLM and Computational Programs fit together, and map them to SNIA terms</li>
+      <li>read a quiet trace and find the first abnormal event in a hung execution</li>
+      <li>list what must be confirmed in CP 1.3 before writing code</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Computational Programs Command Set Specification, Revision 1.3</cite> — "Computational Programs model", "Compute namespace", "Programs", "Memory Range Sets", "Load Program command", "Program Activation Management command", "Memory Range Set Management command", "Execute Program command", status definitions.</li>
+    <li><cite class="spec">NVM Express Subsystem Local Memory Command Set Specification, Revision 1.3</cite> — memory namespaces and data movement.</li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4</cite> — CSI, Command and Feature Lockdown, Abort; <cite class="spec">NVM Express Revision Changes (2026-07-30)</cite>, summarized in <a href="nvme-2-4.html">2026 NVMe 2.4 Updates</a>.</li>
+    <li><cite class="spec">SNIA Computational Storage Architecture and Programming Model</cite> and the SNIA Computational Storage API — vocabulary and host API context.</li>
+    <li>Deeper in this course: the <a href="dd46.html">Computational Programs</a> and <a href="dd47.html">Subsystem Local Memory</a> deep-dive modules.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch62.html">Subsystem Local Memory</a> — the memory namespaces that programs compute on, and how data moves into and out of them.</p>
+</section>

@@ -1,0 +1,965 @@
+<p class="lead">A command says <em>what</em> to read or write; the <span class="g" data-term="prp">Physical Region Page (PRP)</span> entries say <em>where in host memory</em> the bytes live. This chapter teaches you to build, read and audit PRP1, PRP2 and PRP lists by hand, to count the pages a buffer touches, and to predict exactly which PCIe packets the controller will send to move the data.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>Every NVM Express (NVMe) Read, Write, Identify, Get Log Page and dozens of other commands move data between the host's memory and the controller. The 64-byte Submission Queue Entry (SQE) cannot carry the data itself, and it cannot carry a long list of addresses either: it has exactly sixteen bytes of room for the <span class="g" data-term="dptr">Data Pointer (DPTR)</span>. The Physical Region Page mechanism is how NVMe over PCIe squeezes "a buffer of any size, scattered across memory pages" into those sixteen bytes.</p>
+  <p>When PRPs are wrong, the failure is rarely polite. A wrong PRP does not usually produce a clean error status. It produces a controller that writes 4 KiB of somebody else's data into the wrong page, a read that returns success with zeros, an Input/Output Memory Management Unit (IOMMU) fault in the kernel log that nobody connects to the storage stack, or a machine that crashes an hour later in unrelated code. Engineers who can decode a PRP set in their head find these bugs in minutes. Engineers who cannot spend weeks.</p>
+  <p>This chapter is also the first place where three separate technologies meet in one field: the NVMe Base Specification defines what a PRP entry means; the NVMe over PCIe Transport Specification says PRPs are how data pointers work over PCI Express (PCIe); and the PCIe Base Specification governs the Memory Read and Memory Write Transaction Layer Packets (TLPs) the controller generates when it follows those pointers. Keep the three apart in your head and the rest of the chapter becomes easy.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>State the format of a PRP entry and explain which bits are the page base and which are the offset, for any memory page size.</li>
+    <li>Derive the memory page size from <code>CC.MPS</code> and know why it must lie between <code>CAP.MPSMIN</code> and <code>CAP.MPSMAX</code>.</li>
+    <li>Decide, for any buffer address and length, whether PRP2 is unused, a second data page, or a PRP list pointer.</li>
+    <li>Build a PRP list, including chained list pages, and say where the chain pointer goes.</li>
+    <li>Count the pages a buffer touches and the list entries it needs.</li>
+    <li>Predict the number and size of Memory Write (MWr) or Memory Read (MRd) TLPs, given Max Payload Size (MPS), Max Read Request Size (MRRS) and the Read Completion Boundary (RCB).</li>
+    <li>Explain why "physical address" in the name is really "the address the device emits", which is an I/O virtual address (IOVA) when an IOMMU is on.</li>
+    <li>Recognize the trace signature of a malformed PRP set.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <ul>
+      <li><a href="ch20.html">Chapter 20 — DMA</a>: the device moves data itself; the CPU only sets things up.</li>
+      <li><a href="ch24.html">Chapter 24 — NVMe Registers</a>: <code>CAP</code> at offset 00h and <code>CC</code> at offset 14h.</li>
+      <li><a href="ch29.html">Chapter 29 — NVMe Command Structure</a>: the 64-byte SQE and where DPTR sits.</li>
+      <li><a href="ch32.html">Chapter 32 — READ</a> and <a href="ch33.html">Chapter 33 — WRITE</a>: direction of the data movement.</li>
+      <li><a href="ch10.html">Chapter 10 — TLPs</a> and <a href="ch13.html">Chapter 13 — PCIe Tags</a>: MWr, MRd, completions with data (CplD), and tags.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Imagine a giant warehouse where every shelf is exactly the same size. A delivery robot comes to pick up your toys. Your toys do not fit on one shelf, so they are spread over several shelves, and the shelves are not next to each other: one is in aisle 7, the next in aisle 2, the next in aisle 31.</p>
+    <p>You give the robot an order card. The card only has two lines. On line one you write "start at aisle 7, shelf position 3" — you are allowed to start part-way along the first shelf. If your toys fill just one more shelf, line two simply says "then aisle 2". But if there are many shelves, line two says "go read the clipboard hanging at aisle 50". The clipboard is a list: "aisle 2, aisle 31, aisle 9…". Every shelf on the clipboard starts at its very beginning. If the clipboard is full and there are still more shelves, the very last line of the clipboard says "continue on the clipboard at aisle 51".</p>
+    <p>The robot never asks you anything. It reads the card, reads the clipboards, and carries toys to and from exactly those shelves. If you wrote the wrong aisle, it happily fills the wrong shelf.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>In a real distribution center, a pick ticket for a large order does not list every bin on the paper slip handed to the forklift driver. The slip has a header and a reference to a pick list stored at a terminal. The warehouse is divided into identical bin sizes (the memory page size), the first bin may be partly used by an earlier order (the offset in PRP1), every other bin on the list is a full, whole bin used from its start, and a long pick list continues on a second sheet whose location is printed in the last line of the first. The forklift driver (the controller's direct memory access engine) works without phoning the office (the CPU) for each bin.</p>
+  </aside>
+  <aside class="callout breaks">
+    <ul>
+      <li><strong>The robot cannot see the aisle numbers you see.</strong> Software thinks in virtual addresses. The controller only sees bus addresses, which an IOMMU may translate again. The warehouse story hides that there are two or three different "aisle numbering systems".</li>
+      <li><strong>Only the first shelf may be partly used.</strong> In a real warehouse you could start mid-shelf anywhere. With PRPs, every entry after the first must start at the beginning of a page, and every page except the last must be used to its end. That rigidity is the whole reason Scatter Gather Lists (SGLs) exist (<a href="ch37.html">Chapter 37</a>).</li>
+      <li><strong>The clipboard is fetched over the same road as the toys.</strong> Reading a PRP list costs real PCIe Memory Read transactions and real latency; the story makes it look free.</li>
+      <li><strong>The robot does not carry a shelf in one trip.</strong> Data moves in TLPs of at most Max Payload Size bytes (256 bytes on our lab system), so one 4 KiB page becomes many separate packets.</li>
+      <li><strong>Nobody checks the card.</strong> Controllers are allowed to, and some do, detect a bad offset; many do not. The story's "happily fills the wrong shelf" is realistic, but it is implementation-dependent.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>Host memory is managed in fixed-size <strong>pages</strong>. On most x86-64 Linux systems the operating system page is 4 KiB, and NVMe controllers are almost always configured to use a 4 KiB memory page size too. When an application asks to read 128 KiB, the kernel's buffer for those bytes is usually <em>virtually</em> contiguous — one unbroken range in the program's address space — but <em>physically</em> it is a collection of 32 separate 4 KiB pages that may be anywhere in RAM.</p>
+  <p>The NVMe controller moves data by itself using direct memory access (DMA). It needs to know, for every byte of the transfer, the address in host memory where that byte goes (for a Read) or comes from (for a Write). A PRP entry is simply a 64-bit address of a place inside one memory page. The controller treats each PRP entry as "the next chunk of the buffer begins here and runs to the end of this page, or until the transfer is finished".</p>
+  <p>The SQE has room for two PRP entries, called <strong>PRP Entry 1</strong> (PRP1) and <strong>PRP Entry 2</strong> (PRP2). Three cases cover every transfer:</p>
+  <table>
+    <caption>The three ways PRP2 is used (memory page size = 4 KiB)</caption>
+    <thead><tr><th>How many page boundaries the transfer crosses</th><th>Pages touched</th><th>PRP1</th><th>PRP2</th></tr></thead>
+    <tbody>
+      <tr><td>None</td><td>1</td><td>address of the first byte</td><td>not used (reserved)</td></tr>
+      <tr><td>Exactly one</td><td>2</td><td>address of the first byte</td><td>address of the second page (page aligned)</td></tr>
+      <tr><td>More than one</td><td>3 or more</td><td>address of the first byte</td><td>address of a <strong><span class="g" data-term="prp-list">PRP list</span></strong>: an array of 8-byte entries, one per remaining page</td></tr>
+    </tbody>
+  </table>
+  <p>Notice the rule is about <em>boundaries crossed</em>, not about size. A 4 KiB transfer that starts in the middle of a page crosses one boundary and needs PRP2. A 512-byte transfer that starts 256 bytes before a page boundary also needs PRP2. Beginners who think "4 KiB fits in one page, so PRP2 is unused" write exactly the bug we dissect in <a href="ch38.html">Chapter 38</a>.</p>
+  <p>The word "physical" in the name comes from the days before IOMMUs were common. Today, the address in a PRP entry is whatever address the device must put on the PCIe bus to reach that memory: a <em>bus address</em> or <em>DMA address</em>. With an IOMMU enabled (as on our lab system), it is an <span class="g" data-term="iova">I/O virtual address (IOVA)</span> that the IOMMU translates to a real physical address. We keep the specification's name and teach you what it really means.</p>
+  <aside class="callout remember">
+    <p>PRP1 may start anywhere inside a page (on a 4-byte boundary). Every other data pointer starts at the beginning of a page. Every page except the first and last is used completely. If a buffer does not fit that shape, PRPs cannot describe it.</p>
+  </aside>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>The PRP entry format</h3>
+  <p>A PRP entry is a 64-bit (8-byte, "quadword") memory address. How its bits divide depends on the memory page size. If the page size is 2<sup><var>n</var></sup> bytes, bits 63:<var>n</var> hold the page base address and bits <var>n</var>−1:0 hold the offset within the page. Bits 1:0 are always required to be zero, so every PRP entry is at least dword (4-byte) aligned.</p>
+  <table class="packet">
+    <caption>PRP entry layout for a 4 KiB memory page (n = 12). Bits 63:32 omitted; they are part of the page base.</caption>
+    <thead><tr><th class="row-label">Bits</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">63:32</td><td colspan="32" class="hl">Page Base Address (upper)</td></tr>
+      <tr><td class="row-label">31:0</td><td colspan="20" class="hl">Page Base Address (bits 31:12)</td><td colspan="10">Offset (bits 11:2)</td><td colspan="2" class="rsvd">00b</td></tr>
+    </tbody>
+  </table>
+  <p>With an 8 KiB page (n = 13) the offset widens to bits 12:2; with a 64 KiB page (n = 16) it is bits 15:2. The format never changes; only the line between "which page" and "where in the page" moves.</p>
+  <table>
+    <caption>Fields that a PRP set depends on</caption>
+    <thead><tr><th>Field</th><th>Where</th><th>Owner (writes it)</th><th>Consumer</th><th>Purpose</th><th>What breaks if wrong</th></tr></thead>
+    <tbody>
+      <tr><td>PRP1</td><td>SQE Dwords 6–7 (part of DPTR)</td><td>Host driver</td><td>Controller</td><td>Address of the first byte of data, may have offset</td><td>Data lands at the wrong place; dword misalignment may be reported as an error</td></tr>
+      <tr><td>PRP2</td><td>SQE Dwords 8–9 (part of DPTR)</td><td>Host driver</td><td>Controller</td><td>Unused, second page, or PRP list pointer</td><td>Second page wrong, or the controller reads a data page as if it were a list</td></tr>
+      <tr><td>PRP list entries</td><td>Host memory</td><td>Host driver</td><td>Controller (via MRd)</td><td>Page addresses 2…N, plus chain pointers</td><td>Stale or missing entries send data to old pages</td></tr>
+      <tr><td><code>CC.MPS</code></td><td>Controller Configuration register (offset 14h)</td><td>Host driver, before enabling</td><td>Controller</td><td>Memory page size = 2<sup>12 + MPS</sup></td><td>Host and controller disagree about where pages end</td></tr>
+      <tr><td><code>CAP.MPSMIN</code>, <code>CAP.MPSMAX</code></td><td>Controller Capabilities register (offset 00h)</td><td>Controller</td><td>Host driver</td><td>Legal range for <code>CC.MPS</code></td><td>Choosing outside the range is invalid configuration</td></tr>
+      <tr><td>PSDT</td><td>SQE Command Dword 0</td><td>Host driver</td><td>Controller</td><td>Selects PRP (00b) or SGL for the data pointer</td><td>Controller interprets DPTR with the wrong format</td></tr>
+      <tr><td>MDTS</td><td>Identify Controller data</td><td>Controller</td><td>Host driver</td><td>Maximum data transfer size, in units of the minimum memory page size</td><td>Over-long commands are rejected or must be split</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Memory page size and CC.MPS</h3>
+  <div class="formula">
+    <div class="eq"><var>PS</var> = 2<sup>(12 + <var>MPS</var>)</sup> bytes, with <var>MPSMIN</var> ≤ <var>MPS</var> ≤ <var>MPSMAX</var></div>
+    <dl class="vars">
+      <dt>PS</dt><dd>memory page size the controller uses to interpret every PRP entry</dd>
+      <dt>MPS</dt><dd>the <span class="g" data-term="memory-page-size">Memory Page Size</span> field of the Controller Configuration (<code>CC</code>) register, written by the host before setting <code>CC.EN</code> to 1 (not to be confused with PCIe Max Payload Size, also abbreviated MPS)</dd>
+      <dt>MPSMIN, MPSMAX</dt><dd>the minimum and maximum page size fields the controller advertises in <code>CAP</code>, encoded the same way</dd>
+    </dl>
+  </div>
+  <p>Our lab system writes <code>CC.MPS = 0</code>, so <var>PS</var> = 4096. The Linux NVMe driver uses a fixed 4 KiB controller page size even on hosts whose own page size is larger (for example 64 KiB on some Arm servers) <span class="badge impl">Implementation-dependent</span>; it then splits each host page into several 4 KiB controller pages when building PRPs.</p>
+  <aside class="callout warn" data-title="Two different 'MPS' on one page">
+    <p>In this chapter "MPS" appears twice. <code>CC.MPS</code> is the NVMe <strong>Memory Page Size</strong>. PCIe <strong>Max Payload Size</strong> (MPS) is the largest data payload a TLP may carry, set in the PCIe Device Control register. On our lab system memory page size is 4096 bytes and Max Payload Size is 256 bytes. They are unrelated settings in different specifications.</p>
+  </aside>
+
+  <h3>PRP1: the only entry that may have an offset</h3>
+  <p>PRP1 points at the first byte of the transfer. It may carry any dword-aligned offset within its page. The amount of data it describes is the smaller of "the rest of that page" and "the whole transfer":</p>
+  <div class="formula">
+    <div class="eq"><var>B</var><sub>1</sub> = min(<var>L</var>, <var>PS</var> − (<var>A</var> mod <var>PS</var>))</div>
+    <dl class="vars">
+      <dt>B<sub>1</sub></dt><dd>bytes described by PRP1</dd>
+      <dt>L</dt><dd>total transfer length in bytes (for a Read or Write: (NLB + 1) × LBA data size, plus interleaved metadata if any)</dd>
+      <dt>A</dt><dd>the address in PRP1</dd>
+      <dt>PS</dt><dd>memory page size</dd>
+    </dl>
+  </div>
+
+  <h3>PRP2: three meanings, chosen by arithmetic</h3>
+  <p>The controller does not get a flag that says "PRP2 is a list". It works out the meaning from the transfer length, the offset in PRP1, and the page size, exactly as the host should have done when it built the command. Both sides must reach the same answer from the same arithmetic. That is why a host that computes the length wrongly (for example, forgets that the Number of Logical Blocks field is zero-based) produces a PRP set that the controller interprets differently from how it was built.</p>
+  <ol class="seq" data-actors="Host driver|Controller">
+    <li data-note="Host driver">L, A, PS known; compute pages N</li>
+    <li data-note="Host driver">N = 1: PRP2 unused</li>
+    <li data-note="Host driver">N = 2: PRP2 = second page</li>
+    <li data-note="Host driver">N &gt; 2: PRP2 = list pointer</li>
+    <li data-from="Host driver" data-to="Controller">SQE with PRP1, PRP2, NLB</li>
+    <li data-note="Controller">same arithmetic from NLB, PRP1 offset, PS</li>
+    <li data-note="Controller">decides PRP2 meaning independently</li>
+  </ol>
+  <p>The page count is:</p>
+  <div class="formula">
+    <div class="eq"><var>N</var> = ⌈ ((<var>A</var> mod <var>PS</var>) + <var>L</var>) / <var>PS</var> ⌉</div>
+    <dl class="vars">
+      <dt>N</dt><dd>number of memory pages the transfer touches, which equals the number of PRP data pointers needed</dd>
+      <dt>A mod PS</dt><dd>the offset in PRP1</dd>
+      <dt>L</dt><dd>transfer length in bytes</dd>
+      <dt>PS</dt><dd>memory page size</dd>
+    </dl>
+  </div>
+  <p>When <var>N</var> &gt; 2, the PRP list must hold <var>N</var> − 1 data entries (PRP1 covers the first page).</p>
+
+  <h3>PRP lists and chaining</h3>
+  <p>A PRP list is an array of 8-byte PRP entries in host memory. Every entry in a list is page aligned (offset zero). The list itself lives in a memory page and may start part-way into that page: PRP2, when it is a list pointer, must be quadword (8-byte) aligned, and the base specification permits it to have a non-zero offset <span class="badge verified">Verified</span>. Linux exploits this: for short lists it allocates list memory from a small pool of 256-byte blocks rather than wasting a whole 4 KiB page on 248 bytes <span class="badge impl">Implementation-dependent</span>.</p>
+  <p>A list never silently runs off the end of its page. The number of slots available in the current list page is:</p>
+  <div class="formula">
+    <div class="eq"><var>S</var> = (<var>PS</var> − (<var>P</var> mod <var>PS</var>)) / 8</div>
+    <dl class="vars">
+      <dt>S</dt><dd>number of 8-byte slots left in the list page that contains the list pointer</dd>
+      <dt>P</dt><dd>address of the first entry of this list (PRP2, or a chain pointer)</dd>
+      <dt>PS</dt><dd>memory page size</dd>
+    </dl>
+  </div>
+  <p>If the entries still to be listed are more than <var>S</var>, the last slot of that page is <em>not</em> a data page. It is a pointer to the next PRP list page, and the first <var>S</var> − 1 slots carry data pages. If the remaining entries are <var>S</var> or fewer, they all go in this page and there is no chain pointer. A page-aligned 4 KiB list page has 512 slots, so a single list page can describe up to 512 more data pages, i.e. 2 MiB beyond PRP1's page. Larger transfers chain.</p>
+  <figure>
+    <pre class="diagram">
+ SQE                         PRP list page 0 (4 KiB, 512 slots)        PRP list page 1
+ +-----------+              +-------------------------------+         +----------------------+
+ | PRP1  ----+--&gt; data page 0 (may have offset)               |         |                      |
+ | PRP2  ----+-------------&gt;| slot 0   -&gt; data page 1         |    +---&gt;| slot 0 -&gt; page 512   |
+ +-----------+              | slot 1   -&gt; data page 2         |    |    | slot 1 -&gt; page 513   |
+                            |  ...                          |    |    |  ...                 |
+                            | slot 510 -&gt; data page 511       |    |    | (no chain if the     |
+                            | slot 511 -&gt; NEXT LIST PAGE  ----+----+    |  rest fits here)     |
+                            +-------------------------------+         +----------------------+
+    </pre>
+    <figcaption>Conceptual: a chained PRP list. Only the last slot of a full list page can be a chain pointer, and only when more entries remain than fit.</figcaption>
+  </figure>
+  <aside class="callout notsaid">
+    <p>The PRP mechanism carries no length field and no "this is a chain pointer" marker. The controller knows an entry is a chain pointer purely because it sits in the last slot of a list page while more than one page of data remains. If the host's idea of the length differs from the controller's by even one page, the two sides disagree about which slot is the chain pointer. Nothing in the format detects that.</p>
+  </aside>
+
+  <h3>Alignment rules in one place</h3>
+  <table>
+    <caption>PRP alignment rules (NVMe over PCIe)</caption>
+    <thead><tr><th>Item</th><th>Required alignment</th><th>May have offset?</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>PRP1</td><td>dword (bits 1:0 = 00b)</td><td>Yes</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>PRP2 as second data page</td><td>memory page</td><td>No</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>PRP2 as list pointer</td><td>quadword</td><td>Yes</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>Data entries inside a PRP list</td><td>memory page</td><td>No</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>Chain pointer (last slot)</td><td>memory page in practice; check the specification text for whether an offset is permitted</td><td>See note</td><td><span class="badge uncertain">Uncertain</span></td></tr>
+      <tr><td>Last data page</td><td>starts at offset zero; data may end anywhere</td><td>—</td><td><span class="badge derived">Derived</span></td></tr>
+    </tbody>
+  </table>
+  <p>Read the "Physical Region Page Entry and List" material of the NVMe Base Specification for the exact normative sentences. The derived rule in the last row follows from the others: if a later page could start at an offset there would be a gap in the buffer, which PRPs cannot express.</p>
+
+  <h3>What shape of buffer PRPs can describe</h3>
+  <p>Put the rules together and you get a precise shape: <strong>one run of bytes that may start mid-page, continues through whole pages, and may end mid-page</strong>, where each page can live anywhere in memory. Physically scattered pages are fine. Holes inside the run are not. A buffer made of "2 KiB here, 2 KiB there", where each piece starts at offset zero, cannot be described with PRPs, because the second piece would need the first to end exactly at a page boundary. The block layer in Linux avoids ever building such a request for NVMe by declaring a <em>virtual boundary</em> equal to the controller page size; requests that would create a gap are split before they reach the driver <span class="badge impl">Implementation-dependent</span>.</p>
+
+  <h3>Physical addresses, bus addresses and IOVAs</h3>
+  <p>The address in a PRP entry is what the device emits on PCIe. Three cases exist:</p>
+  <ul>
+    <li><strong>No IOMMU, or IOMMU in pass-through mode:</strong> bus address equals CPU physical address (on common x86 platforms).</li>
+    <li><strong>IOMMU in translated mode (our lab system):</strong> the driver obtains an IOVA from the kernel's DMA mapping layer. The device puts the IOVA in its TLPs, and the IOMMU translates it, checking permissions per device. An entry pointing at an unmapped IOVA triggers an IOMMU fault instead of corrupting memory.</li>
+    <li><strong>Virtual machine with an assigned device:</strong> the guest writes guest-physical addresses or guest IOVAs, and a second level of translation maps them.</li>
+  </ul>
+  <p>The PRP list itself is also fetched by DMA, so the list pointer and chain pointers are IOVAs too, and the list memory must be mapped for the device just like the data.</p>
+
+  <h3>Where else PRPs appear</h3>
+  <ul>
+    <li><strong>Admin command buffers</strong> such as Identify (opcode 06h) and Get Log Page (opcode 02h). Identify returns 4 KiB; if the host's buffer starts at an offset, it touches two pages and needs PRP2. Over PCIe, admin commands use PRPs.</li>
+    <li><strong>Non-contiguous I/O queues.</strong> When a host creates an I/O Submission or Completion Queue with the Physically Contiguous bit cleared (only allowed if the controller does not require contiguous queues), PRP1 of the Create command points to a PRP list describing the queue pages. See <a href="ch27.html">Chapter 27</a>.</li>
+    <li><strong>Metadata.</strong> With PRPs selected (PSDT = 00b), the Metadata Pointer (MPTR, SQE Dwords 4–5) is a single address of a contiguous metadata buffer, not a PRP. Metadata that must be scattered needs SGLs.</li>
+  </ul>
+
+  <h3>How PRPs interact with MDTS and the block layer</h3>
+  <p>The <span class="g" data-term="mdts">Maximum Data Transfer Size (MDTS)</span> field in Identify Controller limits one command's transfer to 2<sup>MDTS</sup> × the minimum memory page size (zero means no limit is reported). A controller with MDTS = 5 and a 4 KiB minimum page accepts at most 128 KiB per command, which is 32 pages and a 31-entry list. The Linux block layer reads MDTS and caps <code>max_hw_sectors_kb</code>, so a 1 MiB application read may reach the device as eight 128 KiB commands. Whether you ever see a chained PRP list in a trace depends on MDTS and on the driver <span class="badge impl">Implementation-dependent</span>.</p>
+
+  <h3>The teaching ladder for PRPs</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>The order card has two lines: where to start, and either the next shelf or the clipboard that lists all the other shelves.</p></div>
+    <div class="rung" data-rung="B"><p>The data pointer in each SQE has two 64-bit entries. PRP1 is the address of the first byte. PRP2 is unused, the second page, or the address of a PRP list of page addresses.</p></div>
+    <div class="rung" data-rung="C"><p>The driver writes PRP entries into the SQE and list pages in host DRAM. The controller's DMA engine fetches the SQE and list with PCIe reads, translates entries into a per-command page table in its own SRAM, and drives data TLPs to those addresses; the IOMMU checks each one.</p></div>
+    <div class="rung" data-rung="D"><p>The NVMe Base Specification defines the PRP entry, PRP list, offset and alignment rules and the PRP Offset Invalid status; <code>CC.MPS</code> sets the page size; PSDT = 00b selects PRPs; the NVMe over PCIe Transport Specification makes PRPs the PCIe data pointer.</p></div>
+    <div class="rung" data-rung="E"><p>Over PCIe: MRd for the SQE, MRd for each list region, then MWr (for an NVMe Read) or MRd + CplD (for an NVMe Write) per data chunk, cut by Max Payload Size, MRRS and the 4 KiB address-boundary rule.</p></div>
+    <div class="rung" data-rung="F"><p>In an analyzer: a 64-byte SQE read, a short read of 8 × (N−1) bytes from the list region, then a run of data TLPs whose addresses jump at every page boundary to the next listed page.</p></div>
+    <div class="rung" data-rung="G"><p>If data TLP addresses do not match the list you expect, or a "list read" goes to a data page, or an IOMMU fault names an address the driver never mapped, compare the host's length arithmetic with the controller's: a PRP bug is almost always a disagreement about length or offset.</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for PRP</h3>
+  <table>
+    <caption>PRP through the sixteen questions</caption>
+    <thead><tr><th>#</th><th>Question</th><th>Answer for PRP</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>What is it?</td><td>A 64-bit pointer into one memory page; a command's data buffer is described by PRP1, PRP2 and optionally PRP lists.</td></tr>
+      <tr><td>2</td><td>Why was it created?</td><td>To describe scattered physical pages compactly in a fixed 64-byte command, with very simple hardware to walk it.</td></tr>
+      <tr><td>3</td><td>What problem does it solve?</td><td>Virtually contiguous buffers are physically scattered; the device needs one address per page without the CPU copying data into a contiguous bounce buffer.</td></tr>
+      <tr><td>4</td><td>What existed before?</td><td>Advanced Host Controller Interface (AHCI) used a Physical Region Descriptor Table of address/length pairs in a command table; many controllers used vendor-specific scatter lists.</td></tr>
+      <tr><td>5</td><td>Why is the current design better?</td><td>Fixed-size, page-aligned entries make the device's address arithmetic trivial (shift and add) and let it compute the page for any byte offset without walking a list sequentially.</td></tr>
+      <tr><td>6</td><td>Who creates it?</td><td>The host driver (Linux <code>nvme</code> driver, SPDK, a boot loader, firmware).</td></tr>
+      <tr><td>7</td><td>Who consumes it?</td><td>The controller's DMA and data-pointer fetch logic.</td></tr>
+      <tr><td>8</td><td>Where does it live?</td><td>PRP1/PRP2 in SQE Dwords 6–9; PRP lists in host memory (or a Controller Memory Buffer if supported and allowed).</td></tr>
+      <tr><td>9</td><td>What memory/registers are involved?</td><td><code>CC.MPS</code>, <code>CAP.MPSMIN/MPSMAX</code>, MDTS in Identify Controller, the IOMMU page tables, the data pages, the list pages.</td></tr>
+      <tr><td>10</td><td>What happens before it?</td><td>The driver maps the buffer for DMA, gets bus addresses, computes the page count and builds the list.</td></tr>
+      <tr><td>11</td><td>What happens after it?</td><td>The doorbell write; the controller fetches the SQE, then the list, then moves data; on completion the driver unmaps and frees the list.</td></tr>
+      <tr><td>12</td><td>What happens if it is wrong?</td><td>Wrong-page DMA, silent corruption, IOMMU faults, PRP Offset Invalid or Data Transfer Error status, timeouts.</td></tr>
+      <tr><td>13</td><td>What does the analyzer show?</td><td>The SQE bytes (decodable PRP1/PRP2), MRd to the list address, data TLP addresses per page.</td></tr>
+      <tr><td>14</td><td>What does Linux show?</td><td><code>CC.MPS</code> via register dumps, MDTS via Identify, queue limits in sysfs, IOMMU faults in the kernel log; not the PRP values themselves without tracing tools.</td></tr>
+      <tr><td>15</td><td>What would validation test?</td><td>Every offset (0, 4, 0x800, PS−4), lengths that end exactly on and one byte past boundaries, lists that end exactly at a page end, chained lists, list pointers with offsets, MDTS-sized commands, invalid offsets.</td></tr>
+      <tr><td>16</td><td>What would a senior suspect on failure?</td><td>A length mismatch between host and controller (zero-based NLB, wrong LBA size after format), a list freed or reused before the command completed, an unmapped IOVA, or a list that ran off a page without a chain.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <aside class="callout hw">
+    <p>Inside the controller, a command passes through a front end that fetches SQEs, a data-pointer engine that turns PRP entries into an internal scatter table, and one or more DMA engines that move data between host memory and the controller's buffers. The exact partitioning is private to each controller design <span class="badge impl">Implementation-dependent</span>.</p>
+  </aside>
+  <h3>What the controller does with a PRP set</h3>
+  <ol>
+    <li><strong>Decode.</strong> From the opcode, NLB and namespace format it computes the transfer length. From PRP1's offset and the page size it computes the page count, and so the meaning of PRP2.</li>
+    <li><strong>Fetch lists.</strong> If PRP2 is a list pointer, it issues PCIe MRd requests for the list. Many controllers fetch the whole list (up to the end of the list page) up front; others fetch it in chunks as data moves, a form of prefetching that trades latency for SRAM.</li>
+    <li><strong>Build a per-command scatter table.</strong> Page addresses go into on-chip memory so that the DMA engine can compute "host address for byte <var>k</var> of this command" as <code>page[k / PS] + (k mod PS)</code>, adjusted for PRP1's offset. This random access is the reason PRP entries are page aligned: no sequential walk is needed.</li>
+    <li><strong>Move data.</strong> The DMA engine emits MWr (controller-to-host) or MRd (host-to-controller) TLPs, never crossing a 4 KiB address boundary in one request, never exceeding Max Payload Size for writes, never exceeding MRRS for reads.</li>
+    <li><strong>Release.</strong> After the Completion Queue Entry (CQE) is posted, the controller must not touch the buffer or list again. The host may then unmap and reuse them.</li>
+  </ol>
+  <h3>Who else touches the addresses</h3>
+  <ul>
+    <li><strong>The root complex</strong> receives the TLPs and routes them to memory.</li>
+    <li><strong>The IOMMU</strong> (Intel VT-d, AMD-Vi, Arm SMMU) translates each IOVA and checks that this Requester ID (0x0100 for our SSD) is allowed to access it, in that direction. A failed check produces a fault record in the IOMMU and a log line in the kernel; the TLP is blocked.</li>
+    <li><strong>Caches.</strong> On x86, DMA is cache coherent; on some embedded platforms the driver must flush or invalidate caches for the list and data pages. A list written by the CPU but still in a write-back cache on a non-coherent system is a classic "the controller read stale list entries" bug <span class="badge impl">Implementation-dependent</span>.</li>
+  </ul>
+  <aside class="callout insight">
+    <p>Because the controller can compute the page for any byte directly, it is free to move data out of order — for example, finishing the third page of a Read before the first if that NAND die answered first. Analyzer traces of large Reads often show data TLP addresses that are not monotonic. That is legal and is not a PRP bug.</p>
+  </aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>Three documents are involved:</p>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Physical Region Page Entry and List; Submission Queue Entry (Data Pointer, PSDT); Controller Configuration (MPS); Controller Capabilities (MPSMIN, MPSMAX); Identify Controller (MDTS); Generic Command Status values</cite></li>
+    <li><cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4</cite> — how the data pointer and queues work when the transport is PCIe, including that PRPs are the data pointer mechanism for admin commands.</li>
+    <li><cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3 — Read and Write commands (Starting LBA, Number of Logical Blocks)</cite> — the source of the transfer length the PRPs must cover.</li>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Transaction Layer: Memory Requests, Completions, Max Payload Size, Max Read Request Size, Read Completion Boundary</cite> — the rules for the TLPs that move the data.</li>
+  </ul>
+  <p>The definitions of PRP entry and PRP list, the offset rules, and the meaning of PRP2 are <span class="badge normative">Normative</span>. Figures and examples that show lists are <span class="badge informative">Informative</span>. How a controller fetches, caches or validates lists is not specified.</p>
+
+  <aside class="callout verified">
+    <ul>
+      <li>A PRP entry is a 64-bit address; bits 1:0 are zero; the offset field width depends on the memory page size.</li>
+      <li>Memory page size is 2<sup>12 + CC.MPS</sup>, constrained by <code>CAP.MPSMIN</code> and <code>CAP.MPSMAX</code>.</li>
+      <li>PRP1 may have an offset; a PRP2 used as a data pointer and every data entry in a PRP list have an offset of zero.</li>
+      <li>PRP2 is a list pointer when the transfer crosses more than one memory page boundary; the last entry of a full list page points to the next list page when more entries are needed.</li>
+      <li>PSDT = 00b in Command Dword 0 selects PRPs for the data pointer.</li>
+    </ul>
+  </aside>
+  <aside class="callout derived">
+    <ul>
+      <li>The page-count formula <var>N</var> and the slots-per-list-page formula <var>S</var> follow from the rules; they are not quoted text.</li>
+      <li>PRPs can only describe a buffer whose interior pages are fully used — a consequence of offset-zero entries without length fields.</li>
+      <li>The number of TLPs is a consequence of PCIe rules applied to the PRP-derived address ranges, not of the NVMe specification.</li>
+    </ul>
+  </aside>
+  <aside class="callout impl">
+    <ul>
+      <li>Whether a controller checks offsets and reports PRP Offset Invalid, or simply uses the address.</li>
+      <li>How and when list pages are fetched (all at once, on demand, with prefetch).</li>
+      <li>The order data TLPs are issued in, their exact sizes below the PCIe maximums, and how many requests are outstanding.</li>
+      <li>Driver choices: Linux's fixed 4 KiB controller page, its 256-byte small list pool, when it chooses SGLs instead.</li>
+    </ul>
+  </aside>
+  <aside class="callout version">
+    <p>PRPs have existed since NVMe 1.0 and their core rules have been stable through the 2.x series; the 2.0 restructuring moved transport-specific material into the separate NVMe over PCIe Transport Specification, so older documents describe the same rules in a single base specification. Field names and section titles differ between revisions; always cite the revision you read. In NVMe-oF transports PRPs are not used — data pointers there are SGLs (<a href="ch37.html">Chapter 37</a>).</p>
+  </aside>
+  <aside class="callout notsaid">
+    <ul>
+      <li>The specification does not say a controller must detect every malformed PRP set. Undetected cases lead to undefined data movement.</li>
+      <li>It does not define a length field in PRP entries or a marker for chain pointers.</li>
+      <li>Check in the specification: the exact wording on PRP list pointer offsets and on chain-pointer alignment; which commands forbid a PRP1 offset; the value of the PRP Offset Invalid status code in the Generic Command Status table (13h in the revisions this author has read <span class="badge uncertain">Confirm</span>); MDTS units.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn">
+    <ul>
+      <li>Never assume PRP2 is unused because "the buffer is only 4 KiB" — offsets change the page count.</li>
+      <li>Never assume a PRP address is a CPU physical address when an IOMMU is present.</li>
+      <li>Never assume a controller that accepted a bad PRP set has validated it.</li>
+      <li>Never assume the data TLPs arrive in address order.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>Everything the controller learns about a PRP set it learns by reading host memory over PCIe. Everything it does with the PRP set it does by reading or writing host memory over PCIe. Follow a 128 KiB NVMe Read with a PRP list on the lab system (Gen4 x4, Max Payload Size 256 bytes, MRRS 512 bytes, RCB 64 bytes, Requester ID of the SSD 0x0100):</p>
+  <figure>
+    <ol class="seq" data-actors="Driver (CPU)|Host memory|IOMMU / RC|NVMe controller">
+      <li data-from="Driver (CPU)" data-to="Host memory">write PRP list (31 entries)</li>
+      <li data-from="Driver (CPU)" data-to="Host memory">write SQE: PRP1, PRP2 = list</li>
+      <li data-from="Driver (CPU)" data-to="NVMe controller" data-t="0 ns">MWr: SQ1 tail doorbell</li>
+      <li data-from="NVMe controller" data-to="IOMMU / RC" data-t="0.8 µs">MRd 64 B: fetch SQE</li>
+      <li data-from="IOMMU / RC" data-to="NVMe controller" class="dashed">CplD 64 B</li>
+      <li data-note="NVMe controller">decode: 32 pages, PRP2 is a list</li>
+      <li data-from="NVMe controller" data-to="IOMMU / RC">MRd 248 B: fetch PRP list</li>
+      <li data-from="IOMMU / RC" data-to="NVMe controller" class="dashed">CplD(s): 31 entries</li>
+      <li data-note="NVMe controller">NAND reads (tens of µs)</li>
+      <li data-from="NVMe controller" data-to="IOMMU / RC">512 × MWr 256 B data</li>
+      <li data-from="NVMe controller" data-to="IOMMU / RC">MWr 16 B: CQE to CQ1</li>
+      <li data-from="NVMe controller" data-to="IOMMU / RC">MWr: MSI-X message</li>
+    </ol>
+    <figcaption>Synthetic sequence for teaching: the list fetch is a separate, dependent round trip before any data can move to pages 1–31.</figcaption>
+  </figure>
+  <h3>Direction</h3>
+  <table>
+    <caption>Which TLPs a PRP set produces</caption>
+    <thead><tr><th>NVMe command</th><th>Data direction</th><th>TLPs from controller</th><th>Limits applied</th></tr></thead>
+    <tbody>
+      <tr><td>Read (02h), Identify, Get Log Page</td><td>controller → host memory</td><td>MWr (posted, no completion)</td><td>Max Payload Size; must not cross a 4 KiB address boundary</td></tr>
+      <tr><td>Write (01h), Set Features with data, Firmware Image Download</td><td>host memory → controller</td><td>MRd (non-posted), answered by CplD</td><td>MRRS per request; completions ≤ Max Payload Size, split at RCB boundaries; 4 KiB boundary rule</td></tr>
+      <tr><td>Any command with PRP list</td><td>list: host memory → controller</td><td>MRd for list regions</td><td>same as above</td></tr>
+    </tbody>
+  </table>
+  <h3>Ordering</h3>
+  <p>The controller cannot send data to page 5 before it has read the list entry for page 5, so list reads precede the data that depends on them. The host must have finished writing the list and SQE before the doorbell; on x86 the doorbell MWr is ordered behind the earlier memory writes by the driver's write barrier. The CQE write must not overtake the data writes it reports: PCIe ordering rules keep posted MWr in order unless Relaxed Ordering is set, and controllers that set Relaxed Ordering on data must not set it on the CQE write. See <a href="ch14.html">Chapter 14 — PCIe Ordering</a>.</p>
+  <h3>The 4 KiB boundary and PRP pages</h3>
+  <p>PCIe forbids a single memory request from crossing a 4 KiB address boundary. With a 4 KiB memory page size, every PRP page boundary is also a 4 KiB boundary, so a TLP never spans two PRP pages. With larger memory page sizes (for example 64 KiB) the device still has to cut TLPs at every 4 KiB address boundary inside a PRP page.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Both traces below are synthetic, built from the lab system's numbers. Times are illustrative only; real values are implementation- and platform-dependent.</p>
+  <div class="trace" data-kind="synthetic" data-title="Normal: 128 KiB Read with a one-page PRP list, Gen4 x4">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE601008 Len=1 Data=0x00000012 ReqID=RC</td><td>SQ1 tail doorbell = 0x12</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>780</td><td>MRd64</td><td>Addr=0x1_2340_0440 Len=16 DW Tag=0x10 ReqID=0x0100</td><td>Fetch SQE in slot 0x11 (0x11 × 64 = 0x440)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,420</td><td>CplD</td><td>Tag=0x10 Status=SC ByteCount=64</td><td>SQE: opc=02h NSID=1 PRP1=0x2_0000_0000 PRP2=0x1_5000_0000 NLB=0x00FF</td></tr>
+        <tr class="note"><td colspan="6">Decode: NLB 0xFF → 256 blocks × 512 B = 131,072 B. Offset 0 → 32 pages → PRP2 is a list pointer, 31 entries.</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,510</td><td>MRd64</td><td>Addr=0x1_5000_0000 Len=62 DW Tag=0x11</td><td>Fetch PRP list: 31 × 8 = 248 B</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2,150</td><td>CplD</td><td>Tag=0x11 ByteCount=248 Len=62 DW</td><td>Entries: 0x2_0000_1000, 0x2_0000_2000 … 0x2_0001_F000</td></tr>
+        <tr class="note"><td colspan="6">NAND access, roughly 60 µs, nothing on the link for this command.</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>63,900</td><td>MWr64</td><td>Addr=0x2_0000_0000 Len=64 DW</td><td>Data, page 0 (PRP1), bytes 0–255</td></tr>
+        <tr class="dir-up"><td>7–21</td><td>Dev→Host</td><td>…</td><td>MWr64</td><td>Addr=0x2_0000_0100 … 0x2_0000_0F00</td><td>Rest of page 0 (16 TLPs per page)</td></tr>
+        <tr class="dir-up"><td>22</td><td>Dev→Host</td><td>65,950</td><td>MWr64</td><td>Addr=0x2_0000_1000 Len=64 DW</td><td>Page 1 from list entry 0</td></tr>
+        <tr class="dir-up"><td>…</td><td>Dev→Host</td><td>…</td><td>MWr64</td><td>…</td><td>512 data MWr in total</td></tr>
+        <tr class="dir-up"><td>517</td><td>Dev→Host</td><td>81,600</td><td>MWr64</td><td>Addr=0x2_0001_FF00 Len=64 DW</td><td>Last 256 B of page 31 (list entry 30)</td></tr>
+        <tr class="dir-up"><td>518</td><td>Dev→Host</td><td>81,700</td><td>MWr64</td><td>Addr=0x1_2341_0120 Len=4 DW</td><td>CQE in CQ1 slot 0x12: SQHD, CID, Status=Success, phase</td></tr>
+        <tr class="dir-up"><td>519</td><td>Dev→Host</td><td>81,760</td><td>MWr32</td><td>Addr=0xFEE0_1000 Len=1 Data=0x41</td><td>MSI-X vector 1</td></tr>
+      </tbody>
+    </table>
+    <p>How to read it: the 64-byte SQE read gives you PRP1, PRP2 and NLB. From those you predict a 248-byte list read at exactly PRP2, and 512 MWr whose addresses match PRP1 and the 31 list entries. Every prediction matches, so the PRP set is consistent. An analyzer that decodes NVMe will show the SQE fields directly; one that does not still lets you decode bytes 24–39 of the SQE yourself.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: 8 KiB Read from an offset buffer, PRP2 built as a data page">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE601008 Data=0x00000031</td><td>SQ1 tail doorbell</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>800</td><td>MRd64</td><td>Addr=0x1_2340_0C00 Len=16 DW Tag=0x22</td><td>Fetch SQE slot 0x30</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,450</td><td>CplD</td><td>Tag=0x22 ByteCount=64</td><td>SQE: opc=02h PRP1=0x2_0004_0800 PRP2=0x2_0004_1000 NLB=0x000F</td></tr>
+        <tr class="note"><td colspan="6">Controller: 16 × 512 = 8,192 B, offset 0x800 → touches 3 pages (2 KiB + 4 KiB + 2 KiB). More than one boundary crossed → PRP2 is a LIST pointer.</td></tr>
+        <tr class="abnormal"><td>4</td><td>Dev→Host</td><td>1,530</td><td>MRd64</td><td>Addr=0x2_0004_1000 Len=4 DW Tag=0x23</td><td>FIRST ABNORMAL EVENT: a "list" read from an address the driver allocated as a data page</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2,100</td><td>CplD</td><td>Tag=0x23 ByteCount=16</td><td>Returns 16 bytes of stale buffer contents, e.g. 0x0000000000000000, 0x6F6F6F6F6F6F6F6F</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>58,000</td><td>MWr64</td><td>Addr=0x2_0004_0800 Len=64 DW</td><td>First 2 KiB to PRP1 page: correct</td></tr>
+        <tr class="abnormal"><td>14</td><td>Dev→Host</td><td>59,100</td><td>MWr64</td><td>Addr=0x0000_0000_0000_0000 Len=64 DW</td><td>Data for "page 1" sent to address 0 (list entry 0 was zero)</td></tr>
+        <tr class="note"><td colspan="6">IOMMU blocks the write; the kernel logs a DMA fault for device 0000:01:00.0 at address 0x0. Remaining data goes to 0x6F6F6F6F6F6F6000 (entry 1 with offset bits ignored, or rejected — implementation-dependent).</td></tr>
+        <tr class="dir-up"><td>38</td><td>Dev→Host</td><td>62,000</td><td>MWr64</td><td>Addr=0x1_2341_0300 Len=4 DW</td><td>CQE: Status=Success, or a data-transfer error status — implementation-dependent</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The SQE decodes cleanly, so the first place host and controller can disagree is the next request. You know from the arithmetic that an 8 KiB transfer at offset 0x800 touches three pages; the controller therefore must read a list at PRP2. Seeing that read land on 0x2_0004_1000 — which is the second page of the data buffer itself — tells you the host built PRP2 for a two-page transfer. The root cause is the driver's page-count formula ignoring the offset: it computed 8192 / 4096 = 2 pages. Everything after event 4 (writes to address 0, IOMMU fault, possibly success status) is consequence, not cause.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Every command in this section only reads state. None issues I/O to the device or changes configuration.</p></aside>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Controller registers: CAP (MPSMIN/MPSMAX) and CC (MPS). Needs root.</span>
+sudo nvme show-regs /dev/nvme0 -H | grep -i -E 'memory page size|MPS'
+
+<span class="cm"># Maximum data transfer size the controller reports</span>
+sudo nvme id-ctrl /dev/nvme0 | grep -i mdts
+
+<span class="cm"># What the block layer derived from MDTS and the controller page size</span>
+cat /sys/block/nvme0n1/queue/max_hw_sectors_kb
+cat /sys/block/nvme0n1/queue/max_sectors_kb
+cat /sys/block/nvme0n1/queue/max_segments
+cat /sys/block/nvme0n1/queue/max_segment_size
+cat /sys/block/nvme0n1/queue/virt_boundary_mask   <span class="cm"># newer kernels only</span>
+
+<span class="cm"># Is the device behind a translating IOMMU?</span>
+ls /sys/bus/pci/devices/0000:01:00.0/iommu_group/devices/
+cat /sys/bus/pci/devices/0000:01:00.0/iommu_group/type 2&gt;/dev/null
+
+<span class="cm"># IOMMU faults that mention the SSD</span>
+sudo dmesg | grep -i -E 'DMAR|AMD-Vi|iommu|smmu' | grep -i '01:00.0'</code></pre>
+  <h3>What these outputs prove — and what they cannot</h3>
+  <table>
+    <caption>Evidence from Linux</caption>
+    <thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>show-regs</code> MPS fields</td><td>The page size the controller was configured with</td><td>That a particular command's PRPs respected it</td></tr>
+      <tr><td>MDTS and <code>max_hw_sectors_kb</code></td><td>The largest command the driver will build, hence the longest PRP list you can see</td><td>The actual sizes of commands in a workload (use tracing or the analyzer)</td></tr>
+      <tr><td><code>virt_boundary_mask</code> = 4095</td><td>The block layer will not hand the driver a request with gaps that PRPs cannot express</td><td>That a user-space driver (SPDK, a test tool using passthrough) obeys the same rule</td></tr>
+      <tr><td>IOMMU group type <code>DMA</code> or <code>DMA-FQ</code></td><td>PRP addresses are IOVAs and are checked</td><td>Which IOVA belongs to which command</td></tr>
+      <tr><td>An IOMMU fault line naming 01:00.0</td><td>The SSD emitted a request to an address that was not mapped (or not mapped for that direction)</td><td>Which command or which PRP entry produced it; you correlate by time and address</td></tr>
+    </tbody>
+  </table>
+  <p>The kernel's <code>nvme_setup_cmd</code> tracepoint (under <code>/sys/kernel/tracing/events/nvme/</code>) records queue, command identifier, opcode and command dwords 10–15. It does not print PRP1/PRP2. To see the PRPs you need a PCIe analyzer, a debug build of the driver, or a user-space driver where you construct them yourself <span class="badge version">Version-dependent</span>. Output formats of all these tools vary by version; treat any sample output you see elsewhere as illustrative.</p>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>The host-side algorithm, written the way a driver writes it. This is simplified from the shape of real drivers; it assumes one virtually contiguous buffer already mapped to a single IOVA range, which is the simplest case.</p>
+  <pre class="code" data-kind="pseudocode" data-lang="c" data-title="build_prps.c"><code><span class="cm">/* ps: memory page size (1 &lt;&lt; (12 + CC.MPS)); iova: DMA address of byte 0; len: bytes */</span>
+int build_prps(struct sqe *cmd, u64 iova, u32 len, u32 ps)
+{
+    u32 off   = iova &amp; (ps - 1);
+    u32 first = min(len, ps - off);             <span class="cm">/* bytes covered by PRP1         */</span>
+    u32 npages = (off + len + ps - 1) / ps;     <span class="cm">/* pages touched (uses offset!)  */</span>
+
+    if (iova &amp; 3) return -EINVAL;               <span class="cm">/* PRP1 must be dword aligned    */</span>
+    cmd-&gt;prp1 = iova;
+    if (npages == 1) { cmd-&gt;prp2 = 0; return 0; }
+    u64 next = (iova - off) + ps;               <span class="cm">/* page-aligned second page     */</span>
+    if (npages == 2) { cmd-&gt;prp2 = next; return 0; }
+
+    u64 *list = alloc_list_page(&amp;list_iova);    <span class="cm">/* must be DMA-mapped too        */</span>
+    cmd-&gt;prp2 = list_iova;
+    u32 slot = 0, slots = ps / 8;               <span class="cm">/* page-aligned list: 512 slots  */</span>
+    for (u32 left = npages - 1; left; left--) {
+        if (slot == slots - 1 &amp;&amp; left &gt; 1) {    <span class="cm">/* last slot, more than 1 to go  */</span>
+            u64 *nl = alloc_list_page(&amp;nl_iova);
+            list[slot] = nl_iova;               <span class="cm">/* chain pointer                 */</span>
+            list = nl; slot = 0;
+        }
+        list[slot++] = next;
+        next += ps;
+    }
+    write_barrier();                            <span class="cm">/* list visible before doorbell  */</span>
+    return 0;
+}</code></pre>
+  <p>Note the condition <code>left &gt; 1</code>: if exactly one entry remains when we reach the last slot, it goes in that slot as data. The off-by-one variant <code>left &gt; 0</code> wastes a page and, worse, disagrees with the controller, which expects data in that slot. That bug is a case in <a href="ch38.html">Chapter 38</a>.</p>
+
+  <p>A small executable calculator for the arithmetic. It prints, for each buffer, the page count, PRP2's role and the list layout. The full PRP walker with TLP prediction and a checker is in <a href="ch38.html#code">Chapter 38</a>.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="prp_count.py"><code>#!/usr/bin/env python3
+"""Count pages and PRP list entries for NVMe buffers. Standard library only."""
+
+def prp_shape(addr, length, ps=4096, list_ptr=None):
+    off = addr % ps
+    pages = (off + length + ps - 1) // ps
+    if pages == 1:
+        return pages, "PRP2 unused", []
+    if pages == 2:
+        return pages, "PRP2 = second page", []
+    entries = pages - 1
+    lp = list_ptr if list_ptr is not None else 0   # offset of list in its page
+    layout, left = [], entries
+    while left:
+        slots = (ps - lp % ps) // 8
+        if left &gt; slots:
+            layout.append((slots - 1, "chain"))
+            left -= slots - 1
+        else:
+            layout.append((left, "end"))
+            left = 0
+        lp = 0                                        # chained pages start aligned
+    return pages, "PRP2 = list pointer", layout
+
+if __name__ == "__main__":
+    for addr, n, lp in [(0x200000000, 4096, None), (0x200000800, 4096, None),
+                        (0x200000800, 8192, None), (0x200000000, 131072, None),
+                        (0x200000000, 1 &lt;&lt; 20, 0xC00), (0x200000000, 4 &lt;&lt; 20, 0)]:
+        pages, role, layout = prp_shape(addr, n, list_ptr=lp)
+        desc = ", ".join(f"{k} data + {t}" for k, t in layout) or "-"
+        print(f"0x{addr:x} len {n:&gt;8}: {pages:&gt;4} pages, {role:&lt;20} lists: {desc}")</code></pre>
+  <p>Running it prints one line per buffer (the 1 MiB case with its list starting at offset 0xC00 shows <code>127 data + chain, 128 data + end</code>; the 4 MiB case shows <code>511 data + chain, 512 data + end</code>). Run it yourself rather than trusting this paragraph.</p>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p>Five buffers, all on the lab system (memory page size 4 KiB, PCIe Max Payload Size 256 bytes, MRRS 512 bytes, RCB 64 bytes, data buffers from 0x2_0000_0000, PRP list pages from 0x1_5000_0000, Namespace 1 with 512-byte logical blocks). Every value below is a synthetic example for teaching. For each buffer we compute the pages, write the PRP set, draw it, and predict the data TLPs. TLP counts assume a controller that cuts requests at naturally aligned Max Payload Size or MRRS boundaries; real devices may cut differently <span class="badge impl">Implementation-dependent</span>, but none may exceed the limits.</p>
+
+  <h3>Example 1 — 4 KiB, page aligned</h3>
+  <p>Read of 8 blocks: NLB = 7 (zero-based), L = 8 × 512 = 4,096 bytes, buffer at 0x2_0000_0000.</p>
+  <ul>
+    <li>Offset = 0; N = ⌈(0 + 4096) / 4096⌉ = 1 page. No boundary crossed.</li>
+    <li><strong>PRP1 = 0x0000_0002_0000_0000</strong>; PRP2 unused (the driver writes 0; the controller ignores it).</li>
+  </ul>
+  <figure>
+    <pre class="diagram">
+ SQE                      host memory
+ PRP1 = 0x2_0000_0000 --&gt; [0x2_0000_0000 ........................ 0x2_0000_0FFF]  4096 B
+ PRP2 = (unused)
+    </pre>
+    <figcaption>Synthetic example: one page, no list.</figcaption>
+  </figure>
+  <table>
+    <caption>Data TLPs for Example 1</caption>
+    <thead><tr><th>Command</th><th>Requests</th><th>Completions</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Read (controller → host)</td><td>16 × MWr64, 256 B each, at 0x2_0000_0000, …0100, … …0F00</td><td>none (posted)</td><td>4,096 / 256 = 16</td></tr>
+      <tr><td>Write (host → controller)</td><td>8 × MRd64, 512 B each</td><td>16 CplD if the completer returns 256-byte completions; up to 64 if it returns 64-byte (RCB-sized) pieces</td><td>Completer behavior is platform-dependent</td></tr>
+    </tbody>
+  </table>
+  <p>Add the fixed per-command traffic you will see for every example: one doorbell MWr, one 64-byte SQE MRd and its CplD, one 16-byte CQE MWr, and one MSI-X MWr if interrupts are enabled for the queue.</p>
+
+  <h3>Example 2 — 8 KiB, page aligned</h3>
+  <p>Read of 16 blocks: NLB = 15, L = 8,192 bytes, buffer at 0x2_0000_0000, physically two consecutive pages. (They need not be consecutive; the second could be anywhere.)</p>
+  <ul>
+    <li>Offset = 0; N = 2. Exactly one boundary crossed.</li>
+    <li><strong>PRP1 = 0x2_0000_0000</strong>, <strong>PRP2 = 0x2_0000_1000</strong> (a data page, offset 0).</li>
+  </ul>
+  <figure>
+    <pre class="diagram">
+ PRP1 = 0x2_0000_0000 --&gt; [page A: 0x2_0000_0000 - 0x2_0000_0FFF]  4096 B
+ PRP2 = 0x2_0000_1000 --&gt; [page B: 0x2_0000_1000 - 0x2_0000_1FFF]  4096 B
+    </pre>
+    <figcaption>Synthetic example: PRP2 is the second data page, not a list.</figcaption>
+  </figure>
+  <p>Read: 32 MWr of 256 B. Write: 16 MRd of 512 B, answered by 32 to 128 CplD. If page B had been 0x2_0009_3000 instead, the TLP addresses would jump from 0x2_0000_0F00 to 0x2_0009_3000 halfway through; nothing else would change.</p>
+
+  <h3>Example 3 — 4 KiB with an offset, crossing a page</h3>
+  <p>Read of 8 blocks into a buffer at 0x2_0000_0800 (offset 0x800 = 2,048). L = 4,096 bytes.</p>
+  <ul>
+    <li>N = ⌈(2048 + 4096) / 4096⌉ = 2. One boundary crossed, so PRP2 is needed even though the buffer is "only 4 KiB".</li>
+    <li>B<sub>1</sub> = min(4096, 4096 − 2048) = 2,048 bytes in the first page.</li>
+    <li><strong>PRP1 = 0x2_0000_0800</strong>, <strong>PRP2 = 0x2_0000_1000</strong>.</li>
+  </ul>
+  <figure>
+    <div class="svg-diagram">
+      <svg viewBox="0 0 640 190" role="img" aria-label="A 4 KiB buffer starting at offset 0x800 covers the second half of page A and the first half of page B">
+        <text x="10" y="20" class="mono" font-size="12" fill="currentColor">page A 0x2_0000_0000</text>
+        <rect x="10" y="30" width="290" height="40" fill="none" stroke="currentColor"/>
+        <rect x="155" y="30" width="145" height="40" fill="currentColor" fill-opacity="0.25" stroke="currentColor"/>
+        <text x="40" y="55" font-size="12" class="muted" fill="currentColor">not ours</text>
+        <text x="170" y="55" font-size="12" fill="currentColor">2,048 B (PRP1)</text>
+        <text x="330" y="20" class="mono" font-size="12" fill="currentColor">page B 0x2_0000_1000</text>
+        <rect x="330" y="30" width="290" height="40" fill="none" stroke="currentColor"/>
+        <rect x="330" y="30" width="145" height="40" fill="currentColor" fill-opacity="0.25" stroke="currentColor"/>
+        <text x="345" y="55" font-size="12" fill="currentColor">2,048 B (PRP2)</text>
+        <text x="500" y="55" font-size="12" class="muted" fill="currentColor">not ours</text>
+        <line x1="155" y1="75" x2="155" y2="110" stroke="currentColor"/>
+        <text x="100" y="125" class="mono" font-size="11" fill="currentColor">PRP1=0x2_0000_0800</text>
+        <line x1="330" y1="75" x2="330" y2="140" stroke="currentColor"/>
+        <text x="290" y="155" class="mono" font-size="11" fill="currentColor">PRP2=0x2_0000_1000 (offset 0)</text>
+        <text x="10" y="182" font-size="11" class="muted" fill="currentColor">Each MWr is 256 B: 8 in page A (0x800…0xF00), 8 in page B (0x000…0x700). No TLP crosses the page line.</text>
+      </svg>
+    </div>
+    <figcaption>Synthetic example: an offset buffer spreads 4 KiB across two pages.</figcaption>
+  </figure>
+  <p>Read: 16 MWr (8 + 8). Write: 8 MRd of 512 B (4 per page; 0x800 is 512-aligned). Now change the offset to 0x810: the controller's first MWr can only run to the next 256-byte boundary (0x900), so it carries 240 bytes; then 15 full 256-byte writes; then a final 16-byte write at 0x2_0000_1800. That is 17 MWr — one more packet, and two short ones, for the same 4 KiB. Unaligned buffers cost link efficiency, which is one reason drivers prefer aligned buffers.</p>
+
+  <h3>Example 4 — 128 KiB, requiring a PRP list</h3>
+  <p>Read of 256 blocks: NLB = 0xFF, L = 131,072 bytes, buffer at 0x2_0000_0000 (32 pages, here shown consecutive for readability).</p>
+  <ul>
+    <li>N = 32; more than one boundary crossed → PRP2 is a list pointer.</li>
+    <li>List entries = N − 1 = 31, size 248 bytes; list at 0x1_5000_0000 has 512 slots, so no chaining.</li>
+    <li><strong>PRP1 = 0x2_0000_0000</strong>, <strong>PRP2 = 0x1_5000_0000</strong>.</li>
+  </ul>
+  <figure>
+    <pre class="diagram">
+ PRP1 = 0x2_0000_0000 -----------------------------&gt; data page 0
+ PRP2 = 0x1_5000_0000 --&gt; PRP list (248 B used of a 4 KiB page)
+                          0x1_5000_0000: 0x0000_0002_0000_1000 -&gt; data page 1
+                          0x1_5000_0008: 0x0000_0002_0000_2000 -&gt; data page 2
+                          ...
+                          0x1_5000_00F0: 0x0000_0002_0001_F000 -&gt; data page 31
+                          0x1_5000_00F8: (not part of the list - never read)
+    </pre>
+    <figcaption>Synthetic example: a 31-entry PRP list in one list page.</figcaption>
+  </figure>
+  <table>
+    <caption>TLPs for Example 4</caption>
+    <thead><tr><th>Purpose</th><th>Read command</th><th>Write command</th></tr></thead>
+    <tbody>
+      <tr><td>PRP list fetch</td><td>1 MRd of 248 B (62 DW) + 1–4 CplD</td><td>same</td></tr>
+      <tr><td>Data</td><td>512 MWr of 256 B</td><td>256 MRd of 512 B + 512 or more CplD</td></tr>
+      <tr><td>Tags needed for data</td><td>none (posted)</td><td>up to 256, limited by the controller's outstanding-read budget; 8-bit tags allow 256 in flight</td></tr>
+    </tbody>
+  </table>
+  <p>If the buffer had started at offset 0x200 instead, it would touch 33 pages and need 32 list entries (256 bytes). The Linux small list pool is 256 bytes, which holds exactly 32 entries; this is not a coincidence <span class="badge impl">Implementation-dependent</span>.</p>
+  <div class="formula">
+    <div class="eq"><var>η</var> ≈ <var>P</var> / (<var>P</var> + <var>O</var>) = 256 / (256 + 24) ≈ 0.91</div>
+    <dl class="vars">
+      <dt>η</dt><dd>approximate fraction of link bytes that carry data for a stream of MWr TLPs</dd>
+      <dt>P</dt><dd>payload bytes per TLP (Max Payload Size, 256 here)</dd>
+      <dt>O</dt><dd>per-TLP overhead in bytes: a 4-DW header (16 B) plus framing and Link CRC (about 8 B at Gen4); excludes DLLPs and skip ordered sets, so the real figure is a little lower <span class="badge derived">Derived</span></dd>
+    </dl>
+  </div>
+  <p>At roughly 7.9 GB/s of raw Gen4 x4 bandwidth per direction, 128 KiB of data takes about 18 µs on the link. The list fetch adds one dependent round trip (about 0.6–1 µs) but is hidden behind the NAND read time on a Read.</p>
+
+  <h3>Example 5 — 1 MiB with chained lists</h3>
+  <p>Read of 2,048 blocks: NLB = 0x7FF, L = 1,048,576 bytes, buffer at 0x2_0000_0000. This needs a controller whose MDTS allows 1 MiB (MDTS ≥ 8 with a 4 KiB minimum page). N = 256 pages, so 255 list entries are needed.</p>
+  <p>If the list started at the beginning of a list page, 255 entries would fit in its 512 slots and there would be no chain. To see chaining with 1 MiB, the list pointer in this example has an offset: the driver placed the list at <strong>0x1_5000_0C00</strong>, three quarters of the way into its page (legal: PRP2 as a list pointer need only be quadword aligned).</p>
+  <ul>
+    <li>Slots left in the first list page: S = (4096 − 0xC00) / 8 = 1024 / 8 = 128.</li>
+    <li>255 &gt; 128, so slots 0–126 carry data pages 1–127, and slot 127 (at 0x1_5000_0FF8) is a chain pointer to the next list page, 0x1_5000_1000.</li>
+    <li>Remaining entries: 255 − 127 = 128. The next list page has 512 slots, so all 128 fit (0x1_5000_1000 … 0x1_5000_13F8). No further chain.</li>
+    <li><strong>PRP1 = 0x2_0000_0000</strong>, <strong>PRP2 = 0x1_5000_0C00</strong>.</li>
+  </ul>
+  <figure>
+    <div class="svg-diagram">
+      <svg viewBox="0 0 660 260" role="img" aria-label="Chained PRP list: PRP2 points to offset 0xC00 of list page 0; its last slot points to list page 1">
+        <rect x="10" y="20" width="120" height="60" fill="none" stroke="currentColor"/>
+        <text x="20" y="42" class="mono" font-size="11" fill="currentColor">PRP1 0x2_0000_0000</text>
+        <text x="20" y="64" class="mono" font-size="11" fill="currentColor">PRP2 0x1_5000_0C00</text>
+        <text x="10" y="14" font-size="11" fill="currentColor">SQE</text>
+        <rect x="200" y="20" width="200" height="200" fill="none" stroke="currentColor"/>
+        <text x="200" y="14" font-size="11" fill="currentColor">list page 0x1_5000_0000</text>
+        <rect x="200" y="20" width="200" height="150" fill="currentColor" fill-opacity="0.08" stroke="none"/>
+        <text x="210" y="100" font-size="11" class="muted" fill="currentColor">0x000–0xBFF: other lists</text>
+        <rect x="200" y="170" width="200" height="40" fill="currentColor" fill-opacity="0.25" stroke="currentColor"/>
+        <text x="208" y="187" class="mono" font-size="10" fill="currentColor">0xC00–0xFF0: 127 data</text>
+        <rect x="200" y="210" width="200" height="10" fill="currentColor" fill-opacity="0.6" stroke="currentColor"/>
+        <text x="405" y="219" class="mono" font-size="10" fill="currentColor">0xFF8: chain</text>
+        <line x1="130" y1="60" x2="198" y2="172" stroke="currentColor"/>
+        <rect x="480" y="20" width="160" height="200" fill="none" stroke="currentColor"/>
+        <text x="480" y="14" font-size="11" fill="currentColor">list page 0x1_5000_1000</text>
+        <rect x="480" y="20" width="160" height="50" fill="currentColor" fill-opacity="0.25" stroke="currentColor"/>
+        <text x="488" y="48" class="mono" font-size="10" fill="currentColor">0x000–0x3F8: 128 data</text>
+        <text x="488" y="120" font-size="11" class="muted" fill="currentColor">unused</text>
+        <path d="M470 215 C 460 140, 470 60, 478 30" fill="none" stroke="currentColor"/>
+        <text x="10" y="250" font-size="11" class="muted" fill="currentColor">Data pages: PRP1 = page 0; list page 0 = pages 1–127; list page 1 = pages 128–255.</text>
+      </svg>
+    </div>
+    <figcaption>Synthetic example: a 1 MiB transfer whose list starts at offset 0xC00 must chain after 127 entries.</figcaption>
+  </figure>
+  <table>
+    <caption>TLPs for Example 5</caption>
+    <thead><tr><th>Purpose</th><th>Count (Read command)</th></tr></thead>
+    <tbody>
+      <tr><td>List fetch, first list page (1,024 B from 0x1_5000_0C00)</td><td>2 MRd of 512 B</td></tr>
+      <tr><td>List fetch, second list page (1,024 B from 0x1_5000_1000)</td><td>2 MRd of 512 B — the controller can only issue these after it has read the chain pointer in slot 127</td></tr>
+      <tr><td>Data</td><td>4,096 MWr of 256 B (a Write command would issue 2,048 MRd of 512 B)</td></tr>
+    </tbody>
+  </table>
+  <p>Contrast: with a page-aligned 4 MiB buffer (1,024 pages, 1,023 entries) the first list page holds 511 data entries and a chain pointer, the second holds the remaining 512 entries exactly — no second chain, because when the remaining entries equal the slots available, the last slot is data. Few controllers accept 4 MiB in one command; check MDTS.</p>
+  <aside class="callout exercise"><p>Before reading on, compute the PRP set for a 12 KiB Write at 0x2_0000_0FFC. (Answer: offset 0xFFC, N = ⌈(4092 + 12288) / 4096⌉ = 4 pages; PRP1 = 0x2_0000_0FFC covers 4 bytes; PRP2 points to a 3-entry list: 0x2_0000_1000, 0x2_0000_2000, 0x2_0000_3000, the last of which holds the final 4,092 bytes.)</p></aside>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <table>
+    <caption>Mistakes engineers actually make with PRPs</caption>
+    <thead><tr><th>Mistake</th><th>Why it happens</th><th>What you see</th></tr></thead>
+    <tbody>
+      <tr><td>Counting pages from length alone, ignoring the PRP1 offset</td><td>Thinking "4 KiB fits in a page"</td><td>PRP2 = data page where the controller expects a list (abnormal trace above)</td></tr>
+      <tr><td>Forgetting NLB is zero-based</td><td>Every other length field in software is one-based</td><td>The controller moves one block more than the buffer holds; the extra block lands past the end of the buffer or at a stale/zero PRP</td></tr>
+      <tr><td>Giving PRP2 (as data pointer) or list entries an offset</td><td>Passing a sub-page pointer from a memory allocator</td><td>PRP Offset Invalid status, or data at the wrong address if not checked</td></tr>
+      <tr><td>Letting a list run past the end of its page</td><td>Allocating a list with an offset and filling it linearly</td><td>The controller treats the last slot as a chain pointer and reads data pages as lists</td></tr>
+      <tr><td>Freeing or reusing the list before the CQE arrives</td><td>Timeout handling, error paths</td><td>Correct data on most runs, wrong page under load</td></tr>
+      <tr><td>Using a CPU physical address where an IOVA is needed</td><td>Bypassing the DMA mapping API</td><td>IOMMU faults; works only with the IOMMU off</td></tr>
+      <tr><td>Using the wrong page size</td><td>Assuming host page size equals <code>CC.MPS</code> page size</td><td>On 64 KiB-page hosts, data scattered at 64 KiB strides where the controller expects 4 KiB pages</td></tr>
+      <tr><td>Confusing memory page size with PCIe Max Payload Size</td><td>Both called "MPS"</td><td>Nonsensical arithmetic in bug reports</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>A PRP problem is a disagreement between two computations of the same thing: the host's idea of where the bytes live and the controller's. Debugging is the act of reproducing both computations from evidence and finding the first place they diverge.</p>
+  <ol>
+    <li><strong>Get the command.</strong> From an analyzer, decode the SQE CplD: opcode, NSID, PRP1, PRP2, Starting LBA, NLB. From software, log them in the driver or user-space tool.</li>
+    <li><strong>Compute L from the namespace format, not from the application.</strong> L = (NLB + 1) × LBA data size (+ metadata if extended LBAs are used). An LBA format change from 512 B to 4 KiB multiplies L by eight for the same NLB.</li>
+    <li><strong>Compute N and PRP2's role</strong> from PRP1's offset and the page size from <code>CC.MPS</code>.</li>
+    <li><strong>Predict the list reads</strong> (address, length) and check they appear in the trace at exactly PRP2 and at each chain pointer.</li>
+    <li><strong>Predict data TLP addresses</strong> per page and compare. The first data TLP to an unexpected page is your first abnormal event.</li>
+    <li><strong>Correlate host-side evidence:</strong> IOMMU faults (address, direction, device), kernel warnings about DMA mapping, memory corruption reports.</li>
+  </ol>
+  <p>The full set of broken cases, with traces, is <a href="ch38.html">Chapter 38 — PRP/SGL Debugging Lab</a>. The correlation method for any command is <a href="ch41.html">Chapter 41 — Command-to-TLP Correlation</a>.</p>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight">
+    <ul>
+      <li><strong>Treat the length as the primary suspect.</strong> In practice, malformed PRP structures are rarer than correct structures built for the wrong length. Format changes, zero-based fields, metadata sizes and protection information all change L without changing the buffer.</li>
+      <li><strong>"Success" is not evidence that the data went where you think.</strong> Posted writes blocked by an IOMMU produce no error back to the device. A Read that completes with Success status can still have delivered nothing. Always pair storage results with the IOMMU log.</li>
+      <li><strong>List lifetime is a protocol.</strong> The list must remain valid and mapped until the CQE is consumed. Abort and timeout paths that free resources early are where use-after-free DMA bugs come from.</li>
+      <li><strong>Prefetching hides bugs.</strong> A controller that fetches the entire list page up front reads slots the host never wrote; one that fetches on demand does not. The same buggy driver can pass on one SSD and corrupt memory on another.</li>
+      <li><strong>Page size is a system decision.</strong> On hosts with large pages, a 4 KiB controller page multiplies list size and fetches; a 64 KiB controller page (if <code>CAP.MPSMAX</code> allows) shrinks lists but forces all interior data pointers to be 64 KiB aligned. Most drivers choose 4 KiB for compatibility.</li>
+      <li><strong>When PRPs hurt, use SGLs.</strong> Many small, unaligned fragments, or metadata that is scattered, are expressed naturally by SGLs — if the controller supports them (<a href="ch37.html">Chapter 37</a>).</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 36 — Build, predict and audit PRP sets</h3>
+  <h4>Objective</h4>
+  <p>Given buffer addresses and lengths, produce PRP1, PRP2 and every list page by hand, verify with a script, and predict the PCIe data TLPs a controller would emit.</p>
+  <h4>Skills</h4>
+  <ul><li>Page-count and slot arithmetic</li><li>Decoding SQE data pointers</li><li>Mapping PRPs to TLP streams</li></ul>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Paper and Python only. The optional Linux step is read-only.</p></aside>
+  <h4>Hardware required</h4>
+  <p>None. Optional: any Linux machine with an NVMe SSD for the read-only step.</p>
+  <h4>Software required</h4>
+  <p>Python 3 (standard library). Optional: <code>nvme-cli</code>.</p>
+  <h4>Input</h4>
+  <table>
+    <caption>Buffers to analyze (memory page size 4 KiB, 512-byte LBAs)</caption>
+    <thead><tr><th>#</th><th>Command</th><th>Buffer IOVA</th><th>NLB</th><th>List pointer (if needed)</th></tr></thead>
+    <tbody>
+      <tr><td>a</td><td>Read</td><td>0x2_0010_0000</td><td>0x0007</td><td>0x1_5000_2000</td></tr>
+      <tr><td>b</td><td>Read</td><td>0x2_0010_0E00</td><td>0x0003</td><td>0x1_5000_2000</td></tr>
+      <tr><td>c</td><td>Write</td><td>0x2_0010_0200</td><td>0x001F</td><td>0x1_5000_2000</td></tr>
+      <tr><td>d</td><td>Write</td><td>0x2_0010_0000</td><td>0x00FF</td><td>0x1_5000_2F00</td></tr>
+      <tr><td>e</td><td>Read</td><td>0x2_0010_0004</td><td>0x07FF</td><td>0x1_5000_2000</td></tr>
+    </tbody>
+  </table>
+  <h4>Expected output</h4>
+  <p>For each row: L, N, PRP1, PRP2 and its role, the list page(s) with entry counts and chain pointers, the list fetch MRds, and the number of data TLPs.</p>
+  <h4>Background</h4>
+  <p>Use the formulas in the engineering section. Remember NLB is zero-based.</p>
+  <h4>Step 1</h4>
+  <p>Compute L and N for every row on paper.</p>
+  <h4>Step 2</h4>
+  <p>Write PRP1 and PRP2. For list cases compute S for the list pointer and decide whether a chain is needed.</p>
+  <h4>Step 3</h4>
+  <p>Run <code>prp_count.py</code> from the code section, or the full walker from <a href="ch38.html#code">Chapter 38</a> (<code>python3 prp_walk.py 0x200100e00 2048</code> and so on), and compare.</p>
+  <h4>Step 4 (optional, read-only)</h4>
+  <p>On a real machine, record <code>CC.MPS</code>, MDTS and <code>max_hw_sectors_kb</code>, and compute the longest PRP list your system will ever build.</p>
+  <h4>Observation</h4>
+  <p>Note which rows surprised you. Most learners are surprised by (b) and (e).</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Which row needs PRP2 although its length is small?</li>
+    <li>Which row needs a chained list, and why — length or list offset?</li>
+    <li>For row (c), how many MRd TLPs fetch data?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Find the smallest transfer length that needs a chained list when the list pointer is page aligned and PRP1 has offset 0. Then find it when PRP1 has offset 4.</p>
+  <details class="hint"><summary>Hint</summary><p>A page-aligned list page holds 511 data entries plus a chain, or 512 data entries without one. Chaining starts when the list needs 513 entries.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <ul>
+      <li>(a) L = 4,096; N = 1; PRP1 = 0x2_0010_0000; PRP2 unused; 16 MWr.</li>
+      <li>(b) L = 2,048; offset 0xE00 leaves 512 bytes in page 0; N = 2; PRP1 = 0x2_0010_0E00, PRP2 = 0x2_0010_1000 (data page, 1,536 bytes used); 8 MWr (2 + 6).</li>
+      <li>(c) L = 16,384; offset 0x200; N = ⌈(512 + 16384)/4096⌉ = 5; PRP2 = 0x1_5000_2000 list with 4 entries (32 B, 1 MRd); data: each page section is 512-aligned, so 32 MRd of 512 B.</li>
+      <li>(d) L = 131,072; N = 32; 31 entries; list at offset 0xF00 has S = 32 slots; 31 ≤ 32 so no chain; one MRd of 248 B; 256 MRd for data.</li>
+      <li>(e) L = 1,048,576; offset 4 → N = 257; 256 entries in a page-aligned list (512 slots) → no chain; PRP1 covers 4,092 bytes, the last page 4 bytes. Data MWr: the first page yields 16 TLPs (first is 252 B), pages 1–255 yield 16 each, the last page 1 → 4,097 MWr.</li>
+      <li>Challenge: page-aligned list, offset 0: 513 list entries means N = 514 pages → L &gt; 513 × 4096 = 2,101,248 bytes, so the smallest is 2,101,249 bytes. With PRP1 offset 4 the first page holds 4 bytes less, so N ≥ 514 when 4 + L &gt; 2,101,248, i.e. the smallest is 2,101,245 bytes. (Real I/O is in whole blocks: at offset 0, 4,104 blocks of 512 B fill exactly 513 pages and do not chain; the smallest chaining Read is 4,105 blocks.)</li>
+    </ul>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>Row (e) is legal but wasteful: an odd offset adds a page, a list entry, and a short TLP at both ends. In a performance investigation, a stream of 252-byte and 4-byte MWr is the fingerprint of misaligned user buffers.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>Row (b) built with PRP2 = 0: second chunk goes to address 0.</li>
+    <li>Row (d) built with a list pointer of 0x1_5000_2F80 (16 slots): the list must chain after 15 entries.</li>
+    <li>Row (a) with NLB set to 8 instead of 7: 4,608 bytes, N = 2, PRP2 required but unset.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Repeat the lab with a 16 KiB memory page size (<code>CC.MPS</code> = 2). Which rows change their PRP2 role?</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>A 64 KiB Read at 0x2_0020_0100 with 4 KiB pages: give N, PRP2 role, and the list length in bytes.
+      <details class="answer"><summary>Answer</summary><p>N = ⌈(256 + 65536)/4096⌉ = 17; PRP2 is a list pointer; 16 entries = 128 bytes.</p></details></li>
+    <li>With <code>CC.MPS</code> = 1 (8 KiB pages), how many slots does a page-aligned list page have, and how much data can one list page describe?
+      <details class="answer"><summary>Answer</summary><p>8192 / 8 = 1,024 slots; without chaining up to 1,024 pages of 8 KiB = 8 MiB beyond PRP1's page.</p></details></li>
+    <li>Explain why the controller cannot be told directly that PRP2 is a list pointer, and what that implies for debugging.
+      <details class="answer"><summary>Answer</summary><p>There is no flag; the role is derived from length and offset. Any disagreement about length (format, NLB, metadata) changes the role, so debugging starts by recomputing length from the controller's point of view.</p></details></li>
+    <li>Write the PRP set for an Identify command whose 4 KiB buffer sits at 0x2_0000_0400.
+      <details class="answer"><summary>Answer</summary><p>PRP1 = 0x2_0000_0400 (3 KiB), PRP2 = 0x2_0000_1000 (1 KiB). Identify uses PRPs over PCIe like any admin command.</p></details></li>
+    <li>A list pointer is 0x1_5000_0FF8. How many entries can the first list page hold, and what must the single slot contain if 5 pages remain?
+      <details class="answer"><summary>Answer</summary><p>One slot. With 5 entries remaining (&gt; 1), the slot must be a chain pointer to the next list page, which then holds all 5 entries. Legal, but a wasted round trip.</p></details></li>
+    <li>Count MWr TLPs for a 4 KiB Read at offset 0x10 with Max Payload Size 128 B.
+      <details class="answer"><summary>Answer</summary><p>First page: 0x010–0x07F (112 B) then 31 full 128 B TLPs to 0xFFF; second page: 16 B at 0x000. Total 33.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>A Read moves 4,096 bytes into a buffer at offset 0x400. What is PRP2?</p>
+      <ul class="options" data-answer="2">
+        <li>Unused, because 4 KiB fits in one page</li>
+        <li>The page-aligned address of the second page</li>
+        <li>A PRP list pointer</li>
+        <li>The address of byte 3,072 of the buffer</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The offset makes the transfer cross exactly one page boundary (3 KiB + 1 KiB), so PRP2 is the second data page, offset zero.</p></details>
+    </li>
+    <li>
+      <p>Which PRP item may have a non-zero page offset?</p>
+      <ul class="options" data-answer="3">
+        <li>Every list entry</li>
+        <li>PRP2 when it is a data pointer</li>
+        <li>PRP1</li>
+        <li>None of them</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Only PRP1 may carry an offset among data pointers. (PRP2 as a list pointer may also have one, but it then points to a list, not to data.)</p></details>
+    </li>
+    <li>
+      <p><code>CC.MPS</code> = 2. What is the memory page size?</p>
+      <ul class="options" data-answer="3">
+        <li>4 KiB</li>
+        <li>8 KiB</li>
+        <li>16 KiB</li>
+        <li>256 bytes</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>2<sup>12+2</sup> = 16,384 bytes.</p></details>
+    </li>
+    <li>
+      <p>A page-aligned PRP list page with 4 KiB pages. Exactly 512 entries remain to be listed. What goes in slot 511?</p>
+      <ul class="options" data-answer="1">
+        <li>The 512th data page</li>
+        <li>A chain pointer</li>
+        <li>Zero, as a terminator</li>
+        <li>The list length</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>A chain pointer is only needed when more entries remain than slots. 512 fit exactly, so slot 511 is data. There is no terminator in a PRP list.</p></details>
+    </li>
+    <li>
+      <p>An NVMe Write of 8 KiB, MRRS 512 bytes. How many data MRd TLPs does an aligned buffer need at minimum?</p>
+      <ul class="options" data-answer="2">
+        <li>8</li>
+        <li>16</li>
+        <li>32</li>
+        <li>2</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>8,192 / 512 = 16. Each is answered by one or more CplD.</p></details>
+    </li>
+    <li>
+      <p>With the IOMMU enabled, a PRP entry contains:</p>
+      <ul class="options" data-answer="3">
+        <li>A user-space virtual address</li>
+        <li>A CPU physical address</li>
+        <li>An I/O virtual address that the IOMMU translates</li>
+        <li>A namespace LBA</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The device emits IOVAs; the IOMMU translates and permission-checks them.</p></details>
+    </li>
+    <li>
+      <p>Why are PRP list entries page aligned?</p>
+      <details class="answer"><summary>Model answer</summary><p>So the controller can locate any byte by index arithmetic (page index = byte offset / page size) without carrying lengths, which keeps the entries 8 bytes and the hardware simple; the price is that only the first page can start mid-page.</p></details>
+    </li>
+    <li>
+      <p>A Read completes with Success, yet the application buffer is unchanged and the kernel log shows an IOMMU fault for 01:00.0 at a page address. Explain how both can be true.</p>
+      <details class="answer"><summary>Model answer</summary><p>Data MWr are posted: the device never learns that the IOMMU blocked them. The controller completes normally. The fault shows a PRP entry (or a list) pointed at an unmapped IOVA — a wrong, stale or freed entry.</p></details>
+    </li>
+    <li>
+      <p>Name two pieces of information you need, besides the SQE, to know what PRP2 means.</p>
+      <details class="answer"><summary>Model answer</summary><p>The memory page size (from <code>CC.MPS</code>) and the namespace's LBA data size (and metadata layout) to turn NLB into bytes. The offset comes from PRP1 itself.</p></details>
+    </li>
+    <li>
+      <p>Why might you see two short MWr TLPs at the start and end of an otherwise 256-byte stream?</p>
+      <details class="answer"><summary>Model answer</summary><p>The buffer starts at an offset that is not a multiple of 256; the first TLP runs only to the next 256-byte boundary and the last covers the remainder. Exact cut points are implementation-dependent.</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><strong>Beginner:</strong> What are PRP1 and PRP2?
+      <details class="answer"><summary>Model answer</summary><p>The two 64-bit entries of the data pointer in an NVMe SQE when PRPs are selected. PRP1 points to the first byte; PRP2 is unused, the second page, or a pointer to a PRP list, depending on how many page boundaries the transfer crosses.</p></details></li>
+    <li><strong>Beginner:</strong> What sets the page size PRPs use?
+      <details class="answer"><summary>Model answer</summary><p><code>CC.MPS</code>, written by the host before enabling the controller, within <code>CAP.MPSMIN</code>–<code>CAP.MPSMAX</code>; page size = 2<sup>12+MPS</sup>.</p></details></li>
+    <li><strong>Intermediate:</strong> Walk me through building PRPs for a 20 KiB buffer at offset 0x100.
+      <details class="answer"><summary>Model answer</summary><p>N = ⌈(256 + 20480)/4096⌉ = 6; PRP1 = buffer address; PRP2 = list pointer to 5 page-aligned entries; one list read of 40 bytes; data in 6 pages, first 3,840 bytes, then 4 full pages, last 256 bytes.</p></details></li>
+    <li><strong>Intermediate:</strong> Why does Linux set a virtual boundary for NVMe queues?
+      <details class="answer"><summary>Model answer</summary><p>So the block layer never merges segments into a request whose interior has gaps or sub-page starts, which PRPs cannot describe; such requests are split instead.</p></details></li>
+    <li><strong>Advanced:</strong> A driver works with one SSD and corrupts memory with another. PRP lists are suspected. What do you look for?
+      <details class="answer"><summary>Model answer</summary><p>Behaviour that depends on how much of the list the controller reads: entries beyond the computed count, stale entries, a list running off its page, list freed early. A controller that prefetches whole list pages will consume slots the driver did not intend; compare list fetch lengths in traces from both SSDs.</p></details></li>
+    <li><strong>Advanced:</strong> How do PRP boundaries relate to the PCIe 4 KiB rule?
+      <details class="answer"><summary>Model answer</summary><p>With 4 KiB memory pages every PRP page boundary is a 4 KiB address boundary, so TLPs never span pages. With larger pages, the device must additionally cut at 4 KiB boundaries inside a page.</p></details></li>
+    <li><strong>Senior:</strong> Design a validation plan for PRP handling in a new controller.
+      <details class="answer"><summary>Model answer</summary><p>Matrix of offsets (0, 4, 0x800, PS−4), lengths at and around 1, 2, list-page-full and chain thresholds, list pointers at page start, mid-page and last slot, chained lists of 2–3 pages, MDTS-sized commands, every supported <code>CC.MPS</code>; negative tests for invalid offsets with expected status; IOMMU-enabled runs with fault monitoring; data-integrity checks with patterns per page; analyzer checks that no TLP touches an address outside the PRP set.</p></details></li>
+    <li><strong>Senior:</strong> When would you prefer SGLs over PRPs on PCIe?
+      <details class="answer"><summary>Model answer</summary><p>When buffers are fragmented at sub-page granularity, when metadata is scattered, when a Bit Bucket is useful for reads, or for very large transfers where descriptor count beats page count; only if the controller advertises SGL support, and measured, because some controllers are faster with PRPs for small I/O.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain the order card with two lines and the clipboard, and why every shelf after the first starts at its beginning.</li>
+    <li><strong>To a junior engineer:</strong> take a buffer address and length and derive PRP1, PRP2 and the list on a whiteboard, including the zero-based NLB.</li>
+    <li><strong>To a senior engineer:</strong> argue why most PRP bugs are length bugs, and how you would prove it from an analyzer trace and an IOMMU log.</li>
+  </ul>
+  <details class="answer"><summary>Model explanation (junior)</summary><p>"Take the offset of the address within a 4 KiB page, add the length, divide by 4,096 and round up. That's the number of pages. One page: PRP1 only. Two: PRP2 is the second page's start. More: PRP2 points to a list with one 8-byte entry per remaining page. If the list would run off its page, the last slot points to another list page. And length is (NLB+1) × block size."</p></details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <ul>
+    <li>PRP entries are 64-bit page-relative addresses; the memory page size comes from <code>CC.MPS</code>.</li>
+    <li>PRP1 may have an offset; all other data pointers are page aligned; interior pages are used fully.</li>
+    <li>PRP2's role — unused, second page, list pointer — is derived from the number of page boundaries crossed.</li>
+    <li>PRP lists hold one entry per page after the first; a full list page chains through its last slot.</li>
+    <li>The addresses are what the device emits: IOVAs when an IOMMU translates.</li>
+    <li>Data TLPs follow the pages, cut by Max Payload Size, MRRS and the 4 KiB rule; list fetches are extra dependent reads.</li>
+    <li>Most PRP bugs are disagreements about length or offset, and many fail silently.</li>
+  </ul>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>derive page size from <code>CC.MPS</code> and state the PRP entry bit split</li>
+      <li>compute N and PRP2's role for any address and length, including offsets</li>
+      <li>build a chained PRP list and place the chain pointer correctly</li>
+      <li>predict list fetches and data TLP counts from MPS, MRRS and RCB</li>
+      <li>find the first abnormal event in a PRP trace and name the length disagreement behind it</li>
+      <li>explain why an IOVA appears in PRPs on an IOMMU system</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Physical Region Page Entry and List; Submission Queue Entry; Controller Configuration; Controller Capabilities; Identify Controller (MDTS)</cite></li>
+    <li><cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4</cite></li>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Transaction Layer (Memory Requests, Max Payload Size, Max Read Request Size, Read Completion Boundary)</cite></li>
+    <li>Linux kernel documentation: "Dynamic DMA mapping using the generic device" (DMA API), and the IOMMU documentation; the NVMe PCI driver source (<code>drivers/nvme/host/pci.c</code>) for a real PRP builder.</li>
+    <li>Course: deeper treatment in <a href="dd34.html">Module 34 — PRP</a>, <a href="dd36.html">Module 36 — DMA with NVMe</a>, <a href="dd02.html">Module 2 — DMA and Address Translation</a>; interactive practice in the <a href="tool-prp.html">PRP Visualizer</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch37.html">Chapter 37 — Scatter Gather Lists</a>, the descriptor-based alternative that removes the page-alignment rules.</p>
+</section>

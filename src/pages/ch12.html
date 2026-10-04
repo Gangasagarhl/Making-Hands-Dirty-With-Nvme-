@@ -1,0 +1,659 @@
+<p class="lead">Every PCI Express (PCIe) request is either <strong>posted</strong> (sent and forgotten) or <strong>non-posted</strong> (sent and answered). This one distinction explains why NVMe doorbells are cheap, why NVMe WRITE commands need many reads in flight, why the CPU never reads device registers on the fast path, and what happens when an answer never comes back.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>In <a href="ch10.html">Chapter 10</a> you met the Transaction Layer Packet (TLP) kinds and in <a href="ch11.html">Chapter 11</a> their headers. Both mentioned, in passing, that some requests get completions and some do not. That passing remark is one of the most consequential design decisions in PCIe, and it shapes NVM Express (NVMe) at every level:</p>
+  <ul>
+    <li>Performance: a posted write costs bandwidth only; a non-posted read costs bandwidth <em>and</em> a round trip of latency.</li>
+    <li>Correctness: a posted write gives the sender no confirmation; you cannot know it has landed without some other mechanism.</li>
+    <li>Error handling: a non-posted request that is never answered becomes a <span class="g" data-term="completion-timeout">Completion Timeout</span>, one of the most common and most misunderstood PCIe errors in storage systems.</li>
+    <li>Deadlock freedom: the three traffic classes (posted, non-posted, completion) are buffered and credited separately so that one can never block another into a cycle.</li>
+  </ul>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Define posted and non-posted requests and classify every TLP kind: MWr, Msg/MsgD (posted); MRd, CfgRd, CfgWr, IORd, IOWr, AtomicOps (non-posted); Cpl/CplD (completions).</li>
+    <li>Explain why memory writes are posted but configuration and I/O writes are not.</li>
+    <li>Map every TLP of an NVMe READ and WRITE to posted/non-posted and explain the performance consequences.</li>
+    <li>Use Little's Law to compute how many outstanding reads a device needs to sustain a target bandwidth.</li>
+    <li>Explain the Completion Timeout mechanism, its configuration in Device Control 2, and what the requester and the CPU see when it fires.</li>
+    <li>Explain how software "flushes" posted writes, and why the NVMe driver rarely needs to.</li>
+    <li>Diagnose a missing completion in a synthetic trace.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>TLP kinds and the request/completion relationship (<a href="ch10.html">Chapter 10</a>); header fields Requester ID, Tag, Byte Count (<a href="ch11.html">Chapter 11</a>). Helpful: the doorbell idea from <a href="ch03.html">Chapter 3</a> (it is taught fully in <a href="ch28.html">Chapter 28</a>).</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>There are two ways to talk to the librarian across town.</p>
+    <p><strong>Sending a postcard.</strong> You write "New request slips are in box 5!" on a postcard and drop it in the mailbox. You do not wait. You go back to your work right away. You never get a reply to a postcard — you trust the mail.</p>
+    <p><strong>Asking a question.</strong> You call the librarian and ask, "What does slip number 4 say?" Now you must wait on the phone until the librarian reads it and answers. If the librarian never answers, you cannot wait forever: after a while you hang up and say "something is wrong".</p>
+    <p>PCIe works the same way. Memory writes are postcards: the doorbell is a postcard. Memory reads are questions: when the SSD wants to read a request slip from the computer's memory, it asks and waits for the answer.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A restaurant kitchen: waiters <em>post</em> orders on the rail (they clip the ticket and walk away — no answer needed). When a waiter needs to know "is table 7's steak ready?", they must ask the chef and wait — and while waiting, that waiter does nothing else useful. A good restaurant is designed so that waiters almost never have to ask; the kitchen <em>posts</em> plates to the pass and rings a bell. NVMe is designed the same way: the host posts doorbells, the device posts data, completion entries and interrupts, and nobody stands waiting on the fast path except the device fetching what it needs.</p>
+  </aside>
+  <aside class="callout breaks">
+    <ul>
+      <li><strong>Postcards can get lost silently; posted writes are not "unreliable".</strong> Each hop's Data Link Layer guarantees delivery with ACK/NAK and replay. What a posted write lacks is an <em>end-to-end confirmation</em>, not reliability on each link.</li>
+      <li><strong>Postcards can arrive in any order.</strong> Posted writes from one source to one destination are delivered in order unless Relaxed Ordering permits otherwise (<a href="ch14.html">Chapter 14</a>), and that order is exactly what makes NVMe work.</li>
+      <li><strong>Someone on the phone waits.</strong> A PCIe requester does not have to wait idle; it can issue many more questions (non-posted requests) before the first answer arrives, up to its tag and credit limits (<a href="ch13.html">Chapter 13</a>). The CPU is the exception: a CPU load from MMIO does stall the instruction that needs the value.</li>
+      <li><strong>Hanging up after silence is a choice in real life.</strong> In PCIe the timeout range is configured in a register and the consequence (an error, all-ones data to the CPU) is defined behaviour.</li>
+      <li><strong>A question answered by "I don't know" is still an answer.</strong> A completion with status Unsupported Request or Completer Abort discharges the request; it is not a timeout.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>A <span class="g" data-term="posted">posted</span> request is one the sender does not expect to hear back about. Once it is handed to the link, the sender considers it done. Memory writes and messages are posted.</p>
+  <p>A <span class="g" data-term="non-posted">non-posted</span> request is one that must be answered by a <span class="g" data-term="completion">completion</span>. The sender keeps a record of it (by its Tag) until the answer arrives. Memory reads, configuration reads and writes, I/O reads and writes, and atomic operations are non-posted.</p>
+  <p>Why the difference? A read obviously needs an answer: the data. A memory write does not need one for the system to work, and skipping the answer doubles the efficiency of writes and removes a round trip. Configuration and I/O writes are different: they change how hardware behaves (enable a device, set a BAR), and software must know they have taken effect before proceeding — so they get a completion even though it carries no data.</p>
+  <table>
+    <caption>Who waits for what</caption>
+    <thead><tr><th>Request</th><th>Category</th><th>Answer</th><th>In NVMe, used for</th></tr></thead>
+    <tbody>
+      <tr><td>Memory Write (MWr)</td><td>Posted</td><td>None</td><td>Doorbells, register writes, READ data to host, CQEs, MSI-X interrupts</td></tr>
+      <tr><td>Message (Msg/MsgD)</td><td>Posted</td><td>None</td><td>Error signalling, INTx emulation, power management, LTR</td></tr>
+      <tr><td>Memory Read (MRd)</td><td>Non-posted</td><td>CplD (or Cpl with error status)</td><td>SQE fetch, PRP/SGL list fetch, WRITE data from host, CPU register reads</td></tr>
+      <tr><td>Configuration Read (CfgRd)</td><td>Non-posted</td><td>CplD (or Cpl)</td><td>Enumeration, lspci</td></tr>
+      <tr><td>Configuration Write (CfgWr)</td><td>Non-posted</td><td>Cpl</td><td>BAR programming, enabling bus mastering and MSI-X</td></tr>
+      <tr><td>I/O Read/Write (IORd/IOWr)</td><td>Non-posted</td><td>CplD / Cpl</td><td>Not used by NVMe</td></tr>
+      <tr><td>AtomicOp (FetchAdd, Swap, CAS)</td><td>Non-posted</td><td>CplD (original value)</td><td>Not normally used by NVMe</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>Posted requests: Memory Write and Messages</h3>
+  <p>A posted request is complete, from the requester's point of view, when its Transaction Layer has transmitted it. The requester keeps no state about it (beyond the Data Link Layer's replay buffer, which is per-hop and released on ACK). Consequences:</p>
+  <ul>
+    <li><strong>No round-trip latency.</strong> A CPU store to an uncacheable MMIO address retires once the write is accepted into the CPU's/Root Complex's posting path; the core continues. This is why an NVMe doorbell write costs tens to hundreds of nanoseconds of CPU time rather than a microsecond-scale round trip.</li>
+    <li><strong>No end-to-end success signal.</strong> If a posted write is dropped because it is malformed or unsupported at the target, the requester is not told by a completion. The detecting component reports through error messages to the Root Complex (AER), not to the requester.</li>
+    <li><strong>Ordering does the work of acknowledgement.</strong> Because a later read from the same requester to the same destination cannot pass an earlier posted write (<a href="ch14.html">Chapter 14</a>), reading back after writing proves the write has reached that point.</li>
+  </ul>
+  <p>Messages are posted for the same reasons: error notifications, interrupt emulation, and power-management handshakes would be self-defeating if they needed answers (imagine an error message timing out). Where a handshake is needed, it is built from two messages (for example, PME_Turn_Off followed later by PME_TO_Ack).</p>
+
+  <h3>Non-posted requests</h3>
+  <p>A non-posted request allocates a Tag and a slot in the requester's outstanding-request tracking, and holds them until the final completion arrives or the request times out. Each kind has a reason to be non-posted:</p>
+  <ul>
+    <li><strong>Memory Read:</strong> needs the data.</li>
+    <li><strong>Configuration Read/Write:</strong> configuration software must know the access took effect, and a function that is not ready can ask for a retry (Configuration Request Retry Status, CRS). Conventional PCI configuration writes were also not posted.</li>
+    <li><strong>I/O Read/Write:</strong> legacy I/O semantics required I/O writes to complete before the CPU's I/O instruction retired; PCIe preserved that.</li>
+    <li><strong>AtomicOps:</strong> return the original value — the whole point of an atomic read-modify-write.</li>
+    <li><strong>Deferrable Memory Write (DMWr)</strong> <span class="badge version">Version-dependent</span>: a write that the completer may refuse, so the requester needs an answer. Only in recent revisions; you will not normally see it with NVMe.</li>
+  </ul>
+
+  <h3>Completions</h3>
+  <p>A completer answers each non-posted request with one or more completions, routed by Requester ID. Rules worth knowing now:</p>
+  <ul>
+    <li>Successful reads (memory, configuration, I/O) and AtomicOps get CplD; successful configuration and I/O writes get Cpl.</li>
+    <li>Unsuccessful requests get Cpl with status UR, CA or (configuration only) CRS, and no data.</li>
+    <li>A memory read may be answered by several CplDs, in increasing address order, splitting only at permitted boundaries (<a href="ch13.html">Chapter 13</a>).</li>
+    <li>If no component claims a non-posted request (no BAR or window matches), the component that determines this — often a switch port or the Root Complex — returns a UR completion itself. For a posted request in the same situation, it simply drops it and reports the error.</li>
+  </ul>
+
+  <h3>Separate classes, separate credits</h3>
+  <p>Inside every PCIe port, the receive buffers are split into three classes — Posted (P), Non-Posted (NP) and Completion (Cpl) — each with separate header and data credits advertised to the link partner (<a href="ch16.html">Chapter 16</a>). The transmitter may only send a TLP of a class when it holds enough credits of that class. This separation is not cosmetic: it is how PCIe avoids deadlock. If a full NP queue could block posted writes or completions, a device waiting for a completion to free its own buffers could wait forever. The ordering rules require that posted requests and completions must be able to pass blocked non-posted requests for exactly this reason (<a href="ch14.html">Chapter 14</a>).</p>
+  <aside class="callout insight" data-title="Requesters reserve completion space up front">
+    <p>A well-behaved requester only issues a read if it has buffer space to receive all of that read's completion data. This is why endpoints and Root Complexes are generally expected to advertise unlimited ("infinite") completion credits: they have already reserved the space before asking. Confirm the exact rule for each component type in the flow-control section of your specification revision. The practical consequence for NVMe: the number of reads an SSD keeps in flight is bounded by its internal completion buffer as well as by its tags.</p>
+  </aside>
+
+  <h3>Completion Timeout</h3>
+  <p>Every requester of non-posted requests must implement a <strong>Completion Timeout</strong>: if a request's completion(s) do not all arrive within the configured time, the request is considered failed. Key facts:</p>
+  <ul>
+    <li><strong>Configuration.</strong> The Device Capabilities 2 register advertises which timeout ranges the function supports and whether the timeout can be disabled; the Device Control 2 register selects the Completion Timeout Value and the Completion Timeout Disable bit. The default range is 50 µs to 50 ms. Optional larger ranges reach seconds (commonly labelled ranges A–D, up to tens of seconds). Exact encodings: <cite class="spec">PCI Express Base Specification — Device Control 2 Register</cite>.</li>
+    <li><strong>It is an error, not a retry.</strong> On expiry the requester logs a Completion Timeout error (in AER, an uncorrectable error, non-fatal by default severity) and reports it. PCIe does not re-issue the request.</li>
+    <li><strong>Late completions become unexpected.</strong> If the completion arrives after the requester has given up and freed the Tag, the requester sees an Unexpected Completion.</li>
+    <li><strong>CPU-side behaviour.</strong> When a CPU MMIO read times out at the Root Complex, the load must still return something: on most platforms it returns all ones (0xFFFFFFFF) <span class="badge impl">Implementation-dependent</span>. This is why drivers treat a register read of all ones as "device may be gone". The Linux NVMe driver checks Controller Status (CSTS) for this value.</li>
+  </ul>
+  <figure>
+    <ol class="seq" data-actors="Lab SSD (requester)|Switch / Root Port|Host memory">
+      <li data-from="Lab SSD (requester)" data-to="Switch / Root Port" data-t="0">MRd64 Tag 0x44, 128 DW</li>
+      <li data-note="Lab SSD (requester)">start timer for Tag 0x44</li>
+      <li data-from="Switch / Root Port" data-to="Host memory" class="bad">request lost or stalled upstream</li>
+      <li data-note="Lab SSD (requester)" data-t="~50 ms">timer expires: Completion Timeout</li>
+      <li data-from="Lab SSD (requester)" data-to="Switch / Root Port" class="bad">Msg ERR_NONFATAL (AER)</li>
+      <li data-note="Lab SSD (requester)">fail the NVMe command using this data</li>
+    </ol>
+    <figcaption>A Completion Timeout at the SSD. Synthetic example for teaching; the timeout value depends on Device Control 2.</figcaption>
+  </figure>
+
+  <h3>Connecting posted/non-posted to NVMe</h3>
+  <p>NVMe's queue design is, at heart, an exercise in using posted writes for everything time-critical and putting non-posted reads only where they are unavoidable — and on the device side, where they can be pipelined.</p>
+  <table>
+    <caption>NVMe operations by PCIe category</caption>
+    <thead><tr><th>NVMe step</th><th>TLP</th><th>Category</th><th>Who waits?</th></tr></thead>
+    <tbody>
+      <tr><td>Driver rings SQ tail doorbell</td><td>MWr32 down</td><td>Posted</td><td>Nobody</td></tr>
+      <tr><td>Controller fetches SQE</td><td>MRd64 up / CplD down</td><td>Non-posted</td><td>Controller (one round trip per fetch, pipelined across commands)</td></tr>
+      <tr><td>Controller fetches PRP list / SGL segments</td><td>MRd / CplD</td><td>Non-posted</td><td>Controller</td></tr>
+      <tr><td>READ: data to host</td><td>MWr64 up</td><td>Posted</td><td>Nobody</td></tr>
+      <tr><td>WRITE: data from host</td><td>MRd64 up / CplD down</td><td>Non-posted</td><td>Controller — many reads in flight to hide latency</td></tr>
+      <tr><td>Controller posts CQE</td><td>MWr64 up</td><td>Posted</td><td>Nobody</td></tr>
+      <tr><td>Controller signals MSI-X</td><td>MWr32 up</td><td>Posted</td><td>Nobody</td></tr>
+      <tr><td>Driver rings CQ head doorbell</td><td>MWr32 down</td><td>Posted</td><td>Nobody</td></tr>
+      <tr><td>Driver reads CSTS (init, error handling)</td><td>MRd32 down / CplD up</td><td>Non-posted</td><td>The CPU core, stalled</td></tr>
+    </tbody>
+  </table>
+  <p>Three design choices stand out:</p>
+  <ol>
+    <li><strong>Doorbells are writes, not reads.</strong> The host tells the controller where the tail is; it never asks the controller anything per command.</li>
+    <li><strong>Completions live in host memory.</strong> The controller writes CQEs (posted) and the host polls its own memory using the phase tag. In AHCI-era designs, drivers commonly read device registers to discover completion status; NVMe removed that from the fast path.</li>
+    <li><strong>The device does the waiting.</strong> All non-posted reads on the fast path are issued by the SSD, which can keep dozens in flight and overlap them with other work. The CPU never stalls on the fast path.</li>
+  </ol>
+
+  <h3>Latency hiding and Little's Law</h3>
+  <p>For an NVMe WRITE the device must <em>read</em> the data. Each read takes a round trip. To keep the link full, the device must have enough bytes requested-but-not-yet-returned at any moment.</p>
+  <div class="formula">
+    <div class="eq"><var>B</var><sub>out</sub> = <var>R</var> × <var>T</var><sub>rt</sub> &nbsp;&nbsp;and&nbsp;&nbsp; <var>N</var> = ⌈ <var>B</var><sub>out</sub> / <var>S</var> ⌉</div>
+    <dl class="vars">
+      <dt>B<sub>out</sub></dt><dd>bytes of read data that must be outstanding (requested, not yet received) at any time</dd>
+      <dt>R</dt><dd>target data rate in bytes per second (completion payload direction)</dd>
+      <dt>T<sub>rt</sub></dt><dd>average read round-trip time in seconds, from MRd transmission to the last CplD of that request</dd>
+      <dt>N</dt><dd>number of read requests that must be outstanding</dd>
+      <dt>S</dt><dd>bytes per read request (at most MRRS; 512 B in the example system)</dd>
+    </dl>
+  </div>
+  <p>Gen4 x4 carries at most 16 GT/s × 4 lanes × 128/130 ÷ 8 ≈ 7.88 GB/s per direction before TLP and DLLP overhead; with MPS 256 B, about 90% of that is payload, ≈ 7.1 GB/s. If <var>T</var><sub>rt</sub> = 1 µs: <var>B</var><sub>out</sub> ≈ 7.1 kB, <var>N</var> ≈ 14 reads of 512 B. If the platform's read latency is 2 µs (for example through a switch, or with IOMMU translation misses), <var>N</var> ≈ 28. A device that can keep only 16 reads in flight would then be capped near 4 GB/s on WRITE workloads regardless of the link. <span class="badge derived">Derived</span></p>
+
+  <h3>Flushing posted writes</h3>
+  <p>When software must know that its posted writes have reached a device (for example, before it times a hardware operation or before it assumes a disable has taken effect), the classic technique is to <strong>read back</strong> from the same device. Because a read request must not pass earlier posted writes from the same requester on the same path, the read's completion cannot be generated until the writes ahead of it have been delivered to the completer. A zero-length read (Length 1, both byte enables 0000b) serves the same purpose for memory.</p>
+  <pre class="code" data-kind="pseudocode" data-lang="c" data-title="the posted-write flush idiom (Linux-style)"><code>writel(value, regs + CTRL);        /* posted MWr: may still be in flight      */
+(void)readl(regs + STATUS);        /* non-posted MRd: its completion cannot   */
+                                   /* return until the write above has reached */
+                                   /* the device (same requester, same path)   */</code></pre>
+  <p>The NVMe driver does not need this for doorbells: the device's reaction (fetching SQEs) is itself the evidence, and nothing on the host depends on the exact moment the doorbell lands. It does matter during controller enable/disable and reset sequences, where the driver polls CSTS (a read) after writing CC — which both waits for the controller and incidentally flushes the write.</p>
+
+  <h3>The central concept on the ladder</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Postcards (no answer) versus questions on the phone (wait for the answer, hang up if none comes).</p></div>
+    <div class="rung" data-rung="B"><p>Posted: MWr, Msg. Non-posted: MRd, CfgRd/Wr, IORd/Wr, AtomicOps — answered by Cpl/CplD matched by Requester ID + Tag; unanswered requests time out.</p></div>
+    <div class="rung" data-rung="C"><p>Ports keep separate P/NP/Cpl buffers and credits. Requesters keep a table of outstanding non-posted requests with timers. CPUs stall a load until its CplD returns; stores to MMIO are posted and retire early.</p></div>
+    <div class="rung" data-rung="D"><p>The PCIe Base Specification classifies each request type, defines completion rules, the Completion Timeout mechanism and its Device Control 2 controls, and the ordering rules that relate the three classes.</p></div>
+    <div class="rung" data-rung="E"><p>NVMe: doorbells, data-to-host, CQEs and MSI-X are posted; SQE/PRP/SGL fetches and data-from-host are non-posted reads issued by the controller.</p></div>
+    <div class="rung" data-rung="F"><p>In a trace, every MRd/Cfg/AtomicOp row should be followed (not necessarily immediately) by completion rows with the same Requester ID and Tag; MWr and Msg rows have no partners.</p></div>
+    <div class="rung" data-rung="G"><p>A non-posted request without a completion is a timeout in the making; a posted write that produced an error is visible only in AER at the detector. Ask "who is waiting on whom?" and "who would have been told?"</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for posted vs non-posted</h3>
+  <table>
+    <caption>Posted vs non-posted through the sixteen questions</caption>
+    <thead><tr><th>#</th><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>What is it?</td><td>The classification of requests by whether a completion is returned.</td></tr>
+      <tr><td>2</td><td>Why was it created?</td><td>To make writes cheap (no round trip) while keeping reads and configuration accesses confirmable.</td></tr>
+      <tr><td>3</td><td>What problem does it solve?</td><td>Write latency and bandwidth waste; deadlock avoidance via separate classes.</td></tr>
+      <tr><td>4</td><td>What existed before?</td><td>PCI posted memory writes in bridges and delayed (split) transactions for reads; PCI-X split completions.</td></tr>
+      <tr><td>5</td><td>Why is the current design better?</td><td>Uniform rules on every link, credit-based buffering per class, Tags for many outstanding requests, defined timeouts.</td></tr>
+      <tr><td>6</td><td>Who creates it?</td><td>The requester chooses the request type, which fixes the category.</td></tr>
+      <tr><td>7</td><td>Who consumes it?</td><td>Completers execute; for non-posted they also generate completions.</td></tr>
+      <tr><td>8</td><td>Where does it live?</td><td>In P/NP/Cpl buffers along the path; non-posted state also in the requester's tracking table.</td></tr>
+      <tr><td>9</td><td>What registers are involved?</td><td>Device Control 2 (Completion Timeout Value/Disable), Device Capabilities 2 (ranges), AER status/mask/severity, flow-control credits (not software-visible as registers).</td></tr>
+      <tr><td>10</td><td>What happens before?</td><td>Credit check for the class; Tag allocation for non-posted.</td></tr>
+      <tr><td>11</td><td>What happens after?</td><td>Posted: nothing returns. Non-posted: completion(s), Tag freed, or timeout.</td></tr>
+      <tr><td>12</td><td>What happens if wrong?</td><td>Posted errors are silent to the requester; non-posted errors appear as error completions or timeouts.</td></tr>
+      <tr><td>13</td><td>What does the analyzer show?</td><td>Request rows with or without matching completion rows; latency between them.</td></tr>
+      <tr><td>14</td><td>What does Linux show?</td><td>Completion timeout configuration (lspci DevCap2/DevCtl2), AER messages, all-ones register reads, NVMe timeouts.</td></tr>
+      <tr><td>15</td><td>What would validation test?</td><td>Correct completion generation, timeout detection in each range, behaviour on late/duplicate completions, posted error reporting.</td></tr>
+      <tr><td>16</td><td>What would a senior suspect?</td><td>Lost/blocked completions in switches, IOMMU faults producing UR, insufficient outstanding reads, misinterpreting posted-write "success".</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <h3>On the CPU side</h3>
+  <ul>
+    <li><strong>MMIO stores</strong> to an uncacheable BAR mapping go into the CPU's store/posting path and on to the Root Complex, which issues MWr TLPs. The core does not wait for the device. (Write-combining mappings, used for some device memory, can additionally merge stores; NVMe register BARs are normally mapped uncacheable.) <span class="badge impl">Implementation-dependent</span></li>
+    <li><strong>MMIO loads</strong> become MRd TLPs; the core's load cannot complete until the CplD returns. Out-of-order cores can keep doing independent work for a while, but anything depending on the loaded value stalls, and uncacheable loads are typically strongly ordered, limiting overlap. A single MMIO read commonly costs on the order of a microsecond on a server.</li>
+    <li><strong>On completion timeout</strong> the Root Complex synthesises a result for the load (commonly all ones) so the core can make progress; it may also raise a platform error.</li>
+  </ul>
+  <h3>On the device side</h3>
+  <ul>
+    <li><strong>Outstanding-request table:</strong> one entry per Tag in use, recording destination buffer, expected byte count and a timer.</li>
+    <li><strong>Completion reassembly buffer:</strong> space reserved for each outstanding read's data before the read is issued.</li>
+    <li><strong>Separate transmit queues per class</strong> so that posted writes (data to host, CQEs) are never stuck behind non-posted reads waiting for NP credits.</li>
+    <li><strong>Completion timer:</strong> granularity and accuracy are implementation-dependent within the configured range — a "50 µs to 50 ms" setting means the timeout must not expire before the lower bound and should expire by the upper bound, not that it fires at a precise time.</li>
+  </ul>
+  <div class="flow">
+    <div>NVMe command engine<small>"need 4 KiB of WRITE data from PRP1"</small></div>
+    <div class="hl">Read DMA engine<small>8 × 512 B requests; reserves 4 KiB of reassembly buffer; allocates Tags 0x40–0x47; starts timers</small></div>
+    <div>Transaction Layer NP queue → link<small>MRd64 TLPs, subject to NP header credits at the Root Port</small></div>
+    <div class="hl">Completion receive path<small>match Tag → write data into reassembly buffer at offset from Lower Address → when Byte Count reached, free Tag, stop timer</small></div>
+    <div>Media write path<small>data handed to the flash translation layer</small></div>
+  </div>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>The classification of requests, the completion rules and the Completion Timeout mechanism are defined in the <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Transaction Layer Specification (Transaction Ordering; Completion Rules; Completion Timeout Mechanism)</cite>, with the controls in the <cite class="spec">PCI Express Capability — Device Capabilities 2 and Device Control 2 registers</cite> and error reporting in the <cite class="spec">Advanced Error Reporting Capability</cite>. The NVMe side — that doorbells are writes to controller registers and that completion queues live in host memory — is defined by the <cite class="spec">NVM Express Base Specification 2.4</cite> and the <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite>.</p>
+  <aside class="callout verified">
+    <ul>
+      <li>Memory Writes and Messages are posted; Memory Reads, I/O and Configuration requests and AtomicOps are non-posted.</li>
+      <li>Configuration writes and I/O writes receive a completion without data.</li>
+      <li>Requesters must implement a Completion Timeout for non-posted requests (with permitted exceptions such as when disabled where supported); the default range is 50 µs to 50 ms.</li>
+      <li>Completion Timeout is an uncorrectable error class reported through AER; a completion arriving for a request that is no longer outstanding is an Unexpected Completion.</li>
+      <li>P, NP and Cpl are separate flow-control classes with separate header and data credits.</li>
+    </ul>
+  </aside>
+  <aside class="callout derived">
+    <ul>
+      <li>The Little's Law sizing of outstanding reads and the Gen4/Gen5 numbers are computed, not quoted.</li>
+      <li>"The NVMe fast path has no host-side non-posted requests" follows from the NVMe register and queue design; neither specification states it as a rule.</li>
+    </ul>
+  </aside>
+  <aside class="callout impl">
+    <ul>
+      <li>What value a CPU load returns when its MMIO read fails or times out (commonly all ones).</li>
+      <li>Whether a platform escalates a completion timeout to a machine check or system error.</li>
+      <li>How many reads a device keeps outstanding; how an NVMe controller maps a PCIe error on a data transfer to an NVMe status code.</li>
+      <li>The actual completion timer accuracy within the configured range.</li>
+    </ul>
+  </aside>
+  <aside class="callout version">
+    <ul>
+      <li>Deferrable Memory Write (a non-posted write) exists only in recent revisions.</li>
+      <li>The name of status 010b changed from Configuration Request Retry Status to Request Retry Status in recent revisions, with broader use.</li>
+    </ul>
+  </aside>
+  <aside class="callout notsaid">
+    <p>Check in the specification: the exact Completion Timeout Value encodings and range definitions; which device types must support which ranges; the rules on infinite completion credits; which requests are exempt from timeout. The NVMe specifications do not say how long a controller should wait for PCIe completions or which NVMe status to use when a PCIe data transfer fails — read your controller's documentation and observe.</p>
+  </aside>
+  <aside class="callout warn">
+    <ul>
+      <li>Never conclude a posted write succeeded because no error completion arrived — there never is one.</li>
+      <li>Never treat a Completion Timeout as proof the completer is broken; the request or completion may have been lost or stalled anywhere on the path.</li>
+      <li>Never read a register of all ones as data without first asking whether the device is still there.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <figure>
+    <ol class="seq" data-actors="CPU core|Root Complex|Lab SSD">
+      <li data-from="CPU core" data-to="Root Complex" data-t="0">store SQ1TDBL (posted)</li>
+      <li data-note="CPU core">core continues immediately</li>
+      <li data-from="Root Complex" data-to="Lab SSD" data-t="~200 ns">MWr32 doorbell</li>
+      <li data-from="CPU core" data-to="Root Complex" data-t="1 µs">load CSTS</li>
+      <li data-from="Root Complex" data-to="Lab SSD">MRd32 BAR0+0x1C, Tag 0x03</li>
+      <li data-from="Lab SSD" data-to="Root Complex" class="dashed">CplD 4 bytes, Tag 0x03</li>
+      <li data-from="Root Complex" data-to="CPU core" class="dashed" data-t="~2 µs">load returns CSTS value</li>
+      <li data-note="CPU core">dependent work stalled ~1 µs</li>
+    </ol>
+    <figcaption>A posted doorbell versus a non-posted register read from the CPU's point of view. Synthetic example for teaching; times are illustrative.</figcaption>
+  </figure>
+  <p>Direction and ownership summary:</p>
+  <ul>
+    <li><strong>Downstream posted:</strong> doorbells and register writes (CPU → device).</li>
+    <li><strong>Downstream non-posted:</strong> CPU register reads and configuration requests (rare on the fast path).</li>
+    <li><strong>Upstream non-posted:</strong> the device's DMA reads (SQEs, PRP/SGL lists, WRITE data).</li>
+    <li><strong>Upstream posted:</strong> the device's DMA writes (READ data, CQEs) and MSI-X; error messages.</li>
+    <li><strong>Completions</strong> flow opposite to their requests: downstream for device reads, upstream for CPU reads.</li>
+  </ul>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <div class="trace" data-kind="synthetic" data-title="Normal: 4 KiB NVMe WRITE — posted doorbell, non-posted data fetch">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>ReqID=RC Addr=0xFE60_1008 Len=1 Data=6</td><td>Posted: SQ1 tail = 6 (SQE in slot 5)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>790</td><td>MRd64</td><td>Tag=0x22 Addr=0x1_2340_0140 Len=16</td><td>Non-posted: SQE fetch (opcode 01h Write)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,600</td><td>CplD</td><td>Tag=0x22 SC BC=64 LA=0x40</td><td>SQE delivered</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,900</td><td>MRd64</td><td>Tag=0x40 Addr=0x2_0000_0000 Len=128</td><td>Data bytes 0–511</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1,930</td><td>MRd64</td><td>Tag=0x41 Addr=0x2_0000_0200 Len=128</td><td>Data bytes 512–1023</td></tr>
+        <tr class="note"><td colspan="6">Tags 0x42–0x47 issued back to back (rows 6–11) at +0x400 … +0xE00. All eight reads are outstanding before the first completion arrives.</td></tr>
+        <tr class="dir-down"><td>12</td><td>Host→Dev</td><td>2,850</td><td>CplD</td><td>Tag=0x40 SC BC=512 LA=0x00 Len=64</td><td>First half of Tag 0x40</td></tr>
+        <tr class="dir-down"><td>13</td><td>Host→Dev</td><td>2,890</td><td>CplD</td><td>Tag=0x40 SC BC=256 LA=0x00 Len=64</td><td>Second half; Tag 0x40 complete</td></tr>
+        <tr class="dir-down"><td>14</td><td>Host→Dev</td><td>2,930</td><td>CplD</td><td>Tag=0x41 SC BC=512 LA=0x00 Len=64</td><td></td></tr>
+        <tr class="note"><td colspan="6">… 13 more CplDs, 2 per Tag, through Tag 0x47 by ≈ 3.5 µs …</td></tr>
+        <tr class="note"><td colspan="6">Program to NAND (buffered in controller DRAM/SRAM; implementation-dependent).</td></tr>
+        <tr class="dir-up"><td>28</td><td>Dev→Host</td><td>9,800</td><td>MWr64</td><td>Addr=0x1_2341_0080 Len=4</td><td>Posted: CQE into CQ1 slot 8</td></tr>
+        <tr class="dir-up"><td>29</td><td>Dev→Host</td><td>9,850</td><td>MWr32</td><td>Addr=0xFEE0_xxxx Len=1</td><td>Posted: MSI-X vector 1</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> Count the obligations: 9 non-posted requests (#2, #4–#11), each discharged by its completions (the SQE in one, each data read in two because CplD ≤ MPS 256). The device issued all eight data reads before the first data completion arrived: that is latency hiding. Everything the host needs to learn (CQE, MSI-X) arrives as posted writes. Synthetic example for teaching.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: one data read is never completed">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,900</td><td>MRd64</td><td>Tag=0x40 Addr=0x2_0000_0000 Len=128</td><td></td></tr>
+        <tr class="note"><td colspan="6">Tags 0x41–0x47 issued as before.</td></tr>
+        <tr class="dir-down"><td>12–21</td><td>Host→Dev</td><td>2,850–3,250</td><td>CplD ×10</td><td>Tags 0x40–0x44, two each, all SC</td><td>Normal</td></tr>
+        <tr class="abnormal"><td>—</td><td>Host→Dev</td><td>—</td><td>(missing)</td><td>Tag=0x45 — no CplD ever seen</td><td>First abnormal event: absence of the completions for Tag 0x45 (expected ≈ 3.3 µs)</td></tr>
+        <tr class="dir-down"><td>22–25</td><td>Host→Dev</td><td>3,330–3,450</td><td>CplD ×4</td><td>Tags 0x46, 0x47, SC</td><td>Later tags complete normally</td></tr>
+        <tr class="note"><td colspan="6">Silence for this command for ~41 ms (until the timer fires). Other commands' traffic continues normally.</td></tr>
+        <tr class="dir-up"><td>26</td><td>Dev→Host</td><td>≈ 41,000,000</td><td>Msg</td><td>ERR_NONFATAL (code 0x31), ReqID=0x0100</td><td>Device reports Completion Timeout (AER)</td></tr>
+        <tr class="dir-up"><td>27</td><td>Dev→Host</td><td>≈ 41,000,400</td><td>MWr64</td><td>Addr=CQ1 slot 8 Len=4</td><td>CQE with an error status (which status is controller-dependent; e.g. Data Transfer Error)</td></tr>
+        <tr class="dir-up"><td>28</td><td>Dev→Host</td><td>≈ 41,000,450</td><td>MWr32</td><td>MSI-X vector 1</td><td>Interrupt</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Walk-through.</strong> The first abnormal event is an <em>absence</em>: the completions for Tag 0x45 never appear, although later tags complete. That rules out "the host stopped answering" in general and points at that single request: was the MRd for Tag 0x45 actually on the wire (check the request row and its link-level ACK)? Was its address valid and mapped (IOMMU log)? Did a switch between the analyzer and the Root Port drop it (capture on the other side of the switch)? The timeout fired after ~41 ms, inside the default 50 µs–50 ms range. The device then did the right things: reported the error and completed the NVMe command with an error status instead of hanging. A tempting wrong conclusion is "the SSD is broken" — the SSD is the only component that behaved correctly in this trace. Synthetic example for teaching.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Completion timeout capability and current setting</span>
+sudo lspci -vvv -s 01:00.0 | grep -E 'DevCap2|DevCtl2|Completion Timeout'
+
+<span class="cm"># Completion timeouts and unexpected completions in AER logs</span>
+sudo dmesg | grep -iE 'CmpltTO|UnxCmplt|Completion Timeout|PCIe Bus Error'
+
+<span class="cm"># NVMe-level symptoms: command timeouts, controller resets, all-ones register reads</span>
+sudo dmesg | grep -iE 'nvme.*(timeout|reset|CSTS)'</code></pre>
+  <p>Illustrative output (wording varies with pciutils and kernel versions):</p>
+  <pre class="code" data-kind="read-only" data-lang="text" data-title="illustrative excerpts"><code>DevCap2: Completion Timeout: Range ABCD, TimeoutDis+ NROPrPrP- LTR+
+DevCtl2: Completion Timeout: 50us to 50ms, TimeoutDis- LTR- 10BitTagReq- OBFF Disabled,
+
+nvme 0000:01:00.0: AER: aer_status: 0x00004000, aer_mask: 0x00000000
+nvme 0000:01:00.0:    [14] CmpltTO                (First)
+
+nvme nvme0: controller is down; will reset: CSTS=0xffffffff, PCI_STATUS=0xffff</code></pre>
+  <table>
+    <caption>Interpreting what Linux shows</caption>
+    <thead><tr><th>Observation</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>DevCtl2 timeout range</td><td>The window in which the requester will declare a timeout.</td><td>The exact moment it fires.</td></tr>
+      <tr><td>AER bit 14 (Completion Timeout) at 01:00.0</td><td>The SSD, as a requester, gave up on at least one non-posted request.</td><td>Which request (no header is necessarily logged for a timeout) or where it was lost.</td></tr>
+      <tr><td>CSTS=0xffffffff</td><td>A CPU read of the controller's CSTS returned all ones — the read failed (device gone, link down, or timed out) or the device really returned that (not a valid CSTS).</td><td>Which of those — check link status at the Root Port and PCI_STATUS.</td></tr>
+      <tr><td>NVMe I/O timeout message</td><td>The driver's per-command timer (tens of seconds by default) expired.</td><td>That any PCIe error occurred — the device may simply not have completed the command.</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout warn">
+    <p>Do not change the Completion Timeout setting with <code>setpci</code> on a production system to "make errors go away". Disabling or lengthening timeouts hides lost completions and can hang the requester. Read-only inspection is safe; writes are an expert-lab operation.</p>
+  </aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>A small simulation of a device fetching WRITE data with a limited number of outstanding reads. It shows latency hiding (throughput grows with outstanding reads until the link saturates) and models completion timeouts.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="np_reads_sim.py"><code>#!/usr/bin/env python3
+"""Simulation: throughput of non-posted reads vs outstanding-request limit.
+Standard library only. All numbers are illustrative, not measurements."""
+import heapq
+import random
+
+LINK_BPS = 7.1e9          # usable completion payload rate, bytes/s (Gen4 x4, MPS 256)
+MRRS = 512                # bytes per read request
+RTT_NS = 1000             # mean read round trip, ns
+JITTER_NS = 200           # +/- uniform jitter
+TIMEOUT_NS = 50_000_000   # 50 ms, upper end of the default range
+LOSS_PROB = 0.0           # probability that a request is lost (never completed)
+
+def simulate(outstanding, total_bytes=8 &lt;&lt; 20, loss=LOSS_PROB, seed=1):
+    rnd = random.Random(seed)
+    t, sent, done, timeouts = 0.0, 0, 0, 0
+    wire_free = 0.0                       # time the completion direction is next free
+    inflight = []                         # heap of (arrival_time, tag)
+    tags = list(range(outstanding))
+    while done &lt; total_bytes:
+        while tags and sent &lt; total_bytes:
+            tag = tags.pop()
+            sent += MRRS
+            if rnd.random() &lt; loss:
+                heapq.heappush(inflight, (t + TIMEOUT_NS, tag, False))
+            else:
+                ready = t + RTT_NS + rnd.uniform(-JITTER_NS, JITTER_NS)
+                start = max(ready, wire_free)          # serialise on the link
+                wire_free = start + MRRS / LINK_BPS * 1e9
+                heapq.heappush(inflight, (wire_free, tag, True))
+        t, tag, ok = heapq.heappop(inflight)
+        if ok:
+            done += MRRS
+        else:
+            timeouts += 1
+            sent -= MRRS                   # the data must be fetched again by a retry policy
+        tags.append(tag)
+    return total_bytes / (t * 1e-9) / 1e9, timeouts
+
+if __name__ == "__main__":
+    print("outstanding  GB/s")
+    for n in (1, 2, 4, 8, 12, 16, 24, 32, 64):
+        gbps, _ = simulate(n)
+        print(f"{n:11d}  {gbps:5.2f}")
+    gbps, to = simulate(32, total_bytes=1 &lt;&lt; 20, loss=0.001)
+    print(f"with 0.1% lost requests: {gbps:.3f} GB/s, {to} timeouts")</code></pre>
+  <p>Expected shape of the output: about 0.5 GB/s with one outstanding read (512 B per ~1 µs), rising roughly linearly, flattening near 7.1 GB/s from about 14–16 outstanding reads. The last line shows how a tiny loss rate destroys throughput when each loss costs a 50 ms timeout: the device waits for the timer, not for the link. (In this simulation the "retry" is an assumption to keep the data flowing; PCIe itself does not retry — a real device fails the command.)</p>
+  <pre class="code" data-kind="pseudocode" data-lang="text" data-title="requester completion-timeout tracking"><code>on issue(request):
+    entry = table[request.tag] = {deadline: now + timeout_value, remaining: request.bytes}
+on completion(cpl):
+    entry = table.get(cpl.tag)
+    if entry is None:            report Unexpected Completion; drop cpl; return
+    if cpl.status != SC:         fail(entry, cpl.status); free(cpl.tag); return
+    deliver(cpl.data, offset_from(cpl.lower_address))
+    entry.remaining -= bytes_in(cpl)
+    if cpl.byte_count == bytes_in(cpl): free(cpl.tag)     # last completion
+periodically:
+    for tag, entry in table:
+        if now &gt; entry.deadline: report Completion Timeout; fail(entry, TIMEOUT); free(tag)</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <h3>How many reads must a Gen5 x4 SSD keep in flight?</h3>
+  <p>Gen5 variant of the example system: 32 GT/s × 4 lanes × 128/130 ÷ 8 ≈ 15.75 GB/s per direction. With MPS 256 B and ~91% TLP efficiency, usable completion payload ≈ 14.3 GB/s. Assume a platform read round trip of 1.5 µs and MRRS 512 B.</p>
+  <ol>
+    <li><var>B</var><sub>out</sub> = 14.3 × 10<sup>9</sup> B/s × 1.5 × 10<sup>−6</sup> s ≈ 21,450 B.</li>
+    <li><var>N</var> = ⌈21,450 / 512⌉ = 42 outstanding reads.</li>
+    <li>With 5-bit tags (32 values) the device could not reach line rate on WRITEs: 32 × 512 B / 1.5 µs ≈ 10.9 GB/s. With 8-bit tags (Extended Tag Field enabled) the tag limit is no longer the bottleneck — <a href="ch13.html">Chapter 13</a>.</li>
+    <li>If MRRS were raised to 1024 B, <var>N</var> would halve to 21; but larger requests increase the granularity of completion splitting and can hurt fairness for other devices sharing the Root Port. <span class="badge derived">Derived</span></li>
+  </ol>
+  <h3>What a driver pays for a register read</h3>
+  <p>Suppose a driver polled CSTS once per I/O at 1 million I/Os per second, with each MMIO read costing ~1 µs of stall: that is a full second of core stall per second — an entire CPU core consumed by waiting. A doorbell write costs a small fraction of that. This is the arithmetic behind NVMe's "no reads on the fast path" design. <span class="badge derived">Derived</span></p>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>"Configuration writes are posted like memory writes."</strong> They are not; they get a Cpl.</li>
+    <li><strong>"No completion means it worked"</strong> for a posted write — no completion was ever going to come.</li>
+    <li><strong>"Completion Timeout means the completer is broken."</strong> It means the requester did not receive all completions in time; the cause can be anywhere on the path (or a completer that is slow but correct, e.g. during its own error recovery).</li>
+    <li><strong>Confusing PCIe Completion Timeout with the NVMe driver's command timeout.</strong> One is microseconds-to-milliseconds at the PCIe requester; the other is typically tens of seconds in the host driver.</li>
+    <li><strong>Assuming the CPU waits for doorbell writes.</strong> It does not; any timing measured around a doorbell store measures the store, not the delivery.</li>
+    <li><strong>Interpreting an error completion (UR/CA) as a timeout.</strong> Error completions discharge the request immediately.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>Posted/non-posted failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>First check</th><th>Second check</th><th>Likely meaning</th></tr></thead>
+    <tbody>
+      <tr><td>AER Completion Timeout at the SSD</td><td>Which MRd has no completion in a trace? Same address region each time?</td><td>IOMMU faults for that address; switch error counters; Root Port errors at the same time</td><td>Lost/blocked request or completion on the path; or a Root Complex that stopped serving the address</td></tr>
+      <tr><td>Driver reads all ones from BAR0</td><td>Root Port link status (is the link up?)</td><td>Config space read of the device (Vendor ID all ones?)</td><td>Device gone / link down / function in reset</td></tr>
+      <tr><td>NVMe WRITE throughput far below READ</td><td>Outstanding MRd count in a trace</td><td>MRRS, Extended Tag enable, read round-trip latency</td><td>Insufficient outstanding reads to cover latency</td></tr>
+      <tr><td>Doorbell written, nothing happens</td><td>Was the MWr seen at the device's link?</td><td>Address correct (BAR0 + doorbell offset)? Memory Space Enable set?</td><td>Write dropped (UR at device, logged in AER) or device not acting</td></tr>
+      <tr><td>Unexpected Completion at SSD</td><td>Was there a Completion Timeout on that Tag just before?</td><td>Duplicate completions from a misbehaving completer</td><td>Late completion after timeout, or completer/switch bug</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight">
+    <p>Posted traffic tells you what <em>was decided</em>; non-posted traffic tells you who is <em>waiting</em>. When a system hangs, list every outstanding non-posted request in the trace at the moment of the hang. Usually the list is short, and one entry explains the whole hang.</p>
+  </aside>
+  <aside class="callout insight" data-title="Timeouts are diagnoses deferred">
+    <p>A Completion Timeout is reported long after the fault (milliseconds later, an eternity in trace time). Always go back in time from the timeout report to the request that caused it; in a long capture, trigger on the AER message and look back by the configured timeout window.</p>
+  </aside>
+  <p>Seniors also know the asymmetry of evidence: a non-posted failure produces evidence at the requester (status or timeout); a posted failure produces evidence only at the detector. When the symptom is "data never arrived" for a posted write, look for AER logs at every component on the path, not at the sender.</p>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <aside class="callout lab" data-title="Lab 12 — Latency hiding and completion timeouts in simulation">
+    <p>Measure, in a simulation, how outstanding reads and lost requests shape WRITE throughput; then inspect your own system's timeout settings read-only.</p>
+  </aside>
+  <h3>Objective</h3>
+  <p>Find the minimum number of outstanding reads needed to saturate a modelled Gen4 x4 link, and quantify the cost of rare completion timeouts.</p>
+  <h3>Skills</h3>
+  <ul><li>Little's Law applied to PCIe</li><li>Reasoning about completion timeouts</li><li>Read-only inspection of DevCap2/DevCtl2</li></ul>
+  <h3>Safety</h3>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Simulation plus read-only <code>lspci</code>. Do not write Device Control 2.</p></aside>
+  <h3>Hardware required</h3>
+  <p>None for the simulation. Optional: a Linux machine with an NVMe SSD for Step 3.</p>
+  <h3>Software required</h3>
+  <p>Python 3; <code>np_reads_sim.py</code>; pciutils (lspci).</p>
+  <h3>Input</h3>
+  <p>The simulation parameters at the top of <code>np_reads_sim.py</code>.</p>
+  <h3>Expected output</h3>
+  <p>A table of throughput versus outstanding reads with a clear knee, and a throughput figure under loss.</p>
+  <h3>Background</h3>
+  <p>Little's Law: outstanding = rate × time. Completion Timeout: default 50 µs–50 ms.</p>
+  <h3>Step 1</h3>
+  <p>Run the simulation as is. Record the outstanding-read count at which throughput reaches 95% of 7.1 GB/s.</p>
+  <h3>Step 2</h3>
+  <p>Set <code>RTT_NS = 2000</code>. Re-run. Predict the new knee using the formula before you look.</p>
+  <h3>Step 3</h3>
+  <p>On a real machine, run <code>sudo lspci -vvv -s &lt;your NVMe BDF&gt; | grep -E 'DevCap2|DevCtl2'</code>. Record the supported ranges and the active setting.</p>
+  <h3>Observation</h3>
+  <p>Compare the knee with your prediction. Note the active timeout range on your machine and what it would mean for a single lost completion.</p>
+  <h3>Questions</h3>
+  <ol>
+    <li>Why does throughput grow linearly before the knee?</li>
+    <li>With <code>loss=0.001</code> and 32 outstanding reads, why is throughput so low?</li>
+    <li>If your machine's timeout range were 50 µs–50 ms, what is the worst-case stall per lost completion?</li>
+  </ol>
+  <h3>Challenge</h3>
+  <p>Modify the simulation so a timeout fails the "command" (stop counting its bytes) instead of retrying, and report the command failure rate.</p>
+  <h3>Hints</h3>
+  <details class="hint"><summary>Hint</summary><p>Before the knee, each outstanding slot delivers MRRS bytes per round trip; total rate = N × MRRS / RTT.</p></details>
+  <h3>Solution</h3>
+  <details class="solution"><summary>Solution</summary>
+    <p>Step 1: the formula predicts the knee at 7.1 GB/s × 1 µs / 512 B ≈ 13.9 outstanding reads; the simulation reaches 95% between 16 and 24 (16 gives ≈ 6.7 GB/s) because jitter and link serialisation round the corner of the curve. Step 2: the formula predicts ≈ 28; expect the simulated knee a little above that. Q1: each read slot independently delivers 512 B per round trip until the link becomes the bottleneck. Q2: each loss blocks one tag for 50 ms; with ~2,000 requests per MiB at 0.1% loss about two losses per MiB are expected (the fixed seed gives one), and the simulated rate collapses to ≈ 0.02 GB/s, each costing 50 ms — the time is dominated by timeouts, not data. Q3: up to 50 ms per lost completion (the timer must not fire before 50 µs and should fire by 50 ms); for the NVMe command it is part of, the latency then includes error handling on top.</p>
+  </details>
+  <h3>What a senior engineer notices</h3>
+  <p>Rare losses are a throughput catastrophe and a latency-tail catastrophe long before they are a "visible error". A tail-latency spike of tens of milliseconds at the 99.99th percentile with occasional CmpltTO entries in AER is this pattern.</p>
+  <h3>Failure variants</h3>
+  <ul>
+    <li>Completer returns UR instead of losing the request: immediate failure, no timeout stall.</li>
+    <li>Completer is slow (RTT 60 ms) but correct: completions arrive after timeout — Unexpected Completions follow the timeouts.</li>
+  </ul>
+  <h3>Extension</h3>
+  <p>Add a second device sharing the completion direction and observe how one device's outstanding reads affect the other's throughput.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Classify: CfgWr1, MsgD (vendor-defined), Swap, IOWr, MRdLk, MWr64 with RO set.</li>
+    <li>Explain why an MSI-X interrupt is posted and what would go wrong if it were non-posted.</li>
+    <li>A device keeps 8 reads of 256 B outstanding with 1.2 µs round trip. What is its maximum data-fetch rate?</li>
+    <li>Why does the NVMe driver poll CSTS after writing CC.EN, and what PCIe property makes the poll also a flush?</li>
+    <li>Describe a scenario in which a posted write is dropped and nobody on the host ever learns of it.</li>
+  </ol>
+  <details class="answer"><summary>Model answers</summary>
+    <ol>
+      <li>CfgWr1 non-posted; MsgD posted; Swap non-posted; IOWr non-posted; MRdLk non-posted; MWr64 posted (RO does not change the category).</li>
+      <li>An interrupt is a notification; if it needed a completion, the device would hold a tag and buffer per interrupt and could time out on the platform's interrupt path. Posting also lets ordering rules ensure it follows the CQE write.</li>
+      <li>8 × 256 B / 1.2 µs ≈ 1.71 GB/s.</li>
+      <li>The controller takes time to become ready; CSTS.RDY reports it. The CSTS read is non-posted and cannot pass the earlier posted CC write from the same requester, so the read's completion also proves the write arrived.</li>
+      <li>A write to an address that no BAR claims, inside a switch's forwarding window: the switch's downstream port finds no target, drops it and logs/reports an error (which may be masked). With error reporting masked or unmonitored, no host software notices.</li>
+    </ol>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>Which request receives a completion without data when successful?</p>
+      <ul class="options" data-answer="2"><li>MWr</li><li>CfgWr</li><li>MRd</li><li>Msg</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>CfgWr (and IOWr) are non-posted writes; success is a Cpl. MWr and Msg get nothing; MRd gets CplD.</p></details></li>
+    <li><p>Which NVMe action produces a non-posted request?</p>
+      <ul class="options" data-answer="3"><li>CQ head doorbell</li><li>CQE write</li><li>Fetching WRITE data from host memory</li><li>MSI-X</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The controller must read the data: MRd → CplD.</p></details></li>
+    <li><p>What is the default Completion Timeout range?</p>
+      <ul class="options" data-answer="1"><li>50 µs to 50 ms</li><li>1 ms to 10 s</li><li>Exactly 30 s</li><li>There is no default</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The default range is 50 µs–50 ms; longer optional ranges may be selected in Device Control 2 if supported.</p></details></li>
+    <li><p>A requester receives a completion for a Tag it has already freed. What does it report?</p>
+      <ul class="options" data-answer="4"><li>Malformed TLP</li><li>Completion Timeout</li><li>Poisoned TLP</li><li>Unexpected Completion</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>No matching outstanding request → Unexpected Completion.</p></details></li>
+    <li><p>Why are posted, non-posted and completion traffic buffered separately?</p>
+      <ul class="options" data-answer="2"><li>For bandwidth fairness only</li><li>To prevent deadlock: blocked non-posted requests must not block posted requests or completions</li><li>Because they have different header sizes</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Deadlock freedom relies on posted requests and completions being able to make progress when non-posted requests are blocked.</p></details></li>
+    <li><p>A CPU load from a BAR returns 0xFFFFFFFF. List three possible explanations.</p>
+      <details class="answer"><summary>Model answer</summary><p>The device is gone or the link is down (the Root Complex synthesised all ones); the read timed out or got UR/CA (also synthesised); or the register genuinely contains all ones (rare, check the register definition).</p></details></li>
+    <li><p>Why can an SSD reach full READ bandwidth with few outstanding non-posted requests but needs many for WRITE?</p>
+      <details class="answer"><summary>Model answer</summary><p>READ data flows to the host as posted writes — no waiting. WRITE data must be fetched with non-posted reads, each costing a round trip; Little's Law demands rate × latency bytes outstanding.</p></details></li>
+    <li><p>What does reading back a register after writing it guarantee, and what does it not?</p>
+      <details class="answer"><summary>Model answer</summary><p>It guarantees the earlier posted write from the same requester on the same path has reached the device before the read completes (ordering). It does not guarantee the device has finished acting on the write (e.g. a reset in progress) — that requires a status bit defined by the device.</p></details></li>
+    <li><p>Is an MSI-X write subject to Completion Timeout? Why or why not?</p>
+      <details class="answer"><summary>Model answer</summary><p>No. It is a posted memory write; there is no completion to time out.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>(Beginner)</strong> Define posted and non-posted with an NVMe example of each.</p>
+      <details class="answer"><summary>Model answer</summary><p>Posted: no completion (doorbell MWr, CQE MWr). Non-posted: completion required (SQE fetch MRd, configuration writes during enumeration).</p></details></li>
+    <li><p><strong>(Intermediate)</strong> Why is a configuration write non-posted?</p>
+      <details class="answer"><summary>Model answer</summary><p>Software must know the configuration change took effect before continuing (e.g. before using a BAR it just programmed), and a function not ready can respond with CRS. It also mirrors conventional PCI behaviour.</p></details></li>
+    <li><p><strong>(Intermediate)</strong> How does NVMe avoid MMIO reads on the I/O path?</p>
+      <details class="answer"><summary>Model answer</summary><p>Doorbells are writes; completions are written by the device into host-memory CQs with a phase tag; the host learns head/tail positions from CQEs (SQ head pointer in each CQE) instead of reading registers.</p></details></li>
+    <li><p><strong>(Advanced)</strong> Explain a Completion Timeout investigation end to end.</p>
+      <details class="answer"><summary>Model answer</summary><p>Identify the requester from AER; capture or reproduce with an analyzer; find the request without completions; check whether the request reached the completer (capture on both sides of switches), whether the address was valid/mapped (IOMMU log), whether the completer produced a completion that was lost or misrouted (wrong Requester ID), and correlate with link events (retrains, replays) at that time.</p></details></li>
+    <li><p><strong>(Advanced)</strong> Would you ever disable Completion Timeout?</p>
+      <details class="answer"><summary>Model answer</summary><p>Only in narrowly controlled cases (e.g. debugging a completer that is known to take very long, or certain platform-recommended configurations), never as a fix: it converts a reported error into a potential permanent hang of the requester.</p></details></li>
+    <li><p><strong>(Senior)</strong> A customer sees occasional 50 ms latency spikes on writes only. What is your hypothesis and how do you test it?</p>
+      <details class="answer"><summary>Model answer</summary><p>Hypothesis: rare lost or late completions for the device's data reads causing timeouts (writes need reads; reads don't). Test: AER counters for CmpltTO/UnxCmplt correlated with spikes; analyzer trigger on AER message with look-back; check if spikes vanish with a different slot/switch/IOMMU setting.</p></details></li>
+    <li><p><strong>(Senior)</strong> How would you explain to a firmware team that "the MWr was ACKed" is not proof it reached memory?</p>
+      <details class="answer"><summary>Model answer</summary><p>ACK is a per-link Data Link Layer acknowledgement from the immediate neighbour. A switch or Root Complex may still drop, block or fail the write after ACKing it; the only end-to-end evidence is a subsequent ordered read or a consumer observing the data.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> postcard versus phone question, and what "hanging up after silence" means.</li>
+    <li><strong>To a junior engineer:</strong> why NVMe WRITEs stress the device's read machinery.</li>
+    <li><strong>To a senior engineer:</strong> why Completion Timeout values are a trade-off between hang detection and false positives during error recovery.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "When you send a postcard you don't wait. When you ask a question on the phone you wait for the answer. If nobody answers for a long time, you hang up and tell a grown-up something is wrong — that's the timeout."</p>
+    <p><strong>Junior:</strong> "For a WRITE, the data is in host memory and the SSD has to ask for it with reads. Every read takes a round trip, so the SSD must keep many reads in flight — rate times latency worth of bytes. Too few tags, small MRRS or high latency caps write bandwidth."</p>
+    <p><strong>Senior:</strong> "Short timeouts detect lost completions quickly and free resources, but a completer in a legitimate slow path (internal error recovery, a Root Complex servicing a memory error, a switch retraining) may answer late; that produces timeouts followed by unexpected completions. Long timeouts avoid that but stall requesters and inflate tail latency. The right value depends on the platform's worst legitimate latency."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>Posted requests (MWr, Msg) are fire-and-forget: cheap, unacknowledged end to end, ordered. Non-posted requests (MRd, CfgRd/CfgWr, IORd/IOWr, AtomicOps) hold a Tag until Cpl/CplD arrives or a Completion Timeout fires. NVMe puts all host-side fast-path actions on posted writes and lets the device do the waiting with pipelined reads. Little's Law tells you how many reads must be outstanding; Device Control 2 tells you how long a requester will wait; AER tells you when it gave up.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>classify every TLP kind as posted, non-posted or completion</li>
+      <li>explain why configuration writes are non-posted</li>
+      <li>map each NVMe step to posted/non-posted and say who waits</li>
+      <li>compute outstanding reads needed for a target bandwidth</li>
+      <li>explain Completion Timeout configuration, reporting and consequences</li>
+      <li>find a missing completion in a trace and list where it could have been lost</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Transaction Layer Specification: Completion Rules; Completion Timeout Mechanism</cite>.</li>
+    <li><cite class="spec">PCI Express Base Specification — Device Capabilities 2 / Device Control 2 registers</cite>.</li>
+    <li><cite class="spec">NVM Express Base Specification 2.4 — Controller Registers; Queue mechanisms</cite>; <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite>.</li>
+    <li>Linux: <code>drivers/nvme/host/pci.c</code> (doorbell writes, CSTS checks), <code>Documentation/PCI/pcieaer-howto.rst</code>.</li>
+    <li>Deeper: <a href="dd12.html">PCIe Completions</a>, <a href="ch52.html">Completion Rules</a>, <a href="ch28.html">Doorbells</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch13.html">Chapter 13 — PCIe Tags and Outstanding Requests</a>: how a requester keeps dozens of reads in flight, how completions find their way home, and how reads are split by MRRS and completions by the Read Completion Boundary.</p>
+</section>

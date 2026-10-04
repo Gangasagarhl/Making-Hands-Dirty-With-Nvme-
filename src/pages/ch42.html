@@ -1,0 +1,728 @@
+<p class="lead">A completion that nobody notices is as useless as a completion that never happened. This chapter teaches how an NVMe controller tells the host "your command is done": the three Peripheral Component Interconnect Express (PCIe) interrupt mechanisms — legacy INTx, Message Signaled Interrupts (MSI) and MSI-X — plus interrupt coalescing and polling, and why NVMe was designed around MSI-X from the start.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>Up to now the course has followed a command from the application down to the media and back up as far as the <a href="ch25.html">Completion Queue</a>: the controller writes a 16-byte Completion Queue Entry (CQE) into host memory, flips the Phase Tag, and stops. But the CPU is not watching that memory. Something has to wake it. That "something" is the interrupt, and it is the last hop of every I/O you will ever trace.</p>
+  <p>Interrupts matter to an engineer for three reasons:</p>
+  <ul>
+    <li><strong>Correctness.</strong> A lost or misrouted interrupt looks exactly like a hung device: the command completed, the CQE is sitting in memory, but Linux times out after 30 seconds and resets the controller. Many "the SSD hung" bug reports are actually interrupt bugs.</li>
+    <li><strong>Performance.</strong> At a million I/O operations per second (IOPS), one interrupt per command means a million interrupts per second. How interrupts are spread across CPUs, batched (coalesced) or avoided altogether (polling) decides tail latency and CPU cost.</li>
+    <li><strong>Debuggability.</strong> The interrupt is the one event that crosses from the device back into the CPU's world. In a protocol analyzer it is a single tiny Memory Write; in Linux it is a counter in <code>/proc/interrupts</code>. Learning to connect the two is a core trace skill.</li>
+  </ul>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Explain what an interrupt is and why a device needs one, in plain words and in PCIe terms.</li>
+    <li>Describe legacy INTx (a virtual wire signalled by Assert/Deassert messages), MSI (a memory write with a small set of vectors) and MSI-X (a memory write with a per-vector table), and compare them on vector count, sharing, masking and CPU steering.</li>
+    <li>Explain why NVMe's many-queue design strongly benefits from MSI-X: one vector per completion queue, one completion queue per CPU.</li>
+    <li>Describe NVMe interrupt coalescing (aggregation threshold and aggregation time) and the per-vector coalescing disable.</li>
+    <li>Explain polling (Linux poll queues, <code>io_uring</code> with I/O polling, <code>RWF_HIPRI</code>) and when it beats interrupts.</li>
+    <li>Know that the NVMe Interrupt Mask Set (INTMS) and Interrupt Mask Clear (INTMC) registers apply only to pin-based and MSI interrupts, never to MSI-X.</li>
+    <li>Recognise an interrupt in a synthetic trace and in Linux, and reason about a "completion arrived but no interrupt" failure.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>You should be comfortable with: <a href="ch12.html">posted vs non-posted transactions</a> (an interrupt message is a posted write), <a href="ch14.html">PCIe ordering</a> (why the interrupt cannot overtake the CQE), <a href="ch18.html">configuration space and capabilities</a>, <a href="ch19.html">BARs and MMIO</a>, <a href="ch25.html">queue architecture</a> and <a href="ch28.html">doorbells</a>, and the full command life cycle in <a href="ch39.html">The Most Important Chapter</a>.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Imagine a classroom where the teacher has sent twenty children to the library to fetch books. The librarian finds each book and puts it in the "done" basket by the classroom door. But the teacher is busy teaching and does not look at the basket.</p>
+    <p>In the oldest school, there is <strong>one bell rope</strong> shared by the whole library. When any book is ready, the librarian pulls the rope and keeps holding it. The teacher hears "ding" but has no idea whose book is ready, so she walks over and checks every basket. If two librarians pull the same rope, it still only rings once.</p>
+    <p>In a newer school, the librarian can <strong>send a note</strong> to the classroom instead. The note says a number, like "note 3". There can be up to 32 different note numbers, but they all go to the same teacher.</p>
+    <p>In the newest school, there is a <strong>list on the wall</strong> with one line per basket: "basket 1 → send a note to Mr. Ahmed in room 1", "basket 2 → send a note to Ms. Chen in room 2", and so on, for up to two thousand baskets. Each teacher only gets notes about their own children's books, and any line can be paused with a little "do not disturb" sticker.</p>
+    <p>Sometimes a teacher says "do not send me a note for every single book — wait until five are ready or until one minute has passed." That is coalescing. And sometimes a teacher is so impatient she just stands at the basket and keeps looking. That is polling.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>Think of a large restaurant kitchen. Plates come out of the kitchen (completions) and must reach the right table. <strong>INTx</strong> is a single dinner gong in the dining room: every waiter hears it, all of them walk to the pass to see if the plate is theirs. <strong>MSI</strong> is a small pager system with a handful of buzzer codes, all routed to one head waiter's belt. <strong>MSI-X</strong> is a pager per waiter, with the kitchen holding a wall chart that says which waiter's pager number to buzz for each section of tables. <strong>Coalescing</strong> is the expediter saying "buzz me when four plates are up or after 30 seconds, whichever comes first." <strong>Polling</strong> is a waiter who never leaves the pass.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What the analogy hides:</strong> an MSI or MSI-X "page" is not a separate wire or radio: it is an ordinary PCIe Memory Write to a special address that the CPU's interrupt hardware watches. That is why it obeys PCIe ordering rules, can be blocked by an Input-Output Memory Management Unit (IOMMU) or interrupt remapping table, and shows up in a protocol analyzer exactly like a data write. <strong>Where it misleads:</strong> the gong suggests INTx is a physical wire; on PCIe it is a pair of in-band <em>messages</em> (Assert_INTx and Deassert_INTx) emulating a level-triggered wire. And the "wall chart" for MSI-X is written by the host, not the kitchen: the operating system decides which CPU each vector goes to, and the device merely obeys the table.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>A CPU runs software. A device works on its own. When a device has finished something the CPU asked for, there are only two ways the CPU can find out:</p>
+  <ol>
+    <li><strong>The CPU checks.</strong> Software keeps looking at a memory location or a register to see whether something changed. This is called <span class="g" data-term="polling">polling</span>.</li>
+    <li><strong>The device tells the CPU.</strong> The device sends a signal that makes the CPU stop what it is doing for a moment, run a small piece of code called an <em>interrupt handler</em>, and then go back. This is an <span class="g" data-term="interrupt">interrupt</span>.</li>
+  </ol>
+  <p>Polling wastes CPU time when nothing is happening but reacts very quickly. Interrupts cost nothing while idle but each one has overhead: saving the CPU's state, running the handler, returning. Good systems use interrupts most of the time and polling when latency matters more than CPU efficiency.</p>
+  <p>On PCIe there are three interrupt mechanisms, each newer than the last:</p>
+  <table>
+    <caption>The three PCIe interrupt mechanisms at a glance</caption>
+    <thead><tr><th>Mechanism</th><th>How it is signalled</th><th>How many per function</th><th>Shared?</th><th>Typical use today</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="intx">INTx</span> (legacy)</td><td>Assert_INTx / Deassert_INTx message pair emulating a level-triggered wire</td><td>1 (one of INTA–INTD)</td><td>Yes, often shared with other devices</td><td>Fallback when nothing else works; very old operating systems</td></tr>
+      <tr><td><span class="g" data-term="msi">MSI</span></td><td>A posted Memory Write of a data value to an address chosen by the host</td><td>1, 2, 4, 8, 16 or 32 (power of two)</td><td>No</td><td>Simple devices, fallback when MSI-X is unavailable</td></tr>
+      <tr><td><span class="g" data-term="msi-x">MSI-X</span></td><td>A posted Memory Write; address and data come from a per-vector table in device memory</td><td>Up to 2048</td><td>No</td><td>NVMe, network cards, anything with many queues</td></tr>
+    </tbody>
+  </table>
+  <p>An NVMe controller can have up to 65,535 I/O queues. Linux typically creates one queue pair per CPU. With MSI-X, each CPU's completion queue gets its own interrupt vector aimed at that same CPU, so the CPU that submitted a command is the CPU that gets told it finished. No sharing, no cross-CPU traffic, no checking queues that belong to someone else. That is the whole reason NVMe "strongly benefits from MSI-X".</p>
+  <aside class="callout remember"><p>An interrupt is just a <strong>notification</strong>. The actual result of the command is in the CQE in host memory. The interrupt carries no status, no command identifier, no data — only "look at queue(s) behind this vector".</p></aside>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>What an interrupt is, precisely</h3>
+  <p>An interrupt is an asynchronous event that diverts a CPU's instruction stream to a handler. On x86-64, the Local Advanced Programmable Interrupt Controller (<span class="g" data-term="lapic">LAPIC</span>) of each core receives interrupt messages and delivers them as an 8-bit interrupt <em>vector</em> number that indexes the Interrupt Descriptor Table. On Arm, the Generic Interrupt Controller (GIC) with its Interrupt Translation Service (ITS) plays the same role for message-signalled interrupts. The details differ, but the device-side picture is the same: the device produces a signal; platform interrupt hardware turns it into "run handler X on CPU Y".</p>
+  <p>Note the two meanings of <em>vector</em>: the <strong>CPU vector</strong> (the IDT index on x86) and the <strong>MSI-X vector</strong> (an index into the device's MSI-X table, 0…N−1). NVMe uses the second meaning. Linux maps each device vector to a Linux IRQ number, and the platform maps that to a CPU vector. Keep the three numbering spaces apart in your head; mixing them is a classic source of confusion in bug reports.</p>
+
+  <h3>Legacy INTx</h3>
+  <p>Conventional PCI had four physical interrupt pins per slot (INTA#–INTD#), active-low and level-triggered, wired-OR so several devices could share one line. PCIe has no sideband interrupt wires. To stay software-compatible, PCIe <em>emulates</em> the wire with message TLPs (Transaction Layer Packets): the device sends an <strong>Assert_INTx</strong> message when its interrupt condition becomes true and a <strong>Deassert_INTx</strong> message when it becomes false. Switches and root ports collapse these into a virtual wire state per INTx line (and remap INTA–INTD across switch ports — the "swizzle"), and the root complex presents it to the platform interrupt controller (an I/O APIC on x86).</p>
+  <ul>
+    <li><strong>Level semantics.</strong> The virtual wire stays asserted until the device deasserts it. The handler must clear the cause in the device, otherwise the interrupt fires again forever (an "interrupt storm").</li>
+    <li><strong>Sharing.</strong> Several functions can be behind the same INTx line. Every handler on that line runs and must ask "was it me?" by reading a device register — a non-posted MMIO read costing on the order of a microsecond.</li>
+    <li><strong>Control bits.</strong> The PCI Command register's <em>Interrupt Disable</em> bit stops the function from sending INTx messages; the Status register's <em>Interrupt Status</em> bit reflects whether the function's INTx condition is pending. The Interrupt Pin register (read-only) says which INTx the function uses; Interrupt Line is just a scratch byte software fills in.</li>
+    <li><strong>Exclusion.</strong> When MSI or MSI-X is enabled, the function must not use INTx.</li>
+  </ul>
+  <p>For NVMe, INTx means one interrupt for the whole controller: on every interrupt the driver must scan all completion queues (or rely on INTMS/INTMC masking, see below). It works, and the NVMe specification allows it, but it throws away the per-queue parallelism NVMe was designed for.</p>
+
+  <h3>MSI</h3>
+  <p>Message Signaled Interrupts replace the wire with a <strong>posted Memory Write</strong>. Software programs a Message Address and a Message Data value into the function's MSI capability (Capability ID 05h in configuration space). To interrupt, the function writes the data value to the address. The platform's interrupt hardware decodes writes to that address range (on x86, the <code>0xFEEx_xxxx</code> window) as interrupt messages rather than memory.</p>
+  <ul>
+    <li><strong>Vectors.</strong> A function advertises how many vectors it can use (Multiple Message Capable: 1, 2, 4, 8, 16 or 32) and software grants some (Multiple Message Enable). With several vectors, the function modifies the low bits of the data value to select the vector. All vectors share one address, so on most platforms they all target the same CPU (or the same set).</li>
+    <li><strong>Masking.</strong> Per-vector masking is optional (Per-Vector Masking Capable); when present there is a Mask Bits and Pending Bits register in the capability.</li>
+    <li><strong>Edge semantics.</strong> One write = one interrupt. There is no "deassert". If the device writes while the CPU is masked, the platform latches it; nothing is lost but nothing is repeated either.</li>
+  </ul>
+
+  <h3>MSI-X</h3>
+  <p>MSI-X (Capability ID 11h) keeps the "interrupt is a memory write" idea but moves the address/data pairs into a <span class="g" data-term="msix-table">table in a BAR</span> (Base Address Register region), one 16-byte entry per vector, each with its own address, data and mask bit. A separate Pending Bit Array (<span class="g" data-term="pba">PBA</span>) records vectors that wanted to fire while masked. Up to 2048 vectors per function. Because every vector has its own address, each can be steered to a different CPU. <a href="ch43.html">Chapter 43</a> is entirely about MSI-X; here we only need the comparison.</p>
+
+  <table>
+    <caption>INTx vs MSI vs MSI-X in engineering detail</caption>
+    <thead><tr><th>Property</th><th>INTx</th><th>MSI</th><th>MSI-X</th></tr></thead>
+    <tbody>
+      <tr><td>Wire format on PCIe</td><td>Message TLPs (Assert_INTx / Deassert_INTx), routed to root complex</td><td>Posted Memory Write (MWr), 1 DW</td><td>Posted Memory Write (MWr), 1 DW</td></tr>
+      <tr><td>Trigger semantics</td><td>Level (virtual wire)</td><td>Edge (one write, one interrupt)</td><td>Edge</td></tr>
+      <tr><td>Vectors per function</td><td>1</td><td>Up to 32, power of two, contiguous data values</td><td>Up to 2048, any count, independent entries</td></tr>
+      <tr><td>Where configuration lives</td><td>Command/Status registers, Interrupt Pin</td><td>MSI capability in config space</td><td>MSI-X capability in config space + table and PBA in a memory BAR</td></tr>
+      <tr><td>Per-vector target CPU</td><td>No (platform routing of the shared line)</td><td>Usually no (one address for all vectors)</td><td>Yes (address per vector)</td></tr>
+      <tr><td>Per-vector mask</td><td>No (Interrupt Disable is all-or-nothing)</td><td>Optional</td><td>Always (Vector Control mask bit) + Function Mask</td></tr>
+      <tr><td>Sharing between devices</td><td>Common</td><td>No</td><td>No</td></tr>
+      <tr><td>"Was it me?" read in handler</td><td>Needed</td><td>Not needed</td><td>Not needed</td></tr>
+      <tr><td>Ordering with data</td><td>Message, but handler must still read device to flush (classic PCI rule)</td><td>Posted write behind posted data writes — ordered for free</td><td>Same as MSI</td></tr>
+      <tr><td>NVMe INTMS/INTMC apply?</td><td>Yes</td><td>Yes</td><td><strong>No</strong> — host must not use them</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Why NVMe strongly benefits from MSI-X</h3>
+  <p>NVMe's performance story is "no shared locks between CPUs". Each CPU has its own Submission Queue (SQ) and Completion Queue (CQ). The submission path needs no lock because only one CPU writes that SQ. If the completion notification then went to a single CPU (INTx or MSI), that one CPU would have to process completions for every other CPU and wake them up with inter-processor interrupts — re-creating exactly the bottleneck NVMe removed. MSI-X closes the loop:</p>
+  <ol>
+    <li>At <a href="ch27.html">Create I/O Completion Queue</a> time, the driver gives each CQ an <strong>Interrupt Vector (IV)</strong> number and sets <strong>Interrupts Enabled (IEN)</strong>.</li>
+    <li>The driver programs MSI-X table entry IV with an address/data that targets the CPU (or CPUs) that own that queue.</li>
+    <li>When the controller posts a CQE to that CQ it writes table entry IV's data to table entry IV's address. Only that CPU is interrupted. Its handler reads only its own CQ.</li>
+  </ol>
+  <figure>
+<pre class="diagram">
+  CPU0           CPU1           CPU2           CPU3            (host)
+   |  ^           |  ^           |  ^           |  ^
+ SQ1  |         SQ2  |         SQ3  |         SQ4  |
+   |  CQ1 ◄─┐     |  CQ2 ◄─┐     |  CQ3 ◄─┐     |  CQ4 ◄─┐
+   |        │     |        │     |        │     |        │
+   |   vec 1│     |   vec 2│     |   vec 3│     |   vec 4│   MSI-X table entries 1..4
+   v        │     v        │     v        │     v        │   each aimed at "its" CPU
+ ┌──────────┴──────────────┴──────────────┴──────────────┴──┐
+ │                 NVMe controller (one PCIe function)       │
+ │  vec 0 ──► admin CQ (CQ0) ──► usually CPU0 or any CPU     │
+ └───────────────────────────────────────────────────────────┘
+</pre>
+    <figcaption>Conceptual: per-CPU queue pairs with one MSI-X vector per completion queue. With INTx or single-vector MSI, all four arrows would land on one CPU.</figcaption>
+  </figure>
+  <p>The NVMe specification permits several CQs to share one vector (the driver gives them the same IV), and it permits fewer vectors than queues. Linux sometimes does this when the device offers fewer vectors than CPUs. The cost is that the handler must check several CQs on each interrupt.</p>
+
+  <h3>NVMe interrupt rules that matter</h3>
+  <ul>
+    <li><strong>Interrupt mode selection.</strong> The controller uses whichever mechanism the host has enabled in PCI configuration space: MSI-X if MSI-X Enable is set, else MSI if MSI Enable is set, else INTx. The NVMe over PCIe Transport specification describes how NVMe completion queues map onto each mode.</li>
+    <li><strong>Admin CQ.</strong> The Admin Completion Queue always uses interrupt vector 0 (it has no Create command; interrupts for it are always enabled once the controller is enabled).</li>
+    <li><strong>Pin-based and MSI masking.</strong> NVMe defines <span class="g" data-term="intms">Interrupt Mask Set (INTMS, offset 0Ch)</span> and Interrupt Mask Clear (INTMC, offset 10h). Writing a 1 to a bit in INTMS masks that vector; writing a 1 to INTMC unmasks it; reads of either return the current mask. These registers exist so a driver can stop interrupts from an INTx or multi-message MSI controller while it drains queues, without touching configuration space. When MSI-X is configured the host must not access INTMS/INTMC; MSI-X has its own per-vector mask bit in the table.</li>
+    <li><strong>When the controller interrupts.</strong> For a CQ with IEN set, the controller generates an interrupt when it has posted entries the host has not yet consumed (the CQ head doorbell tells it how far the host got). Coalescing may delay it (below). The exact "when" — after one CQE, after several, how it treats a CQ that is still non-empty after the host updates the head — is partly defined by the transport specification and partly implementation-dependent. Read the "Interrupts" material in the NVMe over PCIe Transport specification before relying on fine detail.</li>
+  </ul>
+
+  <h3>Interrupt coalescing</h3>
+  <p>Each interrupt costs CPU time: entering the handler, reading the CQ, ringing the CQ head doorbell, returning. At very high IOPS, servicing one completion per interrupt wastes cycles. <span class="g" data-term="interrupt-coalescing">Interrupt coalescing</span> lets the controller wait and deliver one interrupt for several completions.</p>
+  <p>NVMe exposes this as the <strong>Interrupt Coalescing</strong> feature (Feature Identifier 08h, set with Set Features, read with Get Features). Command Dword 11 carries two fields:</p>
+  <table class="packet">
+    <thead><tr><th class="row-label">CDW11</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">Interrupt Coalescing</td><td colspan="16" class="rsvd">Reserved</td><td colspan="8" class="hl">Aggregation Time (TIME)</td><td colspan="8" class="hl">Aggregation Threshold (THR)</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li><strong>Aggregation Threshold (THR)</strong> — the minimum number of completion entries to aggregate per vector before signalling an interrupt. It is a 0's based value: 0 means 1 entry (effectively no coalescing by count), 7 means 8 entries.</li>
+    <li><strong>Aggregation Time (TIME)</strong> — the maximum time the controller may delay an interrupt because of coalescing, in <strong>100-microsecond</strong> increments. 0 means no delay.</li>
+    <li>The interrupt fires when <em>either</em> condition is met: threshold reached or time expired. The default is typically 0/0 (coalescing off).</li>
+    <li>The companion <strong>Interrupt Vector Configuration</strong> feature (Feature Identifier 09h) has, per vector, a <strong>Coalescing Disable (CD)</strong> bit: set it and that vector ignores coalescing. Useful for a latency-sensitive queue next to throughput queues.</li>
+  </ul>
+  <aside class="callout warn"><p>100 µs granularity is coarse compared with a ~10 µs flash read. A TIME of 1 can add up to 100 µs to the completion latency of a lightly loaded queue — ten times the device latency. Coalescing is a throughput tool; it is almost never a latency tool. Linux's NVMe driver does not enable it by default.</p></aside>
+  <aside class="callout impl"><p>How a controller implements the timer (per vector, per CQ, started at the first un-signalled CQE or free-running) is implementation-dependent within what the specification requires. The specification also says the controller is not required to coalesce in every circumstance (for example, it may signal sooner). Measure your device; do not assume THR=7 always produces exactly one interrupt per eight completions. Confirm the current wording on admin-queue and error-completion behaviour in the Interrupt Coalescing feature description of the NVMe Base Specification.</p></aside>
+
+  <h3>Polling: no interrupt at all</h3>
+  <p>At high queue depth, by the time the handler runs there are already more CQEs waiting; interrupts are cheap per I/O. At queue depth 1 on a fast drive, the interrupt path (MSI-X write → LAPIC → context switch to the woken thread) can be several microseconds out of a ~10 µs total. Polling removes it: the submitting thread spins reading the CQ's next entry, looking for the Phase Tag to flip.</p>
+  <ul>
+    <li><strong>Linux poll queues.</strong> The <code>nvme</code> driver's <code>poll_queues</code> module parameter creates extra I/O queue pairs whose CQs are created <em>with IEN cleared</em>: the controller never interrupts for them. They are used only for I/O submitted with the high-priority/polled flag.</li>
+    <li><strong>io_uring.</strong> A ring set up with <code>IORING_SETUP_IOPOLL</code> polls for completions of O_DIRECT I/O instead of sleeping. fio exposes it as <code>--hipri</code> with <code>ioengine=io_uring</code>.</li>
+    <li><strong>preadv2/pwritev2.</strong> The <code>RWF_HIPRI</code> flag requests polled completion for a single direct I/O.</li>
+    <li><strong>Hybrid polling.</strong> Linux block layer can sleep for an estimated fraction of the expected latency before starting to spin, trading a little latency for much less CPU.</li>
+  </ul>
+  <aside class="callout version"><p>Linux block-layer polling has changed several times across kernel versions (classic polling, hybrid polling tunables in <code>/sys/block/&lt;dev&gt;/queue/io_poll</code> and <code>io_poll_delay</code>, the move to dedicated poll queues). Treat specific sysfs knobs as kernel-version-dependent and check your kernel's documentation.</p></aside>
+
+  <h3>The central concept on the ladder</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>When the librarian finishes your book, she sends a note to <em>your</em> teacher, not to the whole school.</p></div>
+    <div class="rung" data-rung="B"><p>When the controller posts a completion into a CQ, it signals the interrupt vector assigned to that CQ, which the operating system has aimed at the CPU that owns the queue.</p></div>
+    <div class="rung" data-rung="C"><p>The controller's completion engine writes the 16-byte CQE through its DMA engine, then its interrupt logic looks up the MSI-X table entry for the CQ's IV, checks the per-vector and function mask, and if unmasked emits a 4-byte write of the entry's Message Data to its Message Address. The CPU's LAPIC (or GIC ITS) receives it and raises the vector.</p></div>
+    <div class="rung" data-rung="D"><p>NVMe Base Specification: Create I/O Completion Queue carries IV and IEN; Interrupt Coalescing (FID 08h) and Interrupt Vector Configuration (FID 09h) features; INTMS/INTMC registers for pin-based and MSI only. NVMe over PCIe Transport: how CQ interrupts map to INTx, MSI, MSI-X. PCI Express Base Specification: MSI and MSI-X capabilities, INTx message emulation.</p></div>
+    <div class="rung" data-rung="E"><p>On the link: Device→Host posted MWr (CQE, 16 bytes) followed by Device→Host posted MWr (MSI-X, 4 bytes, to 0xFEEx_xxxx). PCIe ordering forbids the second posted write from passing the first (unless the interrupt write has Relaxed Ordering set, which it should not), so the CQE is in memory before the CPU can be interrupted.</p></div>
+    <div class="rung" data-rung="F"><p>In an analyzer: a 16-byte MWr to the CQ base region with Requester ID 0x0100, then within a few hundred nanoseconds a 1-DW MWr to 0xFEE0_xxxx with the same Requester ID. No completion follows — posted. Later, an RC→device MWr to the CQ head doorbell.</p></div>
+    <div class="rung" data-rung="G"><p>Command timed out but the CQE is in memory with the correct Phase Tag? Look for the interrupt MWr after it. Missing → controller didn't fire (IEN, mask, coalescing, firmware). Present → host side lost it (IOMMU interrupt remapping fault, wrong table entry, CPU offline, driver bug). That single question splits the search space in half.</p></div>
+  </div>
+
+  <h3>The 16 questions for the MSI-X completion interrupt</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>A posted PCIe Memory Write, generated by the NVMe controller after posting one or more CQEs, whose address and data come from the MSI-X table entry selected by the CQ's interrupt vector.</dd>
+    <dt>2. Why was it created?</dt><dd>To let a device notify a specific CPU of a specific event without shared wires, polling, or "was it me?" reads.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Interrupt sharing, single-CPU bottlenecks, and the ordering hazard of sideband interrupts racing data.</dd>
+    <dt>4. What existed before it?</dt><dd>INTx (shared level-triggered pins, emulated by messages on PCIe) and MSI (up to 32 vectors with one address).</dd>
+    <dt>5. Why is the current design better?</dt><dd>Per-vector address/data/mask, up to 2048 vectors, table in MMIO space that is fast to update, natural ordering behind data.</dd>
+    <dt>6. Who creates it?</dt><dd>The table entries are created by host software (the OS interrupt subsystem); the interrupt write itself is created by the controller.</dd>
+    <dt>7. Who consumes it?</dt><dd>The platform interrupt hardware (IOMMU interrupt remapping, LAPIC/GIC), which raises a CPU vector; then the NVMe driver's handler.</dd>
+    <dt>8. Where does it live?</dt><dd>Capability in configuration space; table and PBA in a BAR (on the lab system BAR0+0x2000 and BAR0+0x3000); the write itself travels upstream on the link.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>MSI-X Message Control (Enable, Function Mask, Table Size), Table Offset/BIR, PBA Offset/BIR, table entries, PBA bits; NVMe CQ IV/IEN; Interrupt Coalescing and Interrupt Vector Configuration features; CQ head doorbell.</dd>
+    <dt>10. What happens before it?</dt><dd>The controller DMA-writes the CQE (with Phase Tag) into the CQ in host memory.</dd>
+    <dt>11. What happens after it?</dt><dd>The handler reads CQEs while the Phase Tag matches, completes requests, then writes the CQ head doorbell.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Wrong address → write lands elsewhere or is blocked by the IOMMU (interrupt remapping fault); wrong data → wrong CPU vector, spurious or unhandled interrupt; masked → pending bit set, no interrupt; missing → I/O timeout and controller reset.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>A 1-DW MWr from the device's Requester ID to an address in the interrupt window, right after the CQE write.</dd>
+    <dt>14. What does Linux show?</dt><dd>Per-CPU counts in <code>/proc/interrupts</code> on lines named <code>nvme0q0</code>, <code>nvme0q1</code>…; affinity in <code>/proc/irq/&lt;n&gt;/</code>; <code>lspci -vvv</code> MSI-X Enable+ and Count.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>Every vector fires to its configured target; masked vectors set PBA bits and fire on unmask; coalescing thresholds and timers; IEN=0 produces no writes; interrupts never overtake CQEs; behaviour across reset and vector reprogramming.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>First: is the CQE there? Then: did the write go out (analyzer)? Then: was it masked, coalesced, remapped, or aimed at an offline CPU? Also: did firmware fire for the wrong CQ (IV mix-up), or fire before the CQE was visible (Relaxed Ordering misuse)?</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>Inside the controller, a completion engine and an interrupt engine cooperate. The completion engine owns, per CQ: the base address, size, tail pointer, current Phase Tag, the host-reported head (from the CQ head doorbell), the IV and IEN. The interrupt engine owns, per vector: a copy (or a read path) of the MSI-X table entry, its mask bit, its pending bit, and coalescing state (count of unsignalled CQEs, a timer).</p>
+  <figure>
+<pre class="diagram">
+             ┌───────────────────── NVMe controller ─────────────────────┐
+ command ──► │ completion engine                 interrupt engine         │
+ done        │  CQ y: base, size, tail, phase    vector v: addr, data,     │
+             │        head (from doorbell),              mask, pending,    │
+             │        IV = v, IEN = 1                    coalesce cnt/timer│
+             │      │ 1. DMA write CQE              ▲                     │
+             │      ▼                               │ 2. "CQ y has new     │
+             │  [ PCIe transaction layer ] ◄────────┘     entries"         │
+             │      │                     3. if !mask && (cnt≥THR+1 ||     │
+             │      │                          timer expired || CD=1):     │
+             │      │                          MWr(addr, data) else PBA=1  │
+             └──────┼─────────────────────────────────────────────────────┘
+                    ▼ upstream posted writes, in order: CQE then MSI-X
+            Root port → (IOMMU / interrupt remapping) → LAPIC of target CPU
+</pre>
+    <figcaption>Conceptual hardware path for an NVMe completion interrupt. Real controllers differ in where state lives (SRAM, registers, firmware).</figcaption>
+  </figure>
+  <p>On the host side the interrupt write reaches the root complex like any other upstream memory write. The root complex recognises the address range as interrupt space. With an IOMMU that does interrupt remapping (Intel VT-d IR, AMD-Vi), the address/data the device sends is not a raw "CPU + vector" but an index into an interrupt remapping table the IOMMU owns; the IOMMU validates the source Requester ID and translates. This is why a device that writes a stale MSI-X entry after the OS has reprogrammed things can produce an IOMMU fault message instead of an interrupt.</p>
+  <h4>INTx hardware</h4>
+  <p>For INTx, the device keeps a single "interrupt pending" condition. Rising edge of the condition → send Assert_INTA (or whichever pin); falling edge → send Deassert_INTA. A switch ORs the virtual wires from all downstream ports per line and forwards a single Assert/Deassert upstream when the OR changes. The root complex feeds the virtual wire into an I/O APIC pin. Because these are messages, they can be lost in exotic failures (for example a link reset between Assert and Deassert) and the virtual wire state must be cleaned up by the hardware on link down.</p>
+  <h4>What is internal and unobservable</h4>
+  <p>The coalescing counter, the timer and the decision "fire now" are inside the controller. You see only their result: an MWr or no MWr. A missing interrupt cannot be distinguished, from the link alone, between "masked", "coalesced and waiting", "IEN was 0" and "firmware bug" — you need register state (table mask bits, PBA, Get Features) to separate them.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>Three documents share this topic. Keep them separate:</p>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — MSI and MSI-X Capability structures; INTx emulation (virtual wire messages)</cite>: defines the mechanisms themselves. A PCI-SIG members' document; cite by name, not by section number.</li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Controller Registers (INTMS, INTMC); Create I/O Completion Queue; Features: Interrupt Coalescing, Interrupt Vector Configuration</cite>: defines how NVMe uses vectors and coalescing.</li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4 — Interrupts</cite>: defines how completion queues map onto INTx, MSI (single and multiple message) and MSI-X on PCIe.</li>
+  </ul>
+  <p>The PCIe-level definitions are <span class="badge normative">Normative</span> in the PCIe Base Specification. NVMe's coalescing semantics are normative but give the controller latitude. Linux behaviour is neither: it is implementation.</p>
+
+  <aside class="callout verified">
+    <p>INTx on PCIe is signalled by Assert_INTx/Deassert_INTx messages. MSI (Capability ID 05h) supports 1–32 vectors in powers of two; MSI-X (Capability ID 11h) supports up to 2048 vectors with a table and PBA located via BIR/offset. NVMe INTMS is at offset 0Ch and INTMC at 10h, and are not used when MSI-X is configured. Create I/O Completion Queue carries Interrupt Vector and Interrupts Enabled. Interrupt Coalescing is Feature Identifier 08h with Aggregation Time in 100 µs units and a 0's based Aggregation Threshold; Interrupt Vector Configuration is Feature Identifier 09h with a Coalescing Disable bit.</p>
+  </aside>
+  <aside class="callout derived">
+    <p>That MSI-X "strongly benefits" NVMe is a design inference: one vector per CQ, each steerable to the owning CPU, preserves the lock-free per-CPU queue model end to end. That the interrupt cannot overtake the CQE follows from PCIe posted-write ordering when neither the interrupt write has Relaxed Ordering set nor the platform reorders.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>Which CPU a vector targets, how many vectors the OS asks for, whether queues share vectors, whether coalescing is enabled, the controller's coalescing timer implementation, and the exact moment within a burst at which the controller fires are implementation-dependent.</p>
+  </aside>
+  <aside class="callout version">
+    <p>Field names and the presence of some interrupt-related fields have evolved across NVMe revisions (for example, the restructuring of NVMe 2.0 moved PCIe-specific interrupt material into the NVMe over PCIe Transport specification). Older drives may report against NVMe 1.x, where the same material lived in a single base specification. Linux polling interfaces are kernel-version-dependent.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p>Check in the specifications: the exact conditions under which a controller must (not merely may) signal an interrupt for a CQ that still contains unconsumed entries after the host updates its head doorbell; whether coalescing applies to the Admin Completion Queue in your target revision; and the multiple-message MSI rules for how NVMe CQs map onto fewer MSI vectors. The NVMe specifications do not say which CPU an interrupt should target — that is entirely an operating-system choice.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume one interrupt per completion; never assume interrupt vector number equals queue number (it usually does in Linux, but the specification does not require it); never assume an interrupt carries status; never assume INTMS/INTMC do anything useful under MSI-X.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>What actually crosses the link for each mechanism, assuming the lab system (root port Requester ID 0x0009, SSD 0x0100):</p>
+  <table>
+    <caption>Interrupt-related traffic on the PCIe link</caption>
+    <thead><tr><th>Mechanism</th><th>TLP</th><th>Direction</th><th>Posted?</th><th>Key fields</th><th>Response</th></tr></thead>
+    <tbody>
+      <tr><td>INTx assert</td><td>Msg (no data), Message Code Assert_INTA (20h); INTB–INTD use 21h–23h</td><td>Device → Root port</td><td>Yes (messages are posted)</td><td>Routing: local, terminate at receiver; Requester ID 0x0100</td><td>None</td></tr>
+      <tr><td>INTx deassert</td><td>Msg, Deassert_INTA (24h); INTB–INTD 25h–27h</td><td>Device → Root port</td><td>Yes</td><td>As above</td><td>None</td></tr>
+      <tr><td>MSI</td><td>MWr, 1 DW data</td><td>Device → Host</td><td>Yes</td><td>Address = Message Address; Data = Message Data with low bits = vector index when multiple messages enabled</td><td>None</td></tr>
+      <tr><td>MSI-X</td><td>MWr, 1 DW data, First BE = 1111b</td><td>Device → Host</td><td>Yes</td><td>Address/Data from table entry; on x86 a 32-bit address in the 0xFEEx_xxxx window → 3-DW header (MWr32)</td><td>None</td></tr>
+      <tr><td>Table programming</td><td>MWr to BAR0+0x2000+16×v</td><td>Host → Device</td><td>Yes</td><td>Requester = RC</td><td>None</td></tr>
+      <tr><td>CQ head doorbell</td><td>MWr to CQyHDBL</td><td>Host → Device</td><td>Yes</td><td>New head value</td><td>None; tells controller entries are consumed</td></tr>
+      <tr><td>INTMS / INTMC</td><td>MWr to BAR0+0x0C / 0x10</td><td>Host → Device</td><td>Yes</td><td>Bit per vector (pin/MSI only)</td><td>None</td></tr>
+    </tbody>
+  </table>
+  <h3>Ordering is the hidden protocol requirement</h3>
+  <p>Because the CQE write and the MSI-X write are both posted Memory Writes from the same function on the same traffic class, the PCIe ordering rules forbid the later one from passing the earlier one unless the later one carries Relaxed Ordering. So when the CPU receives the interrupt, the CQE is already globally visible. Old PCI with sideband pins had no such guarantee, which is why INTx handlers traditionally performed a read of the device ("flush posted writes") first. See <a href="ch14.html">PCIe Ordering</a>.</p>
+  <figure>
+    <ol class="seq" data-actors="Driver (CPU)|Host memory|Root complex / LAPIC|NVMe controller">
+      <li data-note="NVMe controller">READ finished; data DMA-written already</li>
+      <li data-from="NVMe controller" data-to="Host memory" data-t="0 ns">MWr 16 B: CQE into CQ1, Phase=1</li>
+      <li data-from="NVMe controller" data-to="Root complex / LAPIC" data-t="+120 ns">MWr 4 B: MSI-X vec 1 (0xFEE0_xxxx)</li>
+      <li data-from="Root complex / LAPIC" data-to="Driver (CPU)" data-t="+0.8 µs">CPU vector raised on CPU1</li>
+      <li data-from="Driver (CPU)" data-to="Host memory">read CQE, Phase matches</li>
+      <li data-note="Driver (CPU)">complete request; next CQE Phase stale</li>
+      <li data-from="Driver (CPU)" data-to="NVMe controller" data-t="+2.5 µs">MWr: CQ1 head doorbell = new head</li>
+    </ol>
+    <figcaption>Synthetic sequence for one completion delivered by MSI-X. Timings illustrative, implementation- and platform-dependent.</figcaption>
+  </figure>
+  <figure>
+    <ol class="seq" data-actors="Driver (CPU)|I/O APIC / RC|Switch|NVMe controller">
+      <li data-from="NVMe controller" data-to="Switch">Msg Assert_INTA</li>
+      <li data-from="Switch" data-to="I/O APIC / RC">Msg Assert_INTx (after swizzle)</li>
+      <li data-from="I/O APIC / RC" data-to="Driver (CPU)">level interrupt on shared line</li>
+      <li data-from="Driver (CPU)" data-to="NVMe controller">MRd: "was it me?" / scan CQs</li>
+      <li data-from="NVMe controller" data-to="Driver (CPU)" class="dashed">CplD</li>
+      <li data-from="Driver (CPU)" data-to="NVMe controller">MWr: CQ head doorbell(s)</li>
+      <li data-from="NVMe controller" data-to="Switch">Msg Deassert_INTA</li>
+      <li data-from="Switch" data-to="I/O APIC / RC">Msg Deassert_INTx</li>
+    </ol>
+    <figcaption>Conceptual INTx sequence. The virtual wire stays asserted until the device has nothing left to report.</figcaption>
+  </figure>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Both traces below are synthetic, built on the course lab system (Gen4 x4, SSD at 01:00.0 with Requester ID 0x0100, CQ1 base 0x1_2341_0000, MSI-X table at BAR0+0x2000 = 0xFE60_2000). The interrupt addresses are written as they would appear without interrupt remapping, for readability.</p>
+  <div class="trace" data-kind="synthetic" data-title="Normal: 4 KiB READ completes on CQ1, MSI-X vector 1 to CPU1">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Len=1 Data=0x0000_0012</td><td>SQ1 tail doorbell = 0x12</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>640</td><td>MRd64</td><td>Req=0x0100 Tag=0x21 Addr=0x1_2340_0440 Len=16</td><td>Fetch SQE at slot 0x11 (64 B)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1 420</td><td>CplD</td><td>Cpl=0x0009 Req=0x0100 Tag=0x21 Status=SC Len=16</td><td>SQE returned: READ, CID 0x0047, NSID 1</td></tr>
+        <tr class="note"><td colspan="6">≈ 60 µs media read inside the controller (not visible on the link)</td></tr>
+        <tr class="dir-up"><td>4–19</td><td>Dev→Host</td><td>61 300</td><td>MWr64 ×16</td><td>Req=0x0100 Addr=0x2_0000_0000… Len=64 each (256 B)</td><td>4 KiB of data in MPS-sized writes</td></tr>
+        <tr class="dir-up"><td>20</td><td>Dev→Host</td><td>62 950</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_2341_0110 Len=4 (16 B) RO=0</td><td>CQE slot 0x11 in CQ1: CID 0x0047, SQHD 0x12, status 0, P=1</td></tr>
+        <tr class="dir-up"><td>21</td><td>Dev→Host</td><td>63 070</td><td>MWr32</td><td>Req=0x0100 Addr=0xFEE0_1000 Len=1 Data=0x0000_0041 BE=1111</td><td>MSI-X vector 1 → CPU1, CPU vector 0x41</td></tr>
+        <tr class="dir-down"><td>22</td><td>Host→Dev</td><td>65 400</td><td>MWr32</td><td>Req=RC Addr=0xFE60_100C Len=1 Data=0x0000_0012</td><td>CQ1 head doorbell = 0x12: entry consumed</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> Row 20 then row 21: CQE before interrupt, same Requester ID, both posted, the interrupt carries no CID. Row 22 shows the handler ran on the host about 2.3 µs after the interrupt write — that gap is the host's interrupt latency plus handler time, not device time. The data address 0x2_0000_0000 lies in host DRAM IOVA space while 0xFEE0_1000 is the interrupt window; an analyzer with the platform's address map can colour them differently.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: CQE posted, no interrupt, timeout and abort 30 s later">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 ns</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1018 Data=0x0000_0005</td><td>SQ3 tail doorbell = 5 (CPU3's queue)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>700 ns</td><td>MRd64</td><td>Req=0x0100 Tag=0x30 Addr=0x1_2360_0100 Len=16</td><td>Fetch SQE slot 4</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.5 µs</td><td>CplD</td><td>Tag=0x30 Status=SC Len=16</td><td>READ, CID 0x0109</td></tr>
+        <tr class="dir-up"><td>4–19</td><td>Dev→Host</td><td>58 µs</td><td>MWr64 ×16</td><td>Addr=0x2_0040_0000… Len=64</td><td>Data delivered</td></tr>
+        <tr class="dir-up"><td>20</td><td>Dev→Host</td><td>59.6 µs</td><td>MWr64</td><td>Addr=0x1_2363_0040 Len=4</td><td>CQE in CQ3 slot 4, status 0, P=1</td></tr>
+        <tr class="abnormal"><td>—</td><td>—</td><td>59.6 µs → 30 s</td><td>(nothing)</td><td>No MWr to 0xFEEx_xxxx from 0x0100; no CQ3 head doorbell</td><td><strong>First abnormal event:</strong> expected MSI-X write for CQ3 is absent</td></tr>
+        <tr class="dir-down"><td>21</td><td>Host→Dev</td><td>30.000 s</td><td>MRd32</td><td>Req=RC Addr=0xFE60_001C Len=1</td><td>Driver timeout handler reads CSTS</td></tr>
+        <tr class="dir-up"><td>22</td><td>Dev→Host</td><td>30.000 s</td><td>CplD</td><td>Data=0x0000_0001</td><td>CSTS.RDY=1, CFS=0: controller healthy</td></tr>
+        <tr class="dir-down"><td>23</td><td>Host→Dev</td><td>30.000 s</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=…</td><td>Admin SQ tail doorbell: Abort (08h) for SQID 3 / CID 0x0109</td></tr>
+        <tr class="dir-up"><td>24</td><td>Dev→Host</td><td>30.000 s</td><td>MWr64</td><td>Addr=0x1_0000_1xx0 Len=4</td><td>Admin CQE for Abort</td></tr>
+        <tr class="dir-up"><td>25</td><td>Dev→Host</td><td>30.000 s</td><td>MWr32</td><td>Addr=0xFEE0_0000 Data=0x0000_0040</td><td>MSI-X vector 0 fires normally</td></tr>
+        <tr class="note"><td colspan="6">The driver now also finds CID 0x0109 completed in CQ3 when it polls it during timeout handling: "completion polled" rather than a real device hang.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The CQE (row 20) is present and well-formed, so the command did not hang; the controller did its NVMe work. The first abnormal event is an <em>absence</em>: no interrupt write after row 20. Row 25 proves the controller can generate MSI-X writes in general (vector 0 works), so the fault is specific to CQ3's vector. Candidates, in order of what to check: (1) CQ3 created with IEN=0 or wrong IV (check the Create I/O CQ command earlier in the capture); (2) MSI-X table entry for that vector has its mask bit set — read the table and the PBA: a set pending bit means the controller wanted to fire; (3) coalescing with a huge TIME and THR not reached — Get Features 08h; (4) controller firmware bug (PBA clear, entry unmasked, IEN=1, still no write). Linux typically reports this pattern with a message saying the completion was found by polling, which is a strong host-side clue.</p>
+  </div>
+  <aside class="callout insight" data-title="Absence is an event"><p>Beginners scan a trace for red packets. Seniors scan for packets that <em>should</em> be there and are not. A missing interrupt, a missing completion, a missing doorbell — write down the expected sequence first, then diff the capture against it.</p></aside>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>All commands below are read-only. Output formats vary by kernel and distribution; any sample output shown here is illustrative, not captured.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Which interrupt mechanism is enabled, and how many vectors?</span>
+sudo lspci -vvv -s 01:00.0 | grep -E 'MSI|INTx|Interrupt'
+<span class="cm"># Look for: "MSI-X: Enable+ Count=33 Masked-" and "MSI: Enable-"</span>
+<span class="cm"># and "DisINTx+" in the Control line (INTx disabled because MSI/MSI-X in use)</span>
+
+<span class="cm"># Per-CPU interrupt counts for every NVMe queue vector</span>
+grep -E 'nvme' /proc/interrupts
+
+<span class="cm"># Linux IRQ numbers allocated to the device's MSI/MSI-X vectors</span>
+ls /sys/bus/pci/devices/0000:01:00.0/msi_irqs/
+
+<span class="cm"># Which CPUs a given IRQ may target / actually targets</span>
+cat /proc/irq/&lt;irq&gt;/smp_affinity_list
+cat /proc/irq/&lt;irq&gt;/effective_affinity_list
+
+<span class="cm"># Current NVMe interrupt coalescing and per-vector configuration</span>
+sudo nvme get-feature /dev/nvme0 -f 0x08 -H
+sudo nvme get-feature /dev/nvme0 -f 0x09 -c 1 -H   <span class="cm"># vector 1</span>
+
+<span class="cm"># Driver parameters that change interrupt behaviour</span>
+cat /sys/module/nvme/parameters/poll_queues
+cat /sys/module/nvme/parameters/write_queues 2&gt;/dev/null</code></pre>
+  <p>An illustrative (synthetic) <code>/proc/interrupts</code> fragment for the lab system with four CPUs:</p>
+  <pre class="code" data-kind="read-only" data-lang="text" data-title="illustrative, not captured"><code>            CPU0       CPU1       CPU2       CPU3
+ 120:         31          0          0          0  IR-PCI-MSIX-0000:01:00.0    0-edge      nvme0q0
+ 121:     184210          0          0          0  IR-PCI-MSIX-0000:01:00.0    1-edge      nvme0q1
+ 122:          0     179554          0          0  IR-PCI-MSIX-0000:01:00.0    2-edge      nvme0q2
+ 123:          0          0     201377          0  IR-PCI-MSIX-0000:01:00.0    3-edge      nvme0q3
+ 124:          0          0          0     190002  IR-PCI-MSIX-0000:01:00.0    4-edge      nvme0q4</code></pre>
+  <p>Reading it: <code>IR-</code> means the interrupt goes through IOMMU interrupt remapping; <code>PCI-MSIX-0000:01:00.0</code> is the device; the number before <code>-edge</code> is the MSI-X table index; <code>nvme0q0</code> is the admin queue. The diagonal pattern shows each queue's vector landing on one CPU.</p>
+  <table>
+    <caption>What Linux output can and cannot prove</caption>
+    <thead><tr><th>Observation</th><th>Proves</th><th>Does not prove</th></tr></thead>
+    <tbody>
+      <tr><td>MSI-X Enable+ in lspci</td><td>Host enabled MSI-X in config space</td><td>That any table entry is valid or unmasked</td></tr>
+      <tr><td>Counter increments on nvme0q3</td><td>Interrupts for that vector reached the CPU</td><td>That they came at the right time or for the right CQ</td></tr>
+      <tr><td>Counter not moving while I/O runs on CPU3</td><td>No interrupts delivered for that vector</td><td>Whether the device didn't send them or the platform dropped them</td></tr>
+      <tr><td>Get Features 08h = 0</td><td>Coalescing disabled (as reported)</td><td>That firmware actually behaves that way</td></tr>
+      <tr><td>poll_queues &gt; 0</td><td>Poll queues were requested</td><td>That any application is using them</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <h3>Driver interrupt handler (conceptual)</h3>
+  <pre class="code" data-kind="pseudocode" data-lang="c"><code>irqreturn nvme_irq(int irq, struct nvme_queue *cq) {
+    bool found = false;
+    while (cqe_phase(cq-&gt;entries[cq-&gt;head]) == cq-&gt;phase) {
+        rmb();                       <span class="cm">/* read CQE body only after phase is seen */</span>
+        complete_request(cq-&gt;entries[cq-&gt;head].cid,
+                         cq-&gt;entries[cq-&gt;head].status);
+        if (++cq-&gt;head == cq-&gt;depth) { cq-&gt;head = 0; cq-&gt;phase ^= 1; }
+        found = true;
+    }
+    if (found)
+        writel(cq-&gt;head, cq-&gt;head_doorbell);   <span class="cm">/* tell controller entries are free */</span>
+    return found ? IRQ_HANDLED : IRQ_NONE;    <span class="cm">/* IRQ_NONE = spurious */</span>
+}</code></pre>
+  <p>Note the handler never asks the device "why did you interrupt?". The CQ itself is the answer.</p>
+
+  <h3>Coalescing simulator</h3>
+  <p>This standard-library Python program simulates THR/TIME coalescing for a stream of completions and reports interrupts per completion and added latency. Run it as written.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="coalesce_sim.py"><code>#!/usr/bin/env python3
+"""Simulate NVMe-style interrupt coalescing (synthetic model, not a device model).
+
+THR is 0's based (0 => 1 entry). TIME is in 100 us units (0 => no delay).
+An interrupt fires when pending >= THR+1, or when the oldest pending
+completion has waited TIME*100 us. Times are in microseconds."""
+import random
+
+def simulate(arrivals_us, thr, time_units):
+    need = thr + 1
+    limit = time_units * 100.0
+    pending, interrupts, added = [], 0, []
+    def fire(t):
+        nonlocal pending, interrupts
+        interrupts += 1
+        added.extend(t - a for a in pending)
+        pending = []
+    for t in arrivals_us:
+        if pending and limit &gt; 0 and t - pending[0] &gt;= limit:
+            fire(pending[0] + limit)          # timer expired before this arrival
+        pending.append(t)
+        if len(pending) &gt;= need or limit == 0:
+            fire(t)
+    if pending:
+        fire(pending[0] + limit if limit else pending[-1])
+    n = len(arrivals_us)
+    return interrupts, interrupts / n, sum(added) / n, max(added)
+
+def stream(rate_per_us, n, seed=1):
+    rnd, t, out = random.Random(seed), 0.0, []
+    for _ in range(n):
+        t += rnd.expovariate(rate_per_us)
+        out.append(t)
+    return out
+
+if __name__ == "__main__":
+    for label, rate in (("light load  10k IOPS", 0.01), ("heavy load 800k IOPS", 0.8)):
+        arr = stream(rate, 20000)
+        print(label)
+        for thr, tm in ((0, 0), (3, 1), (7, 1), (31, 2)):
+            i, per, avg, worst = simulate(arr, thr, tm)
+            print(f"  THR={thr:2d} TIME={tm} -&gt; interrupts={i:6d} "
+                  f"per-cmd={per:5.3f} added avg={avg:7.1f}us worst={worst:6.1f}us")</code></pre>
+  <p>What you should see: under heavy load coalescing cuts interrupts per command several-fold for a few microseconds of added latency; under light load the threshold is rarely reached, so almost every completion waits for the timer and gains tens of microseconds. That is the coalescing trade-off in one table.</p>
+
+  <h3>Mapping NVMe queues to CPUs from /proc/interrupts</h3>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="nvme_irq_map.py"><code>#!/usr/bin/env python3
+"""Summarise which CPU services each NVMe queue vector. Read-only.
+Uses /proc/interrupts if present, otherwise a built-in synthetic sample."""
+import os, re
+
+SAMPLE = """            CPU0       CPU1
+ 120:         31          0  IR-PCI-MSIX-0000:01:00.0    0-edge      nvme0q0
+ 121:     184210          2  IR-PCI-MSIX-0000:01:00.0    1-edge      nvme0q1
+ 122:          0     179554  IR-PCI-MSIX-0000:01:00.0    2-edge      nvme0q2
+"""
+
+def load():
+    if os.path.exists("/proc/interrupts"):
+        with open("/proc/interrupts") as f:
+            return f.read(), "live /proc/interrupts"
+    return SAMPLE, "synthetic sample"
+
+def main():
+    text, src = load()
+    lines = text.splitlines()
+    cpus = lines[0].split()
+    print(f"source: {src}")
+    for line in lines[1:]:
+        m = re.search(r"(nvme\d+q\d+)\s*$", line)
+        if not m:
+            continue
+        parts = line.split()
+        irq = parts[0].rstrip(":")
+        counts = [int(x) for x in parts[1:1 + len(cpus)]]
+        total = sum(counts)
+        top = max(range(len(counts)), key=counts.__getitem__) if counts else 0
+        share = (counts[top] / total * 100) if total else 0.0
+        print(f"{m.group(1):10s} irq {irq:&gt;4s}  total {total:10d}  "
+              f"mostly {cpus[top]} ({share:5.1f}%)")
+
+if __name__ == "__main__":
+    main()</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Scenario (synthetic).</strong> A database team reports that after a platform firmware update, p99 READ latency on the lab SSD jumped from 95 µs to 190 µs at low load, while throughput at high load improved slightly. Nothing else changed in the application.</p>
+  <ol>
+    <li><strong>Frame the question.</strong> Latency doubled at low load but not at high load. That pattern smells like something that waits for a batch: coalescing, or interrupt moderation in the platform.</li>
+    <li><strong>Check NVMe coalescing.</strong> <code>nvme get-feature /dev/nvme0 -f 0x08 -H</code> reports Aggregation Time = 1 (100 µs) and Aggregation Threshold = 7 (8 entries). Previously both were 0. Something now sets the feature at boot (a vendor tool in the new image).</li>
+    <li><strong>Predict.</strong> At low load the threshold of 8 is rarely reached; each completion waits up to 100 µs for the timer. Average added latency ≈ up to 100 µs, p99 near the full 100 µs. 95 + ~95 ≈ 190 µs: matches.</li>
+    <li><strong>Confirm with evidence, not just arithmetic.</strong> In a trace (or with the <code>nvme:nvme_complete_rq</code> tracepoint and IRQ timestamps) the CQE write and the MSI-X write are now separated by up to ~100 µs at low load, but back-to-back at high load.</li>
+    <li><strong>Fix.</strong> Set coalescing back to 0, or keep it and set Coalescing Disable on the vectors that serve latency-sensitive queues using feature 09h. Re-measure both loads.</li>
+    <li><strong>Regression test.</strong> Boot-time check that Get Features 08h matches the platform policy; latency SLO test at queue depth 1.</li>
+  </ol>
+  <aside class="callout derived"><p>The arithmetic in step 3 is a model, not a measurement. The point is that the hypothesis made a quantitative prediction that the trace could then confirm or refute.</p></aside>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>"The interrupt tells the driver which command finished."</strong> It does not. The CQE does (CID + SQ Identifier).</li>
+    <li><strong>Using INTMS/INTMC with MSI-X.</strong> They are defined for pin-based and MSI interrupts only. Under MSI-X, mask through the table's Vector Control bit or the Function Mask.</li>
+    <li><strong>Assuming vector n = queue n.</strong> Linux usually does that; the specification does not require it. Always read IV from the Create I/O CQ command.</li>
+    <li><strong>Reading the coalescing threshold as 1's based.</strong> THR=0 means one entry, THR=7 means eight.</li>
+    <li><strong>Reading TIME as microseconds.</strong> It is in 100 µs units.</li>
+    <li><strong>Forgetting the CQ head doorbell.</strong> If the host never updates the head, the controller eventually sees the CQ as full and stops posting — and, depending on implementation, may stop interrupting or keep re-interrupting.</li>
+    <li><strong>Counting interrupts as completions.</strong> With coalescing or with several CQEs arriving before the handler runs, interrupts &lt; completions. Use completion counts, not IRQ counts, for IOPS.</li>
+    <li><strong>Blaming the SSD for a host-side interrupt loss.</strong> Prove the interrupt write was missing on the link before blaming the device.</li>
+    <li><strong>Setting Relaxed Ordering on everything in device design.</strong> An interrupt write with Relaxed Ordering could pass the CQE write.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>Interrupt failures show up as one of four symptoms. Each has a first question.</p>
+  <table>
+    <caption>Interrupt symptom → first question</caption>
+    <thead><tr><th>Symptom</th><th>First question</th><th>Evidence that answers it</th><th>Most likely layer</th></tr></thead>
+    <tbody>
+      <tr><td>I/O timeout, but CQE present in memory</td><td>Did the interrupt write leave the device?</td><td>Analyzer: MWr to interrupt window after CQE; PBA bit for that vector</td><td>Controller (no write) or host platform (write lost)</td></tr>
+      <tr><td>Interrupt storm (counter racing, CPU 100% in IRQ)</td><td>Is the handler finding work?</td><td>Linux spurious/unhandled IRQ messages; CQ head doorbell writes present?</td><td>INTx level not cleared, or controller re-firing because head not updated</td></tr>
+      <tr><td>All interrupts on one CPU</td><td>How many vectors were allocated?</td><td><code>/proc/interrupts</code>, <code>msi_irqs/</code>, MSI-X Count, Number of Queues feature result</td><td>Host configuration (MSI or INTx fallback, few vectors)</td></tr>
+      <tr><td>High latency at low load only</td><td>Is anything batching completions?</td><td>Get Features 08h/09h; CQE-to-MSI-X gap in trace</td><td>Coalescing policy</td></tr>
+    </tbody>
+  </table>
+  <p>Forward links: <a href="ch43.html">MSI-X</a> shows how to read the table and PBA; <a href="ch47.html">Error Correlation</a> uses "CQE present, interrupt missing" as one of its worked cases; <a href="ch48.html">NVMe Reset</a> covers what the timeout handler does next.</p>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <ul>
+    <li><strong>Every interrupt is a contract between three owners.</strong> The OS owns the table contents and affinity, the device owns the decision to fire, the platform owns delivery. When an interrupt goes missing, get all three to show evidence before anyone claims innocence.</li>
+    <li><strong>Interrupt latency belongs to the host.</strong> The time from the MSI-X write on the link to the CQ head doorbell is host time. Teams routinely send "slow SSD" bugs to the vendor when the trace shows the device finished in 12 µs and the host took 40 µs to notice.</li>
+    <li><strong>Polling is a CPU purchase.</strong> It buys microseconds with whole cores. Use it for the latency tail you can name, not by default.</li>
+    <li><strong>Coalescing is a policy, not a tuning.</strong> It should be set deliberately per workload class, documented, and checked at boot.</li>
+    <li><strong>Interrupt affinity follows CPU hot-plug.</strong> When a CPU goes offline, its vectors must move or its queues must go quiet. Bugs here show up as timeouts that only occur during CPU hot-plug or power-management transitions.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 42 — Who gets told? Mapping NVMe completions to CPUs</h3>
+  <h4>Objective</h4>
+  <p>Determine which interrupt mechanism your NVMe device uses, map each queue's vector to a CPU, and prove experimentally that I/O submitted from a given CPU is completed via that CPU's vector.</p>
+  <h4>Skills</h4>
+  <p>Reading <code>lspci</code> capabilities, <code>/proc/interrupts</code>, IRQ affinity, NVMe Get Features; designing a disambiguating experiment.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Read-only inspection plus reads with fio against a raw device using <code>--readonly</code>. Do not run write workloads against a device holding data. The optional challenge that changes coalescing is a <span class="badge caution">Caution lab</span>: it alters device behaviour until reset; use a test device.</p></aside>
+  <h4>Hardware required</h4>
+  <p>Any Linux machine with an NVMe SSD. A spare test SSD for the challenge.</p>
+  <h4>Software required</h4>
+  <p>pciutils (<code>lspci</code>), nvme-cli, fio, util-linux (<code>taskset</code>), Python 3.</p>
+  <h4>Input</h4>
+  <p>The device's BDF (e.g. 0000:01:00.0) and its block device (e.g. /dev/nvme0n1).</p>
+  <h4>Expected output</h4>
+  <p>A table: queue name → Linux IRQ → MSI-X index → CPU(s) → observed counter delta during a pinned read workload.</p>
+  <h4>Background</h4>
+  <p>Linux allocates one I/O queue pair per CPU (or per CPU group) and assigns MSI-X vectors with managed affinity. The admin queue uses vector 0.</p>
+  <h4>Step 1 — Identify the mechanism</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo lspci -vvv -s 01:00.0 | grep -E 'MSI|DisINTx'</code></pre>
+  <p>Record MSI-X Count and Enable state, MSI Enable state, and whether DisINTx is set.</p>
+  <h4>Step 2 — Snapshot the vector map</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>python3 nvme_irq_map.py
+for i in $(ls /sys/bus/pci/devices/0000:01:00.0/msi_irqs/); do
+  echo "irq $i -&gt; $(cat /proc/irq/$i/effective_affinity_list 2&gt;/dev/null)"
+done</code></pre>
+  <h4>Step 3 — Pinned experiment</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>grep nvme0q /proc/interrupts &gt; before.txt
+sudo taskset -c 2 fio --name=pin --filename=/dev/nvme0n1 --readonly --direct=1 \
+     --rw=randread --bs=4k --iodepth=1 --ioengine=io_uring --runtime=10 --time_based
+grep nvme0q /proc/interrupts &gt; after.txt
+diff before.txt after.txt</code></pre>
+  <h4>Observation</h4>
+  <p>Which vector's counter moved, and in which CPU column? Roughly how many interrupts per completed I/O (fio reports I/O count)?</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Why did only one vector's counter move significantly?</li>
+    <li>If interrupts per I/O is noticeably below 1.0 at iodepth=1, what could explain it?</li>
+    <li>What would you expect if the device were running in MSI mode with a single vector?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>On a test device only: read Feature 08h, set Aggregation Threshold 7 and Time 1, repeat step 3 at iodepth=1 and iodepth=32, and compare interrupt counts and fio latency percentiles. Restore the original value afterwards (or reset the controller).</p>
+  <details class="hint"><summary>Hint</summary><p>Use the coalescing simulator above to predict the result before you measure. If your device ignores the setting, Get Features may still echo it back.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>1. Linux's block layer maps CPU 2 to the hardware queue whose vector is affined to CPU 2, so submissions from CPU 2 go to that SQ and completions arrive on that CQ's vector, delivered to CPU 2. Other CPUs' counters move only from background I/O.</p>
+    <p>2. At iodepth=1 every completion is alone, so without coalescing expect ≈1.0. Below 1.0 suggests coalescing is active, or the I/O was completed by polling (io_uring with IOPOLL, poll queues), or some completions were harvested during another interrupt on a shared vector.</p>
+    <p>3. A single vector would show all I/O completions on one IRQ line and (usually) one CPU, with the driver checking every CQ on each interrupt.</p>
+    <p>Challenge: at iodepth=1 with THR=7, TIME=1, interrupts per I/O stay near 1.0 but latency rises by up to ~100 µs, because the timer, not the threshold, triggers each interrupt. At iodepth=32 interrupts per I/O fall well below 1.0 with little latency change. Restore the feature to its original value.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>Whether vector 0 (admin) shares a CPU with a busy I/O vector; whether the number of I/O vectors is lower than the number of CPUs (meaning queue sharing); whether the IR- prefix is present (interrupt remapping in the path, which adds a failure point); whether effective affinity differs from requested affinity.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>All counters frozen while I/O completes: device using polled queues, or interrupts lost and the driver recovering by polling — check dmesg.</li>
+    <li>Counter moves on the wrong CPU: affinity changed by irqbalance on a non-managed vector, or CPU hot-plug moved it.</li>
+    <li>Only INTx in use: MSI-X disabled by a kernel parameter (<code>pci=nomsi</code>) or a platform quirk.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Repeat with <code>--hipri</code> (io_uring IOPOLL) on a kernel with poll queues configured. Confirm the counter for the polled queue does not move while fio completes I/O.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Draw the CQE write and the MSI-X write on a timeline and explain, using posted-write ordering, why the handler never sees a stale CQE. Then explain what changes if the MSI-X write carried Relaxed Ordering.</li>
+    <li>A controller has 9 MSI-X vectors and the host has 16 CPUs. Propose a mapping of 16 I/O CQs to vectors and describe the extra work the interrupt handler must do.</li>
+    <li>Compute the worst-case coalescing delay for TIME=3. Then explain why the real worst case might be slightly higher or lower in a given implementation.</li>
+    <li>List every place in the system where an interrupt can be masked or blocked, from the controller to the CPU.</li>
+    <li>Write the pseudocode for an INTx handler for an NVMe controller that uses INTMS/INTMC, including the order of mask, drain, doorbell, unmask.</li>
+  </ol>
+  <details class="answer"><summary>Model answers</summary>
+    <p>1. Both are posted MWr from the same function; a posted request without RO may not pass an earlier posted request, so the CQE is visible before the interrupt is. With RO on the MSI-X write, the interrupt could pass the CQE, and the handler might read the old Phase Tag, find nothing, and return IRQ_NONE — with the CQE then sitting unnoticed until another interrupt or a timeout.</p>
+    <p>2. Vector 0 for admin; 8 I/O vectors each shared by two CQs, ideally CQs belonging to sibling CPUs. Each interrupt handler must check both CQs bound to the vector.</p>
+    <p>3. 3 × 100 µs = 300 µs. Timer granularity, when the timer starts, and firmware scheduling can shift the actual delay.</p>
+    <p>4. Controller: IEN=0, coalescing, MSI-X Function Mask, per-vector mask (or INTMS for pin/MSI; Interrupt Disable for INTx); PCIe: MSI-X Enable cleared, Bus Master Enable cleared (no memory writes at all); platform: IOMMU interrupt remapping entry invalid; CPU: interrupts disabled, vector masked in LAPIC/GIC, CPU offline.</p>
+    <p>5. Write INTMS bit 0 (mask); read CQs while phase matches; write CQ head doorbells; write INTMC bit 0 (unmask). If entries arrived during the drain, the controller re-asserts after unmask.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>How is a legacy INTx interrupt signalled on a PCIe link?</p>
+      <ul class="options" data-answer="2"><li>A dedicated sideband wire per slot</li><li>Assert_INTx and Deassert_INTx message TLPs</li><li>A posted Memory Write to 0xFEE0_0000</li><li>A DLLP</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>PCIe emulates the level-triggered pins with in-band message TLPs; there are no interrupt wires in a PCIe link.</p></details></li>
+    <li><p>What is the maximum number of MSI vectors a single function can be granted?</p>
+      <ul class="options" data-answer="3"><li>1</li><li>8</li><li>32</li><li>2048</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>MSI allows 1, 2, 4, 8, 16 or 32. 2048 is the MSI-X limit.</p></details></li>
+    <li><p>Under MSI-X, how should an NVMe driver mask a vector?</p>
+      <ul class="options" data-answer="3"><li>Write INTMS</li><li>Write INTMC</li><li>Set the Vector Control mask bit of that MSI-X table entry</li><li>Clear CC.EN</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>INTMS/INTMC are for pin-based and MSI only; the host must not use them with MSI-X.</p></details></li>
+    <li><p>Interrupt Coalescing is set with THR=3, TIME=2. What does that mean?</p>
+      <ul class="options" data-answer="1"><li>Interrupt after 4 completions or 200 µs, whichever first</li><li>Interrupt after 3 completions or 2 µs</li><li>Interrupt after 3 completions and 200 µs</li><li>Interrupt every 3rd completion only</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>THR is 0's based (3 → 4 entries); TIME is in 100 µs units; either condition triggers.</p></details></li>
+    <li><p>Which interrupt vector does the Admin Completion Queue use?</p>
+      <ul class="options" data-answer="1"><li>Vector 0</li><li>The vector given in Create I/O CQ</li><li>The last vector</li><li>Whatever INTMS selects</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The admin CQ has no create command; it always uses vector 0.</p></details></li>
+    <li><p>Why does the CPU always see the CQE when the MSI-X interrupt arrives?</p>
+      <ul class="options" data-answer="2"><li>The interrupt carries the CQE</li><li>Posted writes from the device without Relaxed Ordering cannot pass earlier posted writes</li><li>The driver reads CSTS first</li><li>The controller waits for a completion TLP</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>PCIe ordering rules keep the CQE write ahead of the interrupt write.</p></details></li>
+    <li><p>Explain why an INTx handler for NVMe is more expensive than an MSI-X handler.</p>
+      <details class="answer"><summary>Model answer</summary><p>The INTx line may be shared, so the handler must determine whether its device interrupted (often an MMIO read, a non-posted round trip); it must check every CQ, because one line serves all queues; the level-triggered line must be deasserted by the device before return; and all work lands on one CPU.</p></details></li>
+    <li><p>A CQ was created with IEN=0. What happens when the controller posts to it, and why would a driver do that?</p>
+      <details class="answer"><summary>Model answer</summary><p>The controller posts CQEs but generates no interrupt. Linux uses this for poll queues: a thread spinning on the CQ harvests completions, avoiding interrupt latency.</p></details></li>
+    <li><p>In a capture you see the CQE write but no interrupt write, yet Linux's counter for that vector increments. What does that tell you?</p>
+      <details class="answer"><summary>Model answer</summary><p>Something is inconsistent: either the capture missed the interrupt (analyzer filter, wrong link, trigger window), or another source is incrementing the counter (shared vector, a different device mapped to that IRQ). Verify the capture covers the right link and filter before drawing conclusions.</p></details></li>
+    <li><p>When does polling beat interrupts, and what does it cost?</p>
+      <details class="answer"><summary>Model answer</summary><p>At low queue depth on fast devices where interrupt delivery and wake-up is a large fraction of total latency. It costs CPU: the polling core spins instead of doing other work or sleeping.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> What is the difference between polling and interrupts?</p><details class="answer"><summary>Model answer</summary><p>Polling: the CPU repeatedly checks for completion, fast reaction, constant CPU cost. Interrupts: the device notifies the CPU, near-zero idle cost, per-event overhead and latency.</p></details></li>
+    <li><p><strong>Beginner:</strong> Name the three PCIe interrupt mechanisms.</p><details class="answer"><summary>Model answer</summary><p>INTx (legacy, emulated via messages), MSI (memory write, up to 32 vectors), MSI-X (memory write, table of up to 2048 vectors).</p></details></li>
+    <li><p><strong>Intermediate:</strong> Why does NVMe benefit from MSI-X more than, say, a SATA AHCI controller?</p><details class="answer"><summary>Model answer</summary><p>AHCI has one command list per port and typically one interrupt; NVMe has many independent queue pairs designed to be per-CPU. MSI-X lets each CQ interrupt its own CPU, keeping the lock-free per-CPU model intact from submission to completion.</p></details></li>
+    <li><p><strong>Intermediate:</strong> What are INTMS and INTMC and when must you not use them?</p><details class="answer"><summary>Model answer</summary><p>NVMe controller registers at 0Ch and 10h that mask/unmask interrupt vectors for pin-based and MSI interrupts. Not to be used when MSI-X is configured.</p></details></li>
+    <li><p><strong>Advanced:</strong> Describe the trade-offs of interrupt coalescing and how NVMe exposes it.</p><details class="answer"><summary>Model answer</summary><p>Fewer interrupts and better CPU efficiency at high load versus added latency at low load. Feature 08h: Aggregation Threshold (0's based count) and Aggregation Time (100 µs units); either triggers. Feature 09h per-vector Coalescing Disable lets latency-sensitive vectors opt out.</p></details></li>
+    <li><p><strong>Advanced:</strong> How could Relaxed Ordering break interrupt delivery semantics?</p><details class="answer"><summary>Model answer</summary><p>If the interrupt write had RO set it could pass the CQE (or data) write, so the handler might see no new CQE; the completion would be stranded until another interrupt or timeout. Devices keep RO off the interrupt write; whether data writes may use RO depends on the CQE write ordering too.</p></details></li>
+    <li><p><strong>Senior:</strong> A customer sees sporadic 30-second NVMe timeouts only during CPU hot-plug tests. Walk through your investigation.</p><details class="answer"><summary>Model answer</summary><p>Hypothesis: interrupts for queues whose CPU went offline are not being re-targeted or queues not quiesced. Evidence: dmesg around hot-plug (timeouts, "completion polled"), /proc/interrupts and effective affinity before/after, analyzer showing MSI-X writes to the old target address, IOMMU interrupt remapping faults. Check driver/kernel version for managed-affinity handling, reproduce with a single CPU offline while I/O is pinned there.</p></details></li>
+    <li><p><strong>Senior:</strong> How would you design a validation plan for a controller's interrupt logic?</p><details class="answer"><summary>Model answer</summary><p>Cover: every vector fires to its table entry; mask/unmask with PBA behaviour; Function Mask; table reprogramming while traffic runs; IEN=0 queues; shared vectors; coalescing thresholds/timers including boundaries (THR=0, TIME=0, max); CD bit; ordering CQE-before-interrupt under load and with RO enabled on data; INTx and MSI modes; behaviour across Controller Level Reset and FLR; error injection (UR on interrupt address). Measure with an analyzer and host counters.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain why each teacher should get their own notes instead of one bell for the whole school.</li>
+    <li><strong>To a junior engineer:</strong> explain the life of one completion from CQE write to CQ head doorbell, naming the interrupt mechanism and who programs it.</li>
+    <li><strong>To a senior engineer:</strong> argue for or against enabling coalescing on a mixed OLTP/analytics server, citing the NVMe feature fields and the evidence you'd collect.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "If one bell rings for everyone, every teacher has to stop and check. If the librarian sends a note to just your teacher, nobody else is disturbed and your teacher can come right away."</p>
+    <p><strong>Junior:</strong> "The controller writes the 16-byte CQE into the CQ with the new Phase Tag, then writes 4 bytes to the address in its MSI-X table entry for that CQ's vector. The OS wrote that entry earlier so the write lands on the CPU owning the queue. The handler reads CQEs until the phase stops matching, completes each by CID, then writes the CQ head doorbell."</p>
+    <p><strong>Senior:</strong> "Coalescing (FID 08h) trades latency for interrupt rate with 100 µs timer granularity, which is huge relative to flash latency. On a mixed server I'd leave it off globally, or enable it only on vectors serving throughput queues and set Coalescing Disable (FID 09h) on latency queues — if the driver maps workloads to queues at all, which Linux generally does not. I'd show interrupt rate and p99 at QD1 and QD32 before and after."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>A device tells the CPU that work is done either by being polled or by interrupting. PCIe offers INTx (virtual wire messages, shared, level-triggered), MSI (a memory write with up to 32 vectors) and MSI-X (a memory write with a per-vector table of up to 2048 entries). NVMe binds each completion queue to an interrupt vector at creation time (IV, IEN), uses vector 0 for the admin CQ, and benefits strongly from MSI-X because each per-CPU CQ can notify its own CPU. Coalescing (Feature 08h, threshold and 100 µs time) reduces interrupt rate at the cost of latency, and can be disabled per vector (Feature 09h). Polling avoids interrupts entirely for latency-critical I/O. INTMS/INTMC exist only for pin-based and MSI modes. The interrupt write is posted and ordered behind the CQE, and in a trace it is the small MWr to the interrupt window right after the CQE.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>explain INTx, MSI and MSI-X and compare them on six properties</li>
+      <li>explain why NVMe's per-CPU queues need MSI-X to stay lock-free end to end</li>
+      <li>decode an Interrupt Coalescing value and predict its effect at low and high load</li>
+      <li>state when INTMS/INTMC may and may not be used</li>
+      <li>find the CQE write and the interrupt write in a trace and explain their ordering</li>
+      <li>map NVMe queues to IRQs and CPUs on a Linux machine</li>
+      <li>split a "timeout with CQE present" failure into device-side vs host-side using one observation</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — MSI Capability, MSI-X Capability, INTx emulation</cite></li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Controller Registers (INTMS/INTMC), Create I/O Completion Queue, Interrupt Coalescing and Interrupt Vector Configuration features</cite></li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4 — Interrupts</cite></li>
+    <li>Linux kernel documentation: "The MSI Driver Guide HOWTO" (PCI/msi-howto), block layer and io_uring documentation for polled I/O; the <code>nvme</code> driver source (<code>drivers/nvme/host/pci.c</code>).</li>
+    <li>Deeper: <a href="dd19.html">Deep-Dive Module: MSI and MSI-X</a>; performance consequences in <a href="performance.html">Performance Engineering</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch43.html">Chapter 43 — MSI-X</a> opens the MSI-X capability, table and Pending Bit Array field by field, and shows the interrupt in a trace.</p>
+</section>

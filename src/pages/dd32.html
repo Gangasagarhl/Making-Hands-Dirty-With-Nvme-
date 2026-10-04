@@ -1,0 +1,668 @@
+<p class="lead">Flush is four packets on the wire and a promise that every layer above and below can quietly break. This module goes past the definition into how a controller implements the promise, how the promise behaves with many queues, many namespaces, resets and virtual machines, how to measure what a Flush really costs, and how to prove with power cuts that a device keeps it.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p><a href="ch34.html">Chapter 34 (FLUSH)</a> taught the Non-Volatile Memory Express (NVMe) Flush command: opcode 00h, no data, scope "writes completed before the Flush was submitted", the Volatile Write Cache (VWC) field and feature, the latency model, and three traces (a normal drain, a slow Flush hurting reads, a rejected broadcast Flush). This module deepens four things: the <em>flush epoch</em> (how a controller decides what a Flush covers when commands arrive on many queues), Flush across <em>resets, timeouts and shutdown</em>, Flush through <em>intermediate layers</em> (block layer, hypervisors, RAID), and <em>validation</em> by power-cut testing with a statistical stopping rule. Every trace here is new; the basics are linked, not repeated.</p>
+  <aside class="callout prereq">
+    <p>Read first: <a href="ch34.html">FLUSH</a> (scope, VWC bits, CC.SHN/CSTS.SHST, cost model), <a href="ch33.html#engineering">WRITE — what completion means for durability</a>, <a href="ch40.html#durability">End-to-End Write — durability</a>, and <a href="dd31.html">Deep dive: WRITE</a>. For the reset path, <a href="ch48.html">NVMe Reset</a>.</p>
+  </aside>
+  <p>Where it goes next: <a href="dd33.html">Deep dive: Dataset Management</a> (deallocation has the same durability questions), <a href="dd41.html">Deep dive: Reset</a> and <a href="dd54.html">Deep dive: Validation Engineering</a>.</p>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives for this module</caption>
+    <thead><tr><th>Level</th><th>Objective</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Given a timeline of writes and one Flush, mark each write as covered, not covered, or "not covered but may be durable anyway", and say why.</td></tr>
+      <tr><td>Intermediate</td><td>Apply the scope rule across several I/O queues and namespaces, including the broadcast Namespace Identifier (NSID) FFFFFFFFh and the VWC bits that govern it.</td></tr>
+      <tr><td>Advanced</td><td>Decompose Flush latency into firmware, data-drain and mapping-metadata parts from measurements, and predict how Flush interacts with concurrent reads and writes.</td></tr>
+      <tr><td>Senior</td><td>Audit a full storage stack (application, filesystem, block layer, virtualisation, RAID, driver, controller) for places a Flush can be dropped, reordered or acknowledged early, and assign ownership.</td></tr>
+      <tr><td>Trace analysis</td><td>Recognise a Flush by its Submission Queue Entry (SQE), tie its completion to the set of earlier completions, and spot a Flush that is lost in a timeout, abort and reset sequence.</td></tr>
+      <tr><td>Debugging</td><td>Work at least six Flush failure patterns from symptom to a disambiguating experiment, including the trace-invisible "Flush that lies".</td></tr>
+      <tr><td>Validation</td><td>Design a power-cut test that can detect a device that acknowledges Flush early, and compute how many cuts give a stated confidence.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>A class is making a giant paper chain. Children add links on four tables at once, and a helper carries finished pieces to the glue station, where they are stuck to the classroom wall for good. Pieces wait on the tables until the helper comes by.</p>
+    <p>Before the bell, the teacher calls: "Helper, glue to the wall every piece that was <em>finished</em> when I called you. Tell me when it's done." The helper writes down which pieces were finished at that moment, on every table, then glues them. Children keep making links meanwhile, and some new ones might get glued too, but the helper's "done!" only promises the pieces on the list.</p>
+    <p>One day a new helper says "done!" instantly, every time. Is she very fast, or is she not gluing at all? You cannot tell by watching her answer. You can only tell by switching off the lights at a random moment and checking the wall.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <aside class="callout breaks">
+    <p><strong>What it represents.</strong> Tables are I/O Submission Queues; finished pieces are completed writes; the helper's list is the flush epoch; gluing is committing data and mapping metadata to non-volatile media; "done!" is the Flush Completion Queue Entry (CQE); switching off the lights is a power-cut test.</p>
+    <p><strong>What it hides.</strong> The helper must also glue the <em>labels</em> that say where each piece hangs: a controller must persist the flash translation layer (FTL) mapping, or flushed data cannot be found after power loss. The story also hides that there may be several helpers (controllers sharing a namespace) and several adults relaying the teacher's call (filesystem, hypervisor, RAID adapter), each of whom can forget to pass it on.</p>
+    <p><strong>Where it becomes misleading.</strong> In the story pieces finished <em>while</em> the teacher was calling are uncertain; in NVMe the cut-off is precise — completion seen before submission of the Flush — but the host only knows completion times as it observed them, so the host must use its own order of events. And "instant done" is not always a lie: a drive with power-loss protection that reports a volatile cache can legitimately answer quickly.</p>
+  </aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Terms for this module (basic Flush terms are in <a href="ch34.html">Chapter 34</a>)</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="flush-epoch">Flush epoch</span></td><td>The list made when the call came</td><td>Implementation's record of which completed writes a Flush must cover (often a sequence number or generation counter)</td><td>Implements the normative scope rule</td><td>Thinking the specification defines epochs (it defines only the scope)</td></tr>
+      <tr><td>Dirty set</td><td>Pieces not yet glued</td><td>Completed write data (and mapping updates) still only in volatile storage</td><td>Size drives Flush latency</td><td>Assuming the host can query it (it cannot)</td></tr>
+      <tr><td>Durability point</td><td>The moment it is safe</td><td>The earliest host-observable event after which data survives power loss: FUA CQE, Flush CQE, or write CQE when no volatile cache</td><td>Distinct from completion</td><td>Equating "completed" with "durable"</td></tr>
+      <tr><td><span class="g" data-term="vwc">VWC</span> bits 2:1</td><td>"Can you flush everything at once?"</td><td>Identify Controller report of Flush with NSID FFFFFFFFh support (since NVMe 1.4)</td><td>Governs broadcast Flush</td><td>Reading 00b as "supported"</td></tr>
+      <tr><td><span class="g" data-term="preflush">Preflush / postflush</span></td><td>Flush before / after</td><td>Linux block-layer flags and sequencing (REQ_PREFLUSH, REQ_FUA, emulated post-flush)</td><td>Map onto NVMe Flush and FUA</td><td>Thinking they are NVMe fields</td></tr>
+      <tr><td>Flush merging</td><td>One call answers many</td><td>The block layer coalescing concurrent flush requests into one device Flush</td><td>Reduces Flush rate</td><td>Counting application fsync() calls as device Flushes</td></tr>
+      <tr><td><span class="g" data-term="abort-cmd">Abort</span></td><td>"Forget that request"</td><td>Admin command (opcode 08h), best-effort cancellation of one command</td><td>Precedes reset in the timeout path</td><td>Assuming an aborted Flush made nothing durable (or everything)</td></tr>
+      <tr><td><span class="g" data-term="cc-shn">CC.SHN</span> / <span class="g" data-term="csts-shst">CSTS.SHST</span></td><td>"We are switching off"</td><td>Shutdown notification and status; normal shutdown commits cached data</td><td>Controller-wide alternative to Flush</td><td>Assuming every power-off path performs it</td></tr>
+      <tr><td><span class="g" data-term="unsafe-shutdowns">Unsafe shutdowns</span></td><td>Lights went out without warning</td><td>SMART / Health Information log counter of power losses without completed shutdown notification</td><td>Evidence in post-mortems</td><td>Reading an increment as proof of data loss</td></tr>
+      <tr><td><span class="g" data-term="plp">Power-loss protection</span></td><td>A battery for the cache</td><td>Hold-up energy that lets firmware commit the cache after external power fails</td><td>Lets a drive report no volatile cache, or make Flush cheap</td><td>Assuming a datasheet claim is tested on every firmware</td></tr>
+      <tr><td>Write barrier (historical)</td><td>"Nothing passes this point"</td><td>An ordering primitive older stacks used; NVMe has none</td><td>Replaced by wait + Flush + wait</td><td>Calling Flush a barrier</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <figure>
+    <pre class="diagram">
+  application ── fsync()/fdatasync()/O_DSYNC
+       │
+  filesystem ── journal commit: REQ_PREFLUSH | REQ_FUA on commit block
+       │
+  block layer flush machinery ── sequences PREFLUSH → data → FUA (or emulated postflush),
+       │                         merges concurrent flushes, drops them if write_cache = "write through"
+  [optional] device-mapper / md RAID / hypervisor virtual disk ── must forward flushes
+       │
+  NVMe driver ── Flush SQE (opc 00h, NSID n) on the submitting CPU's queue
+       │  PCIe: doorbell MWr ↓, SQE MRd/CplD, … CQE MWr ↑, MSI-X ↑
+  controller ── epoch snapshot ─► cache manager drains dirty set ─► FTL persists map deltas
+       │                                                              │
+       └──────────────── CQE only after both ◄────────────────────────┘
+    </pre>
+    <figcaption>The Flush path from application to media. Every arrow is a place the promise can be dropped. Conceptual.</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture of a Flush</caption>
+    <thead><tr><th>Aspect</th><th>Content</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>Flush SQE: opcode 00h, Command Identifier (CID), NSID (a namespace or FFFFFFFFh); nothing else.</td></tr>
+      <tr><td>Outputs</td><td>One CQE (success or error); inside the device, empty dirty set for the epoch and persisted mapping.</td></tr>
+      <tr><td>Actors</td><td>Application, filesystem, block layer, virtualisation layers, NVMe driver, controller command processor, cache manager, FTL, NAND back end, power-loss circuit.</td></tr>
+      <tr><td>State</td><td>Host: which writes have completed (per request); controller: completion sequence numbers, per-namespace dirty lists, FTL journal position.</td></tr>
+      <tr><td>Memory</td><td>Submission Queue (SQ) and Completion Queue (CQ) rings in host DRAM; controller DRAM cache and mapping tables; NAND.</td></tr>
+      <tr><td>Registers</td><td>SQ tail and CQ head doorbells; CC (shutdown notification), CSTS (shutdown status); no Flush-specific register.</td></tr>
+      <tr><td>Interfaces</td><td>Queue interface for the command; Admin Identify (VWC), Get/Set Features 06h (Volatile Write Cache Enable), Get Log Page (SMART) for evidence.</td></tr>
+      <tr><td>Dependencies</td><td>Writes it must cover must have completed before submission; every intermediate layer must forward it; the controller's report of its cache must be honest.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p>A database calls <code>fdatasync()</code> after two writes on CPU 2 (I/O queue pair 2), while another process writes on queue pair 1.</p>
+  <ol>
+    <li><strong>Writes complete.</strong> Who: controller. What: CQEs for CIDs 0x0101 and 0x0102 posted to CQ2. Where: host memory at CQ2 base 0x1_2343_0000. Evidence: CQE Memory Writes (MWr) and <code>nvme_complete_rq</code>.</li>
+    <li><strong>Host decides a flush is needed.</strong> Who: filesystem and block layer. What: a flush request is created only if the queue's <code>write_cache</code> is "write back"; concurrent flush requests may be merged. Where: kernel memory. Evidence: block tracepoints with the flush flag.</li>
+    <li><strong>Driver submits Flush.</strong> Who: NVMe driver on CPU 2. What: SQE with opcode 00h, NSID 1, CID 0x0300 in SQ2; tail doorbell. Where: SQ2 ring 0x1_2342_0000, doorbell BAR0 + 0x1010. Evidence: <code>nvme_setup_cmd</code> with <code>nvme_cmd_flush</code>; MWr32 to 0xFE60_1010.</li>
+    <li><strong>Controller fetches and snapshots.</strong> Who: command processor. What: records the epoch — every write it had completed (for that namespace, from any queue) when it fetched the Flush; the epoch is at least the host-visible set because the host saw those completions before submitting. Where: controller SRAM. Evidence: SQE fetch only; the snapshot is invisible.</li>
+    <li><strong>Drain.</strong> Who: cache manager and NAND back end. What: dirty buffers in the epoch are programmed, possibly padding partial program units. Where: NAND. Evidence: none on PCIe; concurrent reads may slow.</li>
+    <li><strong>Persist mapping.</strong> Who: FTL. What: map deltas or journal entries for the drained data are made non-volatile. Where: NAND metadata area. Evidence: none; dominates latency on some designs.</li>
+    <li><strong>Complete.</strong> Who: completion engine. What: CQE with status 0 for CID 0x0300, then Message Signaled Interrupts – Extended (MSI-X). Where: CQ2. Evidence: CQE MWr, MSI-X MWr32.</li>
+    <li><strong>Dependent work.</strong> Who: filesystem or database. What: only now submits the commit record (often with FUA). Where: SQ. Evidence: the commit write's SQE appears after the Flush CQE.</li>
+  </ol>
+  <figure>
+    <ol class="seq" data-actors="Database / FS|NVMe driver|Controller|Cache + FTL|NAND">
+      <li data-from="Controller" data-to="NVMe driver" class="dashed">CQEs: writes 0x0101, 0x0102</li>
+      <li data-from="Database / FS" data-to="NVMe driver">fdatasync → flush request</li>
+      <li data-from="NVMe driver" data-to="Controller" data-t="0 µs">doorbell SQ2; Flush CID 0x0300</li>
+      <li data-from="Controller" data-to="NVMe driver" data-t="0.7 µs">MRd SQE / CplD</li>
+      <li data-from="Controller" data-to="Cache + FTL">snapshot epoch E</li>
+      <li data-from="Cache + FTL" data-to="NAND">program dirty data of E</li>
+      <li data-from="Cache + FTL" data-to="NAND">persist map deltas</li>
+      <li data-from="NAND" data-to="Cache + FTL" class="dashed">programs done</li>
+      <li data-from="Controller" data-to="NVMe driver" data-t="640 µs">CQE 0x0300 success + MSI-X</li>
+      <li data-from="NVMe driver" data-to="Database / FS" class="dashed">fdatasync returns</li>
+      <li data-from="Database / FS" data-to="NVMe driver">now: commit record (FUA)</li>
+    </ol>
+    <figcaption>Flush as a fence over the past, with the epoch snapshot made visible. Synthetic example for teaching.</figcaption>
+  </figure>
+  <h3>The central concept on the ladder: the flush epoch</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>The helper writes down every finished piece on every table at the moment the teacher calls, glues those, then says "done".</p></div>
+    <div class="rung" data-rung="B"><p>A Flush covers all writes to its namespace that completed before it was submitted, regardless of which queue they used. The controller implements this with an internal snapshot of its completions.</p></div>
+    <div class="rung" data-rung="C"><p>A completion sequence counter per namespace (or per controller), dirty-buffer lists tagged with sequence numbers, and an FTL journal pointer. The Flush waits until every buffer tagged at or below the snapshot is on NAND and the journal entries covering them are persisted.</p></div>
+    <div class="rung" data-rung="D"><p><cite class="spec">NVM Express Base Specification, Revision 2.4 — Flush command</cite> defines the scope by completion; Identify Controller VWC reports presence and broadcast support; the Volatile Write Cache feature (06h) enables the cache. The epoch is an implementation device, not a specification term <span class="badge impl">Implementation-dependent</span>.</p></div>
+    <div class="rung" data-rung="E"><p>Doorbell MWr, SQE Memory Read (MRd) and Completion with Data (CplD), silence for this command, CQE MWr, MSI-X. No data packets ever.</p></div>
+    <div class="rung" data-rung="F"><p>Mark every write CQE before the Flush doorbell: those are covered. Writes whose CQE comes after the Flush doorbell are outside the guarantee, even if they complete before the Flush CQE.</p></div>
+    <div class="rung" data-rung="G"><p>Data lost "despite fsync": prove the lost write's CQE precedes the Flush submission, the Flush CQE was success, and every layer forwarded it; if all hold, power-cut test the device.</p></div>
+  </div>
+  <p>The sixteen questions for Flush are answered in <a href="ch34.html#engineering">Chapter 34</a>; this module extends answers 10–16 for multi-queue, reset and layered stacks.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <p>Applicable documents (course baseline): <cite class="spec">NVM Express Base Specification, Revision 2.4 — Flush command; Identify Controller data structure (VWC); Volatile Write Cache feature; Controller Configuration and Controller Status (shutdown); SMART / Health Information log</cite>, <cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3 — Write (FUA)</cite>, and <cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite> for queues and doorbells.</p>
+  <table>
+    <caption>Classifying Flush behaviour</caption>
+    <thead><tr><th>Behaviour</th><th>Class</th></tr></thead>
+    <tbody>
+      <tr><td>Flush commits data and metadata of writes completed before its submission for the namespace; completes successfully with no effect when no volatile cache is present</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>NSID FFFFFFFFh applies to all attached namespaces when VWC bits 2:1 = 11b; host must not rely on it otherwise</td><td><span class="badge normative">Normative</span> <span class="badge version">Version-dependent</span> (bits added in 1.4)</td></tr>
+      <tr><td>Normal shutdown (CC.SHN = 01b) completes with CSTS.SHST = 10b after the controller has finished shutdown processing</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>Volatile Write Cache feature support for saving across power cycles</td><td><span class="badge optional">Optional</span>, reported in feature capabilities</td></tr>
+      <tr><td>Flushing more than required (other namespaces, later writes)</td><td>Permitted; host may not rely on it</td></tr>
+      <tr><td>Epoch implementation, drain priority, effect on concurrent I/O, latency, behaviour if reset or power fails mid-Flush</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+      <tr><td>Treatment of an outstanding Flush when the controller is reset (it is aborted like any command; what it had already made durable stays durable)</td><td><span class="badge derived">Derived</span> from reset rules — confirm in the reset sections</td></tr>
+      <tr><td>Linux flush sequencing, merging, timeouts, shutdown timeout derived from RTD3 Entry Latency (RTD3E)</td><td><span class="badge impl">Implementation-dependent</span> <span class="badge version">Version-dependent</span> (kernel)</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout notsaid">
+    <p>The specification does not define: any upper bound on Flush latency; any event telling the host that cached data has reached media without a Flush; an ordering barrier; whether a Flush submitted through one controller covers writes completed through another controller of the same subsystem (confirm the wording; do not assume — <span class="badge uncertain">Uncertain</span>); or what a power failure during a Flush leaves behind beyond the atomicity rules. Check in the specification: the exact Flush scope sentence for your revision; the status returned for an unsupported broadcast NSID; the Abort completion's indication of whether the command was aborted.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume: that a fast Flush is a fake Flush; that a slow Flush is a broken drive; that an aborted or timed-out Flush made anything durable; that the guest operating system's Flush reached the physical drive; or that VWC = 0 on one firmware revision stays 0 after an update.</p>
+  </aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Hardware in a Flush</caption>
+    <thead><tr><th>Category</th><th>Components</th></tr></thead>
+    <tbody>
+      <tr><td>Must participate</td><td>CPU (SQE and doorbell), host DRAM (queues), PCIe link and controller front end (fetch and CQE), completion engine and MSI-X; if a volatile cache holds dirty data: cache DRAM/SRAM, NAND channels and dies, FTL metadata storage</td></tr>
+      <tr><td>May participate</td><td>Power-loss protection capacitors (to make Flush cheap or unnecessary); host RAID adapters with their own battery- or flash-backed caches; hypervisor storage back ends; switches between host and drive</td></tr>
+      <tr><td>Observable</td><td>The four Flush packets; their timing relative to other commands; read latency on other queues during the drain; VWC and feature state; unsafe-shutdown counter; temperature and throttling logs</td></tr>
+      <tr><td>Internal, generally unobservable</td><td>Epoch boundaries, dirty-set size, drain order, padding of partial program units, map-journal commits, capacitor health</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw" data-title="Why a tiny Flush can still be slow">
+    <p>Making one 4 KiB write durable may require programming a whole multi-plane, multi-page unit (padding the rest) <em>and</em> committing a mapping-journal page. A DRAM-less design whose map lives partly in the Host Memory Buffer must also make that map change durable on NAND. The cost of a Flush therefore has a large fixed part whenever the dirty set is non-empty, and a near-zero cost only when it is empty <span class="badge derived">Derived</span>.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>Protocol elements around a Flush</caption>
+    <thead><tr><th>Element</th><th>Request / response</th><th>Ordering</th><th>Errors</th></tr></thead>
+    <tbody>
+      <tr><td>Flush SQE (opcode 00h)</td><td>One CQE</td><td>None with other commands; scope defined by completions seen before submission</td><td>Invalid Namespace or Format (bad or unsupported NSID — confirm status), Internal Error, Namespace Not Ready, aborted by Abort or reset</td></tr>
+      <tr><td>Write with FUA</td><td>One CQE</td><td>Independent of Flush</td><td>As for Write</td></tr>
+      <tr><td>Abort (Admin 08h) of a Flush</td><td>One CQE on Admin CQ; result says whether the target was aborted</td><td>Best-effort</td><td>Abort Command Limit Exceeded and similar</td></tr>
+      <tr><td>Controller reset (CC.EN 1→0)</td><td>Host polls CSTS.RDY = 0</td><td>All outstanding commands, including Flush, are lost without CQE</td><td>Durability of the epoch unknown to host</td></tr>
+      <tr><td>Shutdown (CC.SHN = 01b)</td><td>Host polls CSTS.SHST = 10b</td><td>After outstanding I/O is quiesced</td><td>Timeout → host may cut power anyway (unsafe shutdown)</td></tr>
+    </tbody>
+  </table>
+  <h3>Completion semantics of a failed or lost Flush</h3>
+  <p>A Flush that returns an error, is aborted, or vanishes in a reset gives the host <em>no</em> durability information about its epoch. Some of the data may already be on media (the controller drains continuously), some may not. The only safe host action is to treat the epoch as not durable and re-establish durability: after recovery, issue a new Flush (which covers everything completed before it, including the old epoch, if the data is still in the device) and only then report success upward. If a reset happened with power still applied, the data is usually still in the device; if power was lost, recovery has to rely on the atomicity and journal mechanisms of the filesystem.</p>
+  <aside class="callout proto" data-title="The scope rule is about the host's observations">
+    <p>"Completed before the Flush was submitted" is evaluated from the host's point of view. If the host has <em>seen</em> a CQE before ringing the Flush doorbell, the write is covered. A write whose CQE was already posted in memory but not yet read by the host is also covered (it completed first), but the host cannot <em>know</em> it is covered, so correct software only counts completions it has consumed <span class="badge derived">Derived</span>.</p>
+  </aside>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Four synthetic traces from the lab system: Gen4 x4; namespace 1; I/O queue pair 1 (SQ1 doorbell 0xFE60_1008, CQ1 0x1_2341_0000) and pair 2 (SQ2 0x1_2342_0000, doorbell 0xFE60_1010; CQ2 0x1_2343_0000, head doorbell 0xFE60_1014); Admin SQ 0x1_0000_0000 (doorbell 0xFE60_1000), Admin CQ 0x1_0000_1000. Times are illustrative; abbreviations as in <a href="ch34.html#trace">Chapter 34</a>.</p>
+
+  <h3>Normal: Flush scope across two queues</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M32-N — fdatasync on queue 2 while another process writes on queue 1">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_1010 Data=0x00000012</td><td>SQ2: Writes CID 0x0101 (slot 0x10), 0x0102 (slot 0x11), 4 KiB each</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>2.1</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000081</td><td>SQ1: other process, 128 KiB Write CID 0x0480</td></tr>
+        <tr class="note"><td colspan="6">SQE fetches and data pulls for all three writes (not shown).</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>9.8</td><td>MWr64</td><td>Addr=0x1_2343_0100 CID=0x0101 SC=00h</td><td>CQ2 slot 0x10</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>10.4</td><td>MWr64</td><td>Addr=0x1_2343_0110 CID=0x0102 SC=00h</td><td>CQ2 slot 0x11; MSI-X vector 2 follows</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>14.0</td><td>MWr32</td><td>Addr=0xFE60_1010 Data=0x00000013</td><td>SQ2: Flush CID 0x0300 (slot 0x12) — epoch boundary as the host sees it</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>14.7</td><td>MRd64</td><td>Addr=0x1_2342_0480 Len=16 Tag=0x22</td><td>Flush SQE fetch (0x12 × 64 = 0x480)</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>15.3</td><td>CplD</td><td>BC=64 SC</td><td>opc 00h, NSID 1, all other Dwords zero</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>31.5</td><td>MWr64</td><td>Addr=0x1_2341_0800 CID=0x0480 SC=00h</td><td>CQ1: the 128 KiB write completes <em>after</em> the Flush was submitted</td></tr>
+        <tr class="dir-up"><td>9</td><td>Dev→Host</td><td>640.2</td><td>MWr64</td><td>Addr=0x1_2343_0120 CID=0x0300 SC=00h SQHD=0x13</td><td>Flush success</td></tr>
+        <tr class="dir-up"><td>10</td><td>Dev→Host</td><td>640.4</td><td>MWr32</td><td>Addr=0xFEE0_2000 Data=0x00000042</td><td>MSI-X vector 2</td></tr>
+        <tr class="dir-down"><td>11</td><td>Host→Dev</td><td>646.0</td><td>MWr32</td><td>Addr=0xFE60_1010 Data=0x00000014</td><td>SQ2: commit record, Write with FUA, CID 0x0103</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Covered by Flush 0x0300: writes 0x0101 and 0x0102 (CQEs at rows 3–4, before the doorbell at row 5). Not covered: CID 0x0480, which completed at row 8, after the Flush was submitted, even though it completed long before the Flush did. It may well be durable by row 9, but nobody may rely on that; its owner needs its own Flush. The fact that 0x0480 used another queue is irrelevant: scope is per namespace, not per queue. The host's ordering is correct: the commit record (row 11) is submitted after the Flush CQE. The 625 µs drain is consistent with ≈1 MiB of dirty data on this synthetic drive (compare Trace 34-A).</p>
+  </div>
+
+  <h3>Slow: a small dirty set with a large fixed cost</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M32-S — three fsync cycles of one 4 KiB write each, client drive">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ms)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0.000</td><td>MWr64</td><td>CQ1 CQE CID=0x0510 SC=00h</td><td>4 KiB write complete (cached, 12 µs)</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>0.004</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000091</td><td>Flush CID 0x0511</td></tr>
+        <tr class="abnormal"><td>3</td><td>Dev→Host</td><td>2.081</td><td>MWr64</td><td>CQ1 CQE CID=0x0511 SC=00h</td><td>First abnormal event: 2.08 ms for a dirty set of one 4 KiB block</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>2.090</td><td>MWr32</td><td>SQ1 doorbell</td><td>Next 4 KiB write CID 0x0512</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>2.102</td><td>MWr64</td><td>CQE CID=0x0512 SC=00h</td><td></td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>4.212</td><td>MWr64</td><td>CQE CID=0x0513 (Flush) SC=00h</td><td>Again 2.11 ms</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>4.250</td><td>MWr64</td><td>CQE CID=0x0514 (Flush, no write since last Flush) SC=00h</td><td>Only 35 µs: empty dirty set</td></tr>
+        <tr class="note"><td colspan="6">Earlier in the same capture: a Flush after 256 × 4 KiB (1 MiB) dirty took 2.6 ms, barely more than after one block.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Fit the Chapter 34 model T<sub>flush</sub> ≈ T<sub>fw</sub> + D<sub>dirty</sub>/R<sub>prog</sub> + T<sub>meta</sub> to the three points: empty set 35 µs (T<sub>fw</sub>); 4 KiB 2.08 ms; 1 MiB 2.6 ms. The slope is ≈0.5 ms per MiB (≈2 GB/s program rate), so the 2 ms intercept for any non-empty set is fixed cost: padding a program unit and committing mapping metadata. The application's "one write, one fsync" pattern pays that fixed cost per transaction, capping it near 480 commits per second. No protocol fault exists. The engineering answer is batching (group commit), or a drive with power-loss protection on which Flush has nothing to do. Disambiguating experiment: plot Flush latency against dirty bytes for 0, 1, 4, 64 and 1024 blocks; a large intercept with a shallow slope confirms the fixed-cost model.</p>
+  </div>
+
+  <h3>Failed: a Flush lost in a timeout, abort and reset</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M32-F — Flush CID 0x0620 never completes">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 s</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x000000A1</td><td>Flush CID 0x0620 in SQ1 slot 0xA0</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.7 µs</td><td>MRd64</td><td>Addr=0x1_2340_2800 Len=16 Tag=0x31</td><td>SQE fetched: the controller knows about the Flush</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.3 µs</td><td>CplD</td><td>BC=64 SC</td><td>opc 00h NSID 1</td></tr>
+        <tr class="abnormal"><td>4</td><td>—</td><td>10 ms → 30 s</td><td>(none)</td><td>No CQE for 0x0620; other commands on SQ1 and SQ2 complete normally for 12 s, then all completions stop</td><td>First abnormal event: Flush outstanding far beyond any drain time</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>30.0 s</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x00000006</td><td>Admin SQ tail: Abort (08h) for SQID 1, CID 0x0620 in slot 5</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>30.0 s + 0.7 µs</td><td>MRd64</td><td>Addr=0x1_0000_0140 Len=16</td><td>Abort SQE fetched</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>30.0 s + 9 µs</td><td>MWr64</td><td>Addr=0x1_0000_1050 SC=00h DW0 bit 0 = 1</td><td>Abort completes: target <em>not</em> aborted (bit meaning: confirm)</td></tr>
+        <tr class="dir-down"><td>8</td><td>Host→Dev</td><td>60.0 s</td><td>MWr32</td><td>Addr=0xFE60_0014 Data=0x00460060</td><td>Second timeout: CC.EN cleared (CC 0x0046_0061 → 0x0046_0060), controller reset</td></tr>
+        <tr class="dir-down"><td>9</td><td>Host→Dev</td><td>60.0 s + …</td><td>MRd32</td><td>Addr=0xFE60_001C</td><td>Driver polls CSTS until RDY = 0</td></tr>
+        <tr class="note"><td colspan="6">Re-initialisation follows (AQA, ASQ, ACQ, CC.EN = 1, Identify, queue creation). The Flush CID 0x0620 is completed to the block layer with an error by the driver, not by the device.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The device accepted the Flush (rows 2–3), so this is not a lost doorbell. Other commands kept completing for 12 s, so the front end was alive; then everything stopped, which suggests the back end (drain or metadata commit) wedged and eventually blocked the whole controller. The Abort is best-effort and was refused, the normal outcome for a command already deep in execution. After reset, the host knows nothing about the epoch: it must treat all data the Flush was meant to protect as not durable, and after re-initialisation issue a new Flush before acknowledging anything to the filesystem. Evidence to collect: the kernel log's timeout and reset lines naming the queue and command, the SMART log (critical warning, temperature, media errors), the Error Information log after recovery, and a vendor telemetry log if supported. The root cause is inside the device (firmware hang in the drain path) unless the capture shows the controller waiting on the host (for example, DRAM-less drive's Host Memory Buffer reads failing). Linux's exact timeout and abort sequence varies by kernel version <span class="badge version">Version-dependent</span>.</p>
+  </div>
+
+  <h3>Ambiguous: a Flush that is too fast</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M32-A — 64 MiB dirty, Flush completes in 9 µs, VWC bit 0 = 1">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Before row 1: 512 Writes of 128 KiB (64 MiB) completed in 9.6 ms at ≈7 GB/s. Identify Controller: VWC = 07h (cache present; broadcast Flush supported). Feature 06h: cache enabled.</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000201</td><td>Flush CID 0x0700, NSID FFFFFFFFh</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.7</td><td>MRd64</td><td>Addr=0x1_2340_8000 Len=16</td><td>SQE fetch</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.3</td><td>CplD</td><td>BC=64 SC</td><td>opc 00h NSID FFFFFFFFh</td></tr>
+        <tr class="abnormal"><td>4</td><td>Dev→Host</td><td>9.1</td><td>MWr64</td><td>CQE CID=0x0700 SC=00h</td><td>First abnormal event (suspicious, not proven wrong): success after 8 µs</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Three explanations fit every packet. (1) <em>Power-loss-protected cache</em>: the drive reports a volatile cache but its capacitors guarantee the cache, so firmware treats Flush as nearly free. Legal. (2) <em>Already drained</em>: 64 MiB written at 7 GB/s in 9.6 ms would need a program rate the drive probably lacks, but a large SLC-mode region might absorb it; then little is dirty. Plausible on some drives. (3) <em>Dishonest Flush</em>: firmware acknowledges without committing. A protocol trace cannot separate them. Evidence that can: the product's power-loss-protection documentation; Flush latency versus dirty size (honest drives without protection show a slope); and above all a power-cut test (Labs). Confidence in any conclusion from this trace alone: low. Record it as "requires power-cut validation", not as a bug.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Commands are read-only unless noted. Formats vary across nvme-cli and kernel versions; no output is reproduced here.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># What the controller claims: VWC (bit 0 cache present; bits 2:1 broadcast Flush support)</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -iA4 '^vwc'
+
+<span class="cm"># Volatile Write Cache feature (06h): current, default, saved value, and capabilities</span>
+for sel in 0 1 2 3; do sudo nvme get-feature /dev/nvme0 -f 0x06 -s $sel -H; done
+
+<span class="cm"># What the block layer will do with flushes and FUA for this device</span>
+cat /sys/block/nvme0n1/queue/write_cache /sys/block/nvme0n1/queue/fua
+
+<span class="cm"># Shutdown evidence and timing inputs</span>
+sudo nvme smart-log /dev/nvme0 | grep -iE 'unsafe_shutdowns|power_cycles|critical_warning'
+sudo nvme id-ctrl /dev/nvme0 | grep -iE '^rtd3e'
+cat /sys/module/nvme_core/parameters/shutdown_timeout /sys/module/nvme_core/parameters/io_timeout
+
+<span class="cm"># Watch flushes at the driver boundary (enabling tracepoints changes kernel state; disable after)</span>
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_setup_cmd/enable'
+sudo grep -m 20 nvme_cmd_flush /sys/kernel/tracing/trace_pipe
+sudo sh -c 'echo 0 &gt; /sys/kernel/tracing/events/nvme/nvme_setup_cmd/enable'
+
+<span class="cm"># Block-layer view: flush and FUA flags appear in the RWBS column (F = flush/FUA, version-dependent)</span>
+sudo blktrace -d /dev/nvme0n1 -o - | blkparse -i - | grep -m 20 ' F'
+
+<span class="cm"># Timeout / abort / reset history for the controller</span>
+sudo dmesg -T | grep -iE 'nvme0.*(timeout|abort|reset|shutdown)'</code></pre>
+  <table>
+    <caption>What each output proves</caption>
+    <thead><tr><th>Output</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>VWC and feature 06h with select values</td><td>The claimed cache, its current/default/saved state, whether saving is supported</td><td>Honesty of the claim; power-loss protection</td></tr>
+      <tr><td><code>write_cache</code>, <code>fua</code></td><td>Whether the kernel sends flushes and FUA</td><td>That the device honours them; what layers below a virtual disk do</td></tr>
+      <tr><td>Flush tracepoints and blktrace</td><td>When flushes were issued and whether merges happened</td><td>What the device did; anything after a hypervisor boundary</td></tr>
+      <tr><td>Unsafe shutdowns, power cycles</td><td>How often power was removed without completed shutdown</td><td>Whether data was lost</td></tr>
+      <tr><td>RTD3E, <code>shutdown_timeout</code></td><td>How long the host is prepared to wait for shutdown processing</td><td>That the platform's power sequencing waits that long</td></tr>
+      <tr><td>Timeout/reset log lines</td><td>That a command (which queue, which tag) timed out and recovery ran</td><td>Whether the Flush's epoch reached media</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout warn">
+    <p><code>nvme flush /dev/nvme0n1</code> is non-destructive and safe to run. Changing feature 06h with <code>nvme set-feature</code>, or writing <code>write through</code> to <code>queue/write_cache</code>, changes durability behaviour and belongs on a test machine (<span class="badge caution">Caution lab</span>); the second one in particular stops the kernel from flushing a drive that still caches.</p>
+  </aside>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+
+  <h3>Beginner lab — covered or not covered?</h3>
+  <p><span class="badge safe">Safe lab</span> Paper exercise.</p>
+  <dl>
+    <dt>Objective</dt><dd>Apply the scope rule precisely to a timeline.</dd>
+    <dt>Prerequisites</dt><dd><a href="ch34.html#beginner">Chapter 34, Beginner explanation</a>.</dd>
+    <dt>Setup</dt><dd>Host events on namespace 1 (times in µs): W1 submitted 0, completed 9; W2 submitted 2, completed 30; Flush F submitted 20, completed 700; W3 submitted 25, completed 40; W4 (namespace 2) submitted 5, completed 12; W5 submitted 710, completed 720.</dd>
+    <dt>Procedure</dt><dd>Classify W1–W5 relative to F as covered, not covered, or out of scope.</dd>
+    <dt>Observations</dt><dd>Note which writes completed between F's submission and F's completion.</dd>
+    <dt>Questions</dt><dd>(1) Which writes may the host treat as durable at t = 700? (2) Would NSID FFFFFFFFh change the answer for W4? (3) What must the host do to make W2 durable?</dd>
+    <dt>Expected reasoning</dt><dd>Only completion-before-submission counts; namespace scope; later Flush for the rest.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>W1 covered (completed 9 &lt; 20). W2 not covered (completed 30 &gt; 20), although it completed before F did. W3 not covered (submitted after F). W4 out of scope (namespace 2) for a namespace-1 Flush; with NSID FFFFFFFFh on a controller whose VWC bits 2:1 = 11b it would be covered (completed 12 &lt; 20). W5 is after F entirely. (1) Only W1. (3) Issue another Flush after consuming W2's completion; it will also cover W3 and W5 if their completions were seen first.</p>
+  </details>
+  <p><strong>Extension.</strong> Redo the exercise assuming the host <em>polls</em> completions only every 15 µs: which classifications change, and why does correct software count only consumed completions?</p>
+
+  <h3>Intermediate lab — a flush-scope and ordering checker</h3>
+  <p><span class="badge safe">Safe lab</span> Python 3, standard library.</p>
+  <dl>
+    <dt>Objective</dt><dd>Turn the scope rule into code and use it to find host ordering bugs in event logs (for example, extracted from <code>nvme_setup_cmd</code>/<code>nvme_complete_rq</code> tracepoints).</dd>
+    <dt>Prerequisites</dt><dd>Beginner lab.</dd>
+    <dt>Setup</dt><dd>Save as <code>flush_scope.py</code>.</dd>
+  </dl>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="flush_scope.py"><code>#!/usr/bin/env python3
+"""flush_scope.py - which writes does each Flush actually protect?
+
+Synthetic teaching model (standard library only). Input is a host-side event log of
+submissions (S) and completions (C) across queues, in time order, for one namespace.
+A Flush covers exactly the writes whose completion was seen BEFORE the Flush was submitted.
+The checker also flags dependent writes submitted before the Flush they depend on completed.
+"""
+LOG = [  # (time_us, event, queue, cid, kind, note)
+    (0,   "S", 2, 0x0101, "write", ""),
+    (3,   "S", 3, 0x0102, "write", ""),
+    (11,  "C", 2, 0x0101, "write", ""),
+    (12,  "S", 1, 0x0300, "flush", ""),
+    (14,  "C", 3, 0x0102, "write", ""),
+    (15,  "S", 4, 0x0103, "write", "commit"),     # depends on flush 0x0300 - submitted too early!
+    (19,  "C", 4, 0x0103, "write", "commit"),
+    (640, "C", 1, 0x0300, "flush", ""),
+    (641, "S", 1, 0x0301, "flush", ""),
+    (900, "C", 1, 0x0301, "flush", ""),
+]
+
+def analyse(log):
+    completed, inflight_flush, results = set(), {}, []
+    for t, ev, q, cid, kind, note in log:
+        key = (q, cid)
+        if ev == "S" and kind == "flush":
+            inflight_flush[key] = (t, set(completed))
+        elif ev == "S" and note == "commit" and inflight_flush:
+            results.append(f"t={t:&gt;4} us: commit write q{q}/0x{cid:04X} submitted while "
+                           f"{len(inflight_flush)} flush(es) still outstanding -&gt; ordering bug")
+        elif ev == "C" and kind == "flush":
+            t0, covered = inflight_flush.pop(key)
+            names = ", ".join(f"q{a}/0x{b:04X}" for a, b in sorted(covered)) or "nothing"
+            results.append(f"t={t:&gt;4} us: flush q{q}/0x{cid:04X} (submitted t={t0}) guarantees: {names}")
+        elif ev == "C":
+            completed.add(key)
+    return results
+
+if __name__ == "__main__":
+    for line in analyse(LOG):
+        print(line)</code></pre>
+  <dl>
+    <dt>Procedure</dt><dd>(1) Run it and read the three lines it prints. (2) Fix the log so the commit write is correct (move it after t = 640) and rerun. (3) Encode Trace M32-N as a log and confirm the checker says 0x0480 is not covered by 0x0300.</dd>
+    <dt>Observations</dt><dd>Why is write 0x0102 not guaranteed by the first Flush?</dd>
+    <dt>Questions</dt><dd>(a) The commit write in the original log is on a different queue from the Flush. Does that matter? (b) Why does the second Flush guarantee everything?</dd>
+    <dt>Expected reasoning</dt><dd>Queues are irrelevant to scope and to ordering; only completion and submission times matter.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>Output: an ordering bug at t = 15 (commit submitted while Flush 0x0300 is outstanding); Flush 0x0300 guarantees only q2/0x0101; Flush 0x0301 guarantees all three writes. 0x0102 completed at 14, after the Flush was submitted at 12. (a) No; the commit could become durable before 0x0101/0x0102 regardless of queue. (b) Its submission (641) follows all three completions. After step (2), the ordering-bug line disappears. For step (3) the output lists 0x0101 and 0x0102 for 0x0300, and 0x0480 appears in no guarantee.</p>
+  </details>
+  <p><strong>Extension.</strong> Add namespace IDs and a broadcast Flush (NSID FFFFFFFFh) that is only honoured when a <code>vwc_broadcast</code> flag is set.</p>
+
+  <h3>Advanced lab — how many power cuts prove a Flush is honest?</h3>
+  <p><span class="badge safe">Safe lab</span> (simulation). A real power-cut rig is an <span class="badge expert">Expert lab</span>: dedicated hardware, a controllable supply, a drive whose data does not matter.</p>
+  <dl>
+    <dt>Objective</dt><dd>Understand the statistics of power-cut validation and why one passing cut proves little.</dd>
+    <dt>Prerequisites</dt><dd><a href="ch34.html#debugging">Chapter 34, Debugging</a>.</dd>
+    <dt>Setup</dt><dd>Save as <code>powercut_sim.py</code>.</dd>
+  </dl>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="powercut_sim.py"><code>#!/usr/bin/env python3
+"""powercut_sim.py - how many power cuts does it take to catch a device that fakes Flush?
+
+Synthetic teaching model (standard library only). Each trial: the host writes a batch of
+signed blocks, waits for completions, issues Flush, records the blocks it believes durable,
+keeps writing un-flushed blocks, then power is cut at a random moment. An honest device keeps
+every flushed block. A dishonest device acknowledges Flush early; whatever was still only in
+its cache when power failed is lost (old data returns).
+"""
+import math
+import random
+
+def trial(rng, honest, destage_per_ms=4, cut_window_ms=3.0):
+    flushed = 64                          # blocks the host believes durable
+    in_cache = 0 if honest else flushed   # dishonest: Flush returned without draining
+    cut = rng.uniform(0.0, cut_window_ms) # power fails this long after the Flush CQE
+    still_volatile = max(0, in_cache - int(cut * destage_per_ms * 8))
+    return still_volatile                 # flushed blocks lost (0 means pass)
+
+def run(n, honest, seed=7):
+    rng = random.Random(seed)
+    return sum(1 for _ in range(n) if trial(rng, honest) &gt; 0)
+
+if __name__ == "__main__":
+    for honest in (True, False):
+        fails = run(200, honest)
+        print(f"{'honest   ' if honest else 'dishonest'}: {fails} of 200 cuts lost flushed data")
+    q = run(2000, False) / 2000           # per-cut detection probability for this model
+    n99 = math.ceil(math.log(0.01) / math.log(1 - q))
+    print(f"per-cut detection probability q = {q:.2f}; cuts for 99% confidence = {n99}")</code></pre>
+  <dl>
+    <dt>Procedure</dt><dd>(1) Run it. (2) Make the dishonest device destage faster (<code>destage_per_ms=16</code>) and widen the cut window to 20 ms; rerun. (3) Explain why q falls and the required number of cuts rises.</dd>
+    <dt>Observations</dt><dd>Record q and the cuts needed for 99% confidence in each configuration.</dd>
+    <dt>Questions</dt><dd>(a) Derive n = ⌈ln(1 − C) / ln(1 − q)⌉. (b) Where should a real rig place its cuts relative to the Flush CQE to maximise q? (c) Why must the verifier record which completions it <em>observed</em> before the cut?</dd>
+    <dt>Expected reasoning</dt><dd>Detection requires the cut to land while falsely acknowledged data is still volatile.</dd>
+  </dl>
+  <div class="formula">
+    <div class="eq"><var>n</var> = ⌈ ln(1 − <var>C</var>) ÷ ln(1 − <var>q</var>) ⌉</div>
+    <dl class="vars">
+      <dt>n</dt><dd>number of independent power cuts to run</dd>
+      <dt>C</dt><dd>desired confidence of catching a dishonest device (for example 0.99)</dd>
+      <dt>q</dt><dd>probability that one cut exposes the dishonesty (depends on cut timing and how fast the device destages)</dd>
+    </dl>
+  </div>
+  <details class="solution"><summary>Solution</summary>
+    <p>With the defaults the script reports 0 of 200 failures for the honest model, 140 of 200 for the dishonest one, q ≈ 0.67 and 5 cuts for 99%. With faster destage and a 20 ms window, the dishonest device's cache empties within 0.5 ms, so only cuts in that first 0.5 ms of the 20 ms window detect it: the script estimates q ≈ 0.03 and about 144 cuts (the exact q of 0.025 gives 182; the difference is sampling noise in the estimate, itself a lesson about estimating q from few trials). (a) Probability of missing in all n cuts is (1 − q)ⁿ; set it ≤ 1 − C. (b) As close after the Flush CQE as the rig can manage, and with a large dirty set at Flush time. (c) Only data whose completion (and covering Flush completion) the host saw may be counted as "should have survived"; anything else is legally lost.</p>
+  </details>
+  <p><strong>Extension.</strong> Add a "torn" outcome for in-flight writes larger than AWUPF and make the verifier distinguish legal tears from illegal loss of flushed data.</p>
+
+  <h3>Senior forensic lab — the database that lost its last second</h3>
+  <p><span class="badge safe">Safe lab</span> Evidence analysis.</p>
+  <dl>
+    <dt>Objective</dt><dd>Locate the layer that broke the Flush promise in a virtualised stack.</dd>
+    <dt>Prerequisites</dt><dd>This module; <a href="ch34.html#senior">Chapter 34, Senior engineer insight</a>.</dd>
+    <dt>Setup (evidence pack, synthetic)</dt><dd>
+      <ul>
+        <li>A database in a virtual machine (VM) lost the last ≈1 s of committed transactions after the physical host lost power. Its log shows those transactions as committed (fsync returned).</li>
+        <li>Guest-side tracepoints: every commit issued a flush to the guest's virtual disk, and each flush completed in 20–40 µs.</li>
+        <li>Physical-host NVMe tracepoints captured during a re-run show Write commands from the hypervisor, but <em>no</em> Flush commands for minutes at a time. Physical drive: VWC bit 0 = 1, cache enabled, no power-loss protection.</li>
+        <li>The VM's virtual disk is configured with a cache mode that does not forward guest flush requests (QEMU's <code>cache=unsafe</code> is an example of such a mode).</li>
+        <li>The physical drive's SMART log shows the unsafe-shutdown counter incremented by one.</li>
+      </ul></dd>
+    <dt>Procedure</dt><dd>Find the first layer where a Flush disappears, decide the owner, and propose a fix and a regression test.</dd>
+    <dt>Observations</dt><dd>Compare guest flush latency with physical Flush latency for this drive.</dd>
+    <dt>Questions</dt><dd>(1) Is the SSD at fault? (2) What single comparison exposes the problem fastest? (3) What test would have caught it?</dd>
+    <dt>Expected reasoning</dt><dd>Follow the flush through each boundary; a flush that vanishes between two tracepoint layers was dropped by the layer between them.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>The first abnormal event is at the hypervisor boundary: guest flushes are acknowledged in tens of microseconds while no physical Flush is issued. The SSD behaved correctly: it reported a volatile cache, was never asked to flush, and lost unflushed data on power loss, which the specification permits. Owner: the virtualisation configuration. Fix: a cache mode that forwards flushes (or a drive with power-loss protection that reports no volatile cache, and even then the hypervisor's own page cache must not be in the path). Fastest comparison: guest flush latency (20–40 µs) versus the physical drive's Flush latency for a non-empty dirty set (hundreds of µs or more) — a layer that answers faster than the device can is not forwarding. Regression test: a flush-forwarding check that issues guest flushes and asserts that physical Flush commands appear in the host trace, plus periodic power-cut testing of the whole stack. Confidence: high.</p>
+  </details>
+  <p><strong>Extension.</strong> List every layer in your own production stack that can acknowledge a flush, and the evidence you would use for each.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <p>Six Flush failure patterns beyond those in <a href="ch34.html#debugging">Chapter 34</a>.</p>
+
+  <h3>fsync latency is high and erratic for one tenant</h3>
+  <dl>
+    <dt>Symptom</dt><dd>A small service's fsync takes 0.3 ms usually and 40 ms at times; its own writes are tiny.</dd>
+    <dt>Possible causes</dt><dd>Another tenant's large dirty set on the same namespace (Flush covers everything completed before it); garbage collection; thermal throttling.</dd>
+    <dt>Evidence</dt><dd>Bytes written by all processes to the namespace between Flushes; Flush CQE latency; SMART temperature and throttle counters.</dd>
+    <dt>First check</dt><dd>Correlate slow Flushes with other tenants' write bursts.</dd>
+    <dt>Second check</dt><dd>Is the namespace shared? Separate namespaces do not share Flush scope (the controller may still drain shared NAND).</dd>
+    <dt>Disambiguating experiment</dt><dd>Pause the bulk writer; if spikes vanish, scope sharing is the cause.</dd>
+    <dt>Likely conclusion</dt><dd>Shared dirty set; mitigate with separate namespaces, bulk writer flushing more often, or a protected drive.</dd>
+    <dt>Confidence</dt><dd>High with correlation and the pause experiment.</dd>
+  </dl>
+
+  <h3>Flush latency constant and tiny on a drive that reports a cache</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Trace M32-A behaviour at all dirty sizes.</dd>
+    <dt>Possible causes</dt><dd>Power-loss-protected cache; aggressive continuous destaging; dishonest Flush.</dd>
+    <dt>Evidence</dt><dd>Product documentation, Flush latency versus dirty size, power-cut results.</dd>
+    <dt>First check</dt><dd>Vendor statement on power-loss protection for this model and firmware.</dd>
+    <dt>Second check</dt><dd>Latency slope: does a Flush after 1 GiB of writes take as long as after 4 KiB?</dd>
+    <dt>Disambiguating experiment</dt><dd>Power-cut test with cuts immediately after Flush CQE (advanced lab sizing).</dd>
+    <dt>Likely conclusion</dt><dd>Undetermined without the test.</dd>
+    <dt>Confidence</dt><dd>Low before testing; high after enough cuts.</dd>
+  </dl>
+
+  <h3>Flushed data lost after power failure</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Data whose fsync returned is old after power loss.</dd>
+    <dt>Possible causes</dt><dd>A layer dropped the flush (hypervisor, RAID, <code>write_cache</code> override); host submitted Flush before the write completed; device dishonest; FTL metadata not persisted with data.</dd>
+    <dt>Evidence</dt><dd>Tracepoints at every layer; order of write CQE and Flush submission; Flush CQE status.</dd>
+    <dt>First check</dt><dd>Is there a physical Flush, submitted after the lost write's completion, with success?</dd>
+    <dt>Second check</dt><dd>Is the lost data stale (old version) or garbage? Stale points to unflushed cache or lost mapping; garbage points to atomicity or media.</dd>
+    <dt>Disambiguating experiment</dt><dd>Reproduce with tracing at the physical device and a power-cut rig.</dd>
+    <dt>Likely conclusion</dt><dd>Most often a forwarding layer (senior lab); device fault only when the physical sequence is correct.</dd>
+    <dt>Confidence</dt><dd>High once the physical trace exists.</dd>
+  </dl>
+
+  <h3>Flush times out and the controller resets</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Trace M32-F: Flush outstanding for the driver timeout; Abort refused; reset.</dd>
+    <dt>Possible causes</dt><dd>Firmware hang in drain or metadata commit; media failure during drain; host not answering the device's Host Memory Buffer reads; thermal shutdown.</dd>
+    <dt>Evidence</dt><dd>Kernel timeout/reset lines; SMART critical warning and temperature; Error Information log; capture of the device's upstream requests during the stall.</dd>
+    <dt>First check</dt><dd>Did other commands complete during the stall? Front-end alive vs whole controller dead.</dd>
+    <dt>Second check</dt><dd>Any outstanding device MRd without completion (host side stuck)?</dd>
+    <dt>Disambiguating experiment</dt><dd>Repeat with a smaller dirty set and with Host Memory Buffer disabled (if the drive uses it and policy allows) to see whether the hang tracks the drain or the host.</dd>
+    <dt>Likely conclusion</dt><dd>Device firmware, usually; vendor telemetry required.</dd>
+    <dt>Confidence</dt><dd>Medium.</dd>
+  </dl>
+
+  <h3>Unsafe-shutdown counter grows on every reboot</h3>
+  <dl>
+    <dt>Symptom</dt><dd>SMART unsafe shutdowns increments on orderly reboots.</dd>
+    <dt>Possible causes</dt><dd>Platform removes power before CSTS.SHST = 10b; driver shutdown timeout shorter than device needs; firmware reports shutdown complete late.</dd>
+    <dt>Evidence</dt><dd>RTD3E, <code>shutdown_timeout</code>, kernel shutdown messages (if captured on a serial console), power-sequencing timing.</dd>
+    <dt>First check</dt><dd>Compare RTD3E with the effective host shutdown wait.</dd>
+    <dt>Second check</dt><dd>Does it also happen with the drive idle (empty dirty set) before reboot?</dd>
+    <dt>Disambiguating experiment</dt><dd>Issue <code>nvme flush</code> and wait a few seconds before reboot; if the counter stops growing, shutdown time was too short for the dirty set.</dd>
+    <dt>Likely conclusion</dt><dd>Platform/driver timing; harmless only if the drive has power-loss protection.</dd>
+    <dt>Confidence</dt><dd>Medium to high.</dd>
+  </dl>
+
+  <h3>Broadcast Flush starts failing after a firmware update</h3>
+  <dl>
+    <dt>Symptom</dt><dd>A custom tool's Flush with NSID FFFFFFFFh returns an error status after an update.</dd>
+    <dt>Possible causes</dt><dd>New firmware reports VWC bits 2:1 = 10b (not supported) where the old reported 00b and accepted it anyway.</dd>
+    <dt>Evidence</dt><dd>Identify Controller VWC before and after; CQE status.</dd>
+    <dt>First check</dt><dd>Read VWC bits 2:1.</dd>
+    <dt>Second check</dt><dd>Does the tool check those bits at all?</dd>
+    <dt>Disambiguating experiment</dt><dd>Flush each namespace by its NSID; success confirms.</dd>
+    <dt>Likely conclusion</dt><dd>Tool relied on undefined behaviour; fix the tool and treat earlier "successful" broadcast Flushes on 00b firmware as unverified.</dd>
+    <dt>Confidence</dt><dd>High.</dd>
+  </dl>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>What does a successful Flush promise?</p><details class="answer"><summary>Model answer</summary><p>That data and metadata of writes to its namespace completed before the Flush was submitted are on non-volatile media.</p></details></li>
+    <li><p>Does a Flush carry data?</p><details class="answer"><summary>Model answer</summary><p>No: opcode 00h, no data pointer, no LBA range.</p></details></li>
+    <li><p>Why might a Flush complete almost instantly?</p><details class="answer"><summary>Model answer</summary><p>No volatile cache, an empty dirty set, or a protected cache; or, rarely, a dishonest device.</p></details></li>
+    <li><p>Is Flush a barrier for later writes?</p><details class="answer"><summary>Model answer</summary><p>No; later commands can run and complete before it. Dependent writes must wait for its completion.</p></details></li>
+    <li><p>Where do you find whether the drive has a volatile write cache?</p><details class="answer"><summary>Model answer</summary><p>Identify Controller VWC bit 0; current state via Get Features 06h.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>A write on queue 3 completes before a Flush is submitted on queue 1. Covered?</p><details class="answer"><summary>Model answer</summary><p>Yes, if same namespace: scope is by completion and namespace, not queue.</p></details></li>
+    <li><p>When may a host use NSID FFFFFFFFh with Flush?</p><details class="answer"><summary>Model answer</summary><p>When VWC bits 2:1 = 11b; 10b means not supported, 00b means support not indicated.</p></details></li>
+    <li><p>How does Linux turn a journal commit into NVMe commands on a cached drive?</p><details class="answer"><summary>Model answer</summary><p>REQ_PREFLUSH becomes a Flush before the commit block; REQ_FUA sets FUA on the commit write (or is emulated with a post-flush if FUA is unsupported). Without a volatile cache both are dropped.</p></details></li>
+    <li><p>Why does a Flush with one dirty block sometimes take as long as one with a megabyte?</p><details class="answer"><summary>Model answer</summary><p>Fixed costs: padding a program unit and committing mapping metadata dominate small dirty sets.</p></details></li>
+    <li><p>What does an incremented unsafe-shutdown counter tell you?</p><details class="answer"><summary>Model answer</summary><p>Power was removed without completed shutdown notification; it does not prove data loss.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>A Flush is outstanding when the controller is reset. What does the host know?</p><details class="answer"><summary>Model answer</summary><p>Nothing about the epoch; it must treat the data as not durable and issue a new Flush after recovery before acknowledging upward.</p></details></li>
+    <li><p>How do you detect a hypervisor that swallows flushes, without power cuts?</p><details class="answer"><summary>Model answer</summary><p>Trace the physical device during guest flushes; or compare guest flush latency with the physical device's Flush latency under a non-empty dirty set.</p></details></li>
+    <li><p>Explain the epoch implementation and one bug it can have.</p><details class="answer"><summary>Model answer</summary><p>A sequence counter snapshots completions at Flush fetch; dirty buffers at or below it must drain. Bug: assigning sequence numbers at submission instead of completion, so a write completed before the Flush but submitted late is left out.</p></details></li>
+    <li><p>Why must FTL mapping persistence be part of Flush?</p><details class="answer"><summary>Model answer</summary><p>Data on NAND without a persisted mapping is unreachable after power loss; the LBA would return its old content.</p></details></li>
+    <li><p>How many power cuts to catch a device with per-cut detection probability 0.1 at 99% confidence?</p><details class="answer"><summary>Model answer</summary><p>ln(0.01)/ln(0.9) ≈ 43.7 → 44 cuts.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>Design a durability qualification for a new SSD firmware.</p><details class="answer"><summary>Model answer</summary><p>Power-cut rig with signature verifier recording observed completions; cuts timed at random and right after Flush and FUA CQEs; large and small dirty sets; VWC on/off; shutdown-timeout boundary tests; Flush during heavy I/O and during reset; pass = zero loss of covered data, tears only above atomic units; sample size from the confidence formula; repeat per firmware release.</p></details></li>
+    <li><p>A database team wants to disable the drive cache "for safety". Advise.</p><details class="answer"><summary>Model answer</summary><p>It gives durability at the cost of small-write latency and endurance; correct use of fsync/FUA with group commit is usually better, or buy power-loss-protected drives. Never disable kernel flushing via write_cache instead.</p></details></li>
+    <li><p>How do multi-controller subsystems complicate Flush?</p><details class="answer"><summary>Model answer</summary><p>The scope is framed around the controller processing the Flush; whether writes completed via another controller are covered must be checked in the specification and product. Hosts with multipath should flush through each path that wrote, or confirm subsystem-wide behaviour.</p></details></li>
+    <li><p>What would make you trust a VWC = 0 report?</p><details class="answer"><summary>Model answer</summary><p>Documented power-loss protection, passing power-cut tests on this firmware, capacitor health monitoring, and regression testing in every release.</p></details></li>
+    <li><p>Where in a storage review do you look first for Flush bugs?</p><details class="answer"><summary>Model answer</summary><p>At every layer boundary: where flush requests enter, leave, and what the layer acknowledges before the layer below has; then at custom drivers' completion bookkeeping across queues.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>Write A completes at t = 10; Flush submitted at t = 12; Write B completes at t = 13; Flush completes at t = 500. Which writes are guaranteed durable at t = 500?</p>
+      <ul class="options" data-answer="1"><li>A only</li><li>A and B</li><li>B only</li><li>Neither</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Only completions before submission count.</p></details>
+    </li>
+    <li>
+      <p>VWC = 05h. Which is correct?</p>
+      <ul class="options" data-answer="3"><li>No cache; broadcast Flush supported</li><li>Cache present; broadcast support not indicated</li><li>Cache present; broadcast Flush not supported</li><li>Cache present; broadcast Flush supported</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>05h = 101b: bit 0 = 1 (cache), bits 2:1 = 10b (not supported).</p></details>
+    </li>
+    <li>
+      <p>A Flush is aborted successfully. What can the host assume?</p>
+      <ul class="options" data-answer="4"><li>Its epoch is durable</li><li>Nothing was written</li><li>Only half the epoch is durable</li><li>Nothing about durability of its epoch</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The controller may have drained part or all of it; the host has no guarantee.</p></details>
+    </li>
+    <li>
+      <p>Flush latency: 35 µs (empty), 2.1 ms (4 KiB dirty), 2.6 ms (1 MiB dirty). The dominant cost for small sets is:</p>
+      <ul class="options" data-answer="2"><li>PCIe transfer</li><li>A fixed per-Flush media/metadata cost</li><li>Host interrupt latency</li><li>The data drain rate</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The intercept dwarfs the slope.</p></details>
+    </li>
+    <li>
+      <p>Which Linux setting stops the kernel from sending flushes without changing the device?</p>
+      <ul class="options" data-answer="1"><li>Writing "write through" to queue/write_cache</li><li>Set Features 06h WCE = 0</li><li>nvme flush</li><li>Disabling FUA in the filesystem</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>It changes the kernel's belief, not the drive — dangerous on a cached drive.</p></details>
+    </li>
+    <li>
+      <p>Per-cut detection probability 0.25, confidence 95%. Cuts needed?</p>
+      <ul class="options" data-answer="3"><li>4</li><li>8</li><li>11</li><li>20</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>ln(0.05)/ln(0.75) ≈ 10.4 → 11.</p></details>
+    </li>
+    <li><p>Why is a guest flush latency of 20 µs suspicious on a drive without power-loss protection?</p><details class="answer"><summary>Model answer</summary><p>A real Flush with dirty data takes hundreds of microseconds or more on such a drive; answering faster means some layer did not forward it, or nothing was dirty.</p></details></li>
+    <li><p>What must the host do after recovering from a reset that lost an outstanding Flush?</p><details class="answer"><summary>Model answer</summary><p>Issue a new Flush (covering everything completed before it) before reporting durability; if power was lost, rely on filesystem/database recovery.</p></details></li>
+    <li><p>Why do correct hosts count only completions they have consumed when deciding Flush coverage?</p><details class="answer"><summary>Model answer</summary><p>A CQE written but not yet read is covered in fact, but the host cannot prove it; acting only on observed completions keeps its reasoning sound.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <ol>
+    <li><p><strong>To a child:</strong> why the helper's "done!" covers only the pieces finished when the teacher called.</p>
+      <details class="answer"><summary>Model explanation</summary><p>The helper writes a list at the moment you call and promises only that list. Pieces finished after you called might get glued too, but if you need them safe, call again.</p></details></li>
+    <li><p><strong>To a junior engineer:</strong> how to use Flush correctly in a commit protocol.</p>
+      <details class="answer"><summary>Model explanation</summary><p>Write the data, wait for all its completions, submit Flush, wait for the Flush completion, then write the commit record (with FUA if the record itself must be durable at once). Never overlap these steps; queues do not matter, completions do. Check VWC once at start-up to know whether Flush does anything.</p></details></li>
+    <li><p><strong>To a senior engineer:</strong> why a protocol trace cannot qualify Flush and what can.</p>
+      <details class="answer"><summary>Model explanation</summary><p>Flush's footprint is four packets that look identical whether the device drained 64 MiB or nothing; correctness lives inside the device. Latency versus dirty size gives circumstantial evidence; only power-cut testing with a verifier that records observed completions, cuts placed right after Flush CQEs, and a sample size from n = ln(1−C)/ln(1−q), qualifies it — per firmware release, and per layer stack, because every layer between application and drive can drop or fake the flush.</p></details></li>
+  </ol>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain the flush epoch, its scope across queues and namespaces, and what reset or abort does to it;</li>
+      <li>diagram the Flush path through every software layer and the controller's drain and metadata steps;</li>
+      <li>identify a Flush in a trace, list exactly which writes it covers, and spot a Flush lost in a reset;</li>
+      <li>debug the six patterns above, including the fast-Flush ambiguity, with a disambiguating experiment each;</li>
+      <li>distinguish Flush from FUA (<a href="dd31.html">Deep dive: WRITE</a>), shutdown notification (<a href="ch34.html#protocol">Chapter 34</a>), deallocation durability (<a href="dd33.html">Deep dive: Dataset Management</a>) and controller reset (<a href="dd41.html">Deep dive: Reset</a>);</li>
+      <li>cite the NVMe Base Specification 2.4 (Flush, VWC, Volatile Write Cache feature, CC/CSTS shutdown) and NVM Command Set 1.3 (FUA) for each claim.</li>
+    </ul>
+  </aside>
+  <p>Next: <a href="dd33.html">Deep dive: Dataset Management</a>.</p>
+</section>

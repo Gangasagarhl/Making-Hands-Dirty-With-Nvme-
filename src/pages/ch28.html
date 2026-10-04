@@ -1,0 +1,778 @@
+<p class="lead">A doorbell is a single 32-bit write from the CPU to a register in the SSD. It is the only thing the host must send across PCI Express (PCIe) to start a command, and the only thing it must send to free completion slots. This chapter follows one command through all nine steps, from building the command to the interrupt, shows each doorbell as the exact Transaction Layer Packet (TLP) an analyzer would capture, and then catalogues the doorbell bugs that hang real systems.</p>
+
+<section id="why">
+<h2>Why this chapter exists</h2>
+<p>Doorbells are tiny, and that is exactly why they are misunderstood. A doorbell carries no command and no data — only an index. It does not wait for an answer. It does not tell the controller "one more command" but "the tail is now here". Getting any of those wrong produces commands that are never fetched, commands fetched twice, stale commands re-executed, or completion queues the controller believes are full.</p>
+<p>Doorbells are also the seam between three worlds: the CPU's memory ordering rules (is the command in memory before the doorbell leaves?), PCIe's posted-write semantics (the doorbell has no completion), and NVM Express (NVMe) queue semantics (what the value means). A senior engineer reads a doorbell write in a trace and immediately knows which queue, which side, how many new entries, and whether the value is even legal.</p>
+
+<h3>Learning objectives</h3>
+<ul>
+<li>Describe, step by step, the nine-step flow from building a command to the host being interrupted, naming the actor, the state change and the evidence for each step.</li>
+<li>Compute the address of any SQ tail or CQ head doorbell from CAP.DSTRD and the queue identifier.</li>
+<li>Decode a doorbell write at TLP level: format, type, length, byte enables, address, payload, posted semantics.</li>
+<li>Explain why a write memory barrier is needed before the doorbell and what happens without it.</li>
+<li>Explain the CQ head doorbell: when it is written, what it frees, and what happens if it is late or missing.</li>
+<li>Explain shadow doorbells and the Doorbell Buffer Config command, including their version and optional status.</li>
+<li>Diagnose doorbell bugs: stale tail, wrapping errors, invalid values (and the asynchronous event they cause), wrong stride, wide writes, missing barriers.</li>
+</ul>
+
+<h3>Prerequisites</h3>
+<aside class="callout prereq">
+<p>Queue ownership and the phase tag: <a href="ch25.html">Chapter 25</a>. Queue creation: <a href="ch26.html">Chapter 26</a> and <a href="ch27.html">Chapter 27</a>. Posted versus non-posted transactions: <a href="ch12.html">Chapter 12</a>. TLP header fields: <a href="ch11.html">Chapter 11</a>. PCIe ordering: <a href="ch14.html">Chapter 14</a>. Base Address Registers and MMIO (memory-mapped I/O): <a href="ch19.html">Chapter 19</a>.</p>
+</aside>
+</section>
+
+<section id="story">
+<h2>The story</h2>
+<aside class="callout kid">
+<p>Remember the spinning tray of order cards and the bell? Here's a secret about the bell: it doesn't just ding. Every time a child rings it, they hold up a big number card — "the next empty slot is 8". The shopkeeper doesn't count dings; she looks at the number. If two children ring at once, or a child rings twice by accident, nothing bad happens — the number is still 8.</p>
+<p>But there's a rule: you must put the order card in the tray <em>before</em> you ring and hold up the number. If you ring first and are still writing the card, the shopkeeper might grab a half-written card!</p>
+<p>And when the children have read answer cards, they ring a different bell with a number: "we've read up to answer slot 40" — so the shopkeeper knows those answer slots are free to use again.</p>
+</aside>
+<aside class="callout analogy" data-title="Real-world analogy: the ticket number display at a deli counter">
+<p>At a busy deli, customers pull numbered tickets; the server looks at a display showing "now taking up to ticket 57". The display isn't "one more customer" — it is an absolute position. If the display updates twice to 57, the server isn't confused. If it jumps from 50 to 57, the server knows seven customers are waiting. The display is updated by the front desk after the customer has actually taken a ticket; if the desk updated the display before printing the ticket, the server would call a number nobody holds.</p>
+</aside>
+<aside class="callout breaks">
+<p><strong>What it hides.</strong> The deli display is read by the server whenever she likes; an NVMe doorbell is a write that the controller hardware latches when it arrives — there is no "display" in host memory the controller polls (except with shadow doorbells, below). The deli's numbers keep growing; NVMe indices wrap around at the queue size, so "50 → 7" can be a legal move.</p>
+<p><strong>Where it misleads.</strong> The analogy suggests the display tells the server everything. In NVMe the doorbell carries only an index; the command itself is fetched separately by the controller using DMA (direct memory access) from host memory. The doorbell also has no acknowledgement: the front desk never hears "got it".</p>
+</aside>
+</section>
+
+<section id="beginner">
+<h2>Beginner explanation</h2>
+<p>Each queue pair has two doorbell registers in the controller's BAR0 (Base Address Register 0) space, starting at offset 1000h:</p>
+<ul>
+<li>the <strong>SQ y Tail Doorbell</strong> (<span class="g" data-term="doorbell">SQyTDBL</span>): the host writes the new Submission Queue tail here after adding commands;</li>
+<li>the <strong>CQ y Head Doorbell</strong> (CQyHDBL): the host writes the new Completion Queue head here after consuming completions.</li>
+</ul>
+<p>There are no doorbells for the SQ head or the CQ tail, because those indices belong to the controller (<a href="ch25.html">Chapter 25</a>).</p>
+<p>A doorbell write is a normal CPU store instruction to an uncached memory-mapped address. The CPU hands it to the PCIe root complex, which turns it into a Memory Write TLP and sends it down the link. The CPU does not wait for the device; the store is "posted" — fire and forget.</p>
+
+<h3>The nine steps</h3>
+<ol>
+<li>The host creates a command (a 64-byte Submission Queue Entry, SQE).</li>
+<li>The host writes the command into the SQ slot at its current tail.</li>
+<li>The host updates its SQ tail variable (tail + 1, wrapping at the queue size).</li>
+<li>The host writes the new tail value to the SQ tail doorbell.</li>
+<li>The controller notices the doorbell write.</li>
+<li>The controller fetches the command from host memory.</li>
+<li>The controller executes the command (including any data transfer).</li>
+<li>The controller posts a completion (a 16-byte Completion Queue Entry, CQE) into the CQ.</li>
+<li>The controller interrupts the host, if interrupts are enabled for that CQ.</li>
+</ol>
+<p>Then the host processes the completion and writes the CQ head doorbell. We will walk through every step in detail next.</p>
+</section>
+
+<section id="engineering">
+<h2>Engineering explanation</h2>
+
+<h3>Doorbell addresses</h3>
+<p>The doorbells are laid out in pairs, SQ tail then CQ head, for queue 0, 1, 2 … The spacing between consecutive doorbells is the <strong><span class="g" data-term="dstrd">doorbell stride</span></strong>, set by CAP.DSTRD (Doorbell Stride, CAP bits 35:32): stride = 2<sup>(2 + DSTRD)</sup> bytes, i.e. 4 &lt;&lt; DSTRD.</p>
+<div class="formula">
+<div class="eq">SQyTDBL = 1000h + (2<var>y</var>) × (4 &lt;&lt; <var>DSTRD</var>) &nbsp;&nbsp;&nbsp;&nbsp; CQyHDBL = 1000h + (2<var>y</var> + 1) × (4 &lt;&lt; <var>DSTRD</var>)</div>
+<dl class="vars">
+<dt>y</dt><dd>the queue identifier (0 for the Admin queue)</dd>
+<dt>DSTRD</dt><dd>CAP bits 35:32; 0 gives the minimum stride of 4 bytes (doorbells packed contiguously)</dd>
+<dt>1000h</dt><dd>the offset of the first doorbell within the controller's register space (BAR0)</dd>
+</dl>
+</div>
+<table>
+<caption>Doorbell offsets for the reference system (DSTRD = 0, BAR0 = 0xFE60_0000)</caption>
+<thead><tr><th>Queue</th><th>SQ tail doorbell</th><th>CQ head doorbell</th></tr></thead>
+<tbody>
+<tr><td>0 (Admin)</td><td>1000h → 0xFE60_1000</td><td>1004h → 0xFE60_1004</td></tr>
+<tr><td>1</td><td>1008h → 0xFE60_1008</td><td>100Ch → 0xFE60_100C</td></tr>
+<tr><td>2</td><td>1010h → 0xFE60_1010</td><td>1014h → 0xFE60_1014</td></tr>
+<tr><td>3</td><td>1018h → 0xFE60_1018</td><td>101Ch → 0xFE60_101C</td></tr>
+<tr><td>16</td><td>1080h → 0xFE60_1080</td><td>1084h → 0xFE60_1084</td></tr>
+</tbody>
+</table>
+<p>Why would a controller want a larger stride? So that each queue's doorbells fall on their own cache line or page — useful for hardware that decodes doorbells per region, and for virtualisation, where a hypervisor may want to map one queue's doorbells into one guest without exposing others. Some emulated controllers use a non-zero DSTRD. Never hard-code a stride of 4.</p>
+
+<h3>The doorbell register layout</h3>
+<table class="packet">
+<caption>SQyTDBL and CQyHDBL (32 bits each)</caption>
+<thead><tr><th class="row-label">Reg</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+<tbody>
+<tr><td class="row-label">SQyTDBL</td><td colspan="16" class="rsvd">Reserved</td><td colspan="16" class="hl">SQT — Submission Queue Tail</td></tr>
+<tr><td class="row-label">CQyHDBL</td><td colspan="16" class="rsvd">Reserved</td><td colspan="16" class="hl">CQH — Completion Queue Head</td></tr>
+</tbody>
+</table>
+<p>The value is an absolute slot index (0 to size − 1), not a count of new entries. Writing the same value twice is harmless: the second write adds nothing. Because the field is 16 bits, it can address up to 65,536 slots — matching the largest queue.</p>
+
+<h3>The nine steps, extremely carefully</h3>
+<p>The table follows one 4 KiB Read on I/O queue pair 1 in the reference system (SQ1 base 0x1_2340_0000, CQ1 base 0x1_2341_0000, SQ1 tail currently 5, CQ1 head 37, expected phase 1). Synthetic example for teaching.</p>
+<table>
+<caption>Who acts, what changes, where it changes, and what evidence exists</caption>
+<thead><tr><th>Step</th><th>Actor</th><th>What changes</th><th>Where</th><th>Visible on the PCIe link?</th><th>Other evidence</th></tr></thead>
+<tbody>
+<tr><td>1. Create the command</td><td>Host driver (CPU)</td><td>A 64-byte SQE is built: opcode 02h (Read), CID, NSID 1, PRP Entry 1 = data buffer, starting LBA, number of blocks</td><td>CPU registers / stack</td><td>No</td><td>Driver tracing (e.g. the kernel's nvme_setup_cmd tracepoint)</td></tr>
+<tr><td>2. Write the SQE into the SQ</td><td>CPU</td><td>64 bytes stored at SQ1 base + 5 × 64 = 0x1_2340_0140</td><td>Host memory (possibly still in the CPU cache)</td><td><strong>No</strong> — CPU-to-memory traffic never crosses the device's link</td><td>None, except later the fetched payload</td></tr>
+<tr><td>3. Update the SQ tail</td><td>CPU</td><td>Driver's sq_tail: 5 → 6</td><td>Driver variable in host memory</td><td>No</td><td>None</td></tr>
+<tr><td>— Barrier</td><td>CPU</td><td>Write memory barrier: the SQE store becomes globally visible before any later MMIO store</td><td>CPU store buffer / memory system</td><td>No</td><td>Only by its absence (bugs)</td></tr>
+<tr><td>4. Ring the doorbell</td><td>CPU → root complex</td><td>32-bit store of 0x0000_0006 to 0xFE60_1008</td><td>Travels to the controller's SQ1TDBL</td><td><strong>Yes</strong>: host→device MWr, 1 DW, posted</td><td>Driver trace of the doorbell write (where available)</td></tr>
+<tr><td>5. Controller notices</td><td>Controller</td><td>SQ1's latched tail becomes 6; tail ≠ internal head (5) → work pending</td><td>Controller's doorbell logic and queue context</td><td>No (internal)</td><td>Inferred from the next step's timing</td></tr>
+<tr><td>6. Fetch the command</td><td>Controller</td><td>Reads 64 bytes from 0x1_2340_0140; internal SQ head 5 → 6</td><td>Device's DMA engine; host memory read by root complex</td><td><strong>Yes</strong>: device→host MRd; root complex→device CplD carrying the SQE</td><td>None on the host</td></tr>
+<tr><td>7. Execute</td><td>Controller (+ NAND)</td><td>Media read; data written to the PRP buffer by DMA</td><td>Inside the SSD; then host memory</td><td>Data: <strong>Yes</strong>, device→host MWr TLPs (≤ Max Payload Size each)</td><td>None</td></tr>
+<tr><td>8. Post the completion</td><td>Controller</td><td>16-byte CQE written at CQ1 base + 37 × 16 = 0x1_2341_0250: SQID 1, SQHD 6, CID, status, P = 1. Internal CQ tail 37 → 38</td><td>Host memory</td><td><strong>Yes</strong>: device→host MWr, 4 DW</td><td>None until the host reads it</td></tr>
+<tr><td>9. Interrupt</td><td>Controller</td><td>MSI-X vector 1 signalled (if IEN = 1 and not masked; possibly coalesced)</td><td>Host interrupt controller</td><td><strong>Yes</strong>: device→host MWr to the MSI-X message address</td><td><code>/proc/interrupts</code> count increases</td></tr>
+<tr><td>(10) Reap</td><td>Host</td><td>Reads CQE at head 37: P = 1 matches → complete CID; head 37 → 38</td><td>Host memory; driver variables</td><td>No</td><td>Block-layer completion tracing</td></tr>
+<tr><td>(11) CQ head doorbell</td><td>CPU</td><td>32-bit store of 0x0000_0026 (38) to 0xFE60_100C</td><td>Controller's CQ1HDBL</td><td><strong>Yes</strong>: host→device MWr, 1 DW, posted</td><td>—</td></tr>
+</tbody>
+</table>
+<figure>
+<ol class="seq" data-actors="CPU (driver)|Root complex + memory|NVMe controller">
+<li data-note="CPU (driver)">1–3: build SQE, store at slot 5, tail = 6</li>
+<li data-note="CPU (driver)">wmb()</li>
+<li data-from="CPU (driver)" data-to="NVMe controller" data-t="0 ns">4: MWr 0xFE60_1008 = 6 (posted)</li>
+<li data-note="NVMe controller">5: tail 6 ≠ head 5 → schedule fetch</li>
+<li data-from="NVMe controller" data-to="Root complex + memory" data-t="700 ns">6: MRd 0x1_2340_0140, 16 DW</li>
+<li data-from="Root complex + memory" data-to="NVMe controller" class="dashed" data-t="1.4 µs">CplD: 64-byte SQE</li>
+<li data-note="NVMe controller">7: NAND read (tens of µs)</li>
+<li data-from="NVMe controller" data-to="Root complex + memory" data-t="70 µs">7: MWr data, 16 × 256 B</li>
+<li data-from="NVMe controller" data-to="Root complex + memory" data-t="72 µs">8: MWr CQE @ 0x1_2341_0250</li>
+<li data-from="NVMe controller" data-to="CPU (driver)" data-t="72 µs">9: MWr MSI-X vector 1</li>
+<li data-note="CPU (driver)">reap: P = 1 ✓, head = 38</li>
+<li data-from="CPU (driver)" data-to="NVMe controller" data-t="75 µs">MWr 0xFE60_100C = 38 (posted)</li>
+</ol>
+<figcaption>The nine steps plus reaping, at the PCIe level. Timestamps synthetic and illustrative; real values are platform- and device-dependent.</figcaption>
+</figure>
+
+<h3>The doorbell as a TLP</h3>
+<p>BAR0 in the reference system is a 64-bit BAR assigned below 4 GiB (0xFE60_0000). PCIe requires that a Memory request to an address below 4 GiB use the 32-bit address format (3 DW header), so the doorbell is an <strong>MWr32</strong>: Fmt = 010b (3 DW header with data), Type = 0_0000b (memory request).</p>
+<table class="packet">
+<caption>SQ1 tail doorbell = 6 as a Memory Write TLP (3 DW header + 1 DW payload). Synthetic example.</caption>
+<thead><tr><th class="row-label">DW</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+<tbody>
+<tr><td class="row-label">H0</td><td colspan="3" class="hl">Fmt 010</td><td colspan="5" class="hl">Type 00000</td><td colspan="1">T9</td><td colspan="3">TC 0</td><td colspan="1">T8</td><td colspan="1">Attr</td><td colspan="1">LN</td><td colspan="1">TH</td><td colspan="1">TD</td><td colspan="1">EP</td><td colspan="2">Attr</td><td colspan="2">AT</td><td colspan="10" class="hl">Length = 1</td></tr>
+<tr><td class="row-label">H1</td><td colspan="16">Requester ID (root port / RC)</td><td colspan="8">Tag</td><td colspan="4">Last DW BE 0000</td><td colspan="4" class="hl">First DW BE 1111</td></tr>
+<tr><td class="row-label">H2</td><td colspan="30" class="hl">Address[31:2] = 0xFE60_1008 &gt;&gt; 2</td><td colspan="2" class="rsvd">PH</td></tr>
+<tr><td class="row-label">Data</td><td colspan="32">Payload bytes on the wire: 06 00 00 00 (little-endian 0x0000_0006)</td></tr>
+</tbody>
+</table>
+<p>Things to notice:</p>
+<ul>
+<li><strong>Length = 1 DW, First DW Byte Enables = 1111b, Last DW BE = 0000b</strong>: a single, full 32-bit write. A doorbell write with partial byte enables would be a driver or compiler mistake (for example, a 16-bit store).</li>
+<li><strong>Posted</strong>: there is no completion TLP. The CPU learns nothing about whether the write arrived or was accepted.</li>
+<li><strong>The Requester ID is the root port's / root complex's</strong>, not the device's; MMIO writes originate at the host side of the link.</li>
+<li><strong>The Tag is not meaningful for matching</strong>: posted requests receive no completion, so nothing is matched against the tag.</li>
+<li><strong>Payload byte order</strong>: PCIe carries data bytes in address order. An analyzer may show the payload as bytes <code>06 00 00 00</code> or as the Dword 0x0000_0006, depending on its display mode.</li>
+</ul>
+<aside class="callout insight">
+<p>Because the doorbell is posted, the CPU's store instruction completes in nanoseconds; the cost on the CPU is small. A <em>read</em> of a device register is <span class="g" data-term="non-posted">non-posted</span> and stalls the CPU until the completion returns — often around a microsecond. NVMe's design avoids every MMIO read on the I/O path; doorbells are writes only.</p>
+</aside>
+
+<h3>Why the barrier before the doorbell matters</h3>
+<p>Steps 2 and 4 are both CPU stores, but to different kinds of memory: the SQE goes to cacheable RAM, the doorbell to uncached MMIO. Without a barrier, a weakly ordered CPU may let the MMIO store overtake the SQE store. The controller would then fetch slot 5 before the SQE is there and execute whatever was in slot 5 last time round — an old command, re-executed. That is silent data corruption (a stale Write re-issued) or a mysterious duplicate completion.</p>
+<p>In Linux, <code>writel()</code> includes the necessary ordering: it guarantees that prior writes to normal memory are visible to the device before the MMIO write. That is why the NVMe driver calls <code>writel()</code> rather than the relaxed variant for doorbells. On x86 the hardware already orders these stores; on Arm and other weakly ordered CPUs, the barrier is a real instruction. (The kernel's <code>Documentation/memory-barriers.txt</code> describes this under device I/O.)</p>
+<aside class="callout warn">
+<p>The barrier must come <em>after</em> the SQE is completely written and <em>before</em> the doorbell. Placing it after the doorbell does nothing useful. And it must cover all SQEs in a batch: write slots 5, 6, 7, then one barrier, then one doorbell with tail = 8.</p>
+</aside>
+
+<h3>Batching: one doorbell, many commands</h3>
+<p>Because the doorbell carries the absolute tail, the host can add several SQEs and ring once. That saves PCIe bandwidth and, more importantly, controller work. Linux's block layer tells the driver when a request is the last of a batch, so the driver can defer the doorbell until then. The cost is a little latency for the first commands in the batch. If the "last" signal is lost — for example a batch is cut short by an error path that forgets to ring — commands sit in the SQ unfetched until the next doorbell arrives, sometimes much later: a classic intermittent latency spike or timeout.</p>
+
+<h3>How the controller notices (step 5)</h3>
+<p>The specification defines what the doorbell means, not how quickly a controller must act on it <span class="badge impl">Implementation-dependent</span>. Typical designs:</p>
+<ul>
+<li><strong>Hardware doorbell detection</strong>: the write sets a "pending" bit for the queue; a hardware arbiter or firmware loop picks pending queues according to the arbitration mechanism (round robin or weighted round robin, <a href="ch25.html">Chapter 25</a>).</li>
+<li><strong>Firmware polling</strong> of a doorbell shadow inside the controller.</li>
+<li><strong>Prefetch</strong>: on seeing tail − head = 3, the fetch engine reads all three SQEs in one Memory Read request (192 bytes), subject to Max Read Request Size.</li>
+</ul>
+<p>Doorbell-to-fetch latency in a trace is your measure of step 5. If it varies wildly or grows under load, the controller's front end (arbitration, firmware) is the bottleneck, not the media.</p>
+
+<h3>The CQ head doorbell</h3>
+<p>The CQ head doorbell tells the controller which CQ slots the host has consumed and may be reused. Without it, the controller eventually finds the CQ full and stops posting (<a href="ch25.html">Chapter 25</a>, abnormal trace). Key points:</p>
+<ul>
+<li>It can be written lazily — once per batch of reaped CQEs, not once per CQE.</li>
+<li>It must never move past entries the host has not consumed: that would let the controller overwrite unread completions.</li>
+<li>It does not acknowledge the interrupt. With MSI-X there is no interrupt acknowledgement register; each MSI-X message is an edge-like event. (The Interrupt Mask Set/Clear registers INTMS and INTMC at offsets 0Ch and 10h apply to pin-based and single/multiple-message MSI interrupts, not MSI-X.)</li>
+<li>Controllers may use CQ head doorbell writes as a hint for interrupt coalescing or for posting more CQEs — behaviour that is <span class="badge impl">Implementation-dependent</span>.</li>
+</ul>
+
+<h3>Shadow doorbells and Doorbell Buffer Config</h3>
+<p>In a virtual machine with an emulated NVMe controller, every MMIO doorbell write traps to the hypervisor (a "VM exit"), costing microseconds. NVMe 1.3 added an <span class="badge optional">Optional</span> Admin command, <strong><span class="g" data-term="shadow-doorbell">Doorbell Buffer Config</span></strong> (opcode 7Ch), to reduce those traps <span class="badge version">NVMe 1.3 and later</span>:</p>
+<ul>
+<li>The host gives the controller two memory pages: a <strong>Shadow Doorbell buffer</strong> (PRP Entry 1) and an <strong>EventIdx buffer</strong> (PRP Entry 2). Each has one slot per doorbell, laid out with the same stride as the real doorbells.</li>
+<li>The host writes new tail/head values into the shadow doorbell buffer in host memory, which costs no trap.</li>
+<li>The controller (the hypervisor's emulation) writes into the EventIdx buffer the index at which it next wants a real MMIO doorbell write.</li>
+<li>The host performs the real MMIO doorbell write only when its update crosses the EventIdx value — that is, when the controller has asked to be woken. Otherwise the controller, which is actively polling the shadow buffer, picks up the new value by itself.</li>
+</ul>
+<pre class="code" data-kind="pseudocode" data-lang="c" data-title="Shadow doorbell update (logic as used by the Linux driver)"><code><span class="cm">/* Return true if moving the index from old_idx to new_idx passes event_idx,
+ * i.e. the controller asked to be notified somewhere in (old_idx, new_idx]. */</span>
+static bool need_event(uint16_t event_idx, uint16_t new_idx, uint16_t old_idx) {
+    return (uint16_t)(new_idx - event_idx - 1) &lt; (uint16_t)(new_idx - old_idx);
+}
+
+void ring_sq(struct queue *q, uint16_t new_tail) {
+    if (q-&gt;dbbuf_shadow) {
+        uint16_t old = q-&gt;dbbuf_shadow[q-&gt;sq_db_index];
+        q-&gt;dbbuf_shadow[q-&gt;sq_db_index] = new_tail;     <span class="cm">/* memory write, no trap */</span>
+        mb();                                          <span class="cm">/* shadow before EventIdx read */</span>
+        if (!need_event(q-&gt;dbbuf_eventidx[q-&gt;sq_db_index], new_tail, old))
+            return;                                    <span class="cm">/* controller is polling */</span>
+    }
+    writel(new_tail, q-&gt;sq_db);                        <span class="cm">/* real MMIO doorbell */</span>
+}</code></pre>
+<p>Support is advertised in Identify Controller's Optional Admin Command Support (OACS) field. The scheme mirrors the "event index" technique of virtio. It is aimed at emulated or paravirtualised controllers; physical SSDs rarely implement it, and it changes what you see on the link — far fewer doorbell TLPs than commands. The exact normative rules (buffer layout, when the controller must re-read shadows, behaviour across resets) are in the NVMe Base Specification's Doorbell Buffer Config description; check them there <span class="badge uncertain">Check details</span>.</p>
+
+<h3>Doorbell bugs</h3>
+<table>
+<caption>A catalogue of doorbell bugs</caption>
+<thead><tr><th>Bug</th><th>What the host does</th><th>What the controller sees</th><th>Symptom</th><th>Trace signature</th></tr></thead>
+<tbody>
+<tr><td>Stale tail</td><td>Rings with an old tail value (e.g. a cached copy, or rings before updating the variable)</td><td>No new entries (tail unchanged) or fewer than added</td><td>Commands never fetched; timeouts; then a "catch-up" when the next doorbell arrives</td><td>Doorbell value equals the previous one; SQE fetch count lower than commands submitted</td></tr>
+<tr><td>Missing doorbell</td><td>Adds SQEs but never rings (lost "last in batch")</td><td>Nothing</td><td>Intermittent latency spikes or timeouts</td><td>Gap: no doorbell for that SQ while the driver logged submissions</td></tr>
+<tr><td>Wrap error</td><td>Writes tail = size instead of 0 (or uses the 0's based size in the modulo)</td><td>Invalid value (≥ size), or a tail that skips the last slot</td><td>Asynchronous error event; queue stops; or last slot never used</td><td>Doorbell value equal to the queue size; fetch addresses never reaching the last slot</td></tr>
+<tr><td>Overfill</td><td>Adds more entries than free slots (ignores SQHD)</td><td>Tail passes head; apparent queue contents shrink</td><td>Lost commands, corruption</td><td>Tail advance larger than size − 1 − outstanding</td></tr>
+<tr><td>Doorbell before SQE visible</td><td>Missing or misplaced barrier</td><td>Valid tail; stale SQE contents</td><td>Old command re-executed; duplicate CID completions</td><td>Fetched SQE payload (in the CplD) differs from what the driver wrote; CID of a previously completed command</td></tr>
+<tr><td>Wrong stride</td><td>Assumes stride 4 when DSTRD ≠ 0</td><td>Writes land on other queues' doorbells or reserved offsets</td><td>Wrong queue kicked; invalid doorbell register events</td><td>Doorbell addresses not on (4 &lt;&lt; DSTRD) boundaries</td></tr>
+<tr><td>Wide write</td><td>A 64-bit store to a doorbell</td><td>Two doorbells written at once (with stride 4: SQ tail and CQ head of the same queue)</td><td>Random CQ head corruption</td><td>MWr Length = 2 to a doorbell address</td></tr>
+<tr><td>Invalid CQ head</td><td>Head moved past entries the controller posted, or ≥ size</td><td>Head beyond tail</td><td>Asynchronous error event; overwritten CQEs</td><td>CQ head doorbell value ahead of the last CQE address</td></tr>
+<tr><td>Doorbell for a nonexistent queue</td><td>Uses a QID that was not created (or was deleted)</td><td>A write to an invalid doorbell register</td><td>Asynchronous error event</td><td>Doorbell offset beyond the created queues</td></tr>
+<tr><td>Doorbell while disabled</td><td>Rings before CSTS.RDY = 1 or after CC.EN = 0</td><td>Ignored</td><td>Commands lost across reset</td><td>Doorbell writes between CC.EN = 0 and RDY = 1</td></tr>
+</tbody>
+</table>
+
+<h4>Invalid doorbell values and asynchronous events</h4>
+<p>The specification defines how a controller reports two classes of doorbell misuse to the host, through the Asynchronous Event mechanism (<a href="ch26.html">Chapter 26</a>) with Asynchronous Event Type "Error status":</p>
+<table>
+<caption>Doorbell-related asynchronous error events (names as in the NVMe Base Specification)</caption>
+<thead><tr><th>Asynchronous Event Information (name)</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Write to Invalid Doorbell Register</td><td>Host wrote a doorbell register for a queue that does not exist (or another invalid doorbell register)</td></tr>
+<tr><td>Invalid Doorbell Write Value</td><td>Host wrote a value that is not valid for the queue: for example a tail or head ≥ the queue size, an SQ tail that would overfill the queue, or a CQ head that passes entries not yet posted</td></tr>
+</tbody>
+</table>
+<p>The event is reported only if an Asynchronous Event Request command is outstanding (and the event type is enabled where the specification makes that configurable). Completion Dword 0 of that request names the event type, the event information and the log page to read — the Error Information log (Log Page Identifier 01h). The host must then read that log page (with Get Log Page) before the controller will report further events of that type, unless it uses the Retain Asynchronous Event option. The numeric Asynchronous Event Information values and the precise list of invalid-value conditions are defined in the specification; verify them there <span class="badge uncertain">Check values</span>.</p>
+<aside class="callout notsaid">
+<p>The specification defines the reporting; it does not promise what the controller does with the queue after an invalid doorbell write. Some controllers ignore the write, some stop processing that queue, some require a reset. Never write test cases that depend on post-error queue behaviour without the vendor's documentation.</p>
+</aside>
+
+<h3>The ladder for the central concept: the doorbell</h3>
+<div class="ladder">
+<div class="rung" data-rung="A"><p>Put the order card in the tray first, then ring the bell and hold up the number of the next empty slot.</p></div>
+<div class="rung" data-rung="B"><p>After writing SQEs, the host writes the new absolute SQ tail to SQyTDBL; after consuming CQEs, it writes the new CQ head to CQyHDBL.</p></div>
+<div class="rung" data-rung="C"><p>Doorbells are 32-bit registers at BAR0 + 1000h onward, spaced by 4 &lt;&lt; CAP.DSTRD. A write latches the index into the queue context and flags the queue for the arbiter (SQ) or frees CQ slots (CQ).</p></div>
+<div class="rung" data-rung="D"><p>NVMe Base Specification 2.4 — Controller Registers (SQyTDBL, CQyHDBL, CAP.DSTRD); queueing model; Asynchronous Event information for invalid doorbell writes; Doorbell Buffer Config (optional, NVMe 1.3+). NVMe over PCIe Transport Specification 1.4 for the PCIe register mapping.</p></div>
+<div class="rung" data-rung="E"><p>A posted Memory Write TLP, 1 DW, First BE 1111b, from the root complex to BAR0 + doorbell offset. No completion. Ordered behind earlier posted writes from the same source, which does not order it behind the CPU's earlier writes to RAM — that is the host's barrier's job.</p></div>
+<div class="rung" data-rung="F"><p>MWr32 Addr=0xFE60_1008 Len=1 Data=0x0000_0008, followed ~700 ns later by the device's MRd at the SQ base + old head × 64 with Length = (new − old) × 16 DW.</p></div>
+<div class="rung" data-rung="G"><p>Doorbell present but no fetch → invalid value, wrong address/stride, controller not ready, Bus Master disabled. Fetch present but wrong payload → missing barrier. Doorbell value repeats → stale tail. Value = queue size → wrap bug. CQ head missing → controller stall on full CQ.</p></div>
+</div>
+
+<h3>The sixteen questions: the doorbell</h3>
+<dl>
+<dt>1. What is it?</dt><dd>A 32-bit controller register the host writes to publish a new SQ tail or CQ head.</dd>
+<dt>2. Why was it created?</dt><dd>To let the host notify the controller of new commands or freed completion slots with one cheap, posted write.</dd>
+<dt>3. What problem does it solve?</dt><dd>Without it, the controller would have to poll host memory for new commands (wasting bandwidth and adding latency) or the host would have to perform slow handshakes.</dd>
+<dt>4. What existed before it?</dt><dd>AHCI's Command Issue register (a bit per command slot), and similar "issue" registers in other controllers.</dd>
+<dt>5. Why is the current design better?</dt><dd>One write covers any number of new commands; it carries an absolute index, so repeats are harmless; per-queue doorbells avoid cross-core contention.</dd>
+<dt>6. Who creates it?</dt><dd>The host writes it (the register exists in the controller from enable; it is meaningful once the queue exists).</dd>
+<dt>7. Who consumes it?</dt><dd>The controller's doorbell logic and arbiter.</dd>
+<dt>8. Where does it live?</dt><dd>In BAR0 at 1000h + index × stride.</dd>
+<dt>9. What memory/registers are involved?</dt><dd>SQyTDBL, CQyHDBL, CAP.DSTRD; the SQ memory being published; shadow and EventIdx buffers if Doorbell Buffer Config is used.</dd>
+<dt>10. What happens before it?</dt><dd>SQE written to memory, tail updated, write barrier (SQ); CQEs consumed (CQ).</dd>
+<dt>11. What happens after it?</dt><dd>SQ: arbitration and SQE fetch. CQ: those slots become available for new CQEs.</dd>
+<dt>12. What happens if it is wrong?</dt><dd>Lost, duplicated, stale or corrupted commands; full-CQ stalls; asynchronous error events.</dd>
+<dt>13. What does the protocol analyzer show?</dt><dd>Host→device MWr32 (or MWr64 if BAR0 is above 4 GiB), Length 1, to the doorbell address, with the index as payload.</dd>
+<dt>14. What does Linux show?</dt><dd>Nothing directly; only indirect signs (timeouts, interrupt counts). Tracepoints and analyzers are needed to see doorbells.</dd>
+<dt>15. What would a validation engineer test?</dt><dd>Every invalid value class, doorbells for nonexistent queues, wrap at every size, batching, repeated writes, wide/partial writes, doorbells during reset, shadow doorbell semantics if supported, doorbell-to-fetch latency under load.</dd>
+<dt>16. What would a senior engineer suspect when it fails?</dt><dd>Memory ordering (barrier), stride, wrap arithmetic, lost batch-end doorbells, CQ head not published, a hypervisor trapping and mis-emulating doorbells.</dd>
+</dl>
+</section>
+
+<section id="hardware">
+<h2>Hardware view</h2>
+<p>On the host side, the doorbell page is mapped uncached (UC) so stores go straight to the device without being combined or reordered with each other. Write-combining (WC) mappings are not used for doorbells because combining two doorbell writes into one burst — or delaying them in a buffer — would break their meaning and timing.</p>
+<p>In the controller, the doorbell block is typically a register file with one entry per supported doorbell. A write generates an event for that queue. The controller compares the new SQ tail with its internal head (or the new CQ head with its internal tail) and validates it. Valid SQ events go to the arbiter; valid CQ events update free-slot accounting.</p>
+<aside class="callout hw">
+<p>Some controllers implement doorbells in hardware that directly triggers DMA fetch engines, giving doorbell-to-fetch times well under a microsecond; others hand doorbell events to firmware, where latency depends on firmware load. Both are compliant. Measure, don't assume <span class="badge impl">Implementation-dependent</span>.</p>
+</aside>
+<p>The Controller Memory Buffer (CMB), when supported and used for SQs, changes the picture: the host writes SQEs directly into device memory with posted writes, so step 6 (fetch) becomes internal to the device. The doorbell is still required.</p>
+</section>
+
+<section id="spec">
+<h2>Specification view</h2>
+<ul>
+<li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Controller Registers: Submission Queue y Tail Doorbell, Completion Queue y Head Doorbell, CAP.DSTRD</cite></li>
+<li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Asynchronous Event Request: Error status event information</cite></li>
+<li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Doorbell Buffer Config command</cite></li>
+<li><cite class="spec">NVM Express over PCIe Transport Specification, Revision 1.4 — PCIe register mapping and memory model</cite></li>
+<li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 family — Memory Write requests, posted transactions, ordering rules</cite></li>
+</ul>
+<aside class="callout verified">
+<ul>
+<li>Doorbells start at offset 1000h; SQ y tail at 1000h + (2y × (4 &lt;&lt; CAP.DSTRD)), CQ y head at 1000h + ((2y + 1) × (4 &lt;&lt; CAP.DSTRD)).</li>
+<li>The doorbell value field is bits 15:00; bits 31:16 are reserved.</li>
+<li>The host writes SQ tail and CQ head; the controller never needs the host to report SQ head or CQ tail.</li>
+<li>Invalid doorbell register writes and invalid doorbell values are reported through asynchronous events of type Error status.</li>
+<li>Doorbell Buffer Config (7Ch) is an optional Admin command introduced in NVMe 1.3.</li>
+<li>PCIe Memory Writes are posted: no completion is returned.</li>
+</ul>
+</aside>
+<aside class="callout derived">
+<ul>
+<li>A doorbell value repeated is a no-op; doorbells are idempotent per value.</li>
+<li>A 64-bit store to a doorbell with stride 4 writes two doorbells.</li>
+<li>Doorbell-to-fetch latency in a trace measures the controller's front-end responsiveness.</li>
+<li>With shadow doorbells, the number of doorbell TLPs in a trace can be far lower than the number of commands, so counting doorbells no longer counts batches.</li>
+</ul>
+</aside>
+<aside class="callout impl">
+<ul>
+<li>How fast a controller reacts to a doorbell; how many SQEs it fetches per request.</li>
+<li>What a controller does with the queue after an invalid doorbell write.</li>
+<li>Whether shadow doorbells are supported (most physical SSDs: no; emulated controllers: often).</li>
+<li>Host batching policy and barrier implementation (CPU architecture-dependent).</li>
+</ul>
+</aside>
+<aside class="callout version">
+<p>Doorbell registers and stride have existed since NVMe 1.0. Doorbell Buffer Config arrived in NVMe 1.3. In NVMe 2.x the PCIe-specific aspects are in the NVMe over PCIe Transport specification; other transports (TCP, RDMA) have no doorbell registers at all — the act of sending a command capsule replaces the doorbell. Keep that in mind when reading "doorbell" in fabrics contexts (<a href="ch65.html">Chapter 65</a>).</p>
+</aside>
+<aside class="callout notsaid">
+<ul>
+<li>The specification does not bound doorbell-to-fetch latency.</li>
+<li>It does not require a controller to fetch all published entries at once.</li>
+<li>It does not define post-error queue behaviour after an invalid doorbell value.</li>
+<li>Check in the specification: read behaviour of doorbell registers (do not rely on reading them back), the exact invalid-value conditions, and the numeric Asynchronous Event Information values.</li>
+</ul>
+</aside>
+<aside class="callout warn">
+<ul>
+<li>Never ring before the SQE is visible in memory.</li>
+<li>Never write a count; write the absolute index.</li>
+<li>Never hard-code the stride.</li>
+<li>Never assume a doorbell was received because the store completed — posted writes give no acknowledgement.</li>
+<li>Never use 64-bit or partial-width stores on doorbells.</li>
+</ul>
+</aside>
+</section>
+
+<section id="protocol">
+<h2>Protocol view</h2>
+<p>Ordering is the protocol heart of doorbells. Three ordering relationships matter, and they are enforced by different mechanisms:</p>
+<table>
+<caption>Ordering around doorbells</caption>
+<thead><tr><th>Must happen before</th><th>…this</th><th>Enforced by</th></tr></thead>
+<tbody>
+<tr><td>SQE stored in host memory</td><td>Doorbell reaches device</td><td>Host CPU memory barrier (writel semantics); the device's later read of the SQE is coherent with CPU caches</td></tr>
+<tr><td>Data written to host memory (Read command)</td><td>CQE written to host memory</td><td>PCIe posted-write ordering from the same requester (unless Relaxed Ordering is used on the data writes, in which case the device must not set it on the CQE write in a way that breaks this)</td></tr>
+<tr><td>CQE written</td><td>MSI-X interrupt delivered</td><td>PCIe posted-write ordering: MSI-X is itself a posted Memory Write</td></tr>
+<tr><td>Host consumed CQEs</td><td>CQ head doorbell</td><td>Host program order (read CQEs, then write doorbell)</td></tr>
+</tbody>
+</table>
+<p>Between the host and device the doorbell is a one-way message. The controller's "reply" is its next action: a Memory Read of SQEs. That gives a simple, powerful correlation rule for traces: <em>every SQ tail doorbell that adds N entries should be followed by device reads that together cover exactly those N slots</em>, starting at the previous tail.</p>
+</section>
+
+<section id="trace">
+<h2>Trace view</h2>
+<div class="trace" data-kind="synthetic" data-title="Normal: batched doorbell, prefetch of three SQEs, lazy CQ head doorbell">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Len=1 FBE=1111 Data=0x0000_0008</td><td>SQ1 tail 5 → 8: three new SQEs (slots 5, 6, 7)</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>690</td><td>MRd64</td><td>Req=0x0100 Tag=0x22 Addr=0x1_2340_0140 Len=48 DW</td><td>Fetch slots 5–7 in one request (doorbell-to-fetch 690 ns)</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,380</td><td>CplD</td><td>Cpl=RC Tag=0x22 ByteCount=192 Len=48 DW</td><td>Three SQEs: CIDs 0x0051, 0x0052, 0x0053</td></tr>
+<tr class="note"><td colspan="6">Execution and data transfer for three 4 KiB reads (48 data MWr TLPs) omitted.</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>71,200</td><td>MWr64</td><td>Addr=0x1_2341_0250 Len=4 DW SQHD=8 CID=0x0052 P=1</td><td>CQE slot 37</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>71,210</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x0000_0041</td><td>MSI-X vector 1</td></tr>
+<tr class="dir-up"><td>6</td><td>Dev→Host</td><td>73,900</td><td>MWr64</td><td>Addr=0x1_2341_0260 Len=8 DW (two CQEs) CIDs 0x0051, 0x0053, P=1</td><td>CQE slots 38–39</td></tr>
+<tr class="dir-up"><td>7</td><td>Dev→Host</td><td>73,910</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x0000_0041</td><td>MSI-X vector 1</td></tr>
+<tr class="dir-down"><td>8</td><td>Host→Dev</td><td>76,500</td><td>MWr32</td><td>Addr=0xFE60_100C Len=1 Data=0x0000_0028</td><td>CQ1 head 37 → 40, one doorbell for three CQEs</td></tr>
+</tbody>
+</table>
+<p>Correlation: doorbell #1 adds (8 − 5) mod 1024 = 3 entries starting at slot 5 → expected fetch range 0x140–0x1FF, matched by #2 (48 DW = 192 bytes from 0x140). Doorbell #8 frees (40 − 37) = 3 CQ slots, matching the three CQEs in #4 and #6. Nothing in the doorbells identifies commands; CIDs appear only in SQE payloads (#3) and CQEs (#4, #6).</p>
+</div>
+
+<div class="trace" data-kind="synthetic" data-title="Abnormal: wrap bug writes tail = queue size; controller raises an asynchronous error event">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">SQ1 has 1024 entries. The driver's SQ1 tail is 1022. A modified driver computes the next tail as <code>tail + 1</code> and only wraps when the result exceeds 1024. The Admin queue has one Asynchronous Event Request (CID 0x7001) outstanding.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_03FF</td><td>SQ1 tail 1022 → 1023: legal</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.7</td><td>MRd64</td><td>Addr=0x1_2340_FF80 Len=16 DW</td><td>Fetch slot 1022 (0xFF80 = 1022 × 64)</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.4</td><td>CplD</td><td>ByteCount=64</td><td>SQE for slot 1022</td></tr>
+<tr class="abnormal"><td>4</td><td>Host→Dev</td><td>5.0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0400</td><td>First abnormal event: SQ1 tail = 1024 — not a valid index for a 1024-entry queue (valid: 0–1023). Should have been 0</td></tr>
+<tr class="note"><td colspan="6">No fetch of slot 1023 follows.</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>6.2</td><td>MWr64</td><td>Addr=0x1_0000_1xx0 (Admin CQ) CID=0x7001 SQID=0 P=1 DW0: type Error status, info Invalid Doorbell Write Value, LID 01h</td><td>The outstanding Asynchronous Event Request completes</td></tr>
+<tr class="dir-up"><td>6</td><td>Dev→Host</td><td>6.2</td><td>MWr32</td><td>Addr=0xFEE0_0000 Data=0x0000_0040</td><td>MSI-X vector 0 (Admin)</td></tr>
+<tr class="dir-down"><td>7</td><td>Host→Dev</td><td>40.0</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=…</td><td>Driver submits Get Log Page, LID 01h (Error Information) to read details</td></tr>
+<tr class="note"><td colspan="6">The command in slot 1023 is never fetched; after the I/O timeout the driver aborts/resets. The kernel log shows an asynchronous event notice and later an I/O timeout.</td></tr>
+</tbody>
+</table>
+<p>Reasoning: #4 is the first abnormal event — a value equal to the queue size. Everything after it is consequence. The asynchronous event (#5) is the controller's correct response; its information field and the Error Information log entry (which can identify the queue and the offending value) point straight at the doorbell. Without an outstanding Asynchronous Event Request, the controller would have had no way to tell the host; the trace would show only #4 and silence. The Admin CQ address is elided (xx) because it depends on the Admin CQ tail at that moment.</p>
+</div>
+
+<div class="trace" data-kind="synthetic" data-title="Abnormal: missing barrier — the controller fetches a stale SQE">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Arm server, experimental driver using a relaxed MMIO write for the doorbell. Slot 9 last held a Write (opcode 01h, CID 0x0101) 1024 submissions ago. The driver logs that it placed a Read (opcode 02h, CID 0x0509) in slot 9.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_000A</td><td>SQ1 tail 9 → 10</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>420</td><td>MRd64</td><td>Addr=0x1_2340_0240 Len=16 DW Tag=0x31</td><td>Fetch slot 9 — fast controller, 420 ns after the doorbell</td></tr>
+<tr class="abnormal"><td>3</td><td>Host→Dev</td><td>1,050</td><td>CplD</td><td>Tag=0x31 ByteCount=64 CDW0=0x0101_0001</td><td>First abnormal event: the SQE payload is the <em>old</em> Write (opcode 01h, CID 0x0101), not the Read the driver logged</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,300 …</td><td>MRd64 ×8</td><td>Addr = old Write's data buffer</td><td>Controller executes the stale Write: reads stale data from a buffer that may now belong to someone else</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>48,000</td><td>MWr64</td><td>CQE CID=0x0101 P=1</td><td>Completion for a CID the driver believes finished long ago</td></tr>
+</tbody>
+</table>
+<p>Reasoning: the analyzer's view of the SQE payload in the CplD (#3) is the decisive evidence: the controller read what was in memory at that moment. The CQE for a stale CID (#5) is what the host notices (Linux would log a completion for an invalid or inactive command ID). Root cause: the SQE store was not visible before the doorbell write reached the device. Fix: use an ordered MMIO write (writel) or an explicit write barrier before the doorbell. This bug may only appear on fast controllers and weakly ordered CPUs — which is why it can pass testing on x86.</p>
+</div>
+</section>
+
+<section id="linux">
+<h2>Linux view</h2>
+<p>Linux does not expose doorbell writes as counters. You see their consequences, and you can trace the driver around them.</p>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Doorbell stride and queue limits from CAP</span>
+sudo nvme show-regs /dev/nvme0 -H | grep -iE 'stride|mqes|maximum queue'
+
+<span class="cm"># Does the controller support Doorbell Buffer Config? Look at OACS in Identify Controller</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -i -A12 '^oacs'
+
+<span class="cm"># Driver-level events: command setup and completion tracepoints (requires tracefs; read-only observation)</span>
+sudo ls /sys/kernel/tracing/events/nvme/
+<span class="cm"># e.g. enable nvme_setup_cmd and nvme_complete_rq, run a short read workload, then read the trace buffer.</span>
+<span class="cm"># Disable the events afterwards. Tracing adds overhead; avoid on production systems.</span>
+
+<span class="cm"># Asynchronous events and invalid-command-ID messages appear in the kernel log</span>
+sudo dmesg | grep -iE 'nvme.*(async|invalid id|timeout)'</code></pre>
+<table>
+<caption>What Linux can and cannot tell you about doorbells</caption>
+<thead><tr><th>Source</th><th>Can show</th><th>Cannot show</th></tr></thead>
+<tbody>
+<tr><td><code>show-regs</code></td><td>DSTRD, hence every doorbell address</td><td>Doorbell values (do not try to read doorbells)</td></tr>
+<tr><td>id-ctrl OACS</td><td>Whether Doorbell Buffer Config is supported</td><td>Whether the driver enabled it (the driver uses it only in some environments)</td></tr>
+<tr><td>Tracepoints</td><td>Commands set up and completed, with queue IDs and CIDs</td><td>When the doorbell TLP left, or arrived; batching boundaries</td></tr>
+<tr><td>Kernel log</td><td>Asynchronous event notices; timeouts; completions for invalid command IDs</td><td>The doorbell value that caused them</td></tr>
+</tbody>
+</table>
+<aside class="callout linux">
+<p>To see doorbells themselves you need a PCIe protocol analyzer or interposer, or an emulated device (for example QEMU's NVMe emulation with its own tracing), which can log every doorbell write it receives. The emulator route is an excellent <span class="badge safe">Safe lab</span>.</p>
+</aside>
+</section>
+
+<section id="code">
+<h2>Code / pseudocode</h2>
+<pre class="code" data-kind="pseudocode" data-lang="c" data-title="submit_batch.c (teaching sketch)"><code>void submit_batch(struct queue_pair *q, const struct sqe *cmds, int n) {
+    for (int i = 0; i &lt; n; i++) {
+        memcpy(&amp;q-&gt;sq[q-&gt;sq_tail], &amp;cmds[i], 64);           <span class="cm">/* step 2 */</span>
+        if (++q-&gt;sq_tail == q-&gt;size)                       <span class="cm">/* step 3: wrap at SIZE, */</span>
+            q-&gt;sq_tail = 0;                                <span class="cm">/* never write size      */</span>
+    }
+    <span class="cm">/* step 4: writel() orders all prior normal-memory stores before the MMIO store */</span>
+    writel(q-&gt;sq_tail, q-&gt;sq_db);                          <span class="cm">/* one doorbell for n commands */</span>
+}
+
+void reap_and_release(struct queue_pair *q) {
+    uint16_t start = q-&gt;cq_head;
+    while (cqe_is_new(q)) {                                  <span class="cm">/* phase tag check */</span>
+        handle(&amp;q-&gt;cq[q-&gt;cq_head]);
+        if (++q-&gt;cq_head == q-&gt;size) { q-&gt;cq_head = 0; q-&gt;phase ^= 1; }
+    }
+    if (q-&gt;cq_head != start)
+        writel(q-&gt;cq_head, q-&gt;cq_db);                      <span class="cm">/* free CQ slots */</span>
+}</code></pre>
+<p>The caller must ensure <code>n</code> does not exceed the free SQ slots (computed from the latest SQHD). Notice that <code>writel</code> is a 32-bit store; using <code>writeq</code> here would write two doorbells.</p>
+</section>
+
+<section id="worked">
+<h2>Worked example</h2>
+<p><strong>Problem.</strong> An emulated controller reports CAP.DSTRD = 1. Its BAR0 is at 0x2_0000_0000 (above 4 GiB). (a) Give the SQ3 tail and CQ3 head doorbell addresses. (b) What TLP format carries the doorbell? (c) The analyzer shows a write of 0x0000_0010 to BAR0 + 0x1030. Decode it. (d) The previous value written there was 0x0000_000C, and SQ3 has 16 entries. What should follow on the link?</p>
+<p><strong>(a)</strong> Stride = 4 &lt;&lt; 1 = 8 bytes. SQ3TDBL = 1000h + 2 × 3 × 8 = 1000h + 30h = 1030h → 0x2_0000_1030. CQ3HDBL = 1000h + 7 × 8 = 1038h → 0x2_0000_1038.</p>
+<p><strong>(b)</strong> The address is above 4 GiB, so a 4 DW header Memory Write (MWr64): Fmt = 011b, Type = 0_0000b, Length = 1, First BE 1111b.</p>
+<p><strong>(c)</strong> Offset 1030h = SQ3 tail doorbell (index (1030h − 1000h) / 8 = 6 → even → SQ of queue 3). Value 0x10 = 16. For a 16-entry queue, valid indices are 0–15: <strong>16 is invalid</strong> — a wrap bug.</p>
+<p><strong>(d)</strong> Nothing useful: the controller should not fetch on an invalid value. If an Asynchronous Event Request is outstanding, expect an Admin CQE completing it with an Error status event (Invalid Doorbell Write Value), an interrupt on vector 0, and then the host's Get Log Page for the Error Information log. The intended value was 0, which would have added (0 − 12) mod 16 = 4 entries (slots 12–15) and triggered a fetch from SQ3 base + 12 × 64.</p>
+</section>
+
+<section id="mistakes">
+<h2>Common mistakes</h2>
+<table>
+<caption>Doorbell misconceptions</caption>
+<thead><tr><th>Misconception</th><th>Reality</th></tr></thead>
+<tbody>
+<tr><td>"The doorbell carries the command."</td><td>It carries only an index. The command is fetched by the controller with DMA.</td></tr>
+<tr><td>"Each doorbell means one new command."</td><td>It means "the tail is now here". The number of new commands is the difference from the previous tail, modulo size.</td></tr>
+<tr><td>"The doorbell write is acknowledged."</td><td>It is a posted write: no completion, no acknowledgement.</td></tr>
+<tr><td>"The CQ head doorbell acknowledges the interrupt."</td><td>It frees CQ slots. MSI-X needs no acknowledgement.</td></tr>
+<tr><td>"There's an SQ head doorbell."</td><td>No. SQ head is reported in CQEs (SQHD).</td></tr>
+<tr><td>"The stride is always 4."</td><td>Only when CAP.DSTRD = 0.</td></tr>
+<tr><td>"The barrier is only needed on Arm."</td><td>It is needed in the code everywhere; on x86 it compiles to a compiler barrier, but omitting it is still a bug that the compiler can expose.</td></tr>
+<tr><td>"Counting doorbell TLPs counts commands."</td><td>Batching and shadow doorbells break that; count fetched SQEs instead.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="debugging">
+<h2>Debugging connection</h2>
+<p>A doorbell investigation follows the correlation rule: each SQ doorbell should be followed by fetches covering exactly the slots it published; each CQ doorbell should not pass the CQEs posted.</p>
+<ol>
+<li><strong>Decode every doorbell:</strong> queue, side, value. Flag values ≥ size, offsets not on stride boundaries, Length ≠ 1, partial byte enables.</li>
+<li><strong>Compute the published range</strong> for each SQ doorbell: from the previous tail to the new tail − 1, modulo size.</li>
+<li><strong>Match fetches</strong>: device MRd addresses and lengths should cover the range. Missing fetch → controller-side issue or invalid value. Extra fetch → an earlier doorbell you missed, or the controller re-reading.</li>
+<li><strong>Check payloads</strong>: SQE payloads in the root complex's CplDs must match what the driver logged. Mismatch → barrier/ordering bug or slot reuse.</li>
+<li><strong>Track CQ head</strong>: compare each CQ doorbell value with the CQE addresses posted. Head past the last CQE → invalid value. Long gaps without a CQ doorbell while CQEs pile up → full-CQ risk.</li>
+<li><strong>Look at the Admin CQ</strong> for Asynchronous Event Request completions — the controller may already have told you which doorbell was wrong.</li>
+</ol>
+<aside class="callout debug">
+<p>Many analyzers can trigger on "Memory Write to address range X with data ≥ Y". Set a trigger on the doorbell range with data ≥ the smallest queue size: it catches wrap bugs at the moment they happen, with the preceding traffic in the buffer.</p>
+</aside>
+</section>
+
+<section id="senior">
+<h2>Senior engineer insight</h2>
+<ul>
+<li><strong>The doorbell is the boundary between two memory models.</strong> Bugs here are rarely NVMe bugs; they are CPU memory-ordering bugs that NVMe exposes. Review doorbell code with the CPU architecture manual and the kernel's memory-barrier documentation open.</li>
+<li><strong>Doorbell-to-fetch latency is a first-class performance metric.</strong> It isolates controller front-end delay from media and transfer time. Plot it against queue depth: a knee shows where firmware becomes the bottleneck.</li>
+<li><strong>Doorbells are where virtualisation costs hide.</strong> Each trapped doorbell costs a VM exit. Shadow doorbells, polling modes and hardware virtualisation (SR-IOV, <a href="ch56.html">Chapter 56</a>) exist largely to remove that cost.</li>
+<li><strong>Absence is evidence.</strong> A missing CQ head doorbell, a missing batch-end doorbell, a missing fetch after a doorbell — the most important events in a doorbell investigation are often the ones that never happened. Make sure your capture filter would have shown them.</li>
+<li><strong>Arm an Asynchronous Event Request in every test.</strong> Without it, the controller cannot tell you about invalid doorbell writes, and you lose the cheapest diagnostic you have.</li>
+</ul>
+</section>
+
+<section id="lab">
+<h2>Lab</h2>
+<h3>Lab: Decode and lint a doorbell trace</h3>
+<aside class="callout safety"><p><span class="badge safe">Safe lab</span> Pure software analysis of a synthetic trace.</p></aside>
+<h4>Objective</h4>
+<p>Decode doorbell writes to queue and side, track queue state from doorbells and CQE posts, and detect the doorbell bugs catalogued in this chapter.</p>
+<h4>Skills</h4>
+<p>Doorbell address arithmetic; modulo index arithmetic; correlating host writes with device actions; bug classification.</p>
+<h4>Hardware required</h4>
+<p>None.</p>
+<h4>Software required</h4>
+<p>Python 3.8+.</p>
+<h4>Input</h4>
+<p>A synthetic event list: host MWr TLPs to BAR0 (address, length in DW, data) and device CQE posts (queue, SQHD). Queues 0, 1 and 2 exist with 32, 1024 and 16 entries.</p>
+<h4>Expected output</h4>
+<p>One decoded line per event, with "!!" and an explanation for each violation.</p>
+<h4>Background</h4>
+<p>The doorbell address formula, the bug catalogue, and the asynchronous error events.</p>
+<h4>Step 1 — Run the linter</h4>
+<pre class="code" data-kind="executable" data-lang="python" data-title="doorbell_lint.py"><code>#!/usr/bin/env python3
+"""Doorbell decoder and linter for synthetic traces (teaching model).
+
+Input: host-&gt;device MWr TLPs into BAR0 plus device CQE posts (with SQHD).
+Output: one decoded line per event and any doorbell rule violations.
+"""
+
+BAR0 = 0xFE60_0000
+DSTRD = 0                              # CAP.DSTRD; stride = 4 &lt;&lt; DSTRD bytes
+STRIDE = 4 &lt;&lt; DSTRD
+QUEUES = {0: 32, 1: 1024, 2: 16}       # existing queue pairs: qid -&gt; entries
+
+class Queue:
+    def __init__(self, size):
+        self.size = size
+        self.sq_tail = 0     # last SQ tail doorbell value
+        self.sq_head = 0     # last SQHD seen in a CQE
+        self.cq_tail = 0     # controller's CQ tail (counted from CQE posts)
+        self.cq_head = 0     # last CQ head doorbell value
+
+def decode(addr):
+    off = addr - BAR0
+    if off &lt; 0x1000:
+        return None, None, f"controller register 0x{off:02X}"
+    if (off - 0x1000) % STRIDE:
+        return None, None, f"offset 0x{off:X} not on a doorbell stride boundary"
+    idx = (off - 0x1000) // STRIDE
+    return idx // 2, ("SQ tail" if idx % 2 == 0 else "CQ head"), None
+
+def lint(events):
+    qs = {q: Queue(n) for q, n in QUEUES.items()}
+    for ev in events:
+        t, kind = ev[0], ev[1]
+        if kind == "CQE":                       # ("CQE", qid, sqhd)
+            _, _, qid, sqhd = ev
+            q = qs[qid]
+            q.sq_head = sqhd
+            q.cq_tail = (q.cq_tail + 1) % q.size
+            print(f"{t:&gt;7}  CQE posted on CQ{qid}, SQHD={sqhd}")
+            continue
+        _, _, addr, ndw, value = ev              # ("MWr", addr, length_dw, data)
+        qid, which, note = decode(addr)
+        if note:
+            print(f"{t:&gt;7}  MWr 0x{addr:08X}: {note}")
+            continue
+        problems = []
+        if ndw != 1:
+            problems.append(f"{ndw}-DW write spans {ndw} doorbell registers")
+        if qid not in qs:
+            print(f"{t:&gt;7}  {which} doorbell for queue {qid} = {value}  !! "
+                  "queue does not exist (Invalid Doorbell Register event)")
+            continue
+        q = qs[qid]
+        if value &amp; 0xFFFF0000:
+            problems.append("reserved bits 31:16 set")
+        v = value &amp; 0xFFFF
+        if v &gt;= q.size:
+            problems.append(f"value {v} &gt;= queue size {q.size} (Invalid Doorbell Write Value)")
+        elif which == "SQ tail":
+            added = (v - q.sq_tail) % q.size
+            in_use_before = (q.sq_tail - q.sq_head) % q.size
+            if added == 0:
+                problems.append("tail unchanged: redundant or stale doorbell")
+            elif in_use_before + added &gt; q.size - 1:
+                problems.append(f"adds {added} entries but only {q.size - 1 - in_use_before} free: overfills SQ")
+            q.sq_tail = v
+        else:
+            freed = (v - q.cq_head) % q.size
+            pending = (q.cq_tail - q.cq_head) % q.size
+            if freed &gt; pending:
+                problems.append(f"head moves {freed} but only {pending} CQEs were posted: passes CQ tail")
+            q.cq_head = v
+        flag = "  !! " + "; ".join(problems) if problems else ""
+        print(f"{t:&gt;7}  {which} doorbell Q{qid} = {v}{flag}")
+
+TRACE = [
+    (0,     "MWr", 0xFE60_1008, 1, 3),       # SQ1 tail = 3
+    (900,   "CQE", 1, 3), (910, "CQE", 1, 3), (920, "CQE", 1, 3),
+    (1500,  "MWr", 0xFE60_100C, 1, 3),       # CQ1 head = 3
+    (2000,  "MWr", 0xFE60_1008, 1, 3),       # stale: same tail again
+    (2500,  "MWr", 0xFE60_1008, 1, 1024),    # wrap bug: should be 0
+    (3000,  "MWr", 0xFE60_100C, 1, 5),       # head past tail
+    (3500,  "MWr", 0xFE60_1018, 1, 1),       # SQ3 tail: queue 3 not created
+    (4000,  "MWr", 0xFE60_1008, 2, 4),       # 64-bit write to SQ1TDBL
+    (4500,  "MWr", 0xFE60_1006, 1, 1),       # misaligned
+]
+
+if __name__ == "__main__":
+    lint(TRACE)</code></pre>
+<p>Expected output (deterministic):</p>
+<pre class="code" data-kind="simulation" data-lang="text"><code>      0  SQ tail doorbell Q1 = 3
+    900  CQE posted on CQ1, SQHD=3
+    910  CQE posted on CQ1, SQHD=3
+    920  CQE posted on CQ1, SQHD=3
+   1500  CQ head doorbell Q1 = 3
+   2000  SQ tail doorbell Q1 = 3  !! tail unchanged: redundant or stale doorbell
+   2500  SQ tail doorbell Q1 = 1024  !! value 1024 &gt;= queue size 1024 (Invalid Doorbell Write Value)
+   3000  CQ head doorbell Q1 = 5  !! head moves 2 but only 0 CQEs were posted: passes CQ tail
+   3500  SQ tail doorbell for queue 3 = 1  !! queue does not exist (Invalid Doorbell Register event)
+   4000  SQ tail doorbell Q1 = 4  !! 2-DW write spans 2 doorbell registers
+   4500  MWr 0xFE601006: offset 0x1006 not on a doorbell stride boundary</code></pre>
+<h4>Step 2 — Change the stride</h4>
+<p>Set <code>DSTRD = 1</code> and run again. Explain why the decode of every event changes.</p>
+<h4>Step 3 — Add a missing-fetch check</h4>
+<p>Add a ("FETCH", qid, first_slot, count) event type and check that each SQ doorbell's published range is covered by fetches before the next doorbell.</p>
+<h4>Observation</h4>
+<p>For each flagged event, write the bug name from the catalogue and the asynchronous event (if any) a controller would raise.</p>
+<h4>Questions</h4>
+<ol>
+<li>Which flagged events would cause a controller to raise an asynchronous error event, and with which event information?</li>
+<li>Why is the stale doorbell at t = 2000 not, by itself, an error?</li>
+<li>With DSTRD = 1, what does address 0xFE60_1008 decode to?</li>
+<li>Why does the 2-DW write at t = 4000 matter even though its first Dword is a legal tail?</li>
+</ol>
+<h4>Challenge</h4>
+<p>Extend the linter to support shadow doorbells: add a shadow buffer and an EventIdx buffer per doorbell, and flag any MMIO doorbell write that was <em>not needed</em> (the controller did not ask for it) and any update that crossed EventIdx without an MMIO write (a missed notification).</p>
+<details class="hint"><summary>Hints</summary><p>For Q3: index = (0x1008 − 0x1000) / 8 = 1 → odd → CQ head of queue 0. For the challenge, reuse <code>need_event()</code> from the shadow doorbell pseudocode.</p></details>
+<details class="solution"><summary>Solution</summary>
+<p><strong>Q1.</strong> t = 2500 (value 1024 ≥ size): Invalid Doorbell Write Value. t = 3000 (CQ head passes posted CQEs): Invalid Doorbell Write Value. t = 3500 (queue 3 does not exist): Write to Invalid Doorbell Register. The 2-DW write at t = 4000 writes SQ1TDBL = 4 (legal) and CQ1HDBL = the second Dword (whatever it holds; with data 0 that moves CQ head backwards — likely invalid). The misaligned write at t = 4500 is not a doorbell register at all; controller behaviour is implementation-dependent (likely an invalid doorbell register event or ignored).</p>
+<p><strong>Q2.</strong> Doorbells carry an absolute index; writing the same tail adds zero entries. It is harmless to the controller, but a redundant doorbell in a trace often reveals a host logic error (the host thought it added commands but its tail variable didn't move — a stale tail).</p>
+<p><strong>Q3.</strong> With stride 8, 0x1008 is CQ0HDBL — the Admin CQ head doorbell, not SQ1's tail. A driver that assumes stride 4 on such a controller rings the wrong doorbell.</p>
+<p><strong>Q4.</strong> A Length = 2 write covers 0x1008–0x100F: the second Dword lands on CQ1HDBL and moves the CQ head to an arbitrary value — corrupting the controller's free-slot accounting.</p>
+<p><strong>Step 3 sketch.</strong> Keep <code>pending[qid]</code> = set of slots published but not fetched; on a doorbell, add slots old_tail … new_tail − 1 (mod size); on FETCH remove them; before processing the next doorbell (or at the end) report any remaining slots as "published but never fetched".</p>
+</details>
+<h4>What a senior engineer notices</h4>
+<p>The linter needs the queue sizes. In real investigations you get them from the Create I/O queue SQE payloads earlier in the same capture — which is why seniors start captures before driver load when they can, or decode the create commands from a separate capture of the same build.</p>
+<h4>Failure variants</h4>
+<ul>
+<li>Doorbell writes with First BE = 0011b (a 16-bit store): the upper half is not written; the controller's interpretation is implementation-dependent.</li>
+<li>Doorbell writes during reset (between CC.EN = 0 and RDY = 1): ignored; commands lost.</li>
+<li>A hypervisor coalescing or reordering trapped doorbell writes across queues: per-queue order still holds, cross-queue order does not.</li>
+</ul>
+<h4>Extension</h4>
+<p>Generate a 10,000-event random trace with occasional injected bugs (probability 0.1%) and measure how many the linter finds, then add the fetch check and measure again. This is the seed of an automated analyzer (<a href="auto-trace.html">Automated Trace Analysis</a>).</p>
+</section>
+
+<section id="exercises">
+<h2>Exercises</h2>
+<ol>
+<li>CAP.DSTRD = 2. Give CQ5HDBL's offset. <details class="answer"><summary>Answer</summary><p>Stride = 4 &lt;&lt; 2 = 16. CQ5HDBL = 1000h + (2 × 5 + 1) × 16 = 1000h + 176 = 1000h + B0h = 10B0h.</p></details></li>
+<li>An SQ of 64 entries had tail 60; the host adds 7 commands. What value does it write, and which slots does the controller fetch? <details class="answer"><summary>Answer</summary><p>(60 + 7) mod 64 = 3. Slots 60, 61, 62, 63, 0, 1, 2 — likely as two fetches (60–63 and 0–2) because they are not contiguous in memory.</p></details></li>
+<li>Why can't the controller fetch slots 60–2 in one Memory Read in Exercise 2? <details class="answer"><summary>Answer</summary><p>Slot 63 is at the end of the queue memory and slot 0 at its start; they are not adjacent addresses, and a Memory Read covers one contiguous address range.</p></details></li>
+<li>Explain the difference between a missing CQ head doorbell and a missing SQ tail doorbell as seen in a trace. <details class="answer"><summary>Answer</summary><p>Missing SQ tail doorbell: commands are never fetched — no MRd for those slots. Missing CQ head doorbell: commands are fetched and completed until the CQ is full; then CQE posts stop while fetched work is held inside the controller.</p></details></li>
+<li>With shadow doorbells, a trace shows 50 SQ tail MMIO writes for 10,000 commands. Is that a bug? <details class="answer"><summary>Answer</summary><p>Not necessarily: with Doorbell Buffer Config, the host only performs MMIO writes when an update crosses EventIdx. A low count is expected while the controller is actively polling the shadow buffer.</p></details></li>
+</ol>
+</section>
+
+<section id="quiz">
+<h2>Quiz</h2>
+<ol class="quiz">
+<li><p>What does the value written to an SQ tail doorbell represent?</p>
+<ul class="options" data-answer="2"><li>The number of new commands</li><li>The new absolute tail index</li><li>The Command Identifier</li><li>The SQ head</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>It is the index of the next free slot — the new tail. New commands = (new − old) mod size.</p></details></li>
+<li><p>With CAP.DSTRD = 0, where is the SQ2 tail doorbell?</p>
+<ul class="options" data-answer="3"><li>1008h</li><li>100Ch</li><li>1010h</li><li>1014h</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>1000h + 2 × 2 × 4 = 1010h. 1014h is CQ2's head doorbell.</p></details></li>
+<li><p>What PCIe transaction type is a doorbell write?</p>
+<ul class="options" data-answer="1"><li>Posted Memory Write</li><li>Non-posted Memory Write</li><li>Configuration Write</li><li>Message</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>An MMIO store becomes a Memory Write TLP, which is posted: no completion.</p></details></li>
+<li><p>What happens if the doorbell write reaches the device before the SQE is visible in memory?</p>
+<ul class="options" data-answer="3"><li>The controller waits for the SQE</li><li>The doorbell is rejected</li><li>The controller may fetch and execute stale contents</li><li>PCIe reorders them back</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The controller trusts the doorbell; it fetches whatever is in memory at that moment.</p></details></li>
+<li><p>Which doorbell does not exist?</p>
+<ul class="options" data-answer="4"><li>SQ0 tail</li><li>CQ0 head</li><li>SQ1 tail</li><li>CQ1 tail</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>CQ tail is owned by the controller; there is no CQ tail doorbell.</p></details></li>
+<li><p>The host writes 32 to the tail doorbell of a 32-entry SQ. The controller:</p>
+<ul class="options" data-answer="2"><li>Wraps it to 0 and continues</li><li>Treats it as an invalid doorbell write value and may report an asynchronous error event</li><li>Fetches 32 commands</li><li>Returns a PCIe Completer Abort</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Valid indices are 0–31. Posted writes get no PCIe completion, so the only report path is the NVMe asynchronous event.</p></details></li>
+<li><p>Which Admin command enables shadow doorbells, and since which revision?</p>
+<ul class="options" data-answer="1"><li>Doorbell Buffer Config (7Ch), NVMe 1.3, optional</li><li>Set Features FID 07h, NVMe 1.0</li><li>Create I/O SQ, NVMe 1.0</li><li>Virtualization Management, NVMe 2.4</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Doorbell Buffer Config, opcode 7Ch, introduced in NVMe 1.3 and optional.</p></details></li>
+<li><p>Why does NVMe avoid register reads on the I/O path?</p><details class="answer"><summary>Model answer</summary><p>MMIO reads are non-posted: the CPU stalls until the device returns a completion across the link, typically on the order of a microsecond. Doorbells are writes (posted, cheap), and the device reports its state through host memory (SQHD, phase tag), which the CPU reads from cache.</p></details></li>
+<li><p>Describe the correlation rule between SQ doorbells and fetches, and one situation where it appears violated without a bug.</p><details class="answer"><summary>Model answer</summary><p>Each doorbell that advances the tail from T0 to T1 should be followed by fetches covering slots T0 … T1 − 1. It can appear violated when the capture started mid-stream (earlier doorbells missing), when the controller fetches a previously published range together with new slots, when shadow doorbells are in use, or when SQs live in a Controller Memory Buffer (no host fetch needed).</p></details></li>
+<li><p>What is the difference between an Invalid Doorbell Write Value event and a Write to Invalid Doorbell Register event?</p><details class="answer"><summary>Model answer</summary><p>The first is a bad value written to a real doorbell of an existing queue (out of range, overfilling, passing the CQ tail). The second is a write to a doorbell register that is not valid at all (for example for a queue that does not exist).</p></details></li>
+</ol>
+</section>
+
+<section id="interview">
+<h2>Interview questions</h2>
+<ol>
+<li><strong>Beginner:</strong> What is an NVMe doorbell? <details class="answer"><summary>Model answer</summary><p>A 32-bit controller register the host writes to publish a new SQ tail (new commands) or CQ head (consumed completions). Located at BAR0 + 1000h onward, spaced by the doorbell stride.</p></details></li>
+<li><strong>Beginner:</strong> Does the doorbell contain the command? <details class="answer"><summary>Model answer</summary><p>No — only the new index. The controller fetches the command from host memory by DMA.</p></details></li>
+<li><strong>Intermediate:</strong> Walk me through the nine steps of a command and say which are visible on the PCIe link. <details class="answer"><summary>Model answer</summary><p>Build SQE (no), write into SQ (no), update tail (no), ring doorbell (yes, MWr), controller notices (no), fetch (yes, MRd + CplD), execute (data MWr/MRd yes), post CQE (yes, MWr), interrupt (yes, MSI-X MWr). Then host reaps (no) and rings CQ head doorbell (yes, MWr).</p></details></li>
+<li><strong>Intermediate:</strong> Why is a write barrier needed before the doorbell? <details class="answer"><summary>Model answer</summary><p>The SQE store (cacheable memory) and doorbell store (uncached MMIO) may be reordered on weakly ordered CPUs; the controller could fetch before the SQE is visible and execute stale contents. writel() provides the ordering.</p></details></li>
+<li><strong>Advanced:</strong> What are shadow doorbells and when would you use them? <details class="answer"><summary>Model answer</summary><p>An optional mechanism (Doorbell Buffer Config, NVMe 1.3) where the host writes doorbell values to a memory buffer and only performs MMIO writes when the controller's EventIdx asks for one. It avoids VM exits for emulated controllers in virtual machines.</p></details></li>
+<li><strong>Advanced:</strong> How does a controller report a bad doorbell write, given that posted writes have no completion? <details class="answer"><summary>Model answer</summary><p>Through the NVMe Asynchronous Event mechanism: an outstanding Asynchronous Event Request completes with an Error status event (Invalid Doorbell Write Value or Write to Invalid Doorbell Register), pointing to the Error Information log. Without an outstanding AER it cannot report it immediately.</p></details></li>
+<li><strong>Senior:</strong> I/O on an Arm server occasionally completes the wrong command; x86 never does. What do you suspect and how do you prove it? <details class="answer"><summary>Model answer</summary><p>Missing ordering between SQE stores and the doorbell (relaxed MMIO write, or barrier misplaced), visible only on a weakly ordered CPU with a fast controller. Prove it with an analyzer: compare the SQE payload in the root complex's CplD with the driver's log for that slot; a stale payload proves it. Confirm by fixing the barrier and re-running.</p></details></li>
+<li><strong>Senior:</strong> Design the doorbell portion of a controller validation plan. <details class="answer"><summary>Model answer</summary><p>Address decode across DSTRD values; every invalid value class (≥ size, overfill, CQ head past tail, nonexistent queue, reserved bits, partial and wide writes) with and without AERs outstanding; wrap at all sizes; redundant writes; batching of up to size − 1 commands; doorbells during reset/disable; doorbell-to-fetch latency distributions under load per arbitration mode; shadow doorbell semantics including EventIdx crossing and wrap if supported.</p></details></li>
+</ol>
+</section>
+
+<section id="teachback">
+<h2>Teach-back challenge</h2>
+<ul>
+<li><strong>To a child:</strong> the bell with the number card, and why you must finish writing the order card before ringing.</li>
+<li><strong>To a junior engineer:</strong> the nine steps, the doorbell address formula, and the barrier.</li>
+<li><strong>To a senior engineer:</strong> the ordering relationships, the correlation rule for traces, invalid-value reporting through asynchronous events, and shadow doorbells.</li>
+</ul>
+<details class="answer"><summary>Model explanation for the child</summary><p>"The shop has a tray of order cards and a bell. You write your order card, put it in the tray, and only then ring the bell and show a number that says where the next empty spot is. The shopkeeper looks at the number and picks up every card up to that spot. If you ring before your card is in the tray, she'll pick up an old card by mistake! When you've read your answer cards, you ring another bell with a number, so she knows she can reuse those answer spots."</p></details>
+</section>
+
+<section id="summary">
+<h2>Chapter summary</h2>
+<p>Doorbells are 32-bit registers at BAR0 + 1000h onward, spaced by 4 &lt;&lt; CAP.DSTRD: SQ y tail at 1000h + 2y × stride, CQ y head at 1000h + (2y + 1) × stride. The host writes absolute indices (bits 15:00) — new SQ tail after writing SQEs (with a write barrier first), new CQ head after consuming CQEs. On PCIe each doorbell is a posted Memory Write with 1 DW of payload and no completion. A command's life is: build, write SQE, update tail, ring, controller notices, fetch, execute, post CQE, interrupt; then the host reaps and rings the CQ head doorbell. Doorbell Buffer Config (7Ch, optional, NVMe 1.3+) adds shadow doorbells for emulated controllers. Doorbell bugs — stale tails, wrap errors, missing barriers, wrong stride, wide writes, invalid CQ heads, nonexistent queues — are diagnosed by correlating doorbells with fetches and CQE posts, and by reading the asynchronous error events the controller reports.</p>
+<aside class="callout mastery">
+<p>Do not move on until you can:</p>
+<ul class="checklist">
+<li>compute any doorbell address for any DSTRD</li>
+<li>narrate the nine steps with actor, state change and evidence for each</li>
+<li>decode a doorbell TLP and state why it has no completion</li>
+<li>explain the barrier and recognise its absence in a trace</li>
+<li>apply the doorbell-to-fetch correlation rule to a trace</li>
+<li>name the doorbell bug from its trace signature and the asynchronous event it causes</li>
+<li>explain shadow doorbells, their purpose, version and optional status</li>
+</ul>
+</aside>
+</section>
+
+<section id="next">
+<h2>Further reading and next chapter</h2>
+<ul>
+<li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Controller Registers (doorbells, CAP.DSTRD); Asynchronous Event Request; Doorbell Buffer Config</cite></li>
+<li><cite class="spec">NVM Express over PCIe Transport Specification, Revision 1.4</cite></li>
+<li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 family — Transaction Ordering; Memory Write requests</cite></li>
+<li>Linux: <code>Documentation/memory-barriers.txt</code> (device I/O and MMIO ordering); <code>drivers/nvme/host/pci.c</code> (doorbell writes, dbbuf support).</li>
+<li>Deeper: <a href="dd27.html">Module 27 — Doorbells</a>; the whole command at TLP level: <a href="ch41.html">Chapter 41 — Command-to-TLP Correlation</a> and <a href="command-vs-packet.html">Command vs Packet vs Completion</a>.</li>
+</ul>
+<p><strong>Next:</strong> <a href="ch29.html">Chapter 29 — NVMe Command Structure</a>: what is inside the 64 bytes the doorbell told the controller to fetch.</p>
+</section>

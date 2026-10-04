@@ -1,0 +1,728 @@
+<p class="lead">Every Memory Read an NVMe controller issues — for a submission queue entry, a PRP list, or the data of a Write command — comes back as one or more completions. This advanced chapter teaches the rules completers must follow when they split a read, the Read Completion Boundary, the exact Byte Count and Lower Address arithmetic (with worked examples you can check in code), the completion timeout mechanism and its ranges, and what happens to completions that arrive when nobody is waiting for them.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>Completions are half of all non-posted traffic and most of the bytes for NVMe Write commands. Analyzer users see dozens of Completion with Data (CplD) packets for one request and must decide whether the sequence is legal. Firmware engineers must reassemble those packets correctly, whatever order and size the Root Complex chooses. Validation engineers must know which fields a requester is entitled to check. And when a completion never arrives, the Completion Timeout mechanism decides how long a device waits — a value that ranges from microseconds to over a minute and is often left at a default nobody chose.</p>
+  <p>Getting completions wrong produces data corruption inside a single transfer, malformed-packet errors that take a link down, and "Unexpected Completion" and "Completion Timeout" errors in Advanced Error Reporting (AER) that are easy to misattribute.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Decode every field of a completion header and state its owner and purpose.</li>
+    <li>Apply the completion-splitting rules: Max Payload Size (MPS), Read Completion Boundary (RCB), address order.</li>
+    <li>Compute Byte Count and Lower Address for every completion of a read, including unaligned and single-byte reads.</li>
+    <li>Validate a completion sequence as a requester would, and spot a broken one in a trace.</li>
+    <li>Explain the Completion Timeout mechanism, the timeout range encodings, and the Completion Timeout Disable control, and choose values with reasons.</li>
+    <li>Explain Unexpected Completions: causes, how they are logged, and how to tell a late completion from a misrouted one.</li>
+    <li>Relate completion behaviour to NVMe performance and NVMe error status.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p><a href="ch10.html">Chapter 10 — TLPs</a>, <a href="ch11.html">Chapter 11 — TLP Header Anatomy</a> (byte enables, Length), <a href="ch12.html">Chapter 12 — Posted vs Non-Posted</a>, <a href="ch13.html">Chapter 13 — PCIe Tags</a>, <a href="ch16.html">Chapter 16 — Flow Control</a>, <a href="ch45.html">Chapter 45 — PCIe Errors</a>, <a href="ch46.html">Chapter 46 — AER</a> and <a href="ch51.html">Chapter 51 — PCIe Ordering</a> (rule D5b: completions of one request stay in address order).</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>The librarian orders 200 pages of photocopies from the copy room. The copy room is allowed to send them back in several envelopes, but with rules. No envelope may be heavier than the mail carrier can carry. Every envelope except the last must end at the end of a "chapter" (a fixed number of pages). The envelopes must arrive in page order. And every envelope has two numbers on it: "how many pages are still coming, counting this envelope" and "which page on the shelf the first page in this envelope goes to". The librarian uses the numbers to know when she has everything — and if an envelope shows up for an order she has already given up on, she knows something has gone wrong.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A warehouse fulfilling a large order ships it as multiple parcels. Each parcel is limited by the courier's weight limit (MPS). For efficient pallet handling, every parcel but the last must end at a pallet boundary (RCB). Each label says "items remaining including this parcel" (Byte Count) and "shelf position of the first item" (Lower Address). The customer cancels an order if nothing arrives within a deadline (Completion Timeout); a parcel that arrives after cancellation, or carries someone else's order number, is an "unexpected delivery" (Unexpected Completion).</p>
+  </aside>
+  <aside class="callout breaks">
+    <p>Parcels can arrive in any order; completions for one request may not (they must stay in address order). A warehouse label carries a full shelf address; a completion carries only the low 7 bits of the address — the requester must remember the rest from its own request, matched by Tag. And a customer can phone to ask; a PCIe requester has no way to ask about a missing completion — it can only time out.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>When a device asks for data with a Memory Read (MRd), the answer comes back in one or more <strong>completions with data</strong>. Each completion carries a 3-DWORD header plus a payload.</p>
+  <ul>
+    <li><strong>Requester ID and Tag</strong> say which request this completion belongs to.</li>
+    <li><strong>Completer ID</strong> says who answered.</li>
+    <li><span class="g" data-term="completion-status"><strong>Completion Status</strong> says</span> whether it worked (Successful Completion) or not (Unsupported Request, Completer Abort, or a retry status for configuration requests).</li>
+    <li><span class="g" data-term="byte-count"><strong>Byte Count</strong> says</span> how many bytes are still needed to finish the request, including this completion's bytes.</li>
+    <li><span class="g" data-term="lower-address"><strong>Lower Address</strong> gives</span> the low 7 bits of the byte address of the first byte in this completion.</li>
+  </ul>
+  <p>A completer may split one read into several completions, but each must fit within the maximum payload, all but the last must end at a Read Completion Boundary (64 or 128 bytes), and they must arrive in address order. The requester knows it has everything when a completion's Byte Count equals the bytes it carries.</p>
+  <p>If a requester gets no answer for too long, it <span class="g" data-term="completion-timeout">declares a <strong>Completion Timeout</strong></span>. If it gets an answer it was not waiting for, it <span class="g" data-term="unexpected-completion">records an <strong>Unexpected Completion</strong></span>.</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>The completion header</h3>
+  <table class="packet">
+    <thead><tr><th class="row-label">DW</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">DW0</td><td colspan="3">Fmt</td><td colspan="5">Type = 01010b</td><td colspan="8">T9 · TC · T8 · Attr[2] · LN · TH</td><td colspan="6">TD · EP · Attr[1:0] · AT</td><td colspan="10">Length (DW of payload)</td></tr>
+      <tr><td class="row-label">DW1</td><td colspan="16" class="hl">Completer ID</td><td colspan="3" class="hl">Cpl Status</td><td>BCM</td><td colspan="12" class="hl">Byte Count</td></tr>
+      <tr><td class="row-label">DW2</td><td colspan="16">Requester ID</td><td colspan="8">Tag</td><td class="rsvd">R</td><td colspan="7" class="hl">Lower Address</td></tr>
+    </tbody>
+  </table>
+  <p>Fmt 000b with Type 01010b is a Completion without data (Cpl); Fmt 010b with the same Type is a Completion with Data (CplD). Locked variants (CplLk, CplDLk) exist for legacy locked reads. This is the non-Flit layout; Flit Mode (PCIe 6.0) uses a different header format with the same concepts <span class="badge version">Version-dependent</span>.</p>
+  <table>
+    <caption>Completion header fields</caption>
+    <thead><tr><th>Field</th><th>Owner (sets it)</th><th>Purpose</th><th>What breaks if wrong</th></tr></thead>
+    <tbody>
+      <tr><td>Requester ID, Tag</td><td>Completer copies from the request</td><td>Routing (completions are ID-routed) and matching</td><td>Misrouted completion; Unexpected Completion at the wrong requester; timeout at the right one</td></tr>
+      <tr><td>Completer ID</td><td>Completer</td><td>Identification (diagnostics)</td><td>Little functionally; misleading in analysis (e.g. 0000h before bus number capture)</td></tr>
+      <tr><td>Completion Status</td><td>Completer</td><td>Success or failure class</td><td>Wrong status misleads error handling</td></tr>
+      <tr><td>BCM (Byte Count Modified)</td><td>Only PCI-X completers (through bridges)</td><td>Indicates a PCI-X style partial Byte Count</td><td>A PCIe completer must not set it</td></tr>
+      <tr><td>Byte Count</td><td>Completer</td><td>Remaining bytes including this completion</td><td>Requester mis-detects end of request; data loss or a malformed-completion error</td></tr>
+      <tr><td>Lower Address</td><td>Completer</td><td>Low 7 address bits of the first byte returned</td><td>Data placed at the wrong offset</td></tr>
+      <tr><td>Length</td><td>Completer</td><td>Payload size in DWORDs</td><td>Malformed TLP if inconsistent with payload or above MPS</td></tr>
+      <tr><td>Attr, TC</td><td>Completer copies from the request</td><td>Ordering (RO, IDO) and traffic class</td><td>Ordering hazards (<a href="ch51.html">Ch 51</a>)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Completion Status values</h3>
+  <table>
+    <caption>Completion Status encodings (classic, non-Flit)</caption>
+    <thead><tr><th>Value</th><th>Name</th><th>Meaning for the requester</th></tr></thead>
+    <tbody>
+      <tr><td>000b</td><td>Successful Completion (SC)</td><td>Data (if any) valid</td></tr>
+      <tr><td>001b</td><td>Unsupported Request (UR)</td><td>Completer does not support or does not claim the request (e.g. address not in an enabled BAR, function in D3hot for memory requests, IOMMU-blocked DMA on some platforms)</td></tr>
+      <tr><td>010b</td><td>Configuration Request Retry Status (CRS), Request Retry Status (RRS) in newer revisions</td><td>Configuration request: retry later (<a href="ch49.html">Ch 49</a>)</td></tr>
+      <tr><td>100b</td><td>Completer Abort (CA)</td><td>Completer understood the request but could not complete it because of an internal error or a violation of its programming model</td></tr>
+      <tr><td>Others</td><td>Reserved</td><td>Treated as malformed or as UR depending on revision rules — check the spec</td></tr>
+    </tbody>
+  </table>
+  <p>A completion with a status other than SC terminates the request: no further completions for it will arrive. For a memory read, the requester must treat the whole request as failed even if some data already arrived in earlier SC completions.</p>
+
+  <h3>Who completes what</h3>
+  <ul>
+    <li><strong>Memory Read</strong>: one or more CplD (or a single Cpl with an error status).</li>
+    <li><strong>I/O and Configuration Read</strong>: exactly one CplD with one DWORD (or Cpl with error).</li>
+    <li><strong>I/O and Configuration Write</strong>: exactly one Cpl without data.</li>
+    <li><strong>AtomicOps</strong>: one CplD carrying the original value.</li>
+    <li><strong>Posted requests</strong>: no completion, ever.</li>
+  </ul>
+
+  <h3>Splitting rules</h3>
+  <p>A completer may return a memory read in a single completion or split it. The rules (paraphrased from the PCI Express Base Specification's completion rules; confirm the full set in your revision):</p>
+  <ol>
+    <li><span class="g" data-term="mps"><strong>MPS</strong>: no completion</span>'s payload may exceed the Max Payload Size configured for the completer's link direction (from the Lab SSD's point of view, the host's completions to it are limited to MPS = 256 bytes).</li>
+    <li><strong>RCB</strong>: when a request is split, each completion except the last must end on a naturally aligned RCB boundary. A completion may contain several RCB blocks.</li>
+    <li><strong>Address order</strong>: completions for one request are returned in increasing address order (ordering rule D5b).</li>
+    <li><strong>Exactness</strong>: together the completions return exactly the requested bytes (with whole DWORDs, padding disabled bytes at the start and end).</li>
+    <li><strong>One completion is always legal</strong> if the whole request fits within MPS.</li>
+  </ol>
+  <p><span class="g" data-term="rcb">The Read Completion Boundary is 64 or 128 bytes</span>. A Root Port reports its RCB in its Link Control register (RCB field, read-only for Root Ports); software writes the same value into each endpoint's Link Control RCB field so the endpoint knows what to expect. The 64-or-128 choice applies only to the Root Complex; every other completer (an endpoint answering a peer-to-peer read or a host read of its BAR) uses an RCB of 128 bytes. Switches do not split or merge completions.</p>
+  <aside class="callout insight">
+    <p>Why have an RCB at all? A Root Complex fetches from memory in cache-line-sized chunks. Allowing it to return each chunk as soon as it is available, without waiting to build a full MPS-sized completion, lowers latency. The RCB rule constrains where splits may occur so requesters can size their reassembly buffers and checks predictably.</p>
+  </aside>
+
+  <h3>Byte Count arithmetic</h3>
+  <p>For memory read completions, <strong>Byte Count</strong> is the number of bytes still to be returned, including the bytes in this completion. For the first completion it equals the total number of bytes requested, computed from Length and the byte enables.</p>
+  <div class="formula">
+    <div class="eq"><var>BC</var><sub>1</sub> = 4 × <var>Length</var> − <var>lead</var>(<var>FirstBE</var>) − <var>trail</var>(<var>LastBE</var>) &nbsp;&nbsp;(Length ≥ 2, contiguous enables)</div>
+    <dl class="vars">
+      <dt>BC<sub>1</sub></dt><dd>Byte Count of the first completion = total bytes requested</dd>
+      <dt>Length</dt><dd>request Length in DWORDs</dd>
+      <dt>lead(FirstBE)</dt><dd>number of disabled bytes before the first enabled byte in the first DWORD (number of trailing zero bits of First DW BE)</dd>
+      <dt>trail(LastBE)</dt><dd>number of disabled bytes after the last enabled byte in the last DWORD (4 minus the position of the highest set bit of Last DW BE plus one)</dd>
+    </dl>
+  </div>
+  <div class="formula">
+    <div class="eq"><var>BC</var><sub>k+1</sub> = <var>BC</var><sub>k</sub> − <var>bytes</var><sub>k</sub></div>
+    <dl class="vars">
+      <dt>BC<sub>k</sub></dt><dd>Byte Count field of completion k</dd>
+      <dt>bytes<sub>k</sub></dt><dd>number of requested (enabled) bytes delivered by completion k — for the first completion, the DWORD payload minus the leading disabled bytes; for middle completions, 4 × Length</dd>
+    </dl>
+  </div>
+  <p>Special cases, which you should confirm against the Byte Count table in the specification:</p>
+  <ul>
+    <li><strong>Length = 1</strong>: only First DW BE is used (Last DW BE must be 0000b). Byte Count is the span from the lowest to the highest enabled byte; for non-contiguous enables such as 1001b, the span is 4.</li>
+    <li><strong>Zero-length read</strong> (Length = 1, First DW BE = 0000b): Byte Count is 1, and the completion carries one DWORD whose contents the requester ignores. Zero-length reads are used to flush posted writes (rule B2a) without reading data.</li>
+    <li><strong>Non-memory completions</strong> (I/O and configuration): Byte Count is 4 and Lower Address is 0 <span class="badge uncertain">Uncertain</span> — check the completion rules of your revision, which also define the values for AtomicOp completions.</li>
+    <li><strong>Error completions</strong> for memory reads: check the specification for the Byte Count value required in UR/CA completions; requesters should not depend on it.</li>
+  </ul>
+
+  <h3>Lower Address arithmetic</h3>
+  <p>For memory read completions, <strong>Lower Address</strong> is bits 6:0 of the byte address of the first enabled byte of data returned in this completion.</p>
+  <ul>
+    <li>First completion: (request address bits 6:2) combined with the byte offset implied by First DW BE (00b for xxx1b, 01b for xx10b, 10b for x100b, 11b for 1000b; 00b for 0000b).</li>
+    <li>Later completions: they start on an RCB boundary, so their Lower Address is a multiple of the RCB within 7 bits — with RCB = 64, either 00h or 40h; with RCB = 128, always 00h.</li>
+  </ul>
+  <p>Because Lower Address has only 7 bits, the requester reconstructs the full address from its own record of the request (matched by Tag) plus the running Byte Count. Lower Address is a check and a position hint, not a full address.</p>
+
+  <h3>Worked arithmetic</h3>
+  <p>All examples use the course's Lab SSD conventions: MPS = 256 bytes, RCB = 64 bytes unless stated, host memory (IOVA) addresses. They are generated and validated by the executable model in the Code section.</p>
+  <h4>Example A — aligned 512-byte read at 0x2_0000_0040</h4>
+  <p>Request: Length = 128 DW, First/Last DW BE = 1111b. Total Byte Count 512.</p>
+  <table>
+    <caption>Two legal completion sequences for example A</caption>
+    <thead><tr><th>Policy</th><th>CplD</th><th>Covers</th><th>Length (DW)</th><th>Byte Count</th><th>Lower Address</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="2">Largest legal completions</td><td>1</td><td>0x…040–0x…13F</td><td>64</td><td>512</td><td>40h</td></tr>
+      <tr><td>2</td><td>0x…140–0x…23F</td><td>64</td><td>256</td><td>40h</td></tr>
+      <tr><td rowspan="3">One RCB block per completion</td><td>1</td><td>0x…040–0x…07F</td><td>16</td><td>512</td><td>40h</td></tr>
+      <tr><td>2</td><td>0x…080–0x…0BF</td><td>16</td><td>448</td><td>00h</td></tr>
+      <tr><td>…8</td><td>0x…200–0x…23F</td><td>16</td><td>64</td><td>00h</td></tr>
+    </tbody>
+  </table>
+  <p>Note the first sequence: completion 1 ends at 0x140, which is 64-byte aligned, so it obeys RCB even though it does not end on a 256-byte boundary. The largest legal first completion is 256 bytes ending at 0x140; ending at 0x100 (192 bytes) or 0x080 (64 bytes) would also be legal, but ending at 0x130 would not, because 0x130 is not a 64-byte boundary.</p>
+
+  <h4>Example B — unaligned 200-byte read at byte address 0x2_0000_1006</h4>
+  <p>Last byte 0x2_0000_10CD. DWORD-aligned address 0x2_0000_1004; Length = (0x10CC − 0x1004)/4 + 1 = 51 DW; First DW BE = 1100b (bytes 2 and 3 of the first DWORD); Last DW BE = 0011b (bytes 0 and 1 of the last DWORD). Byte Count = 4 × 51 − 2 − 2 = 200.</p>
+  <table>
+    <caption>Two legal completion sequences for example B</caption>
+    <thead><tr><th>Policy</th><th>CplD</th><th>DW range</th><th>Length (DW)</th><th>Requested bytes delivered</th><th>Byte Count</th><th>Lower Address</th></tr></thead>
+    <tbody>
+      <tr><td>Single</td><td>1</td><td>0x1004–0x10CF</td><td>51</td><td>200</td><td>200</td><td>06h</td></tr>
+      <tr><td rowspan="4">RCB blocks</td><td>1</td><td>0x1004–0x103F</td><td>15</td><td>58 (0x1006–0x103F)</td><td>200</td><td>06h</td></tr>
+      <tr><td>2</td><td>0x1040–0x107F</td><td>16</td><td>64</td><td>142</td><td>40h</td></tr>
+      <tr><td>3</td><td>0x1080–0x10BF</td><td>16</td><td>64</td><td>78</td><td>00h</td></tr>
+      <tr><td>4</td><td>0x10C0–0x10CF</td><td>4</td><td>14 (0x10C0–0x10CD)</td><td>14</td><td>40h</td></tr>
+    </tbody>
+  </table>
+  <p>Check: 58 + 64 + 64 + 14 = 200. The last completion's Byte Count (14) is less than its payload (16 bytes) because the last two bytes are disabled; that is how the requester knows this is the final completion.</p>
+
+  <h4>Example C — the tail of a PRP list</h4>
+  <p>An NVMe controller needs the last three PRP entries of a list page: 24 bytes at 0x1_5000_0FE8 (a read must not cross a 4 KiB boundary, so the controller cannot read past 0x…0FFF in the same request). Length = 6 DW, both BEs 1111b. One completion: Length 6, Byte Count 24, Lower Address = 0xFE8 &amp; 0x7F = 68h.</p>
+
+  <h4>Example D — a single byte</h4>
+  <p>A 1-byte read at 0x1_0000_0003: Length = 1, First DW BE = 1000b, Last DW BE = 0000b. One CplD, Length 1, Byte Count 1, Lower Address 03h.</p>
+
+  <h4>Example E — RCB = 128</h4>
+  <p>512 bytes at 0x2_0003_0020 with RCB = 128: largest-legal completions are 224 bytes (0x020–0x0FF, Byte Count 512, Lower Address 20h), 256 bytes (0x100–0x1FF, Byte Count 288, Lower Address 00h), and 32 bytes (0x200–0x21F, Byte Count 32, Lower Address 00h).</p>
+
+  <h3>Requester-side checks</h3>
+  <p>A requester matches each completion to an outstanding request by Requester ID and Tag (with 10-bit tags, all 10 bits). It may check, and in some cases must check (see the specification's list of completion-receive rules, many of which are "permitted" rather than "required"):</p>
+  <ul>
+    <li>the Tag is outstanding — otherwise <strong>Unexpected Completion</strong>;</li>
+    <li>the payload does not exceed MPS — otherwise <strong>Malformed TLP</strong>;</li>
+    <li>Byte Count and Lower Address are consistent with the request and with previous completions;</li>
+    <li>the completion does not return more data than requested;</li>
+    <li>the Completion Status is a defined value.</li>
+  </ul>
+  <aside class="callout impl">
+    <p>Which consistency checks a requester performs, and which error it reports when a check fails, is partly implementation-dependent. Two devices can react differently to the same malformed sequence: one logs Malformed TLP, the other Unexpected Completion, a third silently corrupts. Know your device's documented behaviour.</p>
+  </aside>
+
+  <h3>Completion Timeout</h3>
+  <p>A requester that issues a non-posted request starts a timer. If the request has not been completed — all completions received, or an error completion received — when the timer expires, the requester reports a <strong>Completion Timeout</strong> (an uncorrectable error, non-fatal by default severity, logged in AER's Uncorrectable Error Status) and abandons the request. A partially completed read still times out.</p>
+  <p>Control lives in the PCI Express Capability:</p>
+  <ul>
+    <li><strong>Device Capabilities 2</strong>: Completion Timeout Ranges Supported (which ranges A–D the function implements) and Completion Timeout Disable Supported.</li>
+    <li><strong>Device Control 2</strong>: Completion Timeout Value (a 4-bit encoding selecting a range) and Completion Timeout Disable.</li>
+  </ul>
+  <table>
+    <caption>Completion Timeout ranges and values as commonly documented — <span class="badge uncertain">Uncertain</span>: verify each encoding in the Device Control 2 description of your revision</caption>
+    <thead><tr><th>Encoding</th><th>Range</th><th>Timeout window</th></tr></thead>
+    <tbody>
+      <tr><td>0000b</td><td>Default</td><td>50 µs to 50 ms</td></tr>
+      <tr><td>0001b</td><td>A</td><td>50 µs to 100 µs</td></tr>
+      <tr><td>0010b</td><td>A</td><td>1 ms to 10 ms</td></tr>
+      <tr><td>0101b</td><td>B</td><td>16 ms to 55 ms</td></tr>
+      <tr><td>0110b</td><td>B</td><td>65 ms to 210 ms</td></tr>
+      <tr><td>1001b</td><td>C</td><td>260 ms to 900 ms</td></tr>
+      <tr><td>1010b</td><td>C</td><td>1 s to 3.5 s</td></tr>
+      <tr><td>1101b</td><td>D</td><td>4 s to 13 s</td></tr>
+      <tr><td>1110b</td><td>D</td><td>17 s to 64 s</td></tr>
+    </tbody>
+  </table>
+  <p>A window means the timer must not fire before the lower bound and must fire before the upper bound. The specification also recommends that the default not expire in less than about 10 ms; check the exact wording.</p>
+  <p><strong>Choosing a value for an NVMe controller's DMA reads</strong>: host memory reads normally complete in a microsecond or two, but can take far longer under IOMMU page-table walks, memory contention, virtualization (nested translation), remote NUMA memory, or a Root Complex recovering from errors. A timeout in the low milliseconds risks spurious timeouts under stress; a timeout of tens of seconds means a dead path takes tens of seconds to detect — longer than NVMe's own command timeouts in some stacks. Platform firmware, not the NVMe driver, usually programs this.</p>
+  <p><strong>The Root Port's timeout</strong> governs CPU reads of the SSD's BAR (for example, reading CSTS). If the SSD is gone and the Root Port waits for the full timeout, the CPU core stalls for that long on a single load; some platforms convert this into a machine check. That is one reason surprise-removal handling prefers to detect link-down before touching MMIO.</p>
+  <p><strong>Completion Timeout Disable</strong> exists for functions that cannot tolerate abandoning requests. Disabling the timeout means a lost completion waits forever: the request's tag is never reused and the function may hang. Use only with a strong reason and an independent watchdog.</p>
+
+  <h3>Unexpected Completions</h3>
+  <p>A completion that matches no outstanding request at the receiver is an <strong>Unexpected Completion</strong>, logged in AER's Uncorrectable Error Status (default severity non-fatal; in some roles it is handled as an advisory non-fatal error, see the role-based error reporting rules). Causes, from most to least common in practice:</p>
+  <ol>
+    <li><strong>Late completion after a timeout</strong>: the requester gave up, freed the tag, and the completion arrives anyway.</li>
+    <li><strong>Completion after a reset</strong>: FLR or a controller reset discarded outstanding requests; completions still in flight arrive (<a href="ch49.html">Ch 49</a>).</li>
+    <li><strong>Misrouting</strong>: wrong Requester ID copied by a buggy completer, or bus numbers changed (re-enumeration) while requests were outstanding.</li>
+    <li><strong>Duplicate completions</strong>: completer bug sends a completion twice, or splits incorrectly.</li>
+    <li><strong>Tag aliasing</strong>: requester reuses a tag before all completions of the previous use arrived, or mixes 8-bit and 10-bit tag handling between ends.</li>
+  </ol>
+  <p>Telling them apart: a late completion carries a tag that <em>was</em> outstanding recently (correlate with a Completion Timeout logged just before); a misrouted completion carries a Requester ID that is not the receiver's; a duplicate repeats an earlier completion exactly.</p>
+
+  <h3>The ladder for completion splitting</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>The copy room sends 200 pages in envelopes; each envelope says how many pages are still coming and where its first page goes; envelopes end at chapter boundaries and arrive in page order.</p></div>
+    <div class="rung" data-rung="B"><p>A memory read may be answered by several CplDs; each ≤ MPS; all but the last end on an RCB boundary; address order; Byte Count counts down; Lower Address gives the start offset.</p></div>
+    <div class="rung" data-rung="C"><p>The Root Complex reads host memory in cache-line chunks and returns completions as chunks become ready; the SSD's completion reassembly logic places payloads using its tag table entry plus Byte Count and Lower Address.</p></div>
+    <div class="rung" data-rung="D"><p>PCI Express Base Specification: completion rules (splitting, RCB, Byte Count and Lower Address definitions), ordering rule for same-request completions, Completion Timeout mechanism, Unexpected Completion error.</p></div>
+    <div class="rung" data-rung="E"><p>One MRd from the SSD (Requester ID 0x0100) followed by N CplDs from the Root Complex carrying the same Requester ID and Tag, decreasing Byte Count and RCB-aligned Lower Addresses.</p></div>
+    <div class="rung" data-rung="F"><p>An analyzer groups the CplDs under the MRd by tag; check MPS, RCB alignment, Byte Count sequence, address order and the final Byte Count ≤ payload.</p></div>
+    <div class="rung" data-rung="G"><p>A Byte Count that does not decrease by the delivered bytes, a Lower Address that does not match, or a payload above MPS is the first abnormal event; identify the completer (Completer ID) and whether the requester flagged it.</p></div>
+  </div>
+
+  <h3>The sixteen questions, applied to Completion Timeout</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>A requester-side timer per outstanding non-posted request, and the error raised when it expires.</dd>
+    <dt>2. Why was it created?</dt><dd>Non-posted requests otherwise wait forever if a completion is lost (link failure, completer bug, misrouting).</dd>
+    <dt>3. What problem does it solve?</dt><dd>Recovering tags and buffers and surfacing failures instead of hanging.</dd>
+    <dt>4. What existed before it?</dt><dd>Conventional PCI used retries and master-abort/target-abort on the bus with bus-level timers; PCI-X added split transactions with split completion timeouts.</dd>
+    <dt>5. Why is the current design better?</dt><dd>Configurable ranges, optional disable, standardized AER reporting.</dd>
+    <dt>6. Who creates it?</dt><dd>The requester's transaction layer.</dd>
+    <dt>7. Who consumes it?</dt><dd>The requester's error handling, AER, the OS error-recovery path.</dd>
+    <dt>8. Where does it live?</dt><dd>Device Capabilities 2 / Device Control 2 in the requester's PCI Express Capability; AER registers.</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>The tag table, Device Control 2, Uncorrectable Error Status/Mask/Severity, the header log.</dd>
+    <dt>10. What happens before it?</dt><dd>A non-posted request is sent and its completions do not (fully) arrive.</dd>
+    <dt>11. What happens after it?</dt><dd>The request is abandoned; error logged and signalled; for an NVMe controller, the command that needed the data fails (e.g. a data transfer error status) or the controller enters a fatal state, depending on design.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Too short: spurious failures under load. Too long: slow detection, long CPU stalls. Disabled: hangs.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>An MRd with no matching CplD (or partial CplDs) within the window; sometimes a later CplD that becomes an Unexpected Completion.</dd>
+    <dt>14. What does Linux show?</dt><dd>AER messages naming Completion Timeout for the device or port, with the TLP header log if supported; <code>lspci -vv</code> DevCap2/DevCtl2 timeout settings.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>Timer accuracy per encoding; behaviour with dropped completions (via an exerciser); recovery and tag reuse; interaction with resets.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>Host memory latency spikes (IOMMU, virtualization), a hung completer (Root Complex error recovery), link problems causing lost TLPs beyond replay, or an address that should have produced UR but was silently dropped.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <ul>
+    <li><strong>Requester tag table</strong>: for each outstanding tag, the device stores the request's full address, length, byte enables, a destination buffer pointer, a running Byte Count, and a timer. Completion handling is a lookup on (Requester ID, Tag) and a write of the payload at (buffer + offset), where offset is derived from Lower Address and progress so far.</li>
+    <li><strong>Reassembly buffers</strong>: because completions for different tags may arrive in any order (rule D5a), a device fetching write data must buffer out-of-order completions or issue only as many reads as it can buffer. This, together with tag count and MRRS, bounds read throughput (<a href="ch13.html">Chapter 13</a>).</li>
+    <li><strong>Completion credits</strong>: a requester must have buffer space for the completions it solicits; endpoints typically advertise infinite completion credits and therefore must only issue reads they can absorb (<a href="ch53.html">Chapter 53</a>).</li>
+    <li><strong>Root Complex completion generation</strong>: memory controllers return cache lines (commonly 64 bytes). Many Root Complexes return completions in RCB-sized or cache-line-sized pieces; others coalesce up to MPS. The choice is platform-specific and affects link efficiency.</li>
+  </ul>
+  <h3>Link efficiency of small completions</h3>
+  <div class="formula">
+    <div class="eq"><var>η</var> = <var>P</var> / (<var>P</var> + <var>O</var>)</div>
+    <dl class="vars">
+      <dt>η</dt><dd>fraction of link bytes (after line encoding) that carry payload</dd>
+      <dt>P</dt><dd>payload bytes per completion</dd>
+      <dt>O</dt><dd>per-TLP overhead bytes: 12-byte completion header plus sequence number, LCRC and framing — about 20 bytes in non-Flit Gen3/Gen4 framing (an approximation; plus 4 if ECRC is used; DLLP traffic is ignored)</dd>
+    </dl>
+  </div>
+  <p><span class="badge derived">Derived</span>: P = 64 gives η ≈ 64/84 ≈ 76%; P = 256 gives η ≈ 256/276 ≈ 93%. On the Lab SSD's Gen4 x4 link (16 GT/s × 4 lanes × 128/130 ÷ 8 ≈ 7.88 GB/s per direction), host-to-device write-data throughput is bounded near 6.0 GB/s with 64-byte completions and near 7.3 GB/s with 256-byte completions. Real numbers also depend on flow-control updates, Ack DLLPs and the Root Complex's latency.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>Documents: <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Completion Rules; Completion Handling Rules; Read Completion Boundary; Completion Timeout Mechanism; Unexpected Completion; Device Capabilities 2 and Device Control 2 registers; Link Control (RCB); Advanced Error Reporting</cite>. NVMe uses completions only through the transport; the <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite> and the NVMe Base 2.4 status definitions (data transfer errors) describe how a failed DMA surfaces to the host.</p>
+  <aside class="callout verified">
+    <p>Completion header fields (Completer ID, Completion Status, BCM, Byte Count, Requester ID, Tag, Lower Address); status values SC 000b, UR 001b, CRS 010b, CA 100b; completions are routed by ID; a memory read may be completed by multiple completions that must respect MPS and the RCB and be returned in address order; Completion Timeout and Unexpected Completion are uncorrectable errors reported through AER; RCB is 64 or 128 bytes.</p>
+  </aside>
+  <aside class="callout derived">
+    <p>The Byte Count/Lower Address recurrence and the final-completion test (Byte Count ≤ payload bytes after removing leading disabled bytes) follow from the field definitions; the efficiency figures follow from header sizes. The executable model in this chapter encodes these derivations and validates the worked examples.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>Completion sizes chosen by a Root Complex; which receive checks a requester performs; how an NVMe controller maps a UR/CA/timeout on a DMA read to an NVMe status or to a controller fatal status; platform default Completion Timeout values.</p>
+  </aside>
+  <aside class="callout version">
+    <p>CRS was generalized to RRS in the 6.0 era; 10-bit tags (4.0) and 14-bit tags in Flit Mode (6.0) change the matching key width; Flit Mode changes header layout. The Completion Timeout ranges have been stable for many revisions, but verify the encodings.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p>The specification does not tell you which Completion Timeout value to choose, how large completions a Root Complex will send, or what an NVMe controller must do on a DMA completion error beyond reporting. Check in the spec: the exact Byte Count table for single-DWORD and zero-length reads, the Byte Count and Lower Address rules for non-memory and AtomicOp completions, the list of required versus permitted receive checks, and the default-timeout recommendation.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume: completions arrive in the order reads were issued; a read arrives in one completion; the first completion is MPS-sized; Byte Count equals the payload; a Completion Timeout means the completer is dead (it may just be slow); an Unexpected Completion means the completer is buggy (it may be your own timeout or reset).</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>Completion flows in an NVMe Write command (Lab SSD)</caption>
+    <thead><tr><th>Step</th><th>Direction</th><th>TLP</th><th>Completion behaviour</th></tr></thead>
+    <tbody>
+      <tr><td>SQE fetch</td><td>Dev→Host MRd, Host→Dev CplD</td><td>64 B per SQE (or several SQEs per read)</td><td>Usually one CplD (≤ MPS); may be split at RCB</td></tr>
+      <tr><td>PRP list fetch</td><td>Dev→Host MRd, Host→Dev CplD</td><td>8 B per entry, ≤ one 4 KiB page per read</td><td>Lower Address reveals the entry offset in the list page</td></tr>
+      <tr><td>Write data fetch</td><td>Dev→Host MRd (≤ MRRS = 512 B), Host→Dev CplD</td><td>Many reads in flight with different tags</td><td>Multiple CplDs per read; different reads interleave (D5a); each read's CplDs in address order (D5b)</td></tr>
+      <tr><td>Host CSTS read</td><td>Host→Dev MRd, Dev→Host CplD</td><td>4 B</td><td>SSD is the completer; Completer ID 0x0100</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout proto">
+    <p>Completions are ID-routed: switches use the Requester ID's bus number to route them back. This is why a completion carrying a stale or wrong Requester ID ends up somewhere else (or is dropped as unroutable, which is an Unsupported Request at the switch, or an Unexpected Completion at a wrong recipient).</p>
+  </aside>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <div class="trace" data-kind="synthetic" data-title="Normal: two 512-byte write-data reads, RCB-sized completions interleaved">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64</td><td>Addr=0x2_0004_0000 Len=128 Tag=0x50 Req=0x0100</td><td>Fetch data bytes 0–511</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>8</td><td>MRd64</td><td>Addr=0x2_0004_0200 Len=128 Tag=0x51</td><td>Fetch data bytes 512–1023</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>610</td><td>CplD</td><td>Tag=0x50 Len=16 BC=512 LA=0x00 Cmpl=RC Status=SC</td><td>First 64 B of tag 0x50</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>622</td><td>CplD</td><td>Tag=0x51 Len=16 BC=512 LA=0x00</td><td>Tag 0x51 starts — legal interleave</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>634</td><td>CplD</td><td>Tag=0x50 Len=16 BC=448 LA=0x40</td><td>Next 64 B of 0x50</td></tr>
+        <tr class="note"><td colspan="6">Rows 6–17: remaining CplDs, alternating tags, Byte Count decreasing by 64 per tag, Lower Address alternating 0x00/0x40.</td></tr>
+        <tr class="dir-down"><td>18</td><td>Host→Dev</td><td>802</td><td>CplD</td><td>Tag=0x50 Len=16 BC=64 LA=0x40</td><td>Last for 0x50 (BC = payload)</td></tr>
+        <tr class="dir-down"><td>19</td><td>Host→Dev</td><td>814</td><td>CplD</td><td>Tag=0x51 Len=16 BC=64 LA=0x40</td><td>Last for 0x51</td></tr>
+      </tbody>
+    </table>
+    <p>Reasoning: per tag, Byte Count goes 512, 448, …, 64; Lower Address is consistent with 64-byte steps; payloads ≤ MPS; different tags interleave (allowed). The Root Complex chose RCB-sized completions, costing efficiency but not correctness.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: Completion Timeout followed by a late completion">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Lab SSD's Device Control 2: Completion Timeout Value = 0010b (1–10 ms), chosen by platform firmware. Host is a virtualized server under heavy memory pressure.</td></tr>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0 ms</td><td>MRd64</td><td>Addr=0x2_1F00_0000 Len=128 Tag=0x7A Req=0x0100</td><td>Write-data fetch for command 0x0311 on SQ4</td></tr>
+        <tr class="note"><td colspan="6">IOMMU translation miss; nested page walk stalls in the Root Complex.</td></tr>
+        <tr class="abnormal"><td>2</td><td>Device</td><td>9.6 ms</td><td>Event</td><td>Completion Timeout, Tag=0x7A</td><td>First abnormal event: no completion within the 1–10 ms window; AER Uncorrectable: Completion Timeout logged by the SSD</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>9.6 ms</td><td>MWr64</td><td>Addr=0x1_2344_0F20 CQE: CID=0x0311 Status=data transfer error class</td><td>Controller fails the command (design-specific choice of status)</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>9.6 ms</td><td>Msg</td><td>ERR_NONFATAL</td><td>Error message to the Root Complex</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>11.2 ms</td><td>CplD</td><td>Tag=0x7A Len=64 BC=512 LA=0x00 Status=SC</td><td>The real completion arrives, late</td></tr>
+        <tr class="dir-down"><td>6</td><td>Device</td><td>11.2 ms</td><td>Event</td><td>Unexpected Completion, Tag=0x7A</td><td>Consequence, not cause: tag no longer outstanding</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Walk-through.</strong> Two AER errors appear in the log: Completion Timeout and Unexpected Completion. The order and the tag tie them together: the Unexpected Completion is the late answer to the timed-out read, not a misrouting. Root cause: a timeout window (1–10 ms) shorter than worst-case host memory latency under virtualization. Corrective action: raise the Completion Timeout Value to a range B or C setting through platform policy, and investigate the latency spike (IOMMU configuration, huge pages). Regression test: memory-pressure stress with IOMMU enabled while monitoring AER counters.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: inconsistent Byte Count from a peer completer">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Peer-to-peer: the Lab SSD reads 200 bytes from a peer device's memory BAR (e.g. a Controller Memory Buffer on another endpoint) at offset 0x1006. Peer completer RCB 64.</td></tr>
+        <tr class="dir-up"><td>1</td><td>SSD→Peer</td><td>0</td><td>MRd64</td><td>Addr=peer+0x1004 Len=51 FBE=1100 LBE=0011 Tag=0x22</td><td>Request 200 bytes</td></tr>
+        <tr class="dir-down"><td>2</td><td>Peer→SSD</td><td>700</td><td>CplD</td><td>Tag=0x22 Len=15 BC=200 LA=0x06</td><td>Correct first completion (58 bytes)</td></tr>
+        <tr class="abnormal"><td>3</td><td>Peer→SSD</td><td>760</td><td>CplD</td><td>Tag=0x22 Len=16 BC=144 LA=0x40</td><td>First abnormal event: Byte Count should be 142 (200 − 58); completer computed 200 − 56 (60 payload bytes minus 2 leading <em>and</em> 2 trailing disabled bytes — the trailing ones belong to the last completion)</td></tr>
+        <tr class="dir-down"><td>4</td><td>Peer→SSD</td><td>820</td><td>CplD</td><td>Tag=0x22 Len=16 BC=80 LA=0x00</td><td>Error propagates</td></tr>
+        <tr class="dir-down"><td>5</td><td>Peer→SSD</td><td>880</td><td>CplD</td><td>Tag=0x22 Len=4 BC=16 LA=0x40</td><td>Requester expects more data after this (BC 16 &gt; 14 bytes delivered); eventually Completion Timeout</td></tr>
+      </tbody>
+    </table>
+    <p>The validator in the Code section reports "CplD 2: Byte Count 144, expected 142" for exactly this sequence. The completer's bug: it applied the request's trailing disabled bytes (Last DW BE) to the first completion as well as its leading ones, so it counted 56 delivered bytes instead of 58. Depending on the requester's checks, the result is a Malformed TLP report, an Unexpected Completion, or a Completion Timeout — three different AER entries for the same root cause. That is why the first abnormal event matters more than the error name.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Completion Timeout capability and current setting; RCB; MPS/MRRS</span>
+sudo lspci -vvv -s 01:00.0 | grep -E 'DevCap2:|DevCtl2:|LnkCtl:|MaxPayload|MaxReadReq'
+
+<span class="cm"># Root Port side: its RCB and its own Completion Timeout for CPU MMIO reads</span>
+sudo lspci -vvv -s 00:01.1 | grep -E 'DevCap2:|DevCtl2:|LnkCtl:'
+
+<span class="cm"># AER: per-device counters of uncorrectable non-fatal errors (newer kernels)</span>
+cat /sys/bus/pci/devices/0000:01:00.0/aer_dev_nonfatal 2&gt;/dev/null
+
+<span class="cm"># AER log entries naming completion errors</span>
+sudo dmesg -T | grep -i -E 'Completion Timeout|Unexpected Completion|Malformed|CmpltTO|UnxCmplt'</code></pre>
+  <p><code>lspci</code> decodes DevCap2 as something like "Completion Timeout: Range ABCD, TimeoutDis+" and DevCtl2 as "Completion Timeout: 50us to 50ms, TimeoutDis-"; the RCB appears in LnkCtl as "RCB 64 bytes". AER status lines use short names such as CmpltTO and UnxCmplt. Wording is <span class="badge version">Version-dependent</span> across pciutils and kernel versions.</p>
+  <p>What it proves: configuration and counted errors. What it cannot prove: which request timed out, or how large the Root Complex's completions are (you need an analyzer, or at least the AER TLP header log when the platform captures one).</p>
+  <aside class="callout safety">
+    <p><span class="badge expert">Expert lab</span> Changing Completion Timeout Value with <code>setpci</code> is possible but should be done only on a test machine with the device idle; a mid-flight change can make outstanding requests time out immediately or never. Production changes belong in platform firmware policy.</p>
+  </aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>The executable model used for every worked example in this chapter. It builds a Memory Read from a byte range, splits it into completions under two policies, and validates a completion sequence as a careful requester would.</p>
+<pre class="code" data-kind="executable" data-lang="python" data-title="completion_math.py"><code>#!/usr/bin/env python3
+"""Split a PCIe Memory Read into completions and compute Length, Byte Count and
+Lower Address for each completion (teaching model of the completion rules)."""
+
+def request_from_bytes(addr, nbytes):
+    """MRd fields (DW-aligned address, Length in DW, First/Last DW BE) for a byte range."""
+    first, last = addr, addr + nbytes - 1
+    if first // 4096 != last // 4096:
+        raise ValueError("a Memory Read request must not cross a 4 KiB boundary")
+    dw_first, dw_last = first &amp; ~3, last &amp; ~3
+    length = (dw_last - dw_first) // 4 + 1
+    fbe = (0xF &lt;&lt; (first &amp; 3)) &amp; 0xF
+    lbe = 0xF &gt;&gt; (3 - (last &amp; 3))
+    if length == 1:                 # single DW: one BE field, Last DW BE must be 0000b
+        fbe, lbe = fbe &amp; lbe, 0
+    return dw_first, length, fbe, lbe
+
+def total_byte_count(length, fbe, lbe):
+    """Byte Count of the first completion, for contiguous byte enables."""
+    if length == 1:
+        if fbe == 0:
+            return 1                # zero-length read (confirm in the spec's Byte Count table)
+        return fbe.bit_length() - ((fbe &amp; -fbe).bit_length() - 1)
+    lead = (fbe &amp; -fbe).bit_length() - 1
+    trail = 4 - lbe.bit_length()
+    return 4 * length - lead - trail
+
+def split(addr_dw, length, fbe, lbe, mps=256, rcb=64, policy="max"):
+    """policy 'max': largest legal completions; 'rcb': one RCB-aligned block each."""
+    lead = (fbe &amp; -fbe).bit_length() - 1 if fbe else 0
+    total = total_byte_count(length, fbe, lbe)
+    first_byte = addr_dw + lead
+    last_byte = first_byte + total - 1
+    cur, end, remaining, out = addr_dw, addr_dw + 4 * length, total, []
+    while cur &lt; end:
+        if policy == "rcb":
+            stop = min(end, (cur // rcb + 1) * rcb)
+        else:
+            stop = end
+            if stop - cur &gt; mps:    # not the last one: must end on an RCB boundary
+                stop = (cur + mps) // rcb * rcb
+        lo, hi = max(cur, first_byte), min(stop, last_byte + 1)
+        out.append((cur, (stop - cur) // 4, remaining, lo &amp; 0x7F))
+        remaining -= hi - lo
+        cur = stop
+    return out
+
+def validate(cpls, total, mps=256, rcb=64):
+    """Requester-side checks on the completions of one request (address order)."""
+    expected = total
+    for i, (start, ln, bc, la) in enumerate(cpls):
+        n, end = i + 1, start + 4 * ln
+        if 4 * ln &gt; mps:
+            return f"CplD {n}: payload {4 * ln} B exceeds MPS {mps}"
+        if bc != expected:
+            return f"CplD {n}: Byte Count {bc}, expected {expected}"
+        if i and la != start &amp; 0x7F:
+            return f"CplD {n}: Lower Address 0x{la:02X} does not match its data"
+        last = n == len(cpls)
+        if not last and end % rcb:
+            return f"CplD {n}: not last, yet does not end on an RCB boundary"
+        delivered = end - (start + (la &amp; 3) if i == 0 else start)
+        if last:
+            return "ok" if 0 &lt;= delivered - bc &lt;= 3 else f"CplD {n}: length/Byte Count mismatch"
+        expected -= delivered
+    return "incomplete: Byte Count never reached zero"
+
+def show(title, addr, nbytes, mps=256, rcb=64, policy="max"):
+    a, l, f, b = request_from_bytes(addr, nbytes)
+    print(f"{title}: MRd Addr=0x{a:X} Length={l} DW FirstBE={f:04b} LastBE={b:04b}")
+    cpls = split(a, l, f, b, mps, rcb, policy)
+    for i, (start, ln, bc, la) in enumerate(cpls, 1):
+        print(f"  CplD {i}: from 0x{start:X} Length={ln:3d} DW ByteCount={bc:4d} LowerAddr=0x{la:02X}")
+
+if __name__ == "__main__":
+    show("A  aligned 512 B, largest completions", 0x2_0000_0040, 512)
+    show("A' aligned 512 B, RCB-sized", 0x2_0000_0040, 512, policy="rcb")
+    show("B  unaligned 200 B, largest", 0x2_0000_1006, 200)
+    show("B' unaligned 200 B, RCB-sized", 0x2_0000_1006, 200, policy="rcb")
+    show("C  PRP list tail 24 B", 0x1_5000_0FE8, 24)
+    show("D  single byte", 0x1_0000_0003, 1)
+    show("E  512 B at offset 0x20, RCB 128", 0x2_0003_0020, 512, rcb=128)
+    a, l, f, b = request_from_bytes(0x2_0000_1006, 200)
+    good = split(a, l, f, b, policy="rcb")
+    print("validate B':", validate(good, 200))
+    bad = [good[0], (good[1][0], good[1][1], 144, good[1][3])] + good[2:]
+    print("validate B' with a wrong Byte Count:", validate(bad, 200))</code></pre>
+  <p>Expected output: the sequences shown in the worked examples (A: Byte Counts 512, 256; B': 200, 142, 78, 14 with Lower Addresses 06h, 40h, 00h, 40h; C: one completion with Lower Address 68h; D: Byte Count 1, Lower Address 03h; E: 512, 288, 32), followed by <code>validate B': ok</code> and <code>validate B' with a wrong Byte Count: CplD 2: Byte Count 144, expected 142</code>.</p>
+  <p>Requester-side handling in firmware pseudocode:</p>
+<pre class="code" data-kind="pseudocode" data-lang="c" data-title="cpl_rx.c (pseudocode)"><code>void on_completion(const struct cpl *c)
+{
+    struct tag_entry *t = tag_lookup(c-&gt;requester_id, c-&gt;tag);
+    if (!t || !t-&gt;outstanding) { aer_report(UNEXPECTED_COMPLETION, c); return; }
+    if (c-&gt;status != CPL_SC)   { fail_request(t, c-&gt;status); tag_free(t); return; }
+    if (c-&gt;len_dw * 4 &gt; mps_bytes) { aer_report(MALFORMED_TLP, c); return; }
+    if (c-&gt;byte_count != t-&gt;remaining ||
+        c-&gt;lower_addr != expected_lower_addr(t)) {
+        aer_report(MALFORMED_OR_UNEXPECTED, c);      <span class="cm">/* which one is design-specific */</span>
+        fail_request(t, CPL_CA); tag_free(t); return;
+    }
+    size_t skip = t-&gt;first ? (t-&gt;addr &amp; 3) : 0;      <span class="cm">/* leading disabled bytes */</span>
+    size_t n = MIN(c-&gt;len_dw * 4 - skip, t-&gt;remaining);
+    memcpy(t-&gt;buf + t-&gt;done, c-&gt;payload + skip, n);
+    t-&gt;done += n; t-&gt;remaining -= n; t-&gt;first = false;
+    if (t-&gt;remaining == 0) { complete_request(t); tag_free(t); }
+    else restart_timer_if_policy(t);                  <span class="cm">/* timer semantics: check spec */</span>
+}</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Question</strong>: The Lab SSD executes a 128 KiB NVMe Write from a contiguous, page-aligned buffer (PRP list describes 32 pages). With MRRS = 512 bytes and MPS = 256 bytes, how many read requests and completions cross the link for the data, how many tags are needed for full overlap, and how does the Root Complex's completion size change the link time?</p>
+  <ol>
+    <li><strong>Read requests</strong>: 128 KiB / 512 B = 256 MRds (no read may cross a 4 KiB boundary; 512-byte reads aligned to the pages never do).</li>
+    <li><strong>Completions</strong>: if the Root Complex returns 256-byte completions, 2 per read → 512 CplDs; if it returns 64-byte (RCB) completions, 8 per read → 2,048 CplDs.</li>
+    <li><strong>Tags for overlap</strong> (Little's Law, <a href="ch13.html">Chapter 13</a>): with ~1 µs round-trip and ~7 GB/s target, bytes in flight ≈ 7,000 B, i.e. ≈ 14 reads of 512 B outstanding. 8-bit tags (256) are ample; the limit is buffer space, not tags.</li>
+    <li><strong>Link time for data</strong>: 131,072 bytes at η = 93% of 7.88 GB/s ≈ 17.9 µs with 256-byte completions; at η = 76% ≈ 21.9 µs with 64-byte completions — a 22% difference caused only by the Root Complex's completion size.</li>
+    <li><strong>Byte Count spot check</strong>: the 37th read (bytes 18,432–18,943 of the buffer) with 64-byte completions has Byte Counts 512, 448, …, 64 and Lower Address alternating 00h and 40h, because 18,432 = 0x4800 is 128-byte aligned.</li>
+  </ol>
+  <aside class="callout insight">
+    <p>When an NVMe vendor and a platform vendor disagree about write throughput, completion size is one of the first things to look at on an analyzer. It is set by the platform, not the SSD.</p>
+  </aside>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li>Treating Byte Count as "bytes in this completion" instead of "bytes remaining including this one".</li>
+    <li>Mishandling disabled bytes when counting what the first completion delivered (the off-by-two in the abnormal trace).</li>
+    <li>Expecting Lower Address to be a full address, or forgetting it is a byte address (not DWORD).</li>
+    <li>Assuming completions for different tags arrive in issue order.</li>
+    <li>Treating an Unexpected Completion as an independent fault without checking for a preceding Completion Timeout or reset.</li>
+    <li>Choosing a very short Completion Timeout for "fast failure" without considering IOMMU and virtualization latency.</li>
+    <li>Disabling Completion Timeout to "fix" spurious timeouts, converting them into hangs.</li>
+    <li>Ignoring RCB when building a completer (e.g. an FPGA peer device) — splits at arbitrary points are illegal.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>Completion-related failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Confidence</th></tr></thead>
+    <tbody>
+      <tr><td>Completion Timeout on the SSD under load</td><td>Host memory latency spikes; Root Complex stall; too-short timeout</td><td>DevCtl2 timeout value</td><td>IOMMU/virtualization configuration</td><td>Raise timeout range; observe whether errors vanish or merely shift to longer latencies</td><td>High once correlated</td></tr>
+      <tr><td>Completion Timeout followed by Unexpected Completion</td><td>Late completion</td><td>Tag/timestamps in AER header logs or analyzer</td><td>Timeout setting</td><td>As above</td><td>High</td></tr>
+      <tr><td>Unexpected Completion alone</td><td>Misrouting; duplicate; post-reset arrival</td><td>Requester ID in the logged header</td><td>Recent FLR/reset or re-enumeration</td><td>Analyzer trigger on completions whose tag is not outstanding</td><td>Medium</td></tr>
+      <tr><td>Malformed TLP on completions</td><td>Payload &gt; MPS (MPS mismatch between ends); bad Byte Count/length</td><td>MPS on both ends (lspci DevCtl)</td><td>Completer identity</td><td>Lower MPS on both ends; see if errors stop</td><td>High for MPS mismatch</td></tr>
+      <tr><td>Write throughput lower on one platform</td><td>Small completions from the Root Complex</td><td>Analyzer: completion sizes</td><td>MPS setting</td><td>Compare platforms with identical SSD</td><td>High</td></tr>
+      <tr><td>CPU stalls / machine check on device removal</td><td>Root Port Completion Timeout long; MMIO to dead device</td><td>Root Port DevCtl2</td><td>Hot-plug handling order</td><td>Surprise-removal test with shorter Root Port timeout</td><td>Medium</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight">
+    <p><strong>Error names describe what the requester noticed, not what went wrong.</strong> One bad Byte Count can surface as Malformed TLP, Unexpected Completion or Completion Timeout depending on which check fires first. One slow memory read can surface as Completion Timeout plus Unexpected Completion. Always reconstruct the request's life: issue, completions, checks, timer — then name the root cause.</p>
+  </aside>
+  <ul>
+    <li>Completion Timeout values are a system-level contract between platform firmware, OS error recovery and NVMe command timeouts. They should be chosen together: PCIe timeout ≪ NVMe command timeout ≪ application timeout.</li>
+    <li>When validating a completer (any device exposing memory — CMB, PMR, peer-to-peer targets), test unaligned reads with every byte-enable combination, reads ending exactly on RCB boundaries, and reads of 1 to MPS+1 bytes. Byte Count bugs hide at edges.</li>
+    <li>A requester that does not validate Byte Count and Lower Address is fragile; a requester that validates too strictly (beyond the spec) is incompatible. Validate against the specification's rules, not against one Root Complex's behaviour.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab: completion arithmetic and timeout audit</h2>
+  <h4>Objective</h4>
+  <p>Master Byte Count/Lower Address arithmetic with the model, then audit a real system's completion-related configuration.</p>
+  <h4>Skills</h4>
+  <p>Completion splitting, requester validation, Completion Timeout reasoning, AER interpretation.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> throughout: simulation and read-only inspection. No register changes.</p></aside>
+  <h4>Hardware required</h4>
+  <p>Any computer for steps 1–3; a Linux machine with an NVMe SSD for step 4.</p>
+  <h4>Software required</h4>
+  <p>Python 3; pciutils.</p>
+  <h4>Input</h4>
+  <p><code>completion_math.py</code>; the abnormal traces in this chapter.</p>
+  <h4>Expected output</h4>
+  <p>Hand-computed completion tables for three requests, matching the model; an audit table of MPS, MRRS, RCB and Completion Timeout for the SSD and its Root Port; a written recommendation.</p>
+  <h4>Background</h4>
+  <p>Byte Count and Lower Address sections; Completion Timeout table.</p>
+  <h4>Step 1</h4>
+  <p>By hand, compute RCB-sized completions for a 100-byte read at 0x…0FB0 and a 300-byte read at 0x…0F01 (careful: does it cross 4 KiB?). Then run the model and compare.</p>
+  <h4>Step 2</h4>
+  <p>Create three broken sequences (wrong Lower Address, payload above MPS, a non-last completion not ending on RCB) and confirm the validator rejects each with the right message.</p>
+  <h4>Step 3</h4>
+  <p>For the Completion Timeout abnormal trace, write the root-cause statement and choose a new timeout encoding, justifying it against NVMe's 30 s default I/O timeout.</p>
+  <h4>Step 4</h4>
+  <p>On your system, record DevCap2/DevCtl2, RCB, MPS and MRRS for the SSD and its Root Port. Check AER counters.</p>
+  <h4>Observation</h4>
+  <p>Do the SSD and Root Port agree on RCB? Is the timeout at the default?</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Why is the 300-byte read at 0x…0F01 illegal as a single request?</li>
+    <li>Why does the final completion's Byte Count sometimes differ from its payload size?</li>
+    <li>Your Root Port's timeout is 17–64 s. What happens if the SSD dies during a CSTS read?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Extend the model to 10-bit tags and multiple outstanding requests with randomized interleaving of completions (legal under D5a), and make the validator group by tag.</p>
+  <details class="hint"><summary>Hints</summary><p>0x0F01 + 300 − 1 = 0x102C, which crosses 0x1000. Trailing disabled bytes are included in the payload but not in Byte Count. A CPU load waiting for a completion cannot retire until the Root Port gives up.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>Step 1: 100 bytes at 0x…0FB0 end at 0x…1013, so the request crosses a 4 KiB boundary and is illegal as given; a correct requester issues two reads, 80 bytes (0xFB0–0xFFF) and 20 bytes (0x1000–0x1013). The 80-byte read gives completions BC 80 (LA 30h, 4 DW) and BC 64 (LA 40h, 16 DW). Q1: it crosses a 4 KiB boundary; requesters must split such reads. Q2: the final completion includes whole DWORDs, so trailing disabled bytes are in the payload but not counted in Byte Count. Q3: the CPU core issuing the load stalls until the Root Port's timer expires (up to tens of seconds), then the load returns all-ones or the platform raises a machine check; watchdogs may fire first. Step 3: e.g. range C (260–900 ms) — long enough to ride out transient memory stalls, far below NVMe's command timeout so the controller can fail the command cleanly.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>That both step-1 examples cross a 4 KiB boundary. Edge cases hide in innocent-looking numbers — always check the 4 KiB rule before computing completions.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>RCB mismatch between Root Port and endpoint setting: a requester that checks RCB strictly may reject legal 128-byte-aligned splits or accept illegal 64-byte ones.</li>
+    <li>MPS mismatch: completions larger than the receiver's MPS → Malformed TLP.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>On an analyzer, export completions for one NVMe Write and run them through the validator.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Compute all fields for a single CplD answering a read of 6 bytes at 0x…1002.</li>
+    <li>A CplD shows Length = 16, Byte Count = 10, Lower Address = 40h. What can you conclude?</li>
+    <li>Which Completion Timeout encoding would you choose for a requester that must detect a dead path within 100 ms but tolerate 50 ms stalls? Explain.</li>
+    <li>List three distinct root causes that all produce an Unexpected Completion at the SSD.</li>
+    <li>Explain why a zero-length read returns one DWORD of data and Byte Count 1.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p>1. Bytes 0x1002–0x1007: DWORD address 0x1000, Length 2, First DW BE 1100b, Last DW BE 1111b; CplD Length 2, Byte Count 6, Lower Address = 0x…1002 &amp; 0x7F = 02h.</p>
+    <p>2. Byte Count ≤ payload marks it as the final completion, and Lower Address 40h says its data starts on a DWORD (indeed 64-byte) boundary, so there are no leading disabled bytes. But a final completion may carry at most 3 trailing disabled bytes beyond the remaining Byte Count: 10 remaining bytes need a 3-DW (12-byte) payload, not 16 DW (64 bytes). The completion returns more data than requested — a completer bug that a checking requester reports (typically as a Malformed TLP or an Unexpected Completion, depending on the design).</p>
+    <p>3. 0110b (65–210 ms) could fire later than 100 ms; 0101b (16–55 ms) could fire during a 50 ms stall. Neither satisfies both constraints strictly; choose 0110b if stall tolerance matters more, or redesign the detection (e.g. a heartbeat). The exercise shows that timeout windows are coarse.</p>
+    <p>4. Late completion after the SSD's own timeout; completion arriving after an FLR/controller reset discarded the request; misrouted completion with the SSD's Requester ID belonging to another requester's request (completer bug), or duplicates.</p>
+    <p>5. The completion must still be a well-formed CplD for a 1-DWORD request; the specification defines Byte Count = 1 for that case so the requester sees "final completion" semantics; the data is ignored. The purpose is ordering (flushing earlier posted writes), not data.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>Byte Count in a memory read completion means…</p>
+      <ul class="options" data-answer="2"><li>bytes in this completion</li><li>bytes remaining including this completion</li><li>total bytes of the request, in every completion</li><li>bytes already delivered</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Remaining including this one; it equals the total only in the first completion.</p></details></li>
+    <li><p>With RCB = 64, which ending address is legal for a non-final completion?</p>
+      <ul class="options" data-answer="3"><li>0x…130</li><li>0x…1F8</li><li>0x…140</li><li>0x…0A4</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>0x140 is 64-byte aligned (0x140 = 320 = 5 × 64).</p></details></li>
+    <li><p>Lower Address carries…</p>
+      <ul class="options" data-answer="1"><li>bits 6:0 of the byte address of the first returned enabled byte</li><li>bits 11:0 of the DWORD address</li><li>the tag</li><li>the full 64-bit address</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>7 bits of byte address.</p></details></li>
+    <li><p>Which status tells the requester to retry a configuration request later?</p>
+      <ul class="options" data-answer="4"><li>UR</li><li>CA</li><li>SC</li><li>CRS/RRS</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Configuration Request Retry Status (Request Retry Status in newer revisions), 010b.</p></details></li>
+    <li><p>Completions for two different reads arrive interleaved. This is…</p>
+      <ul class="options" data-answer="2"><li>a violation</li><li>legal</li><li>legal only with RO</li><li>legal only in Flit Mode</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>D5a allows completions with different Transaction IDs to pass each other.</p></details></li>
+    <li><p>What is the default Completion Timeout window (encoding 0000b) as commonly documented?</p>
+      <details class="answer"><summary>Model answer</summary><p>50 µs to 50 ms — verify in your revision; the spec also recommends a minimum of roughly 10 ms for the default.</p></details></li>
+    <li><p>Why does an Unexpected Completion often follow a Completion Timeout for the same tag?</p>
+      <details class="answer"><summary>Model answer</summary><p>The requester abandoned the request and freed the tag when its timer expired; the slow completion arrives later and matches nothing outstanding.</p></details></li>
+    <li><p>Give the completion sequence (Length, Byte Count, Lower Address) for 512 bytes at 0x…040 with MPS 256, RCB 64, largest completions.</p>
+      <details class="answer"><summary>Model answer</summary><p>(64 DW, 512, 40h), (64 DW, 256, 40h).</p></details></li>
+    <li><p>Why can a Byte Count bug appear as three different AER errors?</p>
+      <details class="answer"><summary>Model answer</summary><p>Depending on which check fires: a requester validating Byte Count may log Malformed TLP; one that treats the sequence as ended may later see extra completions as Unexpected; one that keeps waiting for missing bytes times out.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> What fields does a requester use to match a completion?</p><details class="answer"><summary>Model answer</summary><p>Requester ID and Tag (the Transaction ID); with 10-bit tags, all tag bits.</p></details></li>
+    <li><p><strong>Beginner:</strong> Can a 512-byte read be completed with one completion if MPS is 256?</p><details class="answer"><summary>Model answer</summary><p>No; each completion's payload must not exceed MPS, so at least two completions are needed.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Explain RCB and why it exists.</p><details class="answer"><summary>Model answer</summary><p>The Read Completion Boundary (64 or 128 bytes) constrains where a split may occur: non-final completions end on naturally aligned RCB boundaries. It lets Root Complexes return cache-line-sized chunks early while keeping requester reassembly predictable.</p></details></li>
+    <li><p><strong>Intermediate:</strong> Compute Byte Count and Lower Address for the second completion of a 200-byte read at 0x…1006 split at 0x…1040.</p><details class="answer"><summary>Model answer</summary><p>First completion delivered 0x1040 − 0x1006 = 58 bytes; Byte Count 142; Lower Address 40h.</p></details></li>
+    <li><p><strong>Advanced:</strong> How should an NVMe controller react to a Completion Timeout on a write-data fetch?</p><details class="answer"><summary>Model answer</summary><p>Abandon the transfer, complete the NVMe command with an appropriate error status (a data transfer error class), report the PCIe error through AER, ensure no partial data is committed as if complete, and recover the tag. Escalation to controller fatal status is design-dependent.</p></details></li>
+    <li><p><strong>Advanced:</strong> Why do write throughputs differ between platforms with the same SSD?</p><details class="answer"><summary>Model answer</summary><p>Root Complex completion sizes (RCB-sized vs MPS-sized), latency to memory, MPS/MRRS configuration, and tag/buffer limits all change efficiency and overlap.</p></details></li>
+    <li><p><strong>Senior:</strong> Propose a Completion Timeout policy for a cloud fleet.</p><details class="answer"><summary>Model answer</summary><p>Pick ranges that exceed worst-case measured host memory latency under virtualization and IOMMU stress with margin (often range B/C), keep them well below NVMe command timeouts, avoid disabling, monitor AER counters for timeouts and unexpected completions per device, and correlate with host memory events.</p></details></li>
+    <li><p><strong>Senior:</strong> Review a peer-to-peer design where an FPGA exposes a buffer read by NVMe SSDs.</p><details class="answer"><summary>Model answer</summary><p>Verify the FPGA completer: MPS/RCB compliance, Byte Count/Lower Address for all alignments and byte enables, address order, correct Completer ID after enumeration, timeout behaviour of the SSDs when the FPGA stalls, ACS/routing through switches, and ordering (data vs flags) for any producer–consumer protocol.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>Child:</strong> the envelopes with "pages still coming" and "where the first page goes".</li>
+    <li><strong>Junior engineer:</strong> how to compute Byte Count and Lower Address for every completion of a read, and how to know the last one.</li>
+    <li><strong>Senior engineer:</strong> how timeouts, late completions and malformed sequences masquerade as each other, and how to choose timeout policy.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "The answer comes in several envelopes. Each one says how many pages are still coming, including its own, and where its first page goes on the shelf. When an envelope says 'this is all that's left', you're done."</p>
+    <p><strong>Junior:</strong> "First completion: Byte Count = total requested bytes, Lower Address = start address &amp; 0x7F. Each next one: subtract the requested bytes the previous completion carried; Lower Address = its start &amp; 0x7F. Non-final ones end on RCB boundaries and stay ≤ MPS. The last one is the one whose Byte Count fits in its payload."</p>
+    <p><strong>Senior:</strong> "Reconstruct the request's life before trusting the error name. Timeouts plus later unexpected completions mean latency, not loss. Byte Count bugs can surface as any of three errors. Timeout policy is a stack-wide contract: PCIe ≪ NVMe ≪ application."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>Completions carry Completer ID, status, Byte Count, Requester ID, Tag and Lower Address. Memory reads may be split into completions that respect MPS, end on RCB boundaries (except the last), and arrive in address order; different requests' completions may interleave. Byte Count counts down the remaining bytes including the current completion; Lower Address is the low 7 bits of the first returned byte's address. Completion Timeout bounds how long a requester waits, with ranges from tens of microseconds to tens of seconds selected in Device Control 2; Unexpected Completions are often late answers to timed-out requests. Completion size chosen by the Root Complex materially affects NVMe write throughput.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>decode a completion header and name each field's owner</li>
+      <li>split any read into legal completions by hand under MPS and RCB</li>
+      <li>compute Byte Count and Lower Address for unaligned and single-byte reads</li>
+      <li>validate a completion sequence and find the first bad completion</li>
+      <li>explain the Completion Timeout ranges, the disable control, and a reasoned policy</li>
+      <li>distinguish late, misrouted and duplicate completions</li>
+      <li>estimate the throughput cost of small completions</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Completion Rules; Completion Handling Rules; Completion Timeout Mechanism; Device Capabilities 2 / Device Control 2; Link Control (RCB); Advanced Error Reporting</cite></li>
+    <li><cite class="spec">NVM Express Base Specification 2.4 — Status codes for data transfer errors</cite>; <cite class="spec">NVMe over PCIe Transport Specification 1.4</cite></li>
+    <li>Linux: drivers/pci/pcie/aer.c, Documentation/PCI/pcieaer-howto.rst; pciutils (lspci) decoding of DevCap2/DevCtl2.</li>
+    <li>Deeper: <a href="dd12.html">Deep-Dive Module 12 — PCIe Completions</a>, <a href="dd13.html">Module 13 — PCIe Tags</a>, <a href="dd40.html">Module 40 — PCIe Errors</a>.</li>
+  </ul>
+  <p>Next: <a href="ch53.html">Chapter 53 — Flow Control and Credits</a>, which explains how completions, posted and non-posted traffic are kept from overflowing each other's buffers.</p>
+</section>

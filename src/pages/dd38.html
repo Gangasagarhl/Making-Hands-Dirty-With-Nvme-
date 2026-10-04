@@ -1,0 +1,734 @@
+<p class="lead">Correlation is the skill of turning a pile of TLPs and log lines into a list of NVMe commands, each with its full life story. <a href="ch41.html">Command-to-TLP Correlation</a> gave you the chain of keys. This module covers the hard cases: captures that start late, doorbells that publish several commands, interrupts that cover several completions, two clocks that drift apart, packets the analyzer missed, and commands whose story contradicts itself.</p>
+
+<section id="orientation">
+<h2>Orientation</h2>
+<p>In <a href="ch41.html">Command-to-TLP Correlation</a> you learned the correlation chain (doorbell address → queue; fetch address → slot; Requester ID and Tag → completion; SQ Identifier (SQID) and Command Identifier (CID) → command; buffer address → data; CQ slot → completion; vector → interrupt), the scope and lifetime of each key, and an algorithm that works when you have full context. <a href="command-vs-packet.html">Command vs Packet vs Completion</a> drilled the difference between NVMe objects and PCIe objects. This module assumes both and goes further in three directions: <strong>recovering context</strong> you were not given, <strong>decomposing latency</strong> per command and per stage, and <strong>judging evidence quality</strong> (dropped packets, clock alignment, ambiguous attribution).</p>
+<aside class="callout prereq">
+<p>Needed first: <a href="ch41.html">Command-to-TLP Correlation</a> (the chain and its keys), <a href="command-vs-packet.html">Command vs Packet vs Completion</a> (four objects, two identifier systems), <a href="ch28.html">Doorbells</a> (tail arithmetic), <a href="ch36.html">Physical Region Pages</a> (which addresses a command may touch), and the first-abnormal-event discipline in <a href="ch47.html">Error Correlation</a>.</p>
+</aside>
+<p>Where this goes next: <a href="dd55.html">Teledyne LeCroy Trace Analysis</a> and <a href="dd57.html">Automated Forensic Analysis</a> turn this method into tool workflows; <a href="dd39.html">NVMe Errors</a> and <a href="dd40.html">PCIe Errors</a> use it to place error events on a command's timeline.</p>
+</section>
+
+<section id="objectives">
+<h2>Required learning objectives</h2>
+<table>
+<caption>Objectives for trace correlation</caption>
+<thead><tr><th>Level</th><th>You will be able to…</th></tr></thead>
+<tbody>
+<tr><td>Beginner</td><td>Given full context, label every TLP of one command with its purpose and attach it to the right (SQID, CID).</td></tr>
+<tr><td>Intermediate</td><td>Correlate several interleaved commands on several queues, including multi-entry fetches, PRP list fetches, coalesced interrupts and completion order different from submission order.</td></tr>
+<tr><td>Advanced</td><td>Infer queue bases, slot numbers and previous tails from a capture that started late; align analyzer time with host time including drift.</td></tr>
+<tr><td>Senior</td><td>Judge whether a correlation is proven, probable or merely consistent; detect analyzer loss; resist attributing a TLP when two commands could own it.</td></tr>
+<tr><td>Trace analysis</td><td>Produce, for every command, a stage-by-stage timeline (doorbell, fetch, PRP fetch, first/last data, CQE, interrupt, head doorbell) and the latency of each stage.</td></tr>
+<tr><td>Debugging</td><td>Use correlation failures (orphans, duplicates, impossible orderings, stale payloads) as the primary evidence of a bug.</td></tr>
+<tr><td>Validation</td><td>Specify an automated correlation checker as a test oracle: invariants, tolerances and what it must report as "unknown" rather than "pass".</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="kid">
+<h2>Kid story</h2>
+<aside class="callout kid">
+<p>A big train station has one camera on the main platform. It records every train that passes, but trains do not carry passenger names. One evening a lost suitcase is found, and a station detective has to work out which family it belongs to.</p>
+<p>She knows the timetable (which platform serves which town), the ticket office log (who bought which ticket, and when), and the luggage tags (a number on each bag, re-used every day). From the video she can see a family board at 18:02 with three bags, and a porter's trolley arrive at 18:05 with bag tag 41. Tag 41 was also used yesterday by someone else, so the tag alone proves nothing. But tag 41 plus "18:05" plus "platform 3, the Riverside train" plus "the ticket office sold three Riverside tickets to the Parks at 17:55" points to one family.</p>
+<p>The camera was switched on at 18:00, so anything earlier is missing. The station clock and the camera clock also disagree by a few seconds, and they drift.</p>
+</aside>
+</section>
+
+<section id="boundary">
+<h2>Analogy boundary</h2>
+<table>
+<caption>Mapping the station story</caption>
+<thead><tr><th>Story</th><th>Represents</th></tr></thead>
+<tbody>
+<tr><td>Camera on one platform</td><td>Protocol analyzer on one link</td></tr>
+<tr><td>Timetable</td><td>Binding context: BAR0, doorbell stride, queue bases and sizes, MSI-X table</td></tr>
+<tr><td>Ticket office log</td><td>Host tracepoints (nvme_setup_cmd, nvme_complete_rq) with qid and cmdid</td></tr>
+<tr><td>Luggage tags re-used daily</td><td>PCIe tags and CIDs, unique only within a scope and lifetime</td></tr>
+<tr><td>Camera switched on late</td><td>A capture that starts after queue creation or mid-command</td></tr>
+<tr><td>Disagreeing clocks</td><td>Analyzer timebase versus kernel monotonic clock</td></tr>
+</tbody>
+</table>
+<aside class="callout breaks">
+<p><strong>What it hides.</strong> On a link, the "passengers" (NVMe commands) are inside the cargo: you must open the payload of the fetch completion to learn the CID and opcode, and the data TLPs carry no command identity at all, only an address. Also, a single "train" can carry several families (one fetch, several SQEs) and one "announcement" can cover several arrivals (one MSI-X, several CQEs).</p>
+<p><strong>Where it misleads.</strong> The story suggests the camera sees everything on its platform. Analyzers can drop packets when their buffers overflow or their filters are wrong, and they cannot see what happens inside the host or the SSD. And the detective's best match is still a hypothesis: the story's confident ending is exactly the habit this module tries to correct.</p>
+</aside>
+</section>
+
+<section id="vocabulary">
+<h2>Vocabulary</h2>
+<table>
+<caption>Terms used in this module</caption>
+<thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+<tbody>
+<tr><td><span class="g" data-term="correlation-key">Correlation key</span></td><td>The clue that links two events</td><td>A field or derived value tying one stage of a command to the next, valid within a scope and lifetime</td><td>Doorbell address, fetch address, (RID, Tag), (SQID, CID), buffer address, CQ slot, vector</td><td>Using a key outside its scope (a tag to match a CQE)</td></tr>
+<tr><td><span class="g" data-term="binding-context">Binding context</span></td><td>The map you need to read addresses</td><td>BAR0 address, CAP.DSTRD, per-queue base/size/CQ/vector, MSI-X table, PRP list pages in use</td><td>Captured at initialisation or inferred</td><td>Assuming the analyzer knows it automatically</td></tr>
+<tr><td><span class="g" data-term="context-inference">Context inference</span></td><td>Working out the map from traffic</td><td>Deriving queue bases and tails from doorbell values and fetch/CQE addresses</td><td>Needed when capture starts late</td><td>Treating inferred values as observed</td></tr>
+<tr><td><span class="g" data-term="stage-latency">Stage latency</span></td><td>How long each step took</td><td>Time between consecutive stages of one command (doorbell→fetch, fetch→data, data→CQE, CQE→MSI-X, MSI-X→head doorbell)</td><td>Separates host, link and device time</td><td>Reading end-to-end latency as device latency</td></tr>
+<tr><td><span class="g" data-term="interrupt-coalescing">Coalesced interrupt</span></td><td>One bell for several answers</td><td>One MSI-X message that covers several CQEs, by controller coalescing or simple timing</td><td>Breaks one-to-one CQE↔interrupt mapping</td><td>Calling the extra CQEs "missing interrupts"</td></tr>
+<tr><td><span class="g" data-term="orphan-tlp">Orphan</span></td><td>A clue with no owner</td><td>A TLP or CQE that matches no outstanding command or request</td><td>Primary bug evidence</td><td>Reporting orphans before excluding HMB, admin traffic and pre-capture state</td></tr>
+<tr><td><span class="g" data-term="capture-loss">Capture loss</span></td><td>The camera blinked</td><td>TLPs that crossed the link but are absent from the capture (buffer overflow, filter, trigger window)</td><td>Detectable through Data Link Layer sequence numbers and ACK/NAK continuity</td><td>Treating absence in a capture as absence on the link</td></tr>
+<tr><td><span class="g" data-term="clock-alignment">Clock alignment</span></td><td>Putting two watches together</td><td>Mapping analyzer time to host time with an offset and a drift term, from marker events</td><td>Needed to merge tracepoints and TLPs</td><td>Using one marker and ignoring drift over long captures</td></tr>
+<tr><td><span class="g" data-term="stale-payload">Stale payload</span></td><td>Yesterday's note</td><td>A fetched SQE or CQE whose contents belong to an earlier pass of the ring</td><td>Reveals host ordering bugs or phase errors</td><td>Assuming the fetched SQE is what the host intended</td></tr>
+<tr><td><span class="g" data-term="attribution-confidence">Attribution confidence</span></td><td>How sure the match is</td><td>Proven (unique key match), probable (address and timing match, alternatives unlikely), consistent (cannot be excluded)</td><td>Reported per TLP or per command</td><td>Writing "the TLP belongs to X" when it is only consistent</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="architecture">
+<h2>Architecture</h2>
+<p>Correlation is an analysis pipeline. Its inputs are evidence streams with their own clocks and blind spots; its output is a command table with per-stage timestamps and a list of anomalies.</p>
+<figure>
+<pre class="diagram">
+  ┌──────────────────────┐   ┌──────────────────────┐   ┌──────────────────────────┐
+  │ Analyzer capture     │   │ Host tracepoints     │   │ Context sources          │
+  │ TLPs + DLLPs, ns,    │   │ setup_cmd/complete_rq│   │ init capture, show-regs, │
+  │ one link only        │   │ qid, cmdid, opcode,  │   │ debugfs, Create SQ/CQ    │
+  │ may drop packets     │   │ monotonic µs         │   │ SQEs, MSI-X table        │
+  └─────────┬────────────┘   └─────────┬────────────┘   └────────────┬─────────────┘
+            │                          │                             │
+            ▼                          ▼                             ▼
+  ┌───────────────────────────────────────────────────────────────────────────────┐
+  │ 1 Clock alignment (offset + drift)  2 Context (observed or inferred, labelled) │
+  │ 3 Classify TLPs by address range    4 Pair MRd ↔ CplD by (RID, Tag), BC       │
+  │ 5 Decode SQEs → command records keyed (SQID, CID), with PRP ranges            │
+  │ 6 Attribute data by address; PRP lists by list page                           │
+  │ 7 Close with CQE (SQID, CID); map MSI-X to CQEs; head doorbells to CQ slots   │
+  │ 8 Check invariants; emit anomalies with confidence                            │
+  └───────────────────────────────────────┬───────────────────────────────────────┘
+                                          ▼
+           Command table: (SQID, CID) · opcode · LBA · stage timestamps · status
+           Anomaly list: orphans · duplicates · stale payloads · order violations · gaps
+</pre>
+<figcaption>The correlation pipeline. Steps 1 and 2 are where most real-world mistakes happen.</figcaption>
+</figure>
+<table>
+<caption>Architecture summary</caption>
+<thead><tr><th>Aspect</th><th>Contents</th></tr></thead>
+<tbody>
+<tr><td>Inputs</td><td>Capture (TLPs, DLLPs, timestamps), host tracepoints, kernel log, context (register values, queue creation commands, MSI-X table)</td></tr>
+<tr><td>Outputs</td><td>Per-command records and stage latencies; anomalies with confidence; a list of what could not be decided</td></tr>
+<tr><td>Actors</td><td>The analyst or tool; indirectly, every agent that produced evidence (driver, controller, root complex)</td></tr>
+<tr><td>State</td><td>Outstanding-request table per (RID, Tag); outstanding-command table per (SQID, CID); per-queue last tail and head; per-CQ expected phase; PRP list pages in use</td></tr>
+<tr><td>Memory</td><td>The analyst's model of host memory regions: SQ, CQ, PRP list pages, data buffers, HMB, MSI-X window</td></tr>
+<tr><td>Registers</td><td>CAP.DSTRD, AQA/ASQ/ACQ, doorbells, MSI-X table entries (all as context)</td></tr>
+<tr><td>Interfaces</td><td>Analyzer export formats (CSV or vendor), tracefs, kernel log</td></tr>
+<tr><td>Dependencies</td><td>Correct binding model (<a href="dd37.html">NVMe over PCIe</a>), DMA shapes (<a href="dd36.html">DMA with NVMe</a>), PCIe completion rules (<a href="dd12.html">PCIe Completions</a>)</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="mechanism">
+<h2>Mechanism</h2>
+<p>The algorithm of <a href="ch41.html#engineering">Chapter 41</a> assumed context. Here are the steps for the realistic case where you have a capture, some host tracing, and partial context. Each step says who acts, what changes, where, and what evidence it relies on. "Who" is the analyst; "what changes" is the analyst's model.</p>
+<ol>
+<li><strong>Bound the evidence.</strong> Record the capture window, the analyzer's filter and trigger, and whether DLLPs were captured. <em>Changes:</em> the list of things you cannot see. <em>Evidence:</em> capture metadata; continuity of Data Link Layer sequence numbers in each direction (a jump means lost TLPs or an analyzer filter).</li>
+<li><strong>Align clocks.</strong> Find two marker events seen by both host and analyzer, compute offset and drift (formula below). <em>Changes:</em> a mapping from analyzer time to host time with an uncertainty. <em>Evidence:</em> trace_marker writes paired with distinctive admin commands.</li>
+<li><strong>Establish or infer context.</strong> If the capture contains initialisation, read context directly (ASQ/ACQ writes, Create I/O SQ/CQ SQEs, MSI-X table writes). Otherwise infer: <var>SQ base</var> = fetch address − first fetched slot × 64, with the first fetched slot = new tail − number of fetched entries (no wrap); <var>CQ base</var> = CQE address − slot × 16, with slot from the head doorbell that consumed it. <em>Changes:</em> context table, each entry marked observed or inferred. <em>Evidence:</em> doorbell values, fetch addresses and lengths, CQE addresses, head doorbell values.</li>
+<li><strong>Classify every TLP</strong> by direction and address range: doorbell, register access, MSI-X table write, SQ fetch, PRP list fetch, data, CQE, interrupt, HMB, unknown.</li>
+<li><strong>Pair requests and completions</strong> by (Requester ID, Tag), reassembling split completions with Byte Count. Keep tag lifetimes: a tag is free after the completion whose Byte Count equals its payload.</li>
+<li><strong>Decode SQEs</strong> from fetch completions into command records keyed by (SQID, CID): opcode, NSID, LBA range, PRP1/PRP2 or SGL, and the slot. Check for stale payloads (a CID or opcode that matches the previous pass of the slot rather than a new command).</li>
+<li><strong>Attribute data</strong> by address against outstanding commands' PRP ranges; fetch PRP lists and add their pages. If two outstanding commands' ranges contain the address, mark attribution ambiguous.</li>
+<li><strong>Close commands</strong> with CQEs keyed by (SQID, CID); verify the phase against the expected phase for that CQ pass; record status and SQ Head Pointer (SQHD).</li>
+<li><strong>Attribute interrupts</strong>: each MSI-X write covers every CQE posted to CQs on that vector since the previous MSI-X on that vector.</li>
+<li><strong>Attribute head doorbells</strong>: each covers every CQE up to the new head.</li>
+<li><strong>Check invariants and emit anomalies</strong>: data outside any range; CQE before its data; CQE for a non-outstanding (SQID, CID); duplicate outstanding (SQID, CID); fetch beyond the published tail; CQ overrun; missing stages. Give each anomaly a confidence.</li>
+</ol>
+<div class="formula">
+<div class="eq"><var>t</var><sub>host</sub> = <var>t</var><sub>h1</sub> + <var>k</var> × (<var>t</var><sub>an</sub> − <var>t</var><sub>a1</sub>),  <var>k</var> = (<var>t</var><sub>h2</sub> − <var>t</var><sub>h1</sub>) / (<var>t</var><sub>a2</sub> − <var>t</var><sub>a1</sub>)</div>
+<dl class="vars">
+<dt>t<sub>host</sub></dt><dd>the event's time on the host's monotonic clock</dd>
+<dt>t<sub>an</sub></dt><dd>the event's time on the analyzer's clock</dd>
+<dt>t<sub>a1</sub>, t<sub>h1</sub></dt><dd>analyzer and host timestamps of marker 1 (the same physical event)</dd>
+<dt>t<sub>a2</sub>, t<sub>h2</sub></dt><dd>analyzer and host timestamps of marker 2, taken later</dd>
+<dt>k</dt><dd>rate ratio between the clocks (1 + drift); for example 1.000001 for 1 part per million</dd>
+</dl>
+</div>
+<p>With one marker you can only remove the offset, and the error grows with distance from the marker: 1 ppm of drift is 60 µs after one minute, larger than the stage latencies you are trying to order. The marker's own uncertainty (how long between the trace_marker write and the doorbell it is paired with) adds a few microseconds either way.</p>
+<figure>
+<ol class="seq" data-actors="Analyst|Capture|Host trace|Command table">
+<li data-from="Analyst" data-to="Capture">bound window; check DLL sequence gaps</li>
+<li data-from="Analyst" data-to="Host trace">find markers 1 and 2</li>
+<li data-note="Analyst">compute offset and drift k</li>
+<li data-from="Analyst" data-to="Capture">doorbells + fetches → infer SQ bases</li>
+<li data-from="Analyst" data-to="Capture">pair MRd/CplD by (RID, Tag)</li>
+<li data-from="Analyst" data-to="Command table">decode SQEs → (SQID, CID) records</li>
+<li data-from="Analyst" data-to="Command table">attribute data, CQE, MSI-X, head DB</li>
+<li data-from="Analyst" data-to="Host trace">cross-check cmdid and times</li>
+<li data-from="Analyst" data-to="Command table" class="bad">emit anomalies + confidence</li>
+</ol>
+<figcaption>The analyst's sequence. The cross-check against host tracepoints catches inference errors that the capture alone cannot.</figcaption>
+</figure>
+<h3>The central concept on the ladder</h3>
+<p>The central concept is <strong>attribution under uncertainty</strong>: assigning each observed event to one command, with a stated basis and confidence, when context may be inferred, keys are reused and evidence may be incomplete.</p>
+<div class="ladder">
+<div class="rung" data-rung="A"><p>Tag 41 alone does not tell you whose bag it is; tag 41 plus the time, the platform and the ticket log does, and you say how sure you are.</p></div>
+<div class="rung" data-rung="B"><p>Each TLP is linked to a command through a chain of keys; every key is unique only for a while and in one place; when a key is inferred or two commands fit, the link is weaker and must be labelled.</p></div>
+<div class="rung" data-rung="C"><p>The controller's queue engine, DMA engines and completion engine each create one kind of key (fetch address, tag, CQ slot); the host creates CIDs, buffer addresses and vectors; the analyzer timestamps and may drop.</p></div>
+<div class="rung" data-rung="D"><p>NVMe Base defines CID uniqueness per SQ, the SQE/CQE fields and the queue arithmetic; the PCI Express Base Specification defines tag uniqueness per requester, completion matching and splitting. Neither defines how to attribute a posted write to a command: that is derived reasoning.</p></div>
+<div class="rung" data-rung="E"><p>Only non-posted requests carry meaningful tags. Data for READs, CQEs and MSI-X are posted and identified only by address and payload. Doorbells are posted and identified by address and value.</p></div>
+<div class="rung" data-rung="F"><p>In a capture: filter by address ranges; pair MRd/CplD by tag; decode payloads; build per-command timelines; watch DLL sequence numbers for gaps.</p></div>
+<div class="rung" data-rung="G"><p>Bugs live in the anomalies: an orphan, a duplicate, a stale payload, a CQE before its data, a fetch without a doorbell. The first anomaly in time is the anchor of the investigation, and its confidence decides how hard you lean on it.</p></div>
+</div>
+<h3>The sixteen questions, applied to attribution</h3>
+<table>
+<caption>Attribution under uncertainty through the sixteen questions</caption>
+<thead><tr><th>Question</th><th>Answer</th></tr></thead>
+<tbody>
+<tr><td>What is it?</td><td>Assigning observed link and host events to specific NVMe commands, with a basis and a confidence.</td></tr>
+<tr><td>Why was it created?</td><td>Because no TLP carries a command identity except inside SQE and CQE payloads.</td></tr>
+<tr><td>What problem does it solve?</td><td>It turns a packet log into a per-command story, which is where bugs and latency become visible.</td></tr>
+<tr><td>What existed before?</td><td>Single-outstanding-command interfaces, where position in time was enough.</td></tr>
+<tr><td>Why is the current design better?</td><td>Deep parallel queues give performance; the cost is that correlation needs method.</td></tr>
+<tr><td>Who creates it?</td><td>The analyst or the analysis tool.</td></tr>
+<tr><td>Who consumes it?</td><td>Debuggers, performance engineers, validation oracles, bug reports.</td></tr>
+<tr><td>Where does it live?</td><td>In the command table and anomaly list produced from the evidence.</td></tr>
+<tr><td>What memory/registers are involved?</td><td>Context: queue bases, doorbell stride, MSI-X table, PRP list pages.</td></tr>
+<tr><td>What happens before it?</td><td>Capture setup, triggering, tracepoint enabling, marker generation.</td></tr>
+<tr><td>What happens after it?</td><td>Stage latency analysis, first-abnormal-event search, root-cause reasoning.</td></tr>
+<tr><td>What happens if it is wrong?</td><td>Wrong command blamed, wrong latency attributed, real anomalies hidden or false ones reported.</td></tr>
+<tr><td>What does the protocol analyzer show?</td><td>Raw keys: addresses, tags, payloads, timestamps; vendor NVMe decode only if configured with context.</td></tr>
+<tr><td>What does Linux show?</td><td>qid, cmdid, opcode, LBA and status per command in tracepoints; timeouts and invalid-CID warnings in the log.</td></tr>
+<tr><td>What would a validation engineer test?</td><td>That an automated checker finds seeded anomalies (orphans, duplicates, stale SQEs), reports "unknown" for lost or pre-capture events, and handles wrap, multi-SQE fetches and coalescing.</td></tr>
+<tr><td>What would a senior engineer suspect when it fails?</td><td>Wrong or stale context, capture loss, clock misalignment, and over-confident attribution of posted writes.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="spec">
+<h2>Specification discipline</h2>
+<table>
+<caption>Sources for each correlation key</caption>
+<thead><tr><th>Key or rule</th><th>Source</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>CID unique within an SQ among outstanding commands; CQE carries SQID, SQHD, CID, phase</td><td><cite class="spec">NVM Express Base Specification, Revision 2.4 — Submission Queue Entry; Completion Queue Entry</cite></td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Doorbell layout and stride; queues and data in host memory</td><td><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite></td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Tag unique per requester while outstanding; completion matching by Requester ID and tag; Byte Count and Lower Address; split completions in address order</td><td><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Transaction Layer; Completion Rules</cite></td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Data Link Layer sequence numbers (12-bit), ACK/NAK</td><td><cite class="spec">PCI Express Base Specification — Data Link Layer</cite></td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Linux tracepoint fields and meaning of cmdid</td><td>Linux kernel source (NVMe driver trace definitions)</td><td><span class="badge impl">Implementation-dependent</span>, <span class="badge version">Version-dependent</span></td></tr>
+<tr><td>Analyzer export formats and decode</td><td>Vendor documentation</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+</tbody>
+</table>
+<aside class="callout verified">
+<p>Verified rules you may rely on: a host must not reuse a CID in the same SQ until the earlier command with that CID has completed; a requester must not reuse a tag until the request is complete; completions for different tags may arrive in any order; completion queue entries are posted in completion order, not submission order; the phase tag inverts on each pass through a CQ.</p>
+</aside>
+<aside class="callout derived">
+<p>Derived, not specified: attribution of posted writes by address range; context inference formulas; coalesced interrupt attribution (an MSI-X covers CQEs since the previous message on that vector); clock alignment; confidence categories. Label them as derived in any report.</p>
+</aside>
+<aside class="callout impl">
+<p>Implementation-dependent: how many SQEs a controller fetches per MRd; whether it fetches across the ring end in one or two requests (it must not run past the queue end); when it fetches PRP lists; interrupt coalescing policy; the Linux driver's CID encoding (a generation counter in the upper bits on current kernels); analyzer buffer sizes and drop behaviour.</p>
+</aside>
+<aside class="callout version">
+<p>Version-dependent: 10-bit tags (PCIe 4.0 and later) and 14-bit tags in FLIT mode (PCIe 6.0 and later) widen the tag space; FLIT mode also changes Data Link Layer sequence handling, so gap detection must follow the revision in use. Linux tracepoint formats change across kernel versions.</p>
+</aside>
+<aside class="callout notsaid">
+<p>No specification defines how to correlate, what confidence is, or how an analyzer must report lost packets. NVMe does not require controllers to fetch commands in the order they were published across different SQs, nor to complete them in order. Check in the specification: the arbitration mechanisms (round robin, weighted round robin with urgent priority) and the Arbitration Burst setting, which affect how fetches interleave across SQs.</p>
+</aside>
+<aside class="callout warn">
+<p>Never use a PCIe tag to match a CQE or data write to a command. Never treat inferred context as observed. Never call an event "missing" without first checking the capture window and Data Link Layer sequence continuity. Never order two events from different clocks when their difference is smaller than the alignment uncertainty.</p>
+</aside>
+</section>
+
+<section id="hardware">
+<h2>Hardware view</h2>
+<table>
+<caption>Hardware relevant to correlation</caption>
+<thead><tr><th>Category</th><th>Hardware</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td rowspan="3">Must participate</td><td>Controller queue engine</td><td>Creates fetch addresses and lengths (slot keys)</td></tr>
+<tr><td>Controller DMA and completion engines</td><td>Create tags, data addresses, CQ slots, MSI-X writes</td></tr>
+<tr><td>Root complex</td><td>Creates completion tags and splits for device reads; is requester for MMIO</td></tr>
+<tr><td rowspan="3">May participate</td><td>Analyzer or interposer</td><td>Adds its own timebase, buffer limits and placement effects (it sees one link)</td></tr>
+<tr><td>PCIe switch</td><td>Adds latency between links; a capture upstream of a switch sees several devices' traffic</td></tr>
+<tr><td>Host trace buffers</td><td>Kernel ring buffers that can also drop events under load</td></tr>
+<tr><td rowspan="2">Observable</td><td>TLP headers and payloads, DLLPs</td><td>The analyzer's view</td></tr>
+<tr><td>Host-side tracepoints and logs</td><td>The kernel's view</td></tr>
+<tr><td rowspan="2">Unobservable</td><td>Controller internal queues, command slots, arbitration decisions</td><td>Seen only as timing between doorbell and fetch</td></tr>
+<tr><td>Root complex internal buffering</td><td>Seen only as completion latency</td></tr>
+</tbody>
+</table>
+<aside class="callout hw" data-title="Analyzer placement changes the timestamps">
+<p>An interposer at the SSD's connector timestamps a device MWr when it leaves the SSD; one at the root port sees it after any switch or retimer. For correlation within one link this does not matter; for comparing with host time it adds a constant offset (absorbed by alignment) plus variable switch queuing (which is not). If a switch sits between the analyzer and the root port, the Requester ID still identifies the SSD, but the timing of completions includes the switch's latency in both directions.</p>
+</aside>
+</section>
+
+<section id="protocol">
+<h2>Protocol view</h2>
+<h3>Patterns that break naive one-to-one matching</h3>
+<table>
+<caption>Many-to-one and one-to-many relationships</caption>
+<thead><tr><th>Pattern</th><th>What you see</th><th>How to correlate</th></tr></thead>
+<tbody>
+<tr><td>One doorbell, several SQEs</td><td>Tail moves by n &gt; 1</td><td>Expect n SQEs; fetches may be one MRd or several</td></tr>
+<tr><td>One fetch, several SQEs</td><td>MRd Len = 16 × n DW</td><td>Split payload into 64-byte entries; slots are consecutive</td></tr>
+<tr><td>Fetch across ring end</td><td>Two MRds: one ending at the queue end, one at the base</td><td>Slot numbering wraps to 0; a single MRd past the end is a controller bug</td></tr>
+<tr><td>Split fetch completion</td><td>Several CplDs for one tag (Byte Count decreasing)</td><td>Reassemble before decoding SQEs</td></tr>
+<tr><td>One command, many data TLPs</td><td>Writes or reads across PRP pages</td><td>Attribute by address range, including PRP list pages</td></tr>
+<tr><td>Interleaved data of several commands</td><td>Alternating addresses</td><td>Ranges are disjoint for correct hosts; overlapping ranges are a host bug or a buffer reuse</td></tr>
+<tr><td>Completion order ≠ submission order</td><td>CQ slots filled by whichever command finishes first</td><td>Key by (SQID, CID), never by slot or order</td></tr>
+<tr><td>One CQ, several SQs</td><td>CQEs with different SQIDs in one CQ</td><td>SQID in CQE DW2 selects the SQ (Linux uses 1:1, other hosts may not)</td></tr>
+<tr><td>One MSI-X, several CQEs</td><td>Fewer interrupts than CQEs</td><td>Interrupt covers CQEs since the last message on its vector</td></tr>
+<tr><td>One head doorbell, several CQEs</td><td>Head jumps by n</td><td>Covers n CQEs; lag is host processing time</td></tr>
+</tbody>
+</table>
+<h3>Ordering facts that make correlation possible</h3>
+<ul>
+<li>A fetch for slot s follows a doorbell that published s. A fetch that precedes any publishing doorbell (within the capture) means either the doorbell was before the capture or the controller fetched beyond the tail (a bug).</li>
+<li>For a READ, the controller writes data, then the CQE, then (possibly) the MSI-X; posted-write ordering preserves this. For a WRITE, the controller's data reads all complete before its CQE.</li>
+<li>Completions for one read request arrive in address order; across tags any order is legal.</li>
+<li>The head doorbell follows the CQEs it acknowledges; the host may batch.</li>
+</ul>
+<h3>Detecting capture loss</h3>
+<p>Each direction of the link numbers TLPs with a 12-bit sequence number (outside FLIT mode), and ACK DLLPs name the latest acknowledged sequence number. If the analyzer captured DLLPs, a jump in TLP sequence numbers that is not explained by a NAK and replay means the analyzer did not record some TLPs. If only TLPs were captured, check the analyzer's own overflow indicators. Without either, "missing" must be written as "not observed".</p>
+</section>
+
+<section id="trace">
+<h2>Trace view</h2>
+<p>Four synthetic traces on the lab system with two I/O queue pairs: SQ1/CQ1 (vector 1, MSI-X address 0xFEE0_1000, data 0x41) and SQ2/CQ2 (bases 0x1_2342_0000 / 0x1_2343_0000, doorbells 0xFE60_1010 / 0xFE60_1014, vector 2 with illustrative address 0xFEE0_2000, data 0x42).</p>
+
+<h3>Normal: three commands, two queues, one coalesced interrupt</h3>
+<div class="trace" data-kind="synthetic" data-title="READ 0x102B and 0x102A on SQ1, WRITE 0x2031 on SQ2">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0006</td><td>SQ1 tail → 6 (slot 5)</td></tr>
+<tr class="dir-down"><td>2</td><td>Host→Dev</td><td>150</td><td>MWr32</td><td>Addr=0xFE60_1010 Data=0x0000_0013</td><td>SQ2 tail → 0x13 (slot 0x12)</td></tr>
+<tr class="dir-up"><td>3</td><td>Dev→Host</td><td>700</td><td>MRd64</td><td>Addr=0x1_2340_0140 Len=16 Tag=0x21</td><td>Fetch SQ1 slot 5</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>850</td><td>MRd64</td><td>Addr=0x1_2342_0480 Len=16 Tag=0x22</td><td>Fetch SQ2 slot 0x12</td></tr>
+<tr class="dir-down"><td>5</td><td>Host→Dev</td><td>1,350</td><td>CplD</td><td>Tag=0x21 BC=64; payload 102A0002 00000001 … 00003000 00000002 … 00102000 0 00000007</td><td>(1, 0x102A) READ 4 KiB → 0x2_0000_3000</td></tr>
+<tr class="dir-down"><td>6</td><td>Host→Dev</td><td>1,500</td><td>CplD</td><td>Tag=0x22 BC=64; payload 20310001 00000001 … 00050000 00000002 … 00204000 0 00000007</td><td>(2, 0x2031) WRITE 4 KiB ← 0x2_0005_0000</td></tr>
+<tr class="dir-up"><td>7–14</td><td>Dev→Host</td><td>2,300–2,370</td><td>MRd64 ×8</td><td>Addr=0x2_0005_0000 … 0x2_0005_0E00 Len=128 Tags 0x30–0x37</td><td>(2, 0x2031) data pull</td></tr>
+<tr class="dir-down"><td>15–30</td><td>Host→Dev</td><td>3,900–4,440</td><td>CplD ×16</td><td>Tags 0x30–0x37, BC 512/256, SC</td><td>(2, 0x2031) data</td></tr>
+<tr class="dir-up"><td>31</td><td>Dev→Host</td><td>4,800</td><td>MWr64</td><td>Addr=0x1_2343_0120; payload 0 0 00020013 00012031</td><td>CQ2 slot 0x12: (2, 0x2031) success</td></tr>
+<tr class="dir-up"><td>32</td><td>Dev→Host</td><td>4,860</td><td>MWr32</td><td>Addr=0xFEE0_2000 Data=0x42</td><td>Vector 2 → CQ2</td></tr>
+<tr class="dir-down"><td>33</td><td>Host→Dev</td><td>7,300</td><td>MWr32</td><td>Addr=0xFE60_1014 Data=0x0000_0013</td><td>CQ2 head → 0x13</td></tr>
+<tr class="dir-down"><td>34</td><td>Host→Dev</td><td>20,000</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0007</td><td>SQ1 tail → 7 (slot 6)</td></tr>
+<tr class="dir-up"><td>35</td><td>Dev→Host</td><td>20,700</td><td>MRd64</td><td>Addr=0x1_2340_0180 Len=16 Tag=0x23</td><td>Fetch SQ1 slot 6</td></tr>
+<tr class="dir-down"><td>36</td><td>Host→Dev</td><td>21,350</td><td>CplD</td><td>Tag=0x23 BC=64; payload 102B0002 00000001 … 00004000 00000002 … 00600000 0 00000007</td><td>(1, 0x102B) READ 4 KiB → 0x2_0000_4000</td></tr>
+<tr class="dir-up"><td>37–52</td><td>Dev→Host</td><td>56,900–57,440</td><td>MWr64 ×16</td><td>Addr=0x2_0000_4000 … 0x2_0000_4F00 Len=64</td><td>(1, 0x102B) data: the later command finishes first</td></tr>
+<tr class="dir-up"><td>53</td><td>Dev→Host</td><td>57,500</td><td>MWr64</td><td>Addr=0x1_2341_00B0; payload 0 0 00010007 0001102B</td><td>CQ1 slot 0x0B: (1, 0x102B)</td></tr>
+<tr class="dir-up"><td>54–69</td><td>Dev→Host</td><td>57,600–58,140</td><td>MWr64 ×16</td><td>Addr=0x2_0000_3000 … 0x2_0000_3F00 Len=64</td><td>(1, 0x102A) data</td></tr>
+<tr class="dir-up"><td>70</td><td>Dev→Host</td><td>58,220</td><td>MWr64</td><td>Addr=0x1_2341_00C0; payload 0 0 00010007 0001102A</td><td>CQ1 slot 0x0C: (1, 0x102A)</td></tr>
+<tr class="dir-up"><td>71</td><td>Dev→Host</td><td>58,280</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x41</td><td>One MSI-X for both CQ1 entries</td></tr>
+<tr class="dir-down"><td>72</td><td>Host→Dev</td><td>60,800</td><td>MWr32</td><td>Addr=0xFE60_100C Data=0x0000_000D</td><td>CQ1 head → 0x0D: two entries consumed</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Rows 53 and 70 were both posted before any interrupt for vector 1, and row 71 covers both; that is not a missing interrupt. Whether the controller deliberately coalesced (Interrupt Coalescing feature) or simply had not yet raised the first interrupt is not decidable from the trace; it does not matter for correctness. Completion order: (1, 0x102B) was submitted 20 µs later but completed 0.7 µs earlier, and so took CQ slot 0x0B. Note that the SQHD in both CQ1 entries is 7, the SQ1 head after both fetches. Per-command stage latencies come out of the intermediate lab's script.</p>
+</div>
+
+<h3>Slow: a fetch that waits for the controller to free resources</h3>
+<p>Scenario: heavy load on SQ1–SQ4 (only SQ1 and SQ3 shown). The analyst notices that one READ on SQ3 has a 38 µs doorbell-to-fetch delay, while every other fetch takes about 0.7 µs. SQ3 tail doorbell is 0xFE60_1018 and its base, inferred, is 0x1_2344_0000.</p>
+<div class="trace" data-kind="synthetic" data-title="Doorbell-to-fetch stall on SQ3 under load">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1018 Data=0x0000_0041</td><td>SQ3 tail → 0x41 (slot 0x40)</td></tr>
+<tr class="note"><td colspan="6">0 → 38,100 ns: no fetch from SQ3. During this time: 64 CQEs posted on CQ1–CQ4, each immediately followed (within 1 µs) by a fetch from the same SQ it completed for.</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>37,950</td><td>MWr64</td><td>Addr=0x1_2341_0410; payload … 00010042 00011066</td><td>CQ1: (1, 0x1066) completes</td></tr>
+<tr class="dir-up"><td>3</td><td>Dev→Host</td><td>38,100</td><td>MRd64</td><td>Addr=0x1_2344_1000 Len=16 Tag=0x5A</td><td>First fetch from SQ3 since row 1: slot 0x40</td></tr>
+<tr class="dir-down"><td>4</td><td>Host→Dev</td><td>38,750</td><td>CplD</td><td>Tag=0x5A BC=64; payload 30200002 …</td><td>(3, 0x3020) READ</td></tr>
+<tr class="note"><td colspan="6">Remaining stages normal: data at ≈ 96 µs, CQE, MSI-X. Total device-visible latency ≈ 97 µs, of which 38 µs before the fetch.</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Correlation splits the latency: 38 µs between doorbell and fetch, 58 µs from fetch to data. The second part is normal NAND time; the first is queueing inside the controller before it even reads the command. The pattern in the note row (each completion followed by a fetch) is the signature of a controller that holds a fixed number of commands in flight and fetches a new one only when a slot frees, choosing among SQs by its arbitration policy. Without correlation, an engineer would report "the SSD's read latency is 97 µs". With it, the report says "the SSD fetched late because it was full; the media read itself took 58 µs", which points at queue depth and arbitration (host queue depth per SQ, Weighted Round Robin settings, Arbitration Burst) rather than media. Confirm with host tracepoints: nvme_setup_cmd for (3, 0x3020) should align with row 1 within the alignment uncertainty.</p>
+</div>
+
+<h3>Failed: the controller fetches a stale SQE</h3>
+<p>Scenario: a driver port to a weakly ordered CPU omits the write barrier between storing the SQE and writing the doorbell. Slot 0x22 of SQ1 last held CID 0x1022 (a READ) one ring pass ago; the host intends a new WRITE with CID 0x2422.</p>
+<div class="trace" data-kind="synthetic" data-title="Doorbell overtakes the SQE store: stale command executed">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0023</td><td>SQ1 tail → 0x23 (slot 0x22)</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>690</td><td>MRd64</td><td>Addr=0x1_2340_0880 Len=16 Tag=0x2E</td><td>Fetch slot 0x22</td></tr>
+<tr class="abnormal"><td>3</td><td>Host→Dev</td><td>1,340</td><td>CplD</td><td>Tag=0x2E BC=64; payload 10220002 00000001 … 00022000 00000002 … 00450000 0 00000007</td><td>First abnormal event: slot contains the previous pass's READ, CID 0x1022, not the intended WRITE 0x2422</td></tr>
+<tr class="dir-up"><td>4–19</td><td>Dev→Host</td><td>57,500–58,040</td><td>MWr64 ×16</td><td>Addr=0x2_0002_2000 … 0x2_0002_2F00</td><td>Data written into a buffer that the host freed long ago</td></tr>
+<tr class="dir-up"><td>20</td><td>Dev→Host</td><td>58,120</td><td>MWr64</td><td>Addr=0x1_2341_0350; payload 0 0 00010023 00011022</td><td>CQE for (1, 0x1022): no such outstanding command on the host</td></tr>
+<tr class="dir-up"><td>21</td><td>Dev→Host</td><td>58,180</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x41</td><td>Interrupt</td></tr>
+<tr class="note"><td colspan="6">Host: warning about a completion with an invalid command id on queue 1 (wording kernel-dependent). WRITE 0x2422 never executes and times out after 30 s.</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> The decisive correlation check is "does the fetched SQE belong to this submission?" Row 3's CID and opcode match the previous pass of slot 0x22, not anything the host published now (host tracepoint: nvme_setup_cmd qid 1 cmdid 0x2422 opcode Write). The controller did exactly what it should: fetch after the doorbell and execute what it read. The data writes in rows 4–19 are particularly dangerous: the buffer 0x2_0002_2000 belonged to the old command and may have been unmapped (IOMMU fault, data lost) or remapped to someone else (silent corruption). Root cause: missing ordering between the SQE stores and the doorbell MMIO write on the host. Evidence against alternatives: the doorbell value is right (not a tail bug); the fetch address is right (not a base bug); the payload is internally consistent (not link corruption, which would also fail LCRC). Fix: restore the barrier (use the platform's ordered MMIO write). Regression test: run with a pattern that writes slot contents just before the doorbell under maximum load on the weakly ordered platform, and have a correlation checker compare every fetched SQE with the host's tracepoint record for that slot.</p>
+</div>
+
+<h3>Ambiguous: a completion whose command was never seen</h3>
+<p>Scenario: a 2-second capture triggered on an AER message. Near the start there is a CQE for (2, 0x2077) with no fetch of that command in the capture. Is something wrong?</p>
+<div class="trace" data-kind="synthetic" data-title="CQE for a command with no observed fetch">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Capture window begins at analyzer time 0 (pre-trigger buffer 2 ms). DLLPs captured.</td></tr>
+<tr class="dir-up"><td>1</td><td>Dev→Host</td><td>14,200</td><td>MWr64</td><td>Seq=0x3A1 Addr=0x2_0007_7000 Len=64</td><td>Data into a page no observed command owns</td></tr>
+<tr class="dir-up"><td>…</td><td>Dev→Host</td><td>…</td><td>MWr64 ×15</td><td>Seq=0x3A2…0x3B0 Addr=0x2_0007_7100 … 0x2_0007_7F00</td><td>Rest of the page</td></tr>
+<tr class="dir-up"><td>17</td><td>Dev→Host</td><td>14,900</td><td>MWr64</td><td>Seq=0x3B1 Addr=0x1_2343_0700; payload 0 0 00020071 00012077</td><td>CQ2: (2, 0x2077) success</td></tr>
+<tr class="dir-up"><td>18</td><td>Dev→Host</td><td>14,960</td><td>MWr32</td><td>Seq=0x3B2 Addr=0xFEE0_2000 Data=0x42</td><td>Vector 2</td></tr>
+<tr class="dir-down"><td>19</td><td>Host→Dev</td><td>15,100</td><td>DLLP Ack</td><td>AckNak_Seq_Num=0x3B2</td><td>All device TLPs through 0x3B2 acknowledged</td></tr>
+<tr class="note"><td colspan="6">Earlier in the capture: device TLP sequence numbers run 0x2F0 → 0x3A0 continuously. No fetch from 0x1_2342_xxxx with a CID of 0x2077 appears.</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Two explanations: (a) the command was fetched before the capture window started, and only its tail end is visible; (b) the analyzer dropped the fetch and its completion. Evidence: device sequence numbers are continuous from 0x2F0 through 0x3B2 inside the window, so no device TLPs were lost inside the window; the fetch would have been a device MRd (with a host CplD in the other direction), so check the host-direction sequence numbers too. If both directions are continuous, (b) is unlikely within the window. (a) fits the timing: on this system a 4 KiB READ takes about 56 µs from fetch to first data, and the data here starts at 14.2 µs, so the fetch would have been about 42 µs before analyzer time 0, outside the window. Conclusion: "fetch not observed; consistent with pre-capture submission; no capture loss detected in the window". Cross-check with host tracepoints: nvme_setup_cmd qid 2 cmdid 0x2077 at an aligned time before the window start would make it proven. Without host tracing, the honest report says "consistent", not "proven", and does not list the CQE as an orphan.</p>
+</div>
+</section>
+
+<section id="linux">
+<h2>Linux view</h2>
+<aside class="callout safety">
+<p><span class="badge safe">Safe lab</span> Tracing is read-only with respect to the device, but enabling high-rate tracepoints costs CPU and can perturb timing. Use a test system for latency-sensitive captures. No output here is from real hardware.</p>
+</aside>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Enable NVMe command tracepoints (host side of the correlation)</span>
+cd /sys/kernel/tracing
+echo 1 | sudo tee events/nvme/nvme_setup_cmd/enable events/nvme/nvme_complete_rq/enable
+<span class="cm"># Optional: the doorbell-side SQ tracepoint, where the kernel provides it</span>
+ls events/nvme/
+
+<span class="cm"># Marker for clock alignment: write a marker, then issue a distinctive admin command</span>
+echo "MARK1" | sudo tee trace_marker
+sudo nvme get-feature /dev/nvme0 -f 0x0b    <span class="cm"># Asynchronous Event Configuration: rare, easy to trigger on</span>
+
+<span class="cm"># Read the trace</span>
+sudo cat trace | head -50
+
+<span class="cm"># Queue-to-vector context</span>
+grep nvme /proc/interrupts</code></pre>
+<table>
+<caption>What host-side evidence contributes</caption>
+<thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+<tbody>
+<tr><td>nvme_setup_cmd with qid, cmdid, opcode, nsid, LBA</td><td>What the driver intended to submit and when (host clock)</td><td>When the controller fetched it, or what it actually read from the slot</td></tr>
+<tr><td>nvme_complete_rq with qid, cmdid, status, retries</td><td>When the driver processed the completion and its status</td><td>When the CQE was written or the interrupt sent</td></tr>
+<tr><td>trace_marker lines</td><td>A host timestamp to pair with a link event</td><td>The exact delay between the marker write and the paired doorbell (µs-level uncertainty)</td></tr>
+<tr><td>/proc/interrupts</td><td>Vector count per queue and CPU</td><td>Per-CQE interrupt mapping (coalescing hides it)</td></tr>
+</tbody>
+</table>
+<aside class="callout linux" data-title="The cmdid you see is not always the CID on the wire">
+<p>Current Linux kernels build the NVMe CID from the block-layer tag plus a small generation counter in the upper bits, and the tracepoint prints the CID as sent. Older kernels used the tag directly. Check which your kernel does before matching tracepoint cmdids with SQE payloads <span class="badge version">Version-dependent</span>.</p>
+</aside>
+</section>
+
+<section id="labs">
+<h2>Labs</h2>
+
+<h3>Beginner lab — Recover queue context from a late capture</h3>
+<p><span class="badge safe">Safe lab</span> Paper.</p>
+<dl>
+<dt>Objective</dt><dd>Infer SQ and CQ bases from doorbells, fetches, CQEs and head doorbells, and mark every value as inferred.</dd>
+<dt>Prerequisites</dt><dd><a href="ch28.html">Doorbells</a>; this module's Mechanism step 3.</dd>
+<dt>Setup</dt><dd>Context known: BAR0 = 0xFE60_0000, DSTRD = 0. Nothing else. Observed: (a) MWr32 0xFE60_1018 data 0x0000_0010; (b) MRd64 Addr=0x1_2344_0380 Len=32; (c) CplD for it, BC=128, two SQEs with CIDs 0x300E and 0x300F; (d) later, MWr64 to 0x1_2345_0040 with DW2 = 0x0003_000F, DW3 = 0x0001_300E; (e) MWr64 to 0x1_2345_0050 with DW3 = 0x0001_300F; (f) MWr32 0xFE60_101C data 0x0000_0006.</dd>
+<dt>Procedure</dt><dd><ol><li>Which queue does (a) address? Which does (f)?</li><li>How many SQEs did (a) publish, assuming (b) fetched all of them?</li><li>Infer the SQ base.</li><li>Infer the CQ base from (d), (e) and (f).</li></ol></dd>
+<dt>Questions</dt><dd>What assumption makes each inference fragile?</dd>
+<dt>Expected reasoning</dt><dd>Doorbell index → queue; fetch length → entries; new tail − entries → first slot; base = address − slot × entry size.</dd>
+</dl>
+<details class="solution"><summary>Solution</summary>
+<p>(a) 0x1018: index (0x18)/4 = 6 → SQ3 tail. (f) 0x101C: index 7 → CQ3 head. (b) Len 32 DW = 128 B = 2 SQEs; new tail 0x10 → slots 0x0E and 0x0F (matching CIDs 0x300E/0x300F, a coincidence of this host's numbering, not a rule). SQ base = 0x1_2344_0380 − 0x0E × 64 = 0x1_2344_0380 − 0x380 = 0x1_2344_0000. CQ: (f) sets head to 6, so the two CQEs consumed were slots 4 and 5; (d) at 0x…0040 is slot 4 → base 0x1_2345_0040 − 4 × 16 = 0x1_2345_0000; (e) at 0x…0050 is slot 5, consistent. Also, (d)'s DW2 says SQID 3, SQHD 0x0F. Fragile assumptions: that (b) fetched all published entries (a controller may fetch in pieces); that no wrap occurred; that the head doorbell consumed exactly these two CQEs (if it consumed more, the slot numbers shift). Mark all three bases "inferred" until confirmed by a later observation, such as a wrap back to the base address.</p>
+</details>
+<dl><dt>Extension</dt><dd>Infer the SQ size from a later fetch that wraps (two MRds, one ending at an address and one starting at the base).</dd></dl>
+
+<h3>Intermediate lab — Stage latencies by script</h3>
+<p><span class="badge safe">Safe lab</span> Python 3, standard library only.</p>
+<dl>
+<dt>Objective</dt><dd>Run a correlator that infers SQ bases, decodes commands, attributes data and interrupts, and prints per-command stage latencies for the normal trace above.</dd>
+<dt>Prerequisites</dt><dd>The normal trace in this module.</dd>
+<dt>Setup</dt><dd>Save as <code>stage_latency.py</code>. The trace is embedded; data rows are generated by a helper to keep the listing short.</dd>
+</dl>
+<pre class="code" data-kind="executable" data-lang="python" data-title="stage_latency.py"><code>#!/usr/bin/env python3
+"""Correlate a synthetic NVMe-over-PCIe capture without queue context and print stage latencies.
+Known context: BAR0 = 0xFE600000, CAP.DSTRD = 0. Everything else is inferred."""
+BAR0, STRIDE = 0xFE600000, 4
+
+def data(t0, base, n, kind, step=36, size=0x100):
+    return [(t0 + i * step, "D", kind, base + i * size, 64, None, None) for i in range(n)]
+
+T = [  # (time_ns, dir H/D, type, addr, len_dw, tag, payload words)
+    (0, "H", "MWr", 0xFE601008, 1, None, [0x6]),
+    (150, "H", "MWr", 0xFE601010, 1, None, [0x13]),
+    (700, "D", "MRd", 0x123400140, 16, 0x21, None),
+    (850, "D", "MRd", 0x123420480, 16, 0x22, None),
+    (1350, "H", "CplD", None, 16, 0x21, [0x102A0002, 1, 0, 0, 0, 0, 0x3000, 2, 0, 0, 0x102000, 0, 7, 0, 0, 0]),
+    (1500, "H", "CplD", None, 16, 0x22, [0x20310001, 1, 0, 0, 0, 0, 0x50000, 2, 0, 0, 0x204000, 0, 7, 0, 0, 0]),
+] + [(2300 + 10 * i, "D", "MRd", 0x200050000 + 0x200 * i, 128, 0x30 + i, None) for i in range(8)] \
+  + [(3900 + 36 * i, "H", "CplD", None, 64, 0x30 + i // 2, None) for i in range(16)] + [
+    (4800, "D", "MWr", 0x123430120, 4, None, [0, 0, 0x20013, 0x12031]),
+    (4860, "D", "MWr", 0xFEE02000, 1, None, [0x42]),
+    (7300, "H", "MWr", 0xFE601014, 1, None, [0x13]),
+    (20000, "H", "MWr", 0xFE601008, 1, None, [0x7]),
+    (20700, "D", "MRd", 0x123400180, 16, 0x23, None),
+    (21350, "H", "CplD", None, 16, 0x23, [0x102B0002, 1, 0, 0, 0, 0, 0x4000, 2, 0, 0, 0x600000, 0, 7, 0, 0, 0]),
+] + data(56900, 0x200004000, 16, "MWr") + [
+    (57500, "D", "MWr", 0x1234100B0, 4, None, [0, 0, 0x10007, 0x1102B]),
+] + data(57600, 0x200003000, 16, "MWr") + [
+    (58220, "D", "MWr", 0x1234100C0, 4, None, [0, 0, 0x10007, 0x1102A]),
+    (58280, "D", "MWr", 0xFEE01000, 1, None, [0x41]),
+    (60800, "H", "MWr", 0xFE60100C, 1, None, [0xD]),
+]
+
+def run(trace):
+    pending_db = {}          # sqid -&gt; (time, new_tail)
+    fetch = {}               # tag -&gt; (time, addr, len_dw, sqid, first_slot)
+    sq_base, cmds, open_cqes = {}, {}, {}
+    tag_owner = {}           # data-read tag -&gt; command key
+    for t, d, typ, addr, ln, tag, pl in sorted(trace, key=lambda r: r[0]):
+        if d == "H" and typ == "MWr" and BAR0 + 0x1000 &lt;= addr &lt; BAR0 + 0x2000:
+            idx = (addr - BAR0 - 0x1000) // STRIDE
+            q, is_cq = divmod(idx, 2)
+            if not is_cq:
+                pending_db[q] = (t, pl[0])
+            else:
+                for k, c in cmds.items():
+                    if k[0] == q and "cqe" in c and "head_db" not in c:
+                        c["head_db"] = t
+        elif d == "D" and typ == "MRd" and pending_db and addr &lt; 0x200000000 and tag not in fetch:
+            # a fetch: attribute to the queue whose un-fetched doorbell is oldest
+            q, (tdb, tail) = min(pending_db.items(), key=lambda kv: kv[1][0])
+            n = ln * 4 // 64
+            first = tail - n
+            sq_base.setdefault(q, addr - first * 64)
+            fetch[tag] = (t, q, first, tdb)
+            del pending_db[q]
+        elif d == "D" and typ == "MRd":
+            for k, c in cmds.items():
+                if c["page"] &lt;= addr &lt; c["page"] + 0x1000:
+                    tag_owner[tag] = k
+                    c.setdefault("first_data", t)
+        elif d == "H" and typ == "CplD" and tag in fetch and pl:
+            tf, q, first, tdb = fetch.pop(tag)
+            for i in range(0, len(pl), 16):
+                sqe = pl[i:i + 16]
+                cid, opc = sqe[0] &gt;&gt; 16, sqe[0] &amp; 0xFF
+                page = (sqe[7] &lt;&lt; 32) | sqe[6]
+                cmds[(q, cid)] = {"opc": opc, "page": page, "doorbell": tdb, "fetch": tf,
+                                  "slot": first + i // 16}
+        elif d == "H" and typ == "CplD" and tag in tag_owner:
+            cmds[tag_owner[tag]]["last_data"] = t
+        elif d == "D" and typ == "MWr" and addr &gt;= 0xFEE00000 and addr &lt; 0xFEF00000:
+            for k in list(open_cqes):
+                cmds[k]["msix"] = t
+                del open_cqes[k]
+        elif d == "D" and typ == "MWr" and ln == 4 and pl:
+            sqid, cid = pl[2] &gt;&gt; 16, pl[3] &amp; 0xFFFF
+            c = cmds.get((sqid, cid))
+            if c is None:
+                print(f"ORPHAN CQE ({sqid}, 0x{cid:04X}) at {t} ns")
+                continue
+            c["cqe"], c["status"] = t, (pl[3] &gt;&gt; 17) &amp; 0x7FFF
+            open_cqes[(sqid, cid)] = True
+        elif d == "D" and typ == "MWr":
+            for k, c in cmds.items():
+                if c["page"] &lt;= addr &lt; c["page"] + 0x1000:
+                    c.setdefault("first_data", t)
+                    c["last_data"] = t
+    return sq_base, cmds
+
+if __name__ == "__main__":
+    bases, cmds = run(T)
+    print("Inferred SQ bases:", {q: hex(b) for q, b in bases.items()})
+    stages = ["doorbell", "fetch", "first_data", "last_data", "cqe", "msix", "head_db"]
+    print(f"{'(SQID,CID)':&lt;14}{'op':&lt;4}" + "".join(f"{s:&gt;11}" for s in stages[1:]))
+    for k, c in sorted(cmds.items(), key=lambda kv: kv[1]["doorbell"]):
+        row = [c.get(s) for s in stages]
+        deltas = [f"{(b - a) / 1000:9.2f}us" if a is not None and b is not None else "        n/a"
+                  for a, b in zip(row, row[1:])]
+        print(f"({k[0]},0x{k[1]:04X})   {c['opc']:02X}  " + "".join(deltas))
+</code></pre>
+<dl>
+<dt>Procedure</dt><dd><ol><li>Run it. Compare the inferred SQ bases with the lab system's real ones.</li><li>Read the stage table: each column is the time since the previous stage.</li><li>Delete the MSI-X at 58,280 ns from the trace and rerun.</li></ol></dd>
+<dt>Observations</dt><dd>SQ1 base 0x1_2340_0000 and SQ2 base 0x1_2342_0000 are inferred correctly. The WRITE's first-data column is the delay to its first data read; the READs' is the media time.</dd>
+<dt>Questions</dt><dd><ol><li>Which stage dominates each command, and which agent owns that stage?</li><li>What happens to both READs when the MSI-X is removed, and is that the right output?</li><li>Name two simplifications in this script that would fail on real captures.</li></ol></dd>
+<dt>Expected reasoning</dt><dd>READs are media-dominated; the WRITE is host-round-trip-dominated; without an interrupt, the msix stage and everything after it become n/a.</dd>
+</dl>
+<details class="solution"><summary>Solution</summary>
+<p>Output (each column is the time since the previous stage): (1, 0x102A): fetch 0.70 µs after the doorbell, first data 56.90 µs after the fetch request (media time), last data 0.54 µs later, CQE 0.08 µs, MSI-X 0.06 µs, head doorbell 2.52 µs (host). (2, 0x2031): fetch 0.70 µs, first data read 1.45 µs after the fetch request (0.80 µs after the SQE arrived), last data completion 2.14 µs later (round trips and serialisation), CQE 0.36 µs, MSI-X 0.06 µs, head doorbell 2.44 µs. (1, 0x102B): fetch 0.70 µs, media 36.20 µs, data 0.54 µs, CQE 0.06 µs, MSI-X 0.78 µs (it waited for the shared interrupt), head doorbell 2.52 µs. The READs are media-dominated; the WRITE is dominated by its data-pull round trips; in every command the largest host-owned stage is interrupt to head doorbell. Removing the MSI-X leaves msix and head_db as n/a for both READs: correct, because the script must not invent an interrupt; a real checker would flag "CQE without interrupt within T" as an anomaly. Simplifications: fetch attribution to "the oldest doorbell not yet followed by a fetch" fails with concurrent doorbells to several SQs (real tools match by inferred SQ range once bases are known); data attribution uses only PRP1's page (no PRP2, no lists); head doorbells are attributed loosely; no wrap, no split fetch completions, no stale-SQE check.</p>
+</details>
+<dl><dt>Extension</dt><dd>Add a check that flags any fetched SQE whose (SQID, CID) is already outstanding (the duplicate-CID case in <a href="ch41.html#trace">Chapter 41</a>), and one that compares fetched SQEs with a list of host tracepoint records.</dd></dl>
+
+<h3>Advanced lab — Align two clocks and order events correctly</h3>
+<p><span class="badge safe">Safe lab</span> Paper or Python.</p>
+<dl>
+<dt>Objective</dt><dd>Compute offset and drift between analyzer and host clocks from two markers, then decide the order of host and link events.</dd>
+<dt>Prerequisites</dt><dd>The alignment formula in Mechanism; <a href="ch47.html#engineering">Error Correlation</a> on timebases.</dd>
+<dt>Setup</dt><dd>Marker 1: analyzer 0.000 000 000 s ↔ host 812.400 120 s. Marker 2: analyzer 60.000 000 000 s ↔ host 872.400 180 s. Marker uncertainty ±3 µs each. Events: (A) analyzer 44.999 998 000 s, CQE for (2, 0x2190); (B) analyzer 45.000 004 000 s, MSI-X vector 2; (C) host 857.400 172 s, nvme_complete_rq qid 2 cmdid 0x2190; (D) host 857.400 160 s, AER correctable error reported for the root port.</dd>
+<dt>Procedure</dt><dd><ol><li>Compute k.</li><li>Map A and B to host time.</li><li>Order A, B, C, D with uncertainties.</li><li>Redo with marker 1 only (offset, no drift) and compare the conclusions.</li></ol></dd>
+<dt>Questions</dt><dd><ol><li>How long did the host take from interrupt to completion?</li><li>Could the AER event be related to this command's completion, or did it happen afterwards?</li></ol></dd>
+<dt>Expected reasoning</dt><dd>Drift is 1 ppm; over 45 s it is 45 µs, which is larger than the gaps being judged.</dd>
+</dl>
+<details class="solution"><summary>Solution</summary>
+<p>k = (872.400180 − 812.400120) / 60 = 60.000060 / 60 = 1.000001 (1 ppm). A: 812.400120 + 1.000001 × 44.999998 = 812.400120 + 45.000043 = 857.400163 s. B: 812.400120 + 1.000001 × 45.000004 = 857.400169 s. Combined uncertainty about ±6 µs for cross-source comparisons (A and B are on the same clock, so their 6 µs spacing is exact).</p>
+<p>Order with drift correction: D (857.400160) and A (857.400163) are 3 µs apart, inside the uncertainty: they are simultaneous for reasoning purposes. Then B (857.400169), then C (857.400172): the host completed the command about 3 µs after the interrupt, which is normal. Conclusion: the correctable error is contemporaneous with this command's completion and may be related (for example a replayed TLP in the same burst); it is worth checking the capture for a NAK near A.</p>
+<p>Offset only: A maps to 857.400118 and B to 857.400124. Now C appears 48 µs after the interrupt (a "slow interrupt handler" that does not exist) and D appears 42 µs after the CQE (an error "unrelated to the command" that may well be related). Both conclusions are artefacts of ignoring 45 µs of drift. Lesson: over long captures, single-marker alignment creates false stories in exactly the microsecond range that matters.</p>
+</details>
+<dl><dt>Extension</dt><dd>Design a marker scheme that gives ±1 µs: for example, a host MMIO read of a harmless register immediately after trace_marker, triggering the analyzer on that MRd32.</dd></dl>
+
+<h3>Senior forensic lab — Lost packets or late start?</h3>
+<p><span class="badge safe">Safe lab</span> Evidence analysis.</p>
+<dl>
+<dt>Objective</dt><dd>Decide whether a correlation anomaly is real, an artefact of capture loss, or a consequence of the capture window, and write the report with confidence levels.</dd>
+<dt>Prerequisites</dt><dd>The ambiguous trace in this module; <a href="me-forensics.html">Root Cause, Ambiguity and Forensic Reporting</a>.</dd>
+<dt>Setup</dt><dd>Evidence (synthetic): a 500 ms capture taken during a fio run with queue depth 128 on 8 queues. The automated checker reports 37 "CQE without fetch" orphans, all in the last 120 ms. The analyzer's status shows "buffer 100 % at 380 ms". Device-direction sequence numbers show a jump from 0x5B2 to 0x9C0 at 381.2 ms with no NAK. Host tracepoints for the same period show every one of the 37 (qid, cmdid) pairs submitted between 381 ms and 500 ms (aligned) and completed with status 0.</dd>
+<dt>Procedure</dt><dd>Classify the 37 orphans; decide whether any is a real anomaly; state what the capture can and cannot support.</dd>
+<dt>Questions</dt><dd><ol><li>How many device TLPs were lost?</li><li>Can you still use the capture after 381.2 ms?</li><li>What should the checker have reported?</li></ol></dd>
+<dt>Expected reasoning</dt><dd>A sequence jump without NAK and an analyzer buffer-full indicator mean capture loss.</dd>
+</dl>
+<details class="solution"><summary>Solution</summary>
+<p>The jump from 0x5B2 to 0x9C0 means 0x9C0 − 0x5B2 − 1 = 0x40D = 1,037 device TLPs were not recorded (modulo 4096, assuming no wrap in the gap; if more than 4096 were lost, the arithmetic is ambiguous and the gap duration says how plausible that is). The buffer-full indicator corroborates capture loss. The host tracepoints show the 37 commands were submitted and completed normally. So all 37 are artefacts: their fetches were among the lost TLPs (or the analyzer switched to a degraded mode). After 381.2 ms, the capture can still be used for events that are fully inside the post-gap region if sequence numbers stay continuous there, but any command that straddles the gap is "partially observed". The checker should have computed sequence continuity first and reported "capture loss at 381.2 ms (1,037 device TLPs); 37 commands partially observed; 0 orphans proven". Confidence that no real anomaly exists among the 37: high, because host evidence shows normal submission and completion for each. Recommend recapturing with a narrower filter (exclude data payloads, keep headers) or a deeper buffer.</p>
+</details>
+<dl><dt>Extension</dt><dd>Specify the checker's output format so that "unknown" is a first-class result, with the reason (pre-capture, capture loss, missing context).</dd></dl>
+</section>
+
+<section id="debugging">
+<h2>Debugging</h2>
+<p>Five correlation-driven failure patterns. In each, the correlation result itself is the evidence.</p>
+
+<h3>Pattern 1 — Orphan CQEs</h3>
+<table><tbody>
+<tr><th>Symptom</th><td>Checker or host reports completions for (SQID, CID) pairs with no outstanding command.</td></tr>
+<tr><th>Possible causes</th><td>Capture started late or lost packets (artefact); stale SQE fetched (host ordering bug); duplicate CID (host); controller posting a completion twice; host processing a stale CQE (phase bug).</td></tr>
+<tr><th>Evidence</th><td>Capture window and sequence continuity; fetched SQE payloads vs host tracepoints; CQE phase vs expected phase.</td></tr>
+<tr><th>First check</th><td>Is the orphan inside the observed window with continuous sequence numbers?</td></tr>
+<tr><th>Second check</th><td>Does the CID match an earlier pass of the same slot (stale SQE) or another outstanding command (duplicate)?</td></tr>
+<tr><th>Disambiguating experiment</th><td>Recapture from before queue creation with DLLPs; add host tracepoints.</td></tr>
+<tr><th>Likely conclusion</th><td>Artefact if window/loss explains it; otherwise host bug (stale SQE, duplicate CID) or controller double completion, distinguished by the payloads.</td></tr>
+<tr><th>Confidence</th><td>High once the window is excluded and payloads compared.</td></tr>
+</tbody></table>
+
+<h3>Pattern 2 — Data outside every command's range</h3>
+<table><tbody>
+<tr><th>Symptom</th><td>Device data TLPs to addresses no outstanding command owns.</td></tr>
+<tr><th>Possible causes</th><td>Host Memory Buffer traffic; PRP list pages not yet attributed; command fetched before the capture; controller address bug; stale SQE pointing at an old buffer.</td></tr>
+<tr><th>Evidence</th><td>HMB descriptor ranges; PRP list fetches; SQE payloads.</td></tr>
+<tr><th>First check</th><td>Exclude HMB ranges and PRP list pages.</td></tr>
+<tr><th>Second check</th><td>Find the most recent SQE (current or previous pass) whose PRPs include the page.</td></tr>
+<tr><th>Disambiguating experiment</th><td>Disable HMB; repeat with host tracing of PRP construction.</td></tr>
+<tr><th>Likely conclusion</th><td>HMB (common, benign); stale SQE (host ordering); controller bug (rare, proven only when the SQE is correct and the address is not).</td></tr>
+<tr><th>Confidence</th><td>Depends on context completeness; state it.</td></tr>
+</tbody></table>
+
+<h3>Pattern 3 — Latency blamed on the SSD that belongs elsewhere</h3>
+<table><tbody>
+<tr><th>Symptom</th><td>High host-measured latency; device datasheet latency is low.</td></tr>
+<tr><th>Possible causes</th><td>Host queueing before the doorbell; controller fetch delay under load (arbitration, internal slots); interrupt coalescing; host handler delay before head doorbell.</td></tr>
+<tr><th>Evidence</th><td>Stage latencies per command: host submit → doorbell, doorbell → fetch, fetch → data, data → CQE, CQE → MSI-X, MSI-X → head doorbell, head doorbell → host complete.</td></tr>
+<tr><th>First check</th><td>Which stage holds the excess?</td></tr>
+<tr><th>Second check</th><td>Does the excess correlate with load on other queues (arbitration) or with interrupt settings (coalescing)?</td></tr>
+<tr><th>Disambiguating experiment</th><td>Reduce queue depth on other SQs; disable coalescing; pin interrupts.</td></tr>
+<tr><th>Likely conclusion</th><td>The stage with excess names the owner.</td></tr>
+<tr><th>Confidence</th><td>High when clocks are aligned within a few µs.</td></tr>
+</tbody></table>
+
+<h3>Pattern 4 — Impossible orderings</h3>
+<table><tbody>
+<tr><th>Symptom</th><td>CQE before its last data; MSI-X before its CQE; host completion before CQE; fetch before doorbell.</td></tr>
+<tr><th>Possible causes</th><td>Real ordering bug (Relaxed Ordering misuse, firmware); clock misalignment (cross-source comparisons); analyzer timestamping across lanes or directions with a skew.</td></tr>
+<tr><th>Evidence</th><td>Whether both events are on the same clock and link direction; attribute bits; alignment uncertainty.</td></tr>
+<tr><th>First check</th><td>Same clock? If not, is the gap larger than the alignment uncertainty?</td></tr>
+<tr><th>Second check</th><td>Same direction on the same link? Then the order is real (posted writes in one direction are captured in transmission order).</td></tr>
+<tr><th>Disambiguating experiment</th><td>Recapture with two markers; force Relaxed Ordering off.</td></tr>
+<tr><th>Likely conclusion</th><td>Same-direction ordering violations are real controller bugs; cross-clock "violations" smaller than ε are not.</td></tr>
+<tr><th>Confidence</th><td>High for same-direction; low for cross-clock below ε.</td></tr>
+</tbody></table>
+
+<h3>Pattern 5 — The analyzer decodes nonsense after a reset</h3>
+<table><tbody>
+<tr><th>Symptom</th><td>After a controller reset mid-capture, the NVMe decode shows wrong commands, invalid opcodes, or nothing at all.</td></tr>
+<tr><th>Possible causes</th><td>Queues recreated at different addresses or sizes; BAR moved; analyzer still applying old context.</td></tr>
+<tr><th>Evidence</th><td>ASQ/ACQ writes and Create I/O SQ/CQ commands after the reset.</td></tr>
+<tr><th>First check</th><td>Find CC.EN 1 → 0 and the re-initialisation in the capture.</td></tr>
+<tr><th>Second check</th><td>Rebuild context from the post-reset queue creation.</td></tr>
+<tr><th>Disambiguating experiment</th><td>Split the capture at the reset and decode the halves with separate contexts.</td></tr>
+<tr><th>Likely conclusion</th><td>Stale analysis context, not a device fault.</td></tr>
+<tr><th>Confidence</th><td>High once new context decodes cleanly.</td></tr>
+</tbody></table>
+</section>
+
+<section id="interview">
+<h2>Interview</h2>
+<h3>Beginner</h3>
+<ol>
+<li><p>Which field ties a CQE to its command?</p><details class="answer"><summary>Model answer</summary><p>The SQ Identifier and Command Identifier in the CQE (DW2 bits 31:16 and DW3 bits 15:0), which together identify the outstanding command.</p></details></li>
+<li><p>Why can't you use the PCIe tag to match a data write to a command?</p><details class="answer"><summary>Model answer</summary><p>Data writes for READs are posted; their tag has no matching meaning. Tags only pair non-posted requests with their completions. Data is attributed by address.</p></details></li>
+<li><p>A doorbell moves the SQ tail from 5 to 8. How many commands were published?</p><details class="answer"><summary>Model answer</summary><p>Three: slots 5, 6 and 7.</p></details></li>
+<li><p>Why do CQ slots not follow submission order?</p><details class="answer"><summary>Model answer</summary><p>The controller writes CQEs as commands finish, and commands finish in any order.</p></details></li>
+<li><p>What is an orphan in a trace?</p><details class="answer"><summary>Model answer</summary><p>An event that matches no outstanding request or command: a completion without a request, data outside every range, a CQE for an unknown CID.</p></details></li>
+</ol>
+<h3>Intermediate</h3>
+<ol>
+<li><p>How do you attribute an MSI-X write when the controller coalesces?</p><details class="answer"><summary>Model answer</summary><p>It covers every CQE posted to CQs that use that vector since the previous message on that vector.</p></details></li>
+<li><p>The fetch MRd length is 48 DW. What does that tell you?</p><details class="answer"><summary>Model answer</summary><p>Three 64-byte SQEs in one request, from consecutive slots.</p></details></li>
+<li><p>How do you infer an SQ base without initialisation in the capture?</p><details class="answer"><summary>Model answer</summary><p>From a doorbell's new tail and the fetch that follows: first fetched slot = new tail − number of entries fetched; base = fetch address − slot × 64. Mark it inferred.</p></details></li>
+<li><p>What does a head doorbell that jumps by 4 mean?</p><details class="answer"><summary>Model answer</summary><p>The host consumed four CQEs before writing the doorbell; the doorbell acknowledges all four.</p></details></li>
+<li><p>How do you detect that the analyzer missed TLPs?</p><details class="answer"><summary>Model answer</summary><p>Data Link Layer sequence numbers jump without a NAK and replay; the analyzer's own overflow indicators; host events with no link counterpart.</p></details></li>
+</ol>
+<h3>Advanced</h3>
+<ol>
+<li><p>Why do you need two markers for clock alignment over a long capture?</p><details class="answer"><summary>Model answer</summary><p>One marker removes only the offset. Clocks drift (parts per million), and over tens of seconds the error exceeds the microsecond gaps you need to order. Two markers give the rate ratio.</p></details></li>
+<li><p>How would you detect a stale SQE fetch?</p><details class="answer"><summary>Model answer</summary><p>Compare each fetched SQE with what the host published for that slot (tracepoints) or check whether its CID and opcode equal the previous pass of the slot. A match with the previous pass means the controller read before the host's store was visible.</p></details></li>
+<li><p>What breaks correlation behind a PCIe switch?</p><details class="answer"><summary>Model answer</summary><p>Upstream of the switch, several devices share the link, so Requester IDs must be filtered; timing includes switch queuing; and the capture may not see peer-to-peer traffic that stays below the switch.</p></details></li>
+<li><p>When is attribution of a data TLP ambiguous?</p><details class="answer"><summary>Model answer</summary><p>When two outstanding commands' described ranges contain its address (buffer reuse, overlapping PRPs) or when the owning command's SQE was not observed. Report it as ambiguous.</p></details></li>
+<li><p>How do 10-bit tags change correlation?</p><details class="answer"><summary>Model answer</summary><p>Up to 768 or 1,024 distinct tags (depending on rules) instead of 256, so tags recycle less often; the analyzer must decode the extra tag bits, otherwise pairings will be wrong.</p></details></li>
+</ol>
+<h3>Senior</h3>
+<ol>
+<li><p>How do you write an automated correlation checker that is a trustworthy test oracle?</p><details class="answer"><summary>Model answer</summary><p>It must verify capture integrity first (sequence continuity, window), separate observed from inferred context, report three outcomes (pass, fail, unknown) with reasons, and be validated by seeded faults (duplicate CID, stale SQE, CQE-before-data, orphans, loss).</p></details></li>
+<li><p>A customer sends a capture and says "your SSD completed a command we never sent". How do you respond?</p><details class="answer"><summary>Model answer</summary><p>Ask for the capture window, DLL data and host tracepoints. Check whether the command was submitted before the window, whether capture loss occurred, and whether the fetched SQE was stale (host ordering) or duplicated. Only after those does "controller fabricated a completion" become a hypothesis.</p></details></li>
+<li><p>How do you report confidence in a correlation-based root cause?</p><details class="answer"><summary>Model answer</summary><p>Per key: proven (unique key match), probable, consistent. Then state evidence for and against, what could precede the first abnormal event unobserved, and the experiment that would raise confidence.</p></details></li>
+<li><p>Why does stage latency matter more than end-to-end latency in vendor disputes?</p><details class="answer"><summary>Model answer</summary><p>Because each stage has a different owner: host queuing, controller fetch policy, media, interrupt delivery, host handling. End-to-end numbers cannot assign responsibility; stage numbers can.</p></details></li>
+<li><p>Design a capture plan for a 1-in-a-million latency spike.</p><details class="answer"><summary>Model answer</summary><p>Host-side detection triggers the analyzer (for example a tracepoint-based latency threshold that performs a distinctive MMIO access the analyzer triggers on), with a deep pre-trigger buffer, header-only capture to avoid overflow, DLLPs for loss detection, two-marker alignment at start and end, and full context from the last initialisation.</p></details></li>
+</ol>
+</section>
+
+<section id="quiz">
+<h2>Quiz</h2>
+<ol class="quiz">
+<li><p>Which key matches a CplD to its MRd?</p>
+<ul class="options" data-answer="2"><li>(SQID, CID)</li><li>(Requester ID, Tag)</li><li>Address</li><li>CQ slot</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Completions are routed and matched by Requester ID and Tag.</p></details></li>
+<li><p>A fetch MRd at 0x1_2342_0480 follows an SQ2 doorbell with new tail 0x13. Assuming one SQE was fetched, the SQ2 base is:</p>
+<ul class="options" data-answer="3"><li>0x1_2342_0480</li><li>0x1_2342_04C0</li><li>0x1_2342_0000</li><li>0x1_2341_0000</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Slot 0x12; 0x12 × 64 = 0x480; 0x1_2342_0480 − 0x480 = 0x1_2342_0000.</p></details></li>
+<li><p>Two CQEs on CQ1 and one MSI-X on vector 1 follow. What is the right conclusion?</p>
+<ul class="options" data-answer="1"><li>One interrupt covers both CQEs; not an error by itself</li><li>One interrupt is missing</li><li>The controller violated the specification</li><li>The second CQE is stale</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>An MSI-X can cover several CQEs; coalescing or timing explains it.</p></details></li>
+<li><p>Device TLP sequence numbers jump from 0x120 to 0x150 without a NAK. What happened?</p>
+<ul class="options" data-answer="4"><li>The SSD skipped sequence numbers</li><li>The link replayed</li><li>The root port rejected 47 TLPs</li><li>The analyzer did not record 47 TLPs</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>0x150 − 0x120 − 1 = 47 missing in the capture; transmitters do not skip numbers, and replays reuse numbers.</p></details></li>
+<li><p>Clock drift is 2 ppm. After 30 s from a single marker, the alignment error from drift alone is about:</p>
+<ul class="options" data-answer="3"><li>0.6 µs</li><li>6 µs</li><li>60 µs</li><li>600 µs</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>30 s × 2 × 10⁻⁶ = 60 µs.</p></details></li>
+<li><p>Which observation most strongly indicates a stale SQE fetch?</p>
+<ul class="options" data-answer="2"><li>The fetch came 0.7 µs after the doorbell</li><li>The fetched CID and opcode equal those of the previous pass of the same slot, not the host's new command</li><li>The fetch used tag 0x2E</li><li>The fetch length was 16 DW</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Only the payload comparison reveals staleness.</p></details></li>
+<li><p>Explain why a CQE for a command with no observed fetch is not automatically an orphan.</p>
+<details class="answer"><summary>Model answer</summary><p>The fetch may precede the capture window or have been lost by the analyzer. Check window timing against expected command duration and sequence continuity before calling it an orphan.</p></details></li>
+<li><p>Give the stages of a READ's latency decomposition and the owner of each.</p>
+<details class="answer"><summary>Model answer</summary><p>Host submit → doorbell (host software); doorbell → fetch (controller fetch policy, arbitration); fetch → first data (media and controller); first → last data (link and controller DMA); last data → CQE (controller); CQE → MSI-X (controller, coalescing); MSI-X → head doorbell (host interrupt path and handler); head doorbell → completion to application (host).</p></details></li>
+<li><p>What three outcomes should a correlation checker report, and why is the third essential?</p>
+<details class="answer"><summary>Model answer</summary><p>Pass, fail and unknown. Unknown is essential because missing context, capture loss and window edges are common; forcing them into pass or fail creates false confidence or false alarms.</p></details></li>
+</ol>
+</section>
+
+<section id="teachback">
+<h2>Teach-back</h2>
+<ol>
+<li><p><strong>To a child.</strong> How does the station detective find the right family for the bag?</p>
+<details class="answer"><summary>Model explanation</summary><p>She does not trust the bag number alone, because numbers are reused. She puts together several clues: the time, the platform, the train, the ticket list. When they all point at one family, she is fairly sure. If the camera was off for part of the evening, she says "I don't know" for that part instead of guessing.</p></details></li>
+<li><p><strong>To a junior engineer.</strong> How do you turn a capture into a command list?</p>
+<details class="answer"><summary>Model explanation</summary><p>Get or infer the context: BAR, doorbell stride, queue bases, vectors. Classify TLPs by address. Use doorbells to know how many commands were published, fetches to know which slots, tags to pair fetches with their completions, and the SQE payloads to get each (SQID, CID), opcode and PRPs. Attribute data by address range, close each command with its CQE's (SQID, CID), and attach interrupts and head doorbells. Then list the stage times and anything that does not fit.</p></details></li>
+<li><p><strong>To a senior engineer.</strong> What makes a correlation result trustworthy?</p>
+<details class="answer"><summary>Model explanation</summary><p>Integrity of evidence (window, sequence continuity, buffer state), provenance of context (observed vs inferred), alignment with quantified uncertainty when sources are merged, keys used only within scope and lifetime, and explicit confidence per attribution. The anomalies are the product: orphans, duplicates, stale payloads and ordering violations, each with the reason it cannot be an artefact.</p></details></li>
+</ol>
+</section>
+
+<section id="mastery">
+<h2>Mastery gate</h2>
+<aside class="callout mastery">
+<p>Do not consider this module mastered until you can:</p>
+<ul class="checklist">
+<li>explain attribution under uncertainty and the three confidence levels</li>
+<li>diagram the correlation pipeline from evidence streams to command table and anomaly list</li>
+<li>reconstruct every command in a multi-queue trace with coalesced interrupts and out-of-order completions, and compute stage latencies</li>
+<li>infer queue context from a late capture and align two clocks with drift</li>
+<li>debug orphans, stale SQEs and impossible orderings, and rule out capture artefacts first</li>
+<li>distinguish correlation from neighbouring skills: decoding a single TLP (<a href="dd11.html">TLP Formats</a>), PCIe completion matching (<a href="dd12.html">PCIe Completions</a>), first-abnormal-event reasoning (<a href="ch47.html">Error Correlation</a>), and tool workflows (<a href="dd55.html">Teledyne LeCroy Trace Analysis</a>)</li>
+<li>cite the source of each key's uniqueness rule: NVMe Base for CID, PCI Express Base for tags and sequence numbers; and label everything else as derived</li>
+</ul>
+</aside>
+<p>Next: <a href="dd39.html">NVMe Errors</a>, where correlation places each error status on its command's timeline.</p>
+</section>

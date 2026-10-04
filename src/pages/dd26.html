@@ -1,0 +1,738 @@
+<p class="lead">Chapter 27 taught you how to create an I/O queue pair. This module treats I/O queues as a living system: many Submission Queues feeding fewer Completion Queues, sharing interrupt vectors, competing for the controller's attention under an arbitration policy, surviving resets, and failing in ways that only show up when you look at more than one queue at a time.</p>
+
+<section id="orientation">
+<h2>Orientation</h2>
+<p>An NVM Express (NVMe) controller on PCI Express (PCIe) can carry tens of I/O queue pairs at once. Chapter 27 showed one pair being born: Create I/O Completion Queue, Create I/O Submission Queue, first doorbell, first fetch. This module goes deeper in four directions that the chapter only touched. First, <strong>topology</strong>: how Submission Queues (SQs) map onto Completion Queues (CQs) and interrupt vectors, and how to size a shared CQ so it can never overflow. Second, <strong>competition</strong>: what arbitration does to latency when queues of different priority are busy at the same time. Third, <strong>lifecycle</strong>: what happens to queues across deletion, controller reset, suspend and resume, and why stale queue state is a classic source of silent failure. Fourth, <strong>evidence</strong>: the per-queue invariants a trace must satisfy, so that you can check a multi-queue capture mechanically instead of by eye.</p>
+<aside class="callout prereq">
+<p>This module assumes you can already encode Create I/O CQ (opcode 05h) and Create I/O SQ (opcode 01h) from memory, explain the creation and deletion order, and compute queue slot and doorbell addresses. If not, read <a href="ch27.html">Chapter 27 — I/O Queues</a> first. The ring arithmetic (head, tail, full, empty, the phase tag) is in <a href="ch25.html">Chapter 25 — Queue Architecture</a>; the Admin queue that carries the create commands is in <a href="ch26.html">Chapter 26 — Admin Queue</a>.</p>
+</aside>
+<p>Where it goes next: <a href="dd27.html">Module 27 — Doorbells</a> studies the 4-byte writes that move each queue, and <a href="dd28.html">Module 28 — NVMe Command Structure</a> studies what sits in each slot. Interrupt delivery for each CQ is treated in depth in <a href="dd19.html">Module 19 — MSI and MSI-X</a>, and queue behaviour across resets in <a href="dd41.html">Module 41 — Reset</a>.</p>
+</section>
+
+<section id="objectives">
+<h2>Required learning objectives</h2>
+<table>
+<caption>Objectives for this module, by level</caption>
+<thead><tr><th>Level</th><th>You will be able to…</th></tr></thead>
+<tbody>
+<tr><td>Beginner</td><td>Explain why a modern SSD uses many I/O queues instead of one, name the two halves of a pair, and state which side owns each index.</td></tr>
+<tr><td>Intermediate</td><td>Design a queue topology for a given host (CPU count, vector count, granted queues) including shared CQs and polled queues, and compute the minimum CQ size that makes overflow impossible.</td></tr>
+<tr><td>Advanced</td><td>Predict how weighted round robin arbitration with an urgent class changes per-queue latency, and explain why the specification's arbitration model governs fetch order but not completion order.</td></tr>
+<tr><td>Senior</td><td>Reason about queue state across deletion, controller reset, suspend/resume and hot-unplug, and design a driver or firmware review checklist for queue lifecycle bugs.</td></tr>
+<tr><td>Trace analysis</td><td>Apply five per-queue invariants (fetch range, CQE range, outstanding bound, SQ Head Pointer monotonicity, phase continuity) to a multi-queue synthetic trace and flag the first violation.</td></tr>
+<tr><td>Debugging</td><td>Separate "queue never created correctly", "queue created but mis-used", "queue starved by arbitration" and "queue state stale after reset" from symptoms plus at most two checks.</td></tr>
+<tr><td>Validation</td><td>Write a queue-management test matrix: limits, sharing, arbitration fairness, deletion with commands outstanding, reset churn, and negative cases with predicted status names.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="kid">
+<h2>Kid story</h2>
+<aside class="callout kid" data-title="The airport baggage hall">
+<p>Imagine a big airport. Every check-in desk has its own conveyor belt that carries suitcases <em>into</em> the baggage room. That is a Submission Queue: each desk puts suitcases on its own belt, and nobody else touches that belt.</p>
+<p>Inside, the baggage handlers take suitcases off the belts. They cannot take from all belts at once, so a supervisor says which belt to take from next: "two from belt 1, then two from belt 2…". Some belts are marked <em>urgent</em> (connecting flights) and get served first.</p>
+<p>When a suitcase has been checked, a small ticket comes back out on a <em>return</em> carousel — that is the Completion Queue. Several desks can share one return carousel, as long as each ticket says which desk it came from. Each carousel has a light that flashes in one office when a ticket arrives — that is the interrupt.</p>
+<p>The airport has rules: you must build the return carousel before you open a desk that sends tickets to it; you must close every desk using a carousel before you take the carousel away; and if a carousel is too small for all the desks sharing it, tickets pile up and the handlers have to stop.</p>
+</aside>
+</section>
+
+<section id="boundary">
+<h2>Analogy boundary</h2>
+<aside class="callout breaks">
+<p><strong>What it represents.</strong> Belts are SQs, owned by one producer (a desk, i.e. a CPU or a group of CPUs). The supervisor is the controller's arbiter. The return carousel is a CQ, possibly shared by several SQs, and each ticket carries the desk number (SQ Identifier) and a ticket number (Command Identifier). The flashing light is the Message Signaled Interrupt eXtended (MSI-X) vector bound to the CQ. Building order and closing order mirror the creation and deletion rules.</p>
+<p><strong>What it hides.</strong> In NVMe the belts and carousels are not inside the airport (the controller); they are memory in the host, and the controller reaches them across the PCIe link with Direct Memory Access (DMA). The handlers do not watch the belts; a desk must press a doorbell with the new belt position. Tickets do not come back in the order suitcases went in. And the airport cannot see whether a desk is staffed: the controller has no idea which CPU uses which queue.</p>
+<p><strong>Where it misleads.</strong> A real carousel overflows physically; an NVMe CQ never overwrites — the controller simply stops posting when the CQ is full, which looks like a hang rather than a mess. "Urgent" belts in an airport finish urgent work first; NVMe arbitration only decides which SQ is <em>fetched</em> next, not which command finishes first inside the device. And an airport can re-route a desk to another carousel while open; an SQ's CQ is fixed at creation.</p>
+</aside>
+</section>
+
+<section id="vocabulary">
+<h2>Vocabulary</h2>
+<table>
+<caption>Terms used in this module</caption>
+<thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship to adjacent terms</th><th>Common confusion</th></tr></thead>
+<tbody>
+<tr><td><span class="g" data-term="queue-pair">Queue pair</span></td><td>A request ring and an answer ring used together</td><td>An I/O SQ and the CQ named in its CQID field at creation</td><td>Many SQs may share one CQ; then "pair" is loose language</td><td>Thinking a CQ belongs to exactly one SQ</td></tr>
+<tr><td>Queue Identifier (QID)</td><td>The queue's number</td><td>16-bit identifier, 0 for Admin, 1… for I/O; SQ and CQ identifier spaces are separate</td><td>Selects the doorbell offset (y in SQyTDBL / CQyHDBL)</td><td>Assuming SQ n must use CQ n; it is only a convention</td></tr>
+<tr><td><span class="g" data-term="number-of-queues">Number of Queues</span></td><td>How many queues the drive allows</td><td>Set Features Feature Identifier (FID) 07h: host requests NSQR/NCQR, controller returns NSQA/NCQA (0's based) in completion Dword 0</td><td>Bounds the legal QIDs for create commands</td><td>Treating the request as the grant</td></tr>
+<tr><td><span class="g" data-term="interrupt-vector-iv">Interrupt Vector (IV)</span></td><td>Which alarm light a carousel uses</td><td>Create I/O CQ CDW11 bits 31:16; with MSI-X, an index into the device's MSI-X table</td><td>IEN (bit 1) decides whether the vector is used at all</td><td>Confusing the MSI-X table index with the operating system's IRQ number</td></tr>
+<tr><td>Polled queue</td><td>A carousel without a light</td><td>CQ created with IEN = 0; host discovers completions by reading phase tags</td><td>Linux "poll queues" for io_uring polled I/O</td><td>Reading a missing MSI-X in a trace as a bug</td></tr>
+<tr><td>Shared CQ</td><td>One carousel for several desks</td><td>Two or more SQs whose CQID is the same CQ</td><td>CQE Dword 2 carries SQID so the host can demultiplex</td><td>Sizing the CQ for one SQ's depth</td></tr>
+<tr><td><span class="g" data-term="arbitration">Arbitration</span></td><td>The supervisor's rule for which belt is next</td><td>Round robin (mandatory) or weighted round robin with urgent priority class (optional), selected in CC.AMS</td><td>Queue Priority (QPRIO) in Create I/O SQ is used only under weighted round robin</td><td>Believing arbitration controls completion order</td></tr>
+<tr><td><span class="g" data-term="queue-depth">Queue depth</span></td><td>How many requests are waiting or in progress</td><td>Either the configured maximum outstanding (size − 1) or the instantaneous number in flight</td><td>Little's Law relates in-flight depth, IOPS and latency</td><td>Mixing the two meanings in one sentence</td></tr>
+<tr><td><span class="g" data-term="blk-mq">blk-mq</span> hardware context</td><td>Linux's handle for one device queue</td><td>One hctx per NVMe I/O queue; a set of CPUs maps to each</td><td>Its tag depth bounds outstanding commands from the host side</td><td>Assuming one hctx per CPU always</td></tr>
+<tr><td><span class="g" data-term="cqr">CAP.CQR</span></td><td>"Rings must be one piece"</td><td>Contiguous Queues Required, CAP bit 16</td><td>If 1, PC must be 1 in both create commands</td><td>Believing an IOMMU changes what CQR means (it changes only how easy it is to satisfy)</td></tr>
+<tr><td><span class="g" data-term="cmb">Controller Memory Buffer (CMB)</span></td><td>Memory inside the drive the host may use</td><td>Optional device memory exposed through a BAR; may hold SQs if the controller reports support</td><td>Changes the SQE fetch from a PCIe read into an internal read</td><td>Assuming every SSD supports SQs in the CMB</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="architecture">
+<h2>Architecture</h2>
+<p>The I/O queue system is a set of rings in host memory, a set of queue contexts inside the controller, a set of doorbells in BAR0 (Base Address Register 0) and a set of MSI-X table entries, all tied together by identifiers. The diagram shows a deliberately non-trivial topology on the course's reference lab system (synthetic example for teaching): four SQs, three CQs, two vectors plus one polled CQ.</p>
+<figure>
+<pre class="diagram">
+ Host CPUs          Host memory (IOVA)                     Controller (Lab SSD, 01:00.0)              Interrupts
+ ─────────          ───────────────────                     ────────────────────────────              ──────────
+ CPU 0-3  ──► SQ1  0x1_2340_0000 (1024 × 64 B) ─┐           SQ ctx 1: base, size, head, CQID=1
+                                                ├─► CQ1 ◄── CQ ctx 1: base 0x1_2341_0000, IV=1, IEN=1 ──► vec 1 (0xFEE0_1000 / 0x41)
+ CPU 4-7  ──► SQ2  0x1_2342_0000 (1024 × 64 B) ─┘   0x1_2341_0000 (2048 × 16 B)
+                                                             SQ ctx 2: CQID=1
+ CPU 8-15 ──► SQ3  0x1_2344_0000 ( 256 × 64 B) ───► CQ3 ◄── CQ ctx 3: IV=2, IEN=1             ──► vec 2 (0xFEE0_2000 / 0x42)
+                                                     0x1_2345_0000 (256 × 16 B)
+ io_uring ──► SQ4  0x1_2346_0000 ( 128 × 64 B) ───► CQ4 ◄── CQ ctx 4: IEN=0 (polled)          ──► none; host spins on phase
+  poller                                             0x1_2347_0000 (128 × 16 B)
+
+ Doorbells (BAR0 = 0xFE60_0000, CAP.DSTRD = 0):
+   SQ1TDBL 0x1008  CQ1HDBL 0x100C   SQ2TDBL 0x1010  (CQ2HDBL 0x1014 unused: CQ2 never created)
+   SQ3TDBL 0x1018  CQ3HDBL 0x101C   SQ4TDBL 0x1020  CQ4HDBL 0x1024
+</pre>
+<figcaption>A four-SQ, three-CQ topology. SQ1 and SQ2 share CQ1, which is therefore sized at 2048 entries. CQ2 does not exist, so its doorbell must never be written. Addresses beyond the canonical SQ1/CQ1/SQ2 values are synthetic extensions for this module.</figcaption>
+</figure>
+<table>
+<caption>The architecture as inputs, outputs, actors, state and dependencies</caption>
+<thead><tr><th>Aspect</th><th>What it is for I/O queues</th></tr></thead>
+<tbody>
+<tr><td>Inputs</td><td>Create/Delete commands on the Admin queue; SQ tail doorbell writes; CQ head doorbell writes; SQEs written into SQ memory by the host.</td></tr>
+<tr><td>Outputs</td><td>Admin Completion Queue Entries (CQEs) for create/delete; SQE fetches (device Memory Reads); I/O CQEs (device Memory Writes); MSI-X Memory Writes.</td></tr>
+<tr><td>Actors</td><td>Host driver (creates, submits, reaps), operating system interrupt subsystem (programs MSI-X, sets affinity), IOMMU (maps queue memory), controller front end (doorbell decode, arbiter, fetch engine), controller completion engine.</td></tr>
+<tr><td>State (host)</td><td>Per SQ: tail, last SQ Head Pointer (SQHD) seen, outstanding Command Identifier (CID) table. Per CQ: head, expected phase. Mapping tables: CPU → queue, (SQID, CID) → request.</td></tr>
+<tr><td>State (controller)</td><td>Per SQ context: base, size, head, latched tail, CQID, priority. Per CQ context: base, size, tail, phase, IV, IEN, coalescing counters, latched head.</td></tr>
+<tr><td>Memory</td><td>SQ rings (64-byte entries), CQ rings (16-byte entries), optional PRP lists describing non-contiguous queues, optional CMB-resident SQs.</td></tr>
+<tr><td>Registers</td><td>CAP.MQES, CAP.CQR, CAP.AMS, CAP.DSTRD; CC.AMS, CC.IOSQES, CC.IOCQES; SQyTDBL, CQyHDBL; MSI-X table entries; the Number of Queues and Arbitration features.</td></tr>
+<tr><td>Interfaces</td><td>Admin command set (create/delete), Set/Get Features, PCIe memory transactions (Memory Write (MWr), Memory Read (MRd), Completion with Data (CplD)), MSI-X.</td></tr>
+<tr><td>Dependencies</td><td>Controller enabled (CSTS.RDY = 1), Bus Master Enable set (the device must be allowed to issue DMA), MSI-X enabled and unmasked, IOMMU mappings valid for queue memory for the entire life of the queue.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="mechanism">
+<h2>Mechanism</h2>
+<p>The life of two SQs sharing one CQ, from negotiation to teardown. Synthetic, reference lab system.</p>
+<ol>
+<li><strong>Negotiate.</strong> <em>Who:</em> driver. <em>What:</em> Set Features FID 07h asks for 32 SQs and 32 CQs. <em>Where:</em> controller's queue-resource allocator. <em>Evidence:</em> Admin CQE Dword 0 (NSQA bits 15:00, NCQA bits 31:16, 0's based).</li>
+<li><strong>Allocate interrupts.</strong> <em>Who:</em> operating system. <em>What:</em> MSI-X table entries 0…N programmed with address/data, affinity chosen. <em>Where:</em> MSI-X table in BAR0 + 0x2000 (reference system). <em>Evidence:</em> BAR writes during probe; <code>/proc/interrupts</code>.</li>
+<li><strong>Allocate and map queue memory.</strong> <em>Who:</em> driver and IOMMU. <em>What:</em> SQ1 and SQ2 (64 KiB each), CQ1 (32 KiB for 2048 entries), zeroed. <em>Where:</em> host DRAM, IOMMU page tables. <em>Evidence:</em> none on the link.</li>
+<li><strong>Create CQ1.</strong> <em>Who:</em> driver, then controller. <em>What:</em> CQ context 1 created: base 0x1_2341_0000, QSIZE 7FFh (2048 entries), IV 1, IEN 1, PC 1. <em>Where:</em> controller queue-context table. <em>Evidence:</em> SQE payload; successful Admin CQE.</li>
+<li><strong>Create SQ1 → CQ1 and SQ2 → CQ1.</strong> <em>Who:</em> driver, waiting for each completion. <em>What:</em> two SQ contexts both naming CQID 1. <em>Where:</em> controller. <em>Evidence:</em> two SQE payloads with CDW11 bits 31:16 = 0001h; two successful Admin CQEs.</li>
+<li><strong>Submit on both.</strong> <em>Who:</em> CPU 0 on SQ1, CPU 5 on SQ2. <em>What:</em> SQ tails advance independently. <em>Where:</em> host SQ memory and the controller's latched tails. <em>Evidence:</em> MWr32 to 0xFE60_1008 and 0xFE60_1010.</li>
+<li><strong>Arbitrate and fetch.</strong> <em>Who:</em> controller arbiter. <em>What:</em> chooses SQ1 or SQ2 by round robin, takes up to Arbitration Burst commands, advances that SQ's head. <em>Where:</em> controller. <em>Evidence:</em> interleaving of MRd64 to the SQ1 and SQ2 ranges.</li>
+<li><strong>Complete into the shared CQ.</strong> <em>Who:</em> controller completion engine. <em>What:</em> CQEs for both SQs written into CQ1 in completion order, each with SQID and SQHD of its own SQ. <em>Where:</em> CQ1 memory. <em>Evidence:</em> MWr64 into 0x1_2341_xxxx with DW2 = SQID/SQHD.</li>
+<li><strong>Interrupt.</strong> <em>Who:</em> controller. <em>What:</em> vector 1 signalled (subject to coalescing). <em>Where:</em> MSI-X address 0xFEE0_1000. <em>Evidence:</em> MWr32 with data 0x41.</li>
+<li><strong>Reap and demultiplex.</strong> <em>Who:</em> interrupt handler on the CPU targeted by vector 1. <em>What:</em> reads CQEs by phase; routes by (SQID, CID). <em>Evidence:</em> CQ1HDBL MWr32 to 0xFE60_100C.</li>
+<li><strong>Tear down.</strong> <em>Who:</em> driver. <em>What:</em> Delete I/O SQ 1 and 2 (opcode 00h), then Delete I/O CQ 1 (04h); or a controller reset (CC.EN = 0) which deletes everything. <em>Evidence:</em> Admin CQEs; possibly I/O CQEs with Command Aborted due to SQ Deletion.</li>
+</ol>
+<figure>
+<ol class="seq" data-actors="CPU 0 (SQ1)|CPU 5 (SQ2)|Controller|Host memory (CQ1)|CPU 2 (vector 1)">
+<li data-from="CPU 0 (SQ1)" data-to="Controller" data-t="0 µs">MWr SQ1TDBL = 7 (2 new)</li>
+<li data-from="CPU 5 (SQ2)" data-to="Controller" data-t="0.3 µs">MWr SQ2TDBL = 3 (3 new)</li>
+<li data-note="Controller">round robin: SQ1 burst, then SQ2</li>
+<li data-from="Controller" data-to="Host memory (CQ1)">MRd SQ1 slots 5-6, then SQ2 slots 0-2</li>
+<li data-note="Controller">execute five commands in parallel</li>
+<li data-from="Controller" data-to="Host memory (CQ1)">CQE SQID 2 CID 0x0201</li>
+<li data-from="Controller" data-to="Host memory (CQ1)">CQE SQID 1 CID 0x0105</li>
+<li data-from="Controller" data-to="CPU 2 (vector 1)" class="dashed">MSI-X vector 1</li>
+<li data-note="CPU 2 (vector 1)">reap by phase, route by SQID</li>
+<li data-from="CPU 2 (vector 1)" data-to="Controller">MWr CQ1HDBL = new head</li>
+</ol>
+<figcaption>Two SQs sharing one CQ. Completions interleave across SQs in whatever order the device finishes. The CPU that handles vector 1 need not be either submitter. Synthetic, illustrative timing.</figcaption>
+</figure>
+<p>With a shared CQ, the CPU that reaps a completion may not be the one that submitted it — a cache-locality cost, and one reason Linux prefers one CQ per SQ when enough CQs and vectors are granted.</p>
+
+<h3>The central concept on the ladder: a multi-queue topology</h3>
+<div class="ladder">
+<div class="rung" data-rung="A"><p>Every check-in desk has its own belt in; desks can share a return carousel; each carousel has a light in one office; urgent belts are served first.</p></div>
+<div class="rung" data-rung="B"><p>Each SQ has one producer and one CQ. Several SQs may name the same CQ. Each CQ has at most one interrupt vector or none. The controller picks which SQ to fetch from with the selected arbitration mechanism.</p></div>
+<div class="rung" data-rung="C"><p>The controller holds a context per queue and a doorbell register per queue side. Its arbiter scans SQ contexts whose latched tail differs from head; its completion engine writes into the CQ named by the command's SQ context and drives the vector named by that CQ context.</p></div>
+<div class="rung" data-rung="D"><p>NVMe Base Specification 2.4: queueing model (many-to-one SQ→CQ, full/empty), Create/Delete I/O SQ/CQ, Number of Queues, Arbitration feature, CAP.AMS/CC.AMS. NVMe over PCIe Transport 1.4: queue memory and interrupts on PCIe.</p></div>
+<div class="rung" data-rung="E"><p>Per SQ: host MWr doorbells and device MRd fetches in that SQ's address range. Per CQ: device MWr CQEs in that CQ's range, then MWr to that CQ's MSI-X address. CQE Dword 2 ties each completion to its SQ.</p></div>
+<div class="rung" data-rung="F"><p>Group trace rows by address range: each SQ range sees only fetches, each CQ range only CQE writes. Interleaving of fetch ranges shows arbitration; SQIDs in one CQ range reveal sharing.</p></div>
+<div class="rung" data-rung="G"><p>When "only some queues" misbehave, build the per-queue fact table (QID, base, size, CQID, IV, IEN, CPU set) from the create payloads and compare columns; when latency differs between CPUs, look at fetch interleaving and the Arbitration settings before blaming media.</p></div>
+</div>
+</section>
+
+<section id="spec">
+<h2>Specification discipline</h2>
+<p>Applicable documents: <cite class="spec">NVM Express Base Specification, Revision 2.4 — Theory of Operation (queueing model); Admin Command Set: Create I/O Completion Queue, Create I/O Submission Queue, Delete I/O Completion Queue, Delete I/O Submission Queue; Set Features: Number of Queues, Arbitration, Interrupt Coalescing, Interrupt Vector Configuration; Controller Registers: CAP, CC</cite> and <cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4 — queue memory, Controller Memory Buffer, MSI-X</cite>. The PCIe side (MSI-X capability, memory transactions) is in the <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 family</cite>.</p>
+<table>
+<caption>What kind of statement each queue fact is</caption>
+<thead><tr><th>Statement</th><th>Kind</th></tr></thead>
+<tbody>
+<tr><td>An SQ completes into exactly one CQ, named at creation; several SQs may share a CQ.</td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>A CQ must exist before an SQ that names it; a CQ cannot be deleted while an SQ maps to it (Invalid Queue Deletion).</td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Round robin arbitration is mandatory; weighted round robin with urgent priority class and vendor-specific arbitration are optional, advertised in CAP.AMS and selected in CC.AMS before enable.</td><td><span class="badge normative">Normative</span> <span class="badge optional">Optional</span> (WRR)</td></tr>
+<tr><td>The Admin SQ is arbitrated at the highest priority under weighted round robin.</td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>The Number of Queues grant may be less than requested; the host must not create more than granted.</td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>A CQ that can never overflow needs at least (sum of maximum outstanding commands of all SQs mapped to it) + 1 entries.</td><td><span class="badge derived">Derived</span> from the full rule and the one-CQE-per-command rule</td></tr>
+<tr><td>Figures showing one queue pair per CPU core.</td><td><span class="badge informative">Informative</span>: allowed, not required</td></tr>
+<tr><td>How many SQEs the controller fetches per read, how it schedules commands after fetch, how fast it notices doorbells.</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+<tr><td>Whether SQs may live in the CMB, whether non-contiguous queues are supported (CAP.CQR = 0), whether WRR is supported.</td><td><span class="badge optional">Optional</span>, reported by the controller</td></tr>
+<tr><td>NVM Set Identifier in Create I/O SQ (NVMe 1.4 onward); queue-related additions in 2.x such as rate-limiting controls in 2.4.</td><td><span class="badge version">Version-dependent</span></td></tr>
+</tbody>
+</table>
+<aside class="callout notsaid">
+<p>The specification does not say how many queues a host should create, which CPUs should use which queue, how deep each queue should be, or whether a shared CQ is a good idea. It does not promise any latency bound for a low-priority SQ under weighted round robin — starvation of lower classes by a continuously busy urgent class is permitted by the model. It does not say what a controller must do internally when a CQ becomes full other than not overwriting it. And the precise behaviour when Set Features Number of Queues is issued again after I/O queues exist should be confirmed in the Base 2.4 Set Features description for your revision <span class="badge uncertain">Uncertain</span>; robust drivers send it once per controller enable.</p>
+</aside>
+</section>
+
+<section id="hardware">
+<h2>Hardware view</h2>
+<table>
+<caption>Hardware participation in I/O queue operation</caption>
+<thead><tr><th>Category</th><th>Hardware</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td rowspan="4">Must participate</td><td>Host DRAM</td><td>Holds every SQ and CQ ring.</td></tr>
+<tr><td>Root complex and root port</td><td>Turns doorbell stores into MWr TLPs (Transaction Layer Packets); completes the device's SQE fetch MRds from memory; receives CQE and MSI-X writes.</td></tr>
+<tr><td>Controller doorbell block, arbiter, fetch engine, completion engine</td><td>Latch tails and heads; choose SQs; read SQEs; write CQEs; signal vectors.</td></tr>
+<tr><td>Controller queue-context storage</td><td>On-chip SRAM or registers holding one context per queue — the physical reason for the Number of Queues limit.</td></tr>
+<tr><td rowspan="4">May participate</td><td>IOMMU</td><td>Translates the device's queue addresses (IOVAs); blocks unmapped ones. Required in most server configurations.</td></tr>
+<tr><td>PCIe switch</td><td>Forwards all queue traffic; adds latency; its ordering rules preserve posted-write order per path.</td></tr>
+<tr><td>Controller Memory Buffer</td><td>If SQs live in device memory, SQE writes become host→device posted writes and fetches become internal.</td></tr>
+<tr><td>Interrupt remapping hardware</td><td>Translates MSI-X writes into CPU interrupts; misconfiguration loses interrupts silently.</td></tr>
+<tr><td>Observable</td><td colspan="2">Doorbell MWrs, SQE fetch MRd/CplD pairs, CQE MWrs, MSI-X MWrs — all on the link with a protocol analyzer. The create and delete commands themselves, as SQE payloads in CplDs from the Root Complex.</td></tr>
+<tr><td>Internal, generally unobservable</td><td colspan="2">Queue contexts, arbiter decisions (inferred only from fetch order), internal command tables, how many commands the controller holds fetched-but-not-started, the CPU's stores into SQ memory, the host's CQE reads (cache hits).</td></tr>
+</tbody>
+</table>
+<aside class="callout impl">
+<p>On the host, NUMA (Non-Uniform Memory Access) placement of queue memory and MSI-X affinity decide whether a CQE write and the handler that reads it are on the same socket. A queue whose ring sits on socket 0 but whose vector targets a CPU on socket 1 pays a cross-socket cache miss on every completion. This is host policy, invisible on the PCIe link, and shows up only as a latency difference between queues that are otherwise identical.</p>
+</aside>
+</section>
+
+<section id="protocol">
+<h2>Protocol view</h2>
+<p>Queues are not messages. They are address ranges. Everything the link carries for an I/O queue is an ordinary memory transaction whose <em>address</em> says which queue it belongs to. That is the key to reading multi-queue traces.</p>
+<table>
+<caption>Messages and transactions per queue (NVMe over PCIe, reference system)</caption>
+<thead><tr><th>Transaction</th><th>Direction</th><th>Posted?</th><th>Identifies the queue by</th><th>Request/response partner</th></tr></thead>
+<tbody>
+<tr><td>Create / Delete I/O SQ or CQ</td><td>SQE payload in CplD, RC→device</td><td>Completion</td><td>QID in CDW10 bits 15:00</td><td>Admin CQE (device MWr) with status</td></tr>
+<tr><td>SQ tail doorbell</td><td>RC→device MWr32</td><td>Posted</td><td>Address 0x1000 + 2y × stride</td><td>None; the device's "answer" is a fetch</td></tr>
+<tr><td>SQE fetch</td><td>Device MRd64, RC CplD</td><td>Non-posted</td><td>Address within [SQ base, base + size × 64)</td><td>CplD with the same Tag and Requester ID 0x0100</td></tr>
+<tr><td>CQE post</td><td>Device MWr64</td><td>Posted</td><td>Address within [CQ base, base + size × 16); SQID in DW2</td><td>None at PCIe level; host reads it later</td></tr>
+<tr><td>Interrupt</td><td>Device MWr32 to 0xFEE0_xxxx</td><td>Posted</td><td>Message address/data of the CQ's vector</td><td>None</td></tr>
+<tr><td>CQ head doorbell</td><td>RC→device MWr32</td><td>Posted</td><td>Address 0x1000 + (2y + 1) × stride</td><td>None; it frees CQ slots</td></tr>
+</tbody>
+</table>
+<h3>Ordering across queues</h3>
+<p>Within one direction on one path, PCIe keeps posted writes in order (absent Relaxed Ordering), so data, CQE and MSI-X for one command arrive in that order. <strong>Across queues there is no NVMe ordering at all.</strong> Two commands on different SQs, even to the same Logical Block Address (LBA), may execute and complete in either order. A host that needs ordering between two I/Os must wait for the first completion before submitting the second — regardless of whether they are on the same queue or not. Shared CQs do not create ordering either: the order of CQEs in a shared CQ is completion order, not submission order.</p>
+<h3>Completion and errors</h3>
+<p>Queue-management errors surface as Admin CQE status values (command specific, Status Code Type 1h, with names such as Completion Queue Invalid, Invalid Queue Identifier, Invalid Queue Size, Invalid Interrupt Vector, Invalid Queue Deletion — numeric codes to be read in the specification). Queue <em>use</em> errors surface differently: invalid doorbell writes through Asynchronous Event Requests (<a href="ch28.html">Chapter 28</a>), DMA faults on queue memory as PCIe completion status (Unsupported Request on an SQE fetch) or as nothing at all (a dropped CQE write to an unmapped IOVA), and lost interrupts as nothing at all. The asymmetry is the theme of the debugging section: the controller can tell you about bad commands; it often cannot tell you about bad queues.</p>
+</section>
+
+<section id="trace">
+<h2>Trace view</h2>
+<p>All four traces are synthetic examples for teaching, on the reference lab system (Lab SSD at 01:00.0, Requester ID 0x0100; BAR0 at 0xFE60_0000 with CAP.DSTRD = 0; Gen4 x4; MPS 256 bytes, MRRS 512 bytes; IOMMU on). Doorbells and MSI-X writes are below 4 GiB and therefore MWr32; queue and data addresses are above 4 GiB and therefore MWr64/MRd64. The topology is the one in the Architecture diagram. Times are illustrative only.</p>
+
+<h3>Normal: two SQs sharing CQ1</h3>
+<div class="trace" data-kind="synthetic" data-title="Normal: SQ1 and SQ2 complete into shared CQ1 (2048 entries, vector 1)">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Queues were just created: SQ1 and SQ2 (1024 entries each) both with CQID 1; CQ1 with 2048 entries, IV 1, IEN 1. All indices start at 0, expected phase 1.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.00</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Len=1 Data=0x0000_0002</td><td>SQ1 tail 0 → 2 (CPU 0 submitted two reads)</td></tr>
+<tr class="dir-down"><td>2</td><td>Host→Dev</td><td>0.30</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1010 Len=1 Data=0x0000_0003</td><td>SQ2 tail 0 → 3 (CPU 5 submitted three reads)</td></tr>
+<tr class="dir-up"><td>3</td><td>Dev→Host</td><td>0.70</td><td>MRd64</td><td>Req=0x0100 Tag=0x30 Addr=0x1_2340_0000 Len=32 DW</td><td>Fetch SQ1 slots 0–1 (128 B)</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>0.76</td><td>MRd64</td><td>Req=0x0100 Tag=0x31 Addr=0x1_2342_0000 Len=48 DW</td><td>Fetch SQ2 slots 0–2 (192 B): round robin moved to the next SQ</td></tr>
+<tr class="dir-down"><td>5</td><td>Host→Dev</td><td>1.38</td><td>CplD</td><td>Cpl=RC Tag=0x30 Status=SC ByteCount=128 Len=32 DW</td><td>SQEs: Read CID 0x0100, Read CID 0x0101</td></tr>
+<tr class="dir-down"><td>6</td><td>Host→Dev</td><td>1.45</td><td>CplD</td><td>Cpl=RC Tag=0x31 Status=SC ByteCount=192 Len=48 DW</td><td>SQEs: Read CIDs 0x0200, 0x0201, 0x0202</td></tr>
+<tr class="note"><td colspan="6">Data MWr64 TLPs for the five reads omitted (16 per 4 KiB read).</td></tr>
+<tr class="dir-up"><td>7</td><td>Dev→Host</td><td>64.20</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_2341_0000 Len=4 DW DW2=0x0002_0003 DW3=0x0001_0202</td><td>CQ1 slot 0: SQID 2, SQHD 3, P 1, success, CID 0x0202 — finished first</td></tr>
+<tr class="dir-up"><td>8</td><td>Dev→Host</td><td>64.30</td><td>MWr32</td><td>Req=0x0100 Addr=0xFEE0_1000 Len=1 Data=0x0000_0041</td><td>MSI-X vector 1</td></tr>
+<tr class="dir-up"><td>9</td><td>Dev→Host</td><td>66.90</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_2341_0010 Len=8 DW; CQE A: DW2=0x0001_0002 DW3=0x0001_0100; CQE B: DW2=0x0002_0003 DW3=0x0001_0200</td><td>CQ1 slots 1–2: SQ1/CID 0x0100 and SQ2/CID 0x0200, one TLP</td></tr>
+<tr class="dir-up"><td>10</td><td>Dev→Host</td><td>67.00</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x0000_0041</td><td>MSI-X vector 1</td></tr>
+<tr class="dir-down"><td>11</td><td>Host→Dev</td><td>68.50</td><td>MWr32</td><td>Req=RC Addr=0xFE60_100C Len=1 Data=0x0000_0003</td><td>CQ1 head 0 → 3</td></tr>
+<tr class="dir-up"><td>12</td><td>Dev→Host</td><td>71.80</td><td>MWr64</td><td>Addr=0x1_2341_0030 Len=8 DW; DW3s=0x0001_0101, 0x0001_0201; DW2s=0x0001_0002, 0x0002_0003</td><td>CQ1 slots 3–4: SQ1/CID 0x0101 and SQ2/CID 0x0201</td></tr>
+<tr class="dir-up"><td>13</td><td>Dev→Host</td><td>71.90</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x0000_0041</td><td>MSI-X vector 1</td></tr>
+<tr class="dir-down"><td>14</td><td>Host→Dev</td><td>73.90</td><td>MWr32</td><td>Addr=0xFE60_100C Data=0x0000_0005</td><td>CQ1 head 3 → 5: all five completions consumed</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Check the five invariants. (I1) Fetches start at each SQ's head and cover exactly what was published: SQ1 0–1, SQ2 0–2. (I2) Every CQE lands in CQ1's range at the next tail slot (0, 1, 2, 3, 4) and carries an SQID mapped to CQ1. (I3) The CQ head doorbells (3, then 5) never pass the posted tail. (I4) SQHD per SQ never moves backwards and never exceeds what was fetched: SQ1 reports 2, SQ2 reports 3. (I5) All CQEs carry P = 1 on the first pass. Completion order (0x0202 first) is unrelated to submission order, and the two SQs' completions interleave in one CQ — both legal. Note the controller packed two CQEs into one 8-Dword MWr (rows 9 and 12); a decoder that assumes one CQE per TLP would miss half the completions.</p>
+</div>
+
+<h3>Slow: an urgent-class SQ starves a medium-class SQ</h3>
+<div class="trace" data-kind="synthetic" data-title="Slow: weighted round robin, background scrubber created as Urgent on SQ3, latency-sensitive read waits on SQ1">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Context: CC.AMS selects weighted round robin with urgent priority class. Create I/O SQ payloads (captured at driver load): SQ1 CDW11=0x0001_0005 (CQID 1, QPRIO 10b Medium, PC 1); SQ3 CDW11=0x0003_0001 (CQID 3, QPRIO 00b Urgent, PC 1). SQ3 has 256 entries and is used by a background media scrubber issuing Verify commands.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_1018 Data=0x0000_00FF</td><td>SQ3 tail 0 → 255: 255 scrub commands (the most a 256-entry SQ can hold)</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.7</td><td>MRd64</td><td>Tag=0x40 Addr=0x1_2344_0000 Len=128 DW</td><td>Fetch SQ3 slots 0–7 (512 B = MRRS)</td></tr>
+<tr class="dir-up"><td>3</td><td>Dev→Host</td><td>0.8</td><td>MRd64</td><td>Tag=0x41 Addr=0x1_2344_0200 Len=128 DW</td><td>Slots 8–15</td></tr>
+<tr class="dir-down"><td>4</td><td>Host→Dev</td><td>2.0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0001</td><td>SQ1 tail 0 → 1: one latency-sensitive 4 KiB read</td></tr>
+<tr class="note"><td colspan="6">2 – 410 µs: the controller keeps fetching SQ3 in 512-byte reads whenever its internal command slots free up (rows elided: 30 more MRd64 to 0x1_2344_0400 … 0x1_2344_3E00). Verify CQEs flow into CQ3. No MRd touches SQ1's range.</td></tr>
+<tr class="abnormal"><td>5</td><td>Dev→Host</td><td>412.0</td><td>MRd64</td><td>Tag=0x5F Addr=0x1_2340_0000 Len=16 DW</td><td>First fetch from SQ1 — 410 µs after its doorbell. First abnormal event: doorbell-to-fetch latency two orders of magnitude above normal</td></tr>
+<tr class="dir-down"><td>6</td><td>Host→Dev</td><td>412.7</td><td>CplD</td><td>Tag=0x5F ByteCount=64</td><td>Read, CID 0x0110</td></tr>
+<tr class="dir-up"><td>7</td><td>Dev→Host</td><td>478.4</td><td>MWr64</td><td>Addr=0x1_2341_0050 Len=4 DW DW2=0x0001_0001 DW3=0x0001_0110</td><td>CQE after a normal 66 µs media time</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> The read's total latency is about 478 µs, but its <em>media</em> time (fetch to CQE) is a healthy 66 µs. All of the excess is between the doorbell (row 4) and the fetch (row 5): the command sat in host memory, published but not yet chosen by the arbiter. Under weighted round robin with urgent priority class, every non-empty Urgent SQ is served before any High, Medium or Low SQ; a scrubber that keeps SQ3 non-empty therefore starves SQ1. The specification permits this. The fix is policy: create background queues as Low (QPRIO 11b) or use round robin. The evidence that clears the media is the fetch timestamp; a latency tool that measures only submission-to-completion on the host would have blamed the NAND.</p>
+</div>
+
+<h3>Failed: the CQ was recreated at a stale address after resume</h3>
+<div class="trace" data-kind="synthetic" data-title="Failed: after resume, Create I/O CQ 3 carries the old IOVA; CQE writes are dropped by the IOMMU">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Context: system resumed from suspend; the driver reset the controller and is recreating queues. Driver log: "CQ3 ring allocated at IOVA 0x1_2355_0000". The previous CQ3 ring at 0x1_2345_0000 was freed and unmapped during suspend.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_1000 Data=0x0000_0007</td><td>Admin SQ tail → 7 (Create I/O CQ 3 in slot 6)</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.7</td><td>MRd64</td><td>Tag=0x06 Addr=0x1_0000_0180 Len=16 DW</td><td>Fetch Admin slot 6</td></tr>
+<tr class="abnormal"><td>3</td><td>Host→Dev</td><td>1.4</td><td>CplD</td><td>Tag=0x06 ByteCount=64 CDW0=0x0026_0005 PRP1=0x1_2345_0000 CDW10=0x00FF_0003 CDW11=0x0002_0003</td><td>First abnormal event: Create I/O CQ 3 names base 0x1_2345_0000, but the ring the host will poll is at 0x1_2355_0000</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>9.0</td><td>MWr64</td><td>Addr=0x1_0000_1060 Len=4 DW DW3=0x0001_0026</td><td>Admin CQE: success — the controller cannot know the address is stale</td></tr>
+<tr class="note"><td colspan="6">Create I/O SQ 3 (CQID 3) also succeeds. I/O resumes.</td></tr>
+<tr class="dir-down"><td>5</td><td>Host→Dev</td><td>150.0</td><td>MWr32</td><td>Addr=0xFE60_1018 Data=0x0000_0001</td><td>SQ3 tail 0 → 1</td></tr>
+<tr class="dir-up"><td>6</td><td>Dev→Host</td><td>150.7</td><td>MRd64</td><td>Tag=0x07 Addr=0x1_2344_0000 Len=16 DW</td><td>SQ3 fetch works: SQ3's base was correct</td></tr>
+<tr class="dir-down"><td>7</td><td>Host→Dev</td><td>151.4</td><td>CplD</td><td>Tag=0x07 ByteCount=64</td><td>Read CID 0x0300</td></tr>
+<tr class="dir-up"><td>8</td><td>Dev→Host</td><td>218.0</td><td>MWr64 ×16</td><td>Addr=0x2_0000_8000 … 0x2_0000_8F00 Len=64 DW each</td><td>Data delivered to the (correctly mapped) buffer</td></tr>
+<tr class="dir-up"><td>9</td><td>Dev→Host</td><td>218.9</td><td>MWr64</td><td>Addr=0x1_2345_0000 Len=4 DW DW2=0x0003_0001 DW3=0x0001_0300</td><td>CQE posted to the stale base. Posted write: no error comes back on the link. The IOMMU blocks it and logs a fault</td></tr>
+<tr class="dir-up"><td>10</td><td>Dev→Host</td><td>219.0</td><td>MWr32</td><td>Addr=0xFEE0_2000 Data=0x0000_0042</td><td>MSI-X vector 2 arrives; the handler polls 0x1_2355_0000, finds P = 0, treats it as spurious</td></tr>
+<tr class="note"><td colspan="6">≈ 30 s later: host I/O timeout, Abort, then controller reset. After the reset the same bug recurs if the driver reuses the cached address.</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> On the link alone, every transaction looks well formed; the controller did exactly what it was told. The first abnormal event is a <em>value</em> (row 3, PRP1 of the create command) that only becomes abnormal when compared with host-side knowledge (the driver's allocation log, or the IOMMU fault address). The kernel log would show an IOMMU fault naming device 0000:01:00.0 and address 0x1_2345_0000; the MSI-X arrives but finds nothing, so the driver may log a spurious or unhandled interrupt. Root cause: the resume path kept a stale DMA handle for CQ3. A tell-tale pattern: SQ3 fetches and data work, only CQ3 writes vanish — so the fault is in CQ3's context, not in the queue pair as a whole.</p>
+</div>
+
+<h3>Ambiguous: a CQE on CQ1 that names SQ3</h3>
+<div class="trace" data-kind="synthetic" data-title="Ambiguous: capture started after driver load; CQ1 receives a completion for SQID 3">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="note"><td colspan="6">Capture triggered on an I/O error report; queue creation was not captured. Assumed (from the driver's documentation) topology: SQ n → CQ n.</td></tr>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_1018 Data=0x0000_0012</td><td>SQ3 tail 0x11 → 0x12</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.7</td><td>MRd64</td><td>Tag=0x22 Addr=0x1_2344_0440 Len=16 DW</td><td>Fetch SQ3 slot 17</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.4</td><td>CplD</td><td>Tag=0x22 ByteCount=64 CDW0=0x0010_0002</td><td>Read, CID 0x0010</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>70.3</td><td>MWr64</td><td>Addr=0x1_2341_0270 Len=4 DW DW2=0x0003_0012 DW3=0x0001_0010</td><td>CQE written into <em>CQ1</em> (slot 39) with SQID 3, SQHD 0x12, CID 0x0010</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>70.4</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x0000_0041</td><td>Vector 1 (CQ1's vector)</td></tr>
+<tr class="note"><td colspan="6">Kernel log at the same moment (illustrative wording): the driver reports a completion for an invalid or inactive command ID on queue 1. SQ1 also has a CID 0x0010 outstanding.</td></tr>
+</tbody>
+</table>
+<p><strong>Two stories fit.</strong> (a) SQ3 was really created with CQID 1 — a legal many-to-one mapping — and the <em>host</em> handler ignores SQID and matches CID 0x0010 against SQ1's outstanding table, completing the wrong request or rejecting the CQE. (b) SQ3 was created with CQID 3, and the <em>controller</em> routed the completion to the wrong CQ. The CQE itself cannot decide between them: it is valid under (a) and a controller bug under (b). The fact that would decide it — Create I/O SQ 3's CDW11 bits 31:16 — is in the part of the trace you did not capture, and NVMe has no command that reads the SQ-to-CQ mapping back. Resolve it by capturing driver initialisation, by reading the driver's queue-creation tracing, or by reproducing after a controller reset with the capture running. Until then, the honest conclusion is "inconsistent mapping between host and controller, owner unknown", with both hypotheses listed and the decisive evidence named.</p>
+</div>
+</section>
+
+<section id="linux">
+<h2>Linux view</h2>
+<p>All commands below are read-only. Some need root. Output formats vary across kernel and nvme-cli versions, so no output is reproduced as if it were authoritative.</p>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Queue grant (Number of Queues, FID 07h): NSQA/NCQA are 0's based</span>
+sudo nvme get-feature /dev/nvme0 -f 0x07 -H
+<span class="cm"># Arbitration feature (FID 01h): burst and the High/Medium/Low weights</span>
+sudo nvme get-feature /dev/nvme0 -f 0x01 -H
+<span class="cm"># CAP.AMS (which arbitration mechanisms exist), CC.AMS (which is selected), MQES, CQR</span>
+sudo nvme show-regs /dev/nvme0 -H | grep -iE 'arbitration|mqes|maximum queue|contiguous'
+<span class="cm"># Interrupt coalescing (FID 08h)</span>
+sudo nvme get-feature /dev/nvme0 -f 0x08 -H
+<span class="cm"># Per-queue interrupts, then the CPU each one targets</span>
+grep -E 'nvme0q[0-9]+' /proc/interrupts
+for irq in $(grep -E 'nvme0q[0-9]+' /proc/interrupts | cut -d: -f1); do
+  echo "irq $irq -&gt; $(cat /proc/irq/$irq/effective_affinity_list)"; done
+<span class="cm"># blk-mq: hardware contexts, their CPUs and their tag depth</span>
+for d in /sys/block/nvme0n1/mq/*/; do echo "$d cpus=$(cat $d/cpu_list) tags=$(cat $d/nr_tags)"; done
+<span class="cm"># Driver queue-type split and depth parameters</span>
+grep -H . /sys/module/nvme/parameters/{io_queue_depth,write_queues,poll_queues} 2&gt;/dev/null
+<span class="cm"># NUMA node of the device (queue memory is usually allocated near it)</span>
+cat /sys/bus/pci/devices/0000:01:00.0/numa_node</code></pre>
+<table>
+<caption>What each output category can and cannot prove about queues</caption>
+<thead><tr><th>Output</th><th>Category</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+<tbody>
+<tr><td>get-feature 0x07</td><td>Controller grant</td><td>How many SQs and CQs the controller allows</td><td>How many the driver created, or their mapping</td></tr>
+<tr><td>get-feature 0x01, show-regs AMS</td><td>Arbitration configuration</td><td>Whether WRR is possible and selected; the weights</td><td>Each SQ's QPRIO (only the create payload shows it)</td></tr>
+<tr><td>/proc/interrupts nvme0qN</td><td>Interrupt-driven queues</td><td>Which queues have vectors, interrupt counts per CPU</td><td>Poll queues (no line), CQ sharing, queue sizes</td></tr>
+<tr><td>effective_affinity_list</td><td>Interrupt routing</td><td>Which CPU receives the vector</td><td>Which CPU submitted the I/O</td></tr>
+<tr><td>mq/*/cpu_list, nr_tags</td><td>Host-side mapping</td><td>CPU → hardware context mapping and per-queue tag limit</td><td>The controller's view of QSIZE or CQID</td></tr>
+<tr><td>numa_node</td><td>Placement</td><td>Which node the device is attached to</td><td>Where each ring actually lives</td></tr>
+</tbody>
+</table>
+<aside class="callout linux">
+<p>Two gaps matter for this module. Linux gives you no direct way to read the SQ→CQ mapping or the QPRIO of each queue as the controller holds them; the authoritative record is the Create I/O SQ payload, visible in a protocol trace or in the driver's command tracepoints when queue creation is traced. And the Linux driver by default does not select weighted round robin, so the starvation trace above is something you will meet on other hosts, custom drivers or user-space drivers (for example SPDK) rather than on a default Linux system <span class="badge impl">Implementation-dependent</span>.</p>
+</aside>
+</section>
+
+<section id="labs">
+<h2>Labs</h2>
+
+<h3>Beginner lab — Draw the queue topology from create payloads</h3>
+<p><span class="badge safe">Safe lab</span> Paper and pencil, or a text editor. No device access.</p>
+<h4>Objective</h4><p>Reconstruct the complete I/O queue topology (SQ→CQ→vector, sizes, priorities, doorbells) from decoded Create I/O CQ/SQ payloads.</p>
+<h4>Prerequisites</h4><p>The create-command field table in <a href="ch27.html">Chapter 27</a>; the doorbell formula in <a href="ch28.html">Chapter 28</a>.</p>
+<h4>Setup</h4><p>The following synthetic payloads were decoded from a capture of driver load on the reference system (CAP.DSTRD = 0, BAR0 = 0xFE60_0000). Each line is opcode, PRP1, CDW10, CDW11.</p>
+<pre class="code" data-kind="simulation" data-lang="text"><code>A  05h  0x1_2341_0000  0x07FF_0001  0x0001_0003
+B  05h  0x1_2345_0000  0x00FF_0003  0x0002_0003
+C  05h  0x1_2347_0000  0x007F_0004  0x0000_0001
+D  01h  0x1_2340_0000  0x03FF_0001  0x0001_0005
+E  01h  0x1_2342_0000  0x03FF_0002  0x0001_0007
+F  01h  0x1_2344_0000  0x00FF_0003  0x0003_0001
+G  01h  0x1_2346_0000  0x007F_0004  0x0004_0001</code></pre>
+<h4>Procedure</h4>
+<ol><li>Decode each line into QID, entries, and either (IV, IEN, PC) or (CQID, QPRIO, PC).</li><li>Draw the topology: SQs on the left, CQs in the middle, vectors on the right.</li><li>For every created queue, compute its doorbell address.</li><li>Compute the minimum CQ size that guarantees no CQ can fill, and compare with what was created.</li></ol>
+<h4>Observations</h4><p>Record a fact table: QID, type, base, entries, CQID or IV/IEN, QPRIO, doorbell.</p>
+<h4>Questions</h4>
+<ol><li>Which CQ is shared, and by which SQs?</li><li>Which CQ is polled?</li><li>Which SQs would be favoured if CC.AMS selected weighted round robin?</li><li>Is CQ1 large enough to never fill?</li></ol>
+<h4>Expected reasoning</h4><p>QSIZE is CDW10 bits 31:16 plus one; QID is bits 15:00. For SQs, CQID is CDW11 bits 31:16 and QPRIO is bits 2:1.</p>
+<details class="solution"><summary>Solution</summary>
+<p>A: CQ1, 2048 entries, IV 1, IEN 1, PC 1. B: CQ3, 256 entries, IV 2, IEN 1. C: CQ4, 128 entries, IV 0 but IEN 0 → polled (IV ignored). D: SQ1, 1024 entries, CQID 1, CDW11 low bits 101b → QPRIO 10b Medium, PC 1. E: SQ2, 1024 entries, CQID 1, low bits 111b → QPRIO 11b Low. F: SQ3, 256 entries, CQID 3, QPRIO 00b Urgent. G: SQ4, 128 entries, CQID 4, QPRIO Urgent.</p>
+<p>Doorbells: SQ1 0xFE60_1008, CQ1 0xFE60_100C, SQ2 0xFE60_1010, SQ3 0xFE60_1018, CQ3 0xFE60_101C, SQ4 0xFE60_1020, CQ4 0xFE60_1024. CQ2's doorbell 0xFE60_1014 belongs to a queue that does not exist.</p>
+<p>(1) CQ1 is shared by SQ1 and SQ2. (2) CQ4. (3) SQ3 and SQ4 (Urgent) before SQ1 (Medium) and SQ2 (Low). (4) SQ1 and SQ2 can each hold 1023 outstanding: 2046 + 1 = 2047 ≤ 2048 — yes, with one entry to spare. CQ3 (256) for SQ3 (255 outstanding) and CQ4 (128) for SQ4 (127) are exactly sufficient.</p>
+</details>
+<h4>Extension</h4><p>Repeat with a version where E's CDW11 is 0x0002_0007. Which status does E return, and which later events would the host see if it ignored that status?</p>
+
+<h3>Intermediate lab — Size a shared CQ, then break it</h3>
+<p><span class="badge safe">Safe lab</span> Pure simulation.</p>
+<h4>Objective</h4><p>Show experimentally that a shared CQ smaller than the sum of its SQs' outstanding limits can block the controller, and that fast host reaping only hides the problem.</p>
+<h4>Prerequisites</h4><p>Full/empty rules from <a href="ch25.html">Chapter 25</a>; Python 3.8+.</p>
+<h4>Setup</h4>
+<pre class="code" data-kind="executable" data-lang="python" data-title="shared_cq.py"><code>#!/usr/bin/env python3
+"""Shared-CQ sizing simulator (synthetic teaching model, standard library only).
+Several SQs complete into one CQ. The controller may post a CQE only when the
+CQ is not full ((tail + 1) % size != head). The host reaps the CQ every
+REAP_EVERY microseconds, frees those commands, and refills its SQs.
+"""
+import random
+
+def simulate(cq_entries, sq_depths, reap_every, run_us=20000, seed=7):
+    rng = random.Random(seed)
+    head = tail = 0                     # CQ indices: controller owns tail, host owns head
+    outstanding = {q: 0 for q in sq_depths}
+    executing = []                      # (finish_time, sqid) inside the controller
+    in_cq = []                          # sqids of CQEs posted but not yet reaped
+    blocked_us, worst_wait = 0, 0
+    for t in range(run_us):
+        for q, depth in sq_depths.items():          # host keeps each SQ full
+            while outstanding[q] &lt; depth:
+                outstanding[q] += 1
+                executing.append((t + rng.randint(60, 140), q))  # media 60-140 us
+        executing.sort()
+        ready = [e for e in executing if e[0] &lt;= t]
+        posted = 0
+        for e in ready:
+            if (tail + 1) % cq_entries == head:     # CQ full: controller must wait
+                break
+            tail = (tail + 1) % cq_entries
+            in_cq.append(e[1])
+            executing.remove(e)
+            posted += 1
+        waiting = len(ready) - posted
+        blocked_us += waiting &gt; 0
+        worst_wait = max(worst_wait, waiting)
+        if t % reap_every == 0:                     # host reaps, then CQ head doorbell
+            for q in in_cq:
+                outstanding[q] -= 1
+            in_cq.clear()
+            head = tail
+    return blocked_us, worst_wait
+
+if __name__ == "__main__":
+    sqs = {1: 255, 2: 255}                  # each SQ may hold 255 outstanding commands
+    need = sum(sqs.values()) + 1
+    print(f"SQ limits {sqs}: a CQ needs at least {need} entries to be unable to fill")
+    for entries, reap in [(256, 200), (256, 20), (511, 200), (1024, 200)]:
+        blocked, worst = simulate(entries, sqs, reap)
+        verdict = "never blocked" if blocked == 0 else f"blocked {blocked} us"
+        print(f"CQ {entries:5d} entries, reap every {reap:3d} us: {verdict:&gt;16}, "
+              f"worst results waiting for a CQ slot = {worst}")</code></pre>
+<h4>Procedure</h4><ol><li>Run the script unchanged.</li><li>Change the media time range to 10–20 µs (a fast cache-hit workload) and rerun.</li><li>Add a third SQ of depth 255 and find the smallest CQ that never blocks with reap interval 200 µs.</li></ol>
+<h4>Observations</h4><p>Expected output of step 1 (deterministic, fixed seed):</p>
+<pre class="code" data-kind="simulation" data-lang="text"><code>SQ limits {1: 255, 2: 255}: a CQ needs at least 511 entries to be unable to fill
+CQ   256 entries, reap every 200 us: blocked 13956 us, worst results waiting for a CQ slot = 255
+CQ   256 entries, reap every  20 us:    never blocked, worst results waiting for a CQ slot = 0
+CQ   511 entries, reap every 200 us:    never blocked, worst results waiting for a CQ slot = 0
+CQ  1024 entries, reap every 200 us:    never blocked, worst results waiting for a CQ slot = 0</code></pre>
+<h4>Questions</h4><ol><li>Why does the 256-entry CQ never block when the host reaps every 20 µs?</li><li>What host events could stretch the reap interval in a real system?</li><li>Why is 511 the threshold rather than 510?</li></ol>
+<h4>Expected reasoning</h4><p>Blocking needs both a CQ smaller than the worst-case outstanding sum and a host that leaves completions unreaped long enough. Design must remove the first condition; the second is not under the driver's full control.</p>
+<details class="solution"><summary>Solution</summary>
+<p>(1) With media time ≥ 60 µs and reaping every 20 µs, at most a few dozen completions can accumulate between reaps, far below 255 free slots: the CQ never fills, by luck of timing rather than by design. (2) Interrupt coalescing with a long aggregation time, a CPU busy with higher-priority work, a long interrupt-disabled section, a virtual machine descheduled by the hypervisor, or a debugger breakpoint. (3) A CQ of N entries holds at most N − 1 entries; 510 outstanding commands need N − 1 ≥ 510, so N ≥ 511. Step 3: three SQs of 255 need 766 entries.</p>
+</details>
+<h4>Extension</h4><p>Model interrupt coalescing: reap only when at least 8 CQEs are waiting or 100 µs have passed. Find the smallest safe CQ again — it does not change, which is the point.</p>
+
+<h3>Advanced lab — A per-queue invariant checker</h3>
+<p><span class="badge safe">Safe lab</span> Offline analysis of a synthetic decoded trace.</p>
+<h4>Objective</h4><p>Implement and apply the five invariants used in the Trace view, and find every violation in a crafted trace.</p>
+<h4>Prerequisites</h4><p>This module's Trace view; <a href="ch28.html">Chapter 28</a> correlation rule.</p>
+<h4>Setup</h4>
+<pre class="code" data-kind="executable" data-lang="python" data-title="queue_invariants.py"><code>#!/usr/bin/env python3
+"""Per-queue invariant checker for synthetic NVMe-over-PCIe traces.
+Standard library only. Events are decoded analyzer rows:
+  ("CQ", qid, base, entries, iv, ien)      Create I/O CQ payload (success assumed)
+  ("SQ", qid, base, entries, cqid)         Create I/O SQ payload (success assumed)
+  ("SQDB", qid, value)                     host MWr to SQ tail doorbell
+  ("FETCH", addr, nbytes)                  device MRd of SQEs
+  ("CQE", addr, sqid, sqhd, cid, phase)    device MWr of one CQE
+  ("CQDB", qid, value)                     host MWr to CQ head doorbell
+"""
+class SQ:
+    def __init__(s, base, n, cqid):
+        s.base, s.n, s.cqid, s.tail, s.head, s.last_sqhd = base, n, cqid, 0, 0, 0
+class CQ:
+    def __init__(c, base, n):
+        c.base, c.n, c.tail, c.head, c.phase = base, n, 0, 0, 1
+
+def check(events):
+    sqs, cqs, out = {}, {}, []
+    def flag(i, msg): out.append(f"#{i:&lt;3} VIOLATION {msg}")
+    for i, ev in enumerate(events, 1):
+        kind = ev[0]
+        if kind == "CQ":
+            _, q, base, n, iv, ien = ev
+            cqs[q] = CQ(base, n)
+        elif kind == "SQ":
+            _, q, base, n, cqid = ev
+            if cqid not in cqs:
+                flag(i, f"SQ{q} names CQ{cqid}, which does not exist")
+            sqs[q] = SQ(base, n, cqid)
+        elif kind == "SQDB":
+            _, q, v = ev
+            sqs[q].tail = v
+        elif kind == "FETCH":
+            _, addr, nbytes = ev
+            hit = [(q, s) for q, s in sqs.items() if s.base &lt;= addr &lt; s.base + s.n * 64]
+            if not hit:
+                flag(i, f"fetch at 0x{addr:X} is outside every SQ (I1)")
+                continue
+            q, s = hit[0]
+            slot = (addr - s.base) // 64
+            count = nbytes // 64
+            published = (s.tail - s.head) % s.n
+            if slot != s.head:
+                flag(i, f"SQ{q} fetch starts at slot {slot}, expected head {s.head} (I1)")
+            if count &gt; published:
+                flag(i, f"SQ{q} fetch of {count} SQEs but only {published} published (I1)")
+            s.head = (slot + count) % s.n
+        elif kind == "CQE":
+            _, addr, sqid, sqhd, cid, p = ev
+            hit = [(q, c) for q, c in cqs.items() if c.base &lt;= addr &lt; c.base + c.n * 16]
+            if not hit:
+                flag(i, f"CQE at 0x{addr:X} is outside every CQ (I2)")
+                continue
+            q, c = hit[0]
+            slot = (addr - c.base) // 16
+            if slot != c.tail:
+                flag(i, f"CQ{q} CQE in slot {slot}, expected tail {c.tail} (I2)")
+                c.tail = slot                    # resynchronise and keep checking
+            if (c.tail + 1) % c.n == c.head:
+                flag(i, f"CQ{q} posted while full (head {c.head}) (I3)")
+            if sqid not in sqs or sqs[sqid].cqid != q:
+                flag(i, f"CQE on CQ{q} carries SQID {sqid}, which is not mapped to CQ{q} (I2)")
+            elif (sqhd - sqs[sqid].last_sqhd) % sqs[sqid].n &gt; (sqs[sqid].head - sqs[sqid].last_sqhd) % sqs[sqid].n:
+                flag(i, f"SQ{sqid} SQHD {sqhd} is beyond what was fetched (I4)")
+            else:
+                sqs[sqid].last_sqhd = sqhd
+            if p != c.phase:
+                flag(i, f"CQ{q} slot {slot} written with P={p}, expected {c.phase} (I5)")
+            c.tail = (c.tail + 1) % c.n
+            if c.tail == 0:
+                c.phase ^= 1
+        elif kind == "CQDB":
+            _, q, v = ev
+            c = cqs[q]
+            if (v - c.head) % c.n &gt; (c.tail - c.head) % c.n:
+                flag(i, f"CQ{q} head doorbell {v} passes the posted tail {c.tail} (I3)")
+            c.head = v
+    return out
+
+TRACE = [
+    ("CQ", 1, 0x1_2341_0000, 8, 1, 1),
+    ("SQ", 1, 0x1_2340_0000, 8, 1),
+    ("SQ", 2, 0x1_2342_0000, 8, 1),            # shares CQ1 (legal)
+    ("SQDB", 1, 3), ("SQDB", 2, 2),
+    ("FETCH", 0x1_2340_0000, 192),             # SQ1 slots 0-2
+    ("FETCH", 0x1_2342_0000, 128),             # SQ2 slots 0-1
+    ("CQE", 0x1_2341_0000, 2, 2, 0x0200, 1),
+    ("CQE", 0x1_2341_0010, 1, 3, 0x0101, 1),
+    ("CQE", 0x1_2341_0020, 1, 3, 0x0100, 1),
+    ("CQDB", 1, 3),
+    ("CQE", 0x1_2341_0030, 3, 1, 0x0300, 1),   # SQ3 was never created
+    ("FETCH", 0x1_2340_00C0, 64),              # SQ1 slot 3 never published
+    ("CQE", 0x1_2341_0050, 2, 2, 0x0201, 1),   # skips slot 4
+    ("CQDB", 1, 7),                            # passes tail
+]
+if __name__ == "__main__":
+    problems = check(TRACE)
+    print("\n".join(problems) if problems else "all invariants hold")</code></pre>
+<h4>Procedure</h4><ol><li>Run it and read the four violations.</li><li>For each, write the bug name and whether the host or the controller produced the bad event.</li><li>Add an invariant I6: a CQ head doorbell must be written for a CQ whose free space has dropped below a quarter of its size within 1 ms (needs timestamps; add a time field to each event).</li></ol>
+<h4>Observations</h4>
+<pre class="code" data-kind="simulation" data-lang="text"><code>#12  VIOLATION CQE on CQ1 carries SQID 3, which is not mapped to CQ1 (I2)
+#13  VIOLATION SQ1 fetch of 1 SQEs but only 0 published (I1)
+#14  VIOLATION CQ1 CQE in slot 5, expected tail 4 (I2)
+#15  VIOLATION CQ1 head doorbell 7 passes the posted tail 6 (I3)</code></pre>
+<h4>Questions</h4><ol><li>Which violations are controller-side and which host-side?</li><li>Why does the checker resynchronise its tail after #14 instead of continuing to expect slot 4?</li><li>What could make #13 a false positive in a real capture?</li></ol>
+<h4>Expected reasoning</h4><p>Ownership decides blame: fetches and CQE posts are controller actions; doorbells are host actions. False positives come from incomplete captures and from analyzers that drop or merge TLPs.</p>
+<details class="solution"><summary>Solution</summary>
+<p>(1) #12 controller (CQE for an unmapped SQID — or a host that mis-created SQ3; see the ambiguous trace), #13 controller (fetch of an unpublished slot: prefetching beyond the tail is not allowed to be used, and reading it at all suggests a stale tail or a missed doorbell in the capture), #14 controller (skipped a CQ slot), #15 host (head doorbell passing the tail — the controller would raise an Invalid Doorbell Write Value asynchronous event if one is armed). (2) Resynchronising keeps one fault from producing a cascade of follow-on violations; report the first, then track reality. (3) A doorbell missing from the capture (filter excluded it, capture started late, analyzer buffer overflow) makes a correct fetch look unpublished. Always check capture completeness before accusing the device.</p>
+</details>
+<h4>Extension</h4><p>Feed the checker the normal trace from this module (encode its rows as events) and confirm "all invariants hold"; then insert the stale-CQ-base failure and observe which invariant catches it (I2: CQE outside every CQ).</p>
+
+<h3>Senior forensic lab — "Random hangs after resume on some CPUs"</h3>
+<p><span class="badge safe">Safe lab</span> Reasoning over supplied synthetic evidence.</p>
+<h4>Objective</h4><p>Produce a root-cause report with first abnormal event, ranked hypotheses, decisive evidence and a regression test.</p>
+<h4>Prerequisites</h4><p>All four traces above; <a href="ch48.html">Chapter 48 — NVMe Reset</a>; the root-cause template in <a href="me-forensics.html">Root Cause, Ambiguity and Forensic Reporting</a>.</p>
+<h4>Setup — evidence bundle (synthetic)</h4>
+<ul>
+<li>Symptom: after suspend/resume, roughly one in five resumes leads to 30-second I/O stalls, only for processes on CPUs 8–15.</li>
+<li>Kernel log (paraphrased): I/O timeouts on queue 3; occasional IOMMU fault for 0000:01:00.0 at an address 0x1_2345_0xx0; controller reset; recovery.</li>
+<li>Trace: identical to the Failed trace above for the bad resumes; for good resumes, Create I/O CQ 3 carries PRP1 = 0x1_2355_0000 or 0x1_2345_0000 depending on run, and the stall happens only when it is 0x1_2345_0000.</li>
+<li>Driver change log: "resume path now reuses queue memory when possible to speed up resume".</li>
+</ul>
+<h4>Procedure</h4><ol><li>State the first abnormal event precisely.</li><li>List at least three hypotheses and the evidence for and against each.</li><li>Propose one disambiguating experiment.</li><li>Write the corrective action and a regression test.</li></ol>
+<h4>Observations</h4><p>Note which facts are host-side, link-side and device-side.</p>
+<h4>Questions</h4><ol><li>Why only CPUs 8–15?</li><li>Why only some resumes?</li><li>Why does the controller report nothing?</li></ol>
+<h4>Expected reasoning</h4><p>Correlate the IOMMU fault address with the create payload, and the CPU set with the blk-mq mapping of queue 3.</p>
+<details class="solution"><summary>Solution</summary>
+<p><strong>First abnormal event:</strong> the Create I/O CQ 3 command after resume carries PRP1 = 0x1_2345_0000, an IOVA that is no longer mapped (the ring was reallocated at 0x1_2355_0000). <strong>Hypotheses:</strong> (H1) the "reuse queue memory" optimisation keeps a stale DMA address when reallocation was actually needed — supported by the change log, by the PRP1 mismatch and by the IOMMU fault address; (H2) the IOMMU mapping was torn down by another component while the queue lived — against: the fault address equals the create payload, not a previously working address; (H3) controller caches the old CQ base across reset — against: the create payload itself contains the old address, so the controller is obeying the host. <strong>Why CPUs 8–15:</strong> blk-mq maps them to hardware context 3, i.e. SQ3/CQ3. <strong>Why only some resumes:</strong> the allocator sometimes returns the same IOVA (bug hidden) and sometimes a new one (bug exposed). <strong>Why the controller is silent:</strong> CQE writes are posted; the IOMMU drops them; no completion status returns to the device. <strong>Disambiguating experiment:</strong> force reallocation at a different IOVA on every resume (or disable reuse); the stall should occur on every resume if H1 is right. <strong>Corrective action:</strong> always program Create I/O CQ with the DMA address returned by the allocation used for this controller enable; add an assertion that the address passed equals the ring's current handle. <strong>Regression test:</strong> 500 suspend/resume cycles with an IOMMU in strict mode and forced IOVA randomisation, checking per-queue first use (fetch, CQE in the expected range, vector) after every resume.</p>
+</details>
+<h4>Extension</h4><p>Rewrite the report for a customer: one paragraph, no TLP names, evidence still stated.</p>
+</section>
+
+<section id="debugging">
+<h2>Debugging</h2>
+<p>Each pattern lists symptom, possible causes, evidence, first check, second check, disambiguating experiment, likely conclusion and confidence.</p>
+
+<h3>Pattern 1 — One queue never raises interrupts but completes when polled</h3>
+<dl>
+<dt>Symptom</dt><dd>I/O from some CPUs completes only after a timeout handler polls the CQ; other CPUs are fine.</dd>
+<dt>Possible causes</dt><dd>IEN = 0 by mistake; IV pointing at an MSI-X entry the OS did not program or left masked; vector shared with a CQ whose handler does not scan this CQ; interrupt remapping fault.</dd>
+<dt>Evidence</dt><dd>Create I/O CQ CDW11; MSI-X MWr presence after CQE posts; <code>/proc/interrupts</code> counts.</dd>
+<dt>First check</dt><dd>In a trace, is there an MWr to the vector's address right after CQEs land in this CQ?</dd>
+<dt>Second check</dt><dd>Decode the create payload: IEN and IV. Compare IV against the number of vectors the OS actually enabled, not the table size.</dd>
+<dt>Disambiguating experiment</dt><dd>Recreate the queue with a known-good vector (for example the one a working queue uses). If interrupts appear, the original vector's table entry or routing is the problem.</dd>
+<dt>Likely conclusion</dt><dd>MWr absent → IEN/IV or masking (host configuration); MWr present → host interrupt routing or handler.</dd>
+<dt>Confidence</dt><dd>High once the MWr presence is established.</dd>
+</dl>
+
+<h3>Pattern 2 — Only queues above a boundary fail</h3>
+<dl>
+<dt>Symptom</dt><dd>Queues 1–8 work; queues 9 and above time out or report Invalid Doorbell events.</dd>
+<dt>Possible causes</dt><dd>Fewer queues granted than created (Invalid Queue Identifier ignored by the driver); doorbell stride arithmetic wrong (DSTRD ≠ 0 assumed 0); vector numbering beyond enabled vectors; doorbells beyond the end of BAR0 on a controller with a small BAR.</dd>
+<dt>Evidence</dt><dd>Number of Queues grant; Admin CQE status for each create; doorbell addresses in the trace.</dd>
+<dt>First check</dt><dd>Compare NSQA/NCQA with the highest QID created.</dd>
+<dt>Second check</dt><dd>Recompute every doorbell address with the real CAP.DSTRD and check it lies inside BAR0's size.</dd>
+<dt>Disambiguating experiment</dt><dd>Limit the driver to 8 queues; then create queue 9 alone with a hand-built command and watch its first use.</dd>
+<dt>Likely conclusion</dt><dd>A boundary almost always means arithmetic or a resource limit, not media.</dd>
+<dt>Confidence</dt><dd>High.</dd>
+</dl>
+
+<h3>Pattern 3 — Latency unfairness between CPUs</h3>
+<dl>
+<dt>Symptom</dt><dd>p99 read latency on CPUs 0–3 is ten times worse than on CPUs 8–15 for the same workload.</dd>
+<dt>Possible causes</dt><dd>Weighted round robin with an urgent or high-weight queue hogging fetches; several CPUs sharing one queue (fewer queues than CPUs) and contending on its lock; shared CQ whose vector targets a remote CPU; NUMA-remote queue memory.</dd>
+<dt>Evidence</dt><dd>Doorbell-to-fetch latency per SQ; the CPU→hctx map; vector affinity; numa_node.</dd>
+<dt>First check</dt><dd>Measure doorbell-to-fetch for the slow CPUs' SQ. If it is large, arbitration is the cause.</dd>
+<dt>Second check</dt><dd>If fetch latency is normal, compare CQE-to-handler time (MSI-X MWr to CQ head doorbell) across queues.</dd>
+<dt>Disambiguating experiment</dt><dd>Switch to round robin (driver/controller configuration on a test system) or move the background job to a Low-class SQ, and remeasure.</dd>
+<dt>Likely conclusion</dt><dd>Fetch delay → arbitration policy; handler delay → host interrupt placement.</dd>
+<dt>Confidence</dt><dd>Medium until per-segment timing is measured; high after.</dd>
+</dl>
+
+<h3>Pattern 4 — Controller stalls under heavy load with a shared CQ</h3>
+<dl>
+<dt>Symptom</dt><dd>At high queue depth, all SQs mapped to one CQ stop completing for milliseconds; fetches continue until the device's internal slots fill.</dd>
+<dt>Possible causes</dt><dd>CQ smaller than the sum of its SQs' outstanding limits combined with delayed reaping (coalescing, CPU busy); CQ head doorbell written too rarely.</dd>
+<dt>Evidence</dt><dd>Gap in CQE writes to that CQ while (tail + 1) mod size equals the last head doorbell value.</dd>
+<dt>First check</dt><dd>Sum the outstanding limits of the SQs on that CQ and compare with its size − 1.</dd>
+<dt>Second check</dt><dd>Track the CQ head doorbell values and timing around the stall.</dd>
+<dt>Disambiguating experiment</dt><dd>Double the CQ size; if stalls vanish, the sizing was the cause.</dd>
+<dt>Likely conclusion</dt><dd>Host design error (CQ sizing) exposed by host timing.</dd>
+<dt>Confidence</dt><dd>High.</dd>
+</dl>
+
+<h3>Pattern 5 — Stalls only after reset, resume or driver rebind</h3>
+<dl>
+<dt>Symptom</dt><dd>Fresh boot is fine; after a controller reset or resume, some queues time out.</dd>
+<dt>Possible causes</dt><dd>Stale queue base addresses; host indices or phase not reset (host expects phase 0 on a fresh CQ, or SQ tail not zeroed while the controller's head restarted at 0); CQ memory not re-zeroed so old entries with P = 1 look new; queue count changed by the new grant.</dd>
+<dt>Evidence</dt><dd>Create payloads after reset vs host allocation; first doorbell value after reset (should be small: tail restarts at 0); first CQE phase.</dd>
+<dt>First check</dt><dd>Is the first SQ tail doorbell after reset a value consistent with a freshly zeroed tail?</dd>
+<dt>Second check</dt><dd>Is CQ memory zeroed before Create I/O CQ, and does the host reset its expected phase to 1?</dd>
+<dt>Disambiguating experiment</dt><dd>Fill CQ memory with a pattern having P = 1 before recreation; phantom completions appear immediately if the host does not re-zero.</dd>
+<dt>Likely conclusion</dt><dd>Host lifecycle bug; the controller starts every queue fresh after CC.EN = 0 → 1.</dd>
+<dt>Confidence</dt><dd>High when the first-use evidence after reset is captured.</dd>
+</dl>
+
+</section>
+
+<section id="interview">
+<h2>Interview</h2>
+<h3>Beginner</h3>
+<ol>
+<li><p>Why does NVMe have many I/O queues instead of one?</p><details class="answer"><summary>Model answer</summary><p>So cores submit and complete in parallel without a shared lock, each with its own interrupt, and the device sees enough work to stay busy.</p></details></li>
+<li><p>What must exist before you create an I/O SQ?</p><details class="answer"><summary>Model answer</summary><p>The I/O CQ it names (and, before that, the Admin queue and the Number of Queues grant).</p></details></li>
+<li><p>Can two SQs share a CQ?</p><details class="answer"><summary>Model answer</summary><p>Yes; each CQE carries the SQID. One SQ cannot spread over several CQs.</p></details></li>
+<li><p>What is a polled queue?</p><details class="answer"><summary>Model answer</summary><p>A CQ created with interrupts disabled (IEN = 0); the host checks phase tags itself instead of waiting for an interrupt.</p></details></li>
+<li><p>Who decides how many I/O queues exist?</p><details class="answer"><summary>Model answer</summary><p>The controller grants a maximum through Number of Queues; the driver decides how many of those to create.</p></details></li>
+</ol>
+<h3>Intermediate</h3>
+<ol>
+<li><p>How big must a CQ shared by two 1024-entry SQs be to never fill?</p><details class="answer"><summary>Model answer</summary><p>2 × 1023 pending CQEs need at least 2047 entries; 2048 is natural.</p></details></li>
+<li><p>What does QPRIO do under round robin?</p><details class="answer"><summary>Model answer</summary><p>Nothing. It is only used when weighted round robin with urgent priority class is selected in CC.AMS.</p></details></li>
+<li><p>Why can a Create I/O CQ succeed with a bad base address?</p><details class="answer"><summary>Model answer</summary><p>Creation records the address without accessing it; the first CQE post is the first access, and a posted write returns no error.</p></details></li>
+<li><p>How does Linux map CPUs to NVMe queues?</p><details class="answer"><summary>Model answer</summary><p>blk-mq creates one hardware context per I/O queue and assigns CPU sets aligned with vector affinity; with fewer queues than CPUs, CPUs share.</p></details></li>
+<li><p>What happens to outstanding commands when an SQ is deleted?</p><details class="answer"><summary>Model answer</summary><p>They complete or are aborted with Command Aborted due to SQ Deletion, posted to the CQ before the Delete completes — so the CQ must outlive the SQ.</p></details></li>
+</ol>
+<h3>Advanced</h3>
+<ol>
+<li><p>Explain how weighted round robin with urgent priority class can starve a queue.</p><details class="answer"><summary>Model answer</summary><p>Urgent is strict priority above the weighted classes; while any Urgent SQ is non-empty, weighted SQs are not fetched — without bound, and legally.</p></details></li>
+<li><p>Does arbitration order equal completion order?</p><details class="answer"><summary>Model answer</summary><p>No. Arbitration orders fetches; execution is parallel and completes in any order.</p></details></li>
+<li><p>Why might a controller support more SQs than CQs?</p><details class="answer"><summary>Model answer</summary><p>CQs carry interrupt state and are bounded by vectors; SQs are cheaper and useful for priority separation.</p></details></li>
+<li><p>How would you prove a queue is healthy after creation?</p><details class="answer"><summary>Model answer</summary><p>First use: doorbell at the right offset, fetch at base + head × 64, CQE at the CQ base with the right SQID and P = 1, and its MSI-X write.</p></details></li>
+<li><p>What is the risk of putting SQs in a Controller Memory Buffer?</p><details class="answer"><summary>Model answer</summary><p>SQE writes become posted writes to the device that must precede the doorbell; write-combining mappings can break that. It is optional, scarce, and removes SQE fetches from traces.</p></details></li>
+</ol>
+<h3>Senior</h3>
+<ol>
+<li><p>Design a queue-management validation matrix.</p><details class="answer"><summary>Model answer</summary><p>Limits (every QID, sizes 2 and MQES + 1); topologies (1:1, many:1, mixed IEN, shared vectors); arbitration (RR fairness, WRR weights, urgent starvation); lifecycle (delete with outstanding commands, wrong delete order, reset during creation, churn, suspend/resume with IOVA randomisation); every queue error status; first-use proof after every event.</p></details></li>
+<li><p>A customer's custom driver uses one SQ per thread (200 SQs) and one shared CQ. What do you review?</p><details class="answer"><summary>Model answer</summary><p>The grant; CQ size versus the sum of outstanding limits (likely beyond MQES); the single reaping CPU as a bottleneck; demultiplexing by SQID; fairness across 200 SQs.</p></details></li>
+<li><p>How do you decide between interrupts and polling per queue?</p><details class="answer"><summary>Model answer</summary><p>Polling saves interrupt delivery at the cost of spinning CPU; it pays at low depth with tight latency targets. Keep polled queues separate.</p></details></li>
+<li><p>A firmware engineer says "queue creation succeeded, so the host is to blame". How do you respond?</p><details class="answer"><summary>Model answer</summary><p>Creation success proves only that fields passed validation. The create payload and first-use evidence decide.</p></details></li>
+<li><p>What queue-related state must survive, and what must not survive, a controller reset?</p><details class="answer"><summary>Model answer</summary><p>No I/O queue context survives CC.EN = 0. The host recreates queues, re-zeroes CQs, resets pointers and phases, renegotiates, and reuses DMA addresses only if still mapped.</p></details></li>
+</ol>
+</section>
+
+<section id="quiz">
+<h2>Quiz</h2>
+<ol class="quiz">
+<li><p>Two SQs, each 256 entries, share one CQ. Minimum CQ entries for no possible overflow?</p>
+<ul class="options" data-answer="3"><li>256</li><li>510</li><li>511</li><li>512</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Each SQ can hold 255 outstanding: 510 CQEs; a CQ of N holds N − 1, so N ≥ 511.</p></details></li>
+<li><p>Under weighted round robin with urgent priority class, which is served first?</p>
+<ul class="options" data-answer="1"><li>Admin SQ</li><li>Urgent SQs</li><li>High-class SQs</li><li>The SQ with the largest weight</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The Admin SQ is the highest strict priority, then Urgent, then weighted High/Medium/Low.</p></details></li>
+<li><p>Create I/O SQ CDW11 = 0x0001_0007. What is QPRIO?</p>
+<ul class="options" data-answer="4"><li>Urgent</li><li>High</li><li>Medium</li><li>Low</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Bits 2:1 of 0x7 = 11b = Low. CQID = 1, PC = 1.</p></details></li>
+<li><p>A CQE written into CQ1 carries SQID 4. Which statement is certainly true?</p>
+<ul class="options" data-answer="2"><li>The controller has a bug</li><li>Either SQ4 maps to CQ1 or host and controller disagree about the mapping</li><li>SQ4 does not exist</li><li>The host must discard it</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Many-to-one is legal; only the Create I/O SQ 4 payload can say which story is true.</p></details></li>
+<li><p>Which evidence clears the media in a "slow read" complaint?</p>
+<ul class="options" data-answer="3"><li>The CQE status is 0</li><li>The MSI-X arrived</li><li>Fetch-to-CQE time is normal while doorbell-to-fetch is large</li><li>The data TLPs are 256 bytes</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>If the excess latency is before the fetch, the command was waiting for arbitration, not for NAND.</p></details></li>
+<li><p>What happens when a controller's CQ is full and it has a completion to post?</p>
+<ul class="options" data-answer="2"><li>It overwrites the oldest entry</li><li>It waits until the host frees slots with the CQ head doorbell</li><li>It posts to another CQ</li><li>It returns a PCIe error</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The controller never overwrites unconsumed entries; it stops posting into that CQ until the head moves.</p></details></li>
+<li><p>Why can an analyzer not show you a queue being "created"?</p><details class="answer"><summary>Model answer</summary><p>Creation is an Admin command exchange; the queue itself is only an address range plus controller-internal context. The analyzer shows the create SQE inside a CplD payload and its Admin CQE; the queue's existence becomes visible only when its doorbells, fetches and CQE writes appear.</p></details></li>
+<li><p>Give two host events that can turn an undersized shared CQ from harmless to harmful.</p><details class="answer"><summary>Model answer</summary><p>Longer interrupt coalescing; the reaping CPU busy or descheduled (virtual machine, real-time task, long interrupt-off section); debugger stops. Each lengthens the interval between CQ head doorbells.</p></details></li>
+</ol>
+</section>
+
+<section id="teachback">
+<h2>Teach-back</h2>
+<ol>
+<li><p><strong>To a child:</strong> explain the airport: desks with their own belts, shared return carousels, the light in the office, urgent belts, and why you build a carousel before opening a desk.</p>
+<details class="answer"><summary>Model explanation</summary><p>"Each desk puts suitcases on its own belt so desks never bump into each other. Workers inside take suitcases from the belts one after another, but urgent belts first. When a suitcase is checked, a ticket comes back on a return carousel — several desks can share one carousel because each ticket says which desk it belongs to. A light flashes in an office when tickets arrive. You build the carousel first, because a desk with nowhere to send tickets would be stuck. And if the carousel is too small for all its desks, the workers have to stop and wait."</p></details></li>
+<li><p><strong>To a junior engineer:</strong> explain topology design for a host with 16 CPUs, a grant of 8 SQs and 4 CQs, and 5 MSI-X vectors.</p>
+<details class="answer"><summary>Model explanation</summary><p>"We can create at most 8 SQs and 4 CQs. With 4 CQs and 4 I/O vectors (vector 0 is Admin), give each CQ its own vector targeting a group of 4 CPUs. Map 2 SQs to each CQ, one SQ per pair of CPUs, so each CQ is shared by 2 SQs — size each CQ at 2 × (SQ entries − 1) + 1 or more. CQEs carry SQID so the handler can route completions. Create every CQ before its SQs and wait for each completion. Prove each queue by its first use."</p></details></li>
+<li><p><strong>To a senior engineer:</strong> argue which queue facts you can and cannot recover from a mid-stream capture, and what that implies for capture practice.</p>
+<details class="answer"><summary>Model explanation</summary><p>"From mid-stream I can infer address ranges, doorbell-to-queue mapping and, from CQE SQIDs, which SQs complete into which CQ ranges — but not QSIZE exactly, not QPRIO, not IEN for silent queues, and not whether an SQID-on-CQ pairing was intended. NVMe offers no read-back of queue contexts. So for any queue-topology question I capture from controller enable, or I correlate with the driver's own creation tracing; otherwise ambiguous traces like an unexpected SQID can only be reported with both hypotheses."</p></details></li>
+</ol>
+</section>
+
+<section id="mastery">
+<h2>Mastery gate</h2>
+<aside class="callout mastery">
+<p>Do not consider this module mastered until you can:</p>
+<ul class="checklist">
+<li>explain the I/O queue system as rings, contexts, doorbells and vectors tied by identifiers</li>
+<li>diagram a many-to-one topology with sizes, vectors and doorbells, and compute the minimum shared CQ size</li>
+<li>identify in a trace each queue's fetch range and CQE range, and the arbitration pattern from fetch interleaving</li>
+<li>apply the five per-queue invariants and name the first violation in a multi-queue trace</li>
+<li>debug the five failure patterns above from symptom to likely conclusion</li>
+<li>distinguish I/O queues from the <a href="dd25.html">Admin queue</a>, from <a href="dd27.html">doorbells</a>, from <a href="dd19.html">MSI-X vectors</a> and from blk-mq hardware contexts</li>
+<li>cite the NVMe Base Specification 2.4 sections by name (queueing model, Create/Delete I/O queue commands, Number of Queues, Arbitration) and the NVMe over PCIe Transport Specification 1.4</li>
+</ul>
+</aside>
+<p>Next: <a href="dd27.html">Module 27 — Doorbells</a>.</p>
+</section>

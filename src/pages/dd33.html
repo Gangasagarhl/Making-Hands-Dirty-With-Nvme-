@@ -1,0 +1,662 @@
+<p class="lead">Dataset Management with Deallocate is the command that tells a solid-state drive what it may forget. Chapter 35 taught its bytes and its effect on garbage collection. This module follows deallocation into the places where real systems get it wrong: range lists on the wire, discard policies that cause latency storms, error-on-read semantics, mapping granularity that silently ignores small ranges, and storage layers that never pass the information down at all.</p>
+
+<section id="orientation">
+  <h2>Orientation</h2>
+  <p><a href="ch35.html">Chapter 35 (Dataset Management)</a> covered the Non-Volatile Memory Express (NVMe) Dataset Management (DSM) command, opcode 09h: Number of Ranges (NR, 0's based), the attributes Deallocate (AD), Integral Dataset for Write (IDW) and Integral Dataset for Read (IDR), the 16-byte range entries, Deallocate Logical Block Features (DLFEAT), the preferred granularity and alignment (NPDG/NPDA), the write-amplification model, and three traces. This module goes deeper on four fronts: the <em>range list as a data transfer</em> (alignment, page crossings, limits), <em>discard policy</em> (continuous, batched, huge) and its latency cost, <em>read semantics after deallocation</em> including the Deallocated or Unwritten Logical Block Error (DULBE) behaviour and granularity effects, and <em>end-to-end pass-through</em> of discards through filesystems, device-mapper and virtualisation.</p>
+  <aside class="callout prereq">
+    <p>Read first: <a href="ch35.html">Dataset Management</a> (command format, DLFEAT, write amplification), <a href="ch33.html">WRITE</a> (the range list moves like write data), <a href="ch36.html">Physical Region Pages</a> (the list's data pointer), <a href="ch34.html">FLUSH</a> (durability of deallocation).</p>
+  </aside>
+  <p>Where it goes next: <a href="dd34.html">Deep dive: PRP</a> and <a href="dd35.html">Deep dive: SGL</a> (how the list is described), <a href="dd44.html">Deep dive: ZNS</a> (zoned namespaces reset zones instead of deallocating LBAs), <a href="dd53.html">Deep dive: Performance Engineering</a>.</p>
+</section>
+
+<section id="objectives">
+  <h2>Required learning objectives</h2>
+  <table>
+    <caption>Objectives for this module</caption>
+    <thead><tr><th>Level</th><th>Objective</th></tr></thead>
+    <tbody>
+      <tr><td>Beginner</td><td>Encode a DSM command and its range list by hand from byte extents, and say what a later read of each range may return.</td></tr>
+      <tr><td>Intermediate</td><td>Predict the Peripheral Component Interconnect Express (PCIe) traffic for a 256-range list at an unaligned address, and audit a list for size, overlap, bounds and granularity problems.</td></tr>
+      <tr><td>Advanced</td><td>Compare continuous, batched and single-huge discard policies quantitatively, and explain why each can hurt latency in a different way.</td></tr>
+      <tr><td>Senior</td><td>Trace a discard from <code>unlink()</code> to the flash translation layer (FTL) through filesystem, device-mapper, virtualisation and driver, identify which layer drops or reshapes it, and judge the security trade-off of passing discards through encryption.</td></tr>
+      <tr><td>Trace analysis</td><td>Decode range lists from Completion with Data (CplD) payloads, distinguish deallocation from Write Zeroes in a trace, and recognise a DULBE error completion.</td></tr>
+      <tr><td>Debugging</td><td>Work at least six deallocation failure patterns, including "trim did nothing", latency storms, unexpected read errors and old data after trim.</td></tr>
+      <tr><td>Validation</td><td>Build a test matrix for NR and limits, granularity, read-back per DLFEAT, DULBE, concurrency with writes, and power loss after deallocation.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="kid">
+  <h2>Kid story</h2>
+  <aside class="callout kid">
+    <p>A big toy library lends toys in boxes. Each shelf holds four box-spots that are cleaned together, a whole shelf at a time. When you no longer want a toy, you post a card: "I don't need spots 12 to 19 any more." The librarian crosses them off, and when she cleans a shelf she doesn't have to move crossed-off toys.</p>
+    <p>Three surprises. If your card says "spot 13 only", she cannot clean a quarter of a shelf, so she may just leave the toy there; ask for spot 13 later and the old toy might still be in it. If you post ten thousand tiny cards one after another, she spends the whole afternoon reading cards instead of lending toys. And if your big brother collects your cards "to post later" and forgets, the librarian never hears about them at all.</p>
+  </aside>
+</section>
+
+<section id="boundary">
+  <h2>Analogy boundary</h2>
+  <aside class="callout breaks">
+    <p><strong>What it represents.</strong> Cards are DSM commands with range lists; box-spots are logical blocks; a shelf is the controller's mapping unit (often reported as NPDG); crossing off is unmapping in the FTL; cleaning a shelf is garbage collection; the big brother is any layer between filesystem and drive (device-mapper, encryption, hypervisor) that may not forward discards.</p>
+    <p><strong>What it hides.</strong> The card must itself be fetched over PCIe like write data; an unaligned card costs extra read requests. The librarian can also be told to answer "that spot is empty" with an error instead of a blank toy (DULBE). And the crossing-off list lives in volatile memory for a while: a power cut can undo it unless it is flushed.</p>
+    <p><strong>Where it becomes misleading.</strong> Crossed-off toys are not destroyed; they remain physically on the shelf until it is cleaned — deallocation is not erasure. And "the old toy might still be there" is not a broken promise if the device reports that it does not guarantee zeros (DLFEAT 000b) or if the range was smaller than its unit; it is a broken promise only when the device claims deterministic zeros for blocks it actually deallocated.</p>
+  </aside>
+</section>
+
+<section id="vocabulary">
+  <h2>Vocabulary</h2>
+  <table>
+    <caption>Terms for this module (format terms are in <a href="ch35.html">Chapter 35</a>)</caption>
+    <thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship</th><th>Common confusion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="g" data-term="discard">Discard</span></td><td>"Forget this"</td><td>Linux block-layer operation (REQ_OP_DISCARD) that the NVMe driver turns into DSM with AD</td><td>Also called TRIM (ATA) and UNMAP (SCSI)</td><td>Thinking it erases</td></tr>
+      <tr><td>Continuous discard</td><td>Tell immediately</td><td>Filesystem mount option that issues discards as blocks are freed</td><td>Opposite of batched discard</td><td>Assuming it is always better</td></tr>
+      <tr><td>Batched discard</td><td>Tell later, in bulk</td><td><code>fstrim</code> (FITRIM ioctl) walking free space periodically</td><td>Fewer, larger DSMs</td><td>Assuming it frees space immediately after deletion</td></tr>
+      <tr><td><span class="g" data-term="npdg">NPDG / NPDA</span></td><td>"Tell me in chunks this size"</td><td>Namespace Preferred Deallocate Granularity / Alignment in Identify Namespace</td><td>Feeds Linux discard_granularity</td><td>Thinking smaller ranges are rejected (they are accepted, maybe not honoured)</td></tr>
+      <tr><td>Mapping unit (indirection unit)</td><td>The shelf</td><td>Smallest LBA span the FTL maps (4 KiB typical; 16 KiB or more on some high-density drives)</td><td>Bounds what deallocation can free</td><td>Equating it with the LBA size</td></tr>
+      <tr><td><span class="g" data-term="dulbe">DULBE</span></td><td>"Tell me if it's empty"</td><td>Deallocated or Unwritten Logical Block Error: when enabled (Error Recovery feature), reads of deallocated blocks fail instead of returning DLFEAT data</td><td>Changes DLFEAT's read behaviour into an error</td><td>Mistaking its error for media failure</td></tr>
+      <tr><td><span class="g" data-term="dlfeat">DLFEAT</span></td><td>What empty looks like</td><td>Identify Namespace field: read value of deallocated blocks (000b not reported, 001b zeros, 010b FFh) and related support bits</td><td>Applies only to blocks actually deallocated</td><td>Applying it to sub-granular ranges</td></tr>
+      <tr><td>NUSE</td><td>How full it really is</td><td>Namespace Utilization: logical blocks currently allocated (meaningful with thin provisioning)</td><td>May drop after deallocation</td><td>Expecting every drive to report it dynamically</td></tr>
+      <tr><td><span class="g" data-term="write-zeroes">Write Zeroes</span> (DEAC)</td><td>"Make it zeros, cheaply"</td><td>Opcode 08h; with its Deallocate bit the controller may deallocate if reads will return zeros</td><td>Guarantees zeros, unlike DSM</td><td>Treating DSM as a zeroing primitive</td></tr>
+      <tr><td>DMRL / DMRSL / DMSL</td><td>Limits per command</td><td>Dataset Management Ranges Limit, Range Size Limit, Size Limit (NVM Command Set Identify Controller)</td><td>Hosts must split to respect them</td><td>Assuming 256 ranges are always accepted</td></tr>
+      <tr><td>Discard pass-through</td><td>Every layer forwards the card</td><td>Each block layer (dm-crypt, LVM, md RAID, virtual disk) must be configured to forward discards</td><td>Determines whether the SSD ever learns</td><td>Trusting fstrim's "trimmed N bytes" as proof</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <figure>
+    <pre class="diagram">
+ unlink()/truncate()   fstrim (FITRIM)          blkdiscard
+        │                    │                       │
+   filesystem: frees extents; continuous discard or later batched walk
+        │
+   dm-crypt / LVM / md / virtual disk ── forward? (allow_discards, discard=unmap, …)
+        │
+   block layer: split by discard_max_bytes, discard_granularity; merge up to max_discard_segments
+        │
+   NVMe driver: DSM SQE (opc 09h, NR, AD) + range-list buffer (≤ 4 KiB, PRP/SGL)
+        │  PCIe: doorbell ↓ · SQE MRd/CplD · list MRd ↑ / CplD ↓ · CQE ↑ · MSI-X ↑
+   controller: validate (NR, bounds, limits) → FTL: unmap whole units, journal partials
+        │                                         │
+   later reads: DLFEAT value, old data (not deallocated), or DULBE error
+   garbage collection: fewer valid pages to copy
+    </pre>
+    <figcaption>The discard path. Conceptual; option names are Linux examples.</figcaption>
+  </figure>
+  <table>
+    <caption>Architecture of deallocation</caption>
+    <thead><tr><th>Aspect</th><th>Content</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs</td><td>DSM SQE (NSID, data pointer, CDW10 NR, CDW11 attributes); range list of (NR+1) × 16 bytes; namespace format.</td></tr>
+      <tr><td>Outputs</td><td>One CQE; FTL map entries cleared; per-block valid counts reduced; possibly NUSE reduced; later read behaviour.</td></tr>
+      <tr><td>Actors</td><td>Filesystem, intermediate block layers, block layer, NVMe driver, controller command processor, FTL, garbage collector.</td></tr>
+      <tr><td>State</td><td>Host: free-extent maps, discard queues. Device: logical-to-physical map, valid counts, trim journal, DULBE setting.</td></tr>
+      <tr><td>Memory</td><td>Range-list buffer in host memory (pulled by the controller); FTL map in device DRAM or partly in Host Memory Buffer (HMB).</td></tr>
+      <tr><td>Registers / fields</td><td>Doorbells; Identify Controller ONCS bit 2 (DSM support); NVM Command Set Identify Controller DMRL/DMRSL/DMSL; Identify Namespace DLFEAT, NPDG, NPDA, NSFEAT, NUSE; Error Recovery feature (05h) with DULBE.</td></tr>
+      <tr><td>Interfaces</td><td>I/O queue for DSM; admin queue for Identify and features.</td></tr>
+      <tr><td>Dependencies</td><td>Every layer forwarding; host serialising DSM against reads/writes to the same LBAs; Flush if deallocation must survive power loss on a cached drive.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="mechanism">
+  <h2>Mechanism</h2>
+  <p><code>fstrim</code> on a filesystem over namespace 1 finds 256 free extents and the block layer issues one DSM.</p>
+  <ol>
+    <li><strong>Build the list.</strong> Who: NVMe driver (or user-space tool). What: 256 × 16 bytes = 4 KiB of (context, Length, Starting LBA) entries. Where: a host buffer, here at IOVA 0x2_0002_0800 (not page-aligned). Evidence: <code>nvme_setup_cmd</code> shows <code>nvme_cmd_dsm</code> with nr and attributes, not the ranges.</li>
+    <li><strong>Describe the list.</strong> Who: driver. What: the 4 KiB list at offset 0x800 touches two pages, so PRP1 = 0x2_0002_0800 and PRP2 = second page 0x2_0007_4000. Where: SQE Dwords 6–9. Evidence: SQE bytes in a capture.</li>
+    <li><strong>Submit.</strong> Who: driver. What: SQE (opcode 09h, NSID 1, CDW10 = 0x000000FF, CDW11 = 0x00000004) in SQ1 slot 0x60; doorbell 0x61. Where: SQ1 ring and BAR0 + 0x1008. Evidence: Memory Write (MWr) doorbell.</li>
+    <li><strong>Fetch and validate.</strong> Who: controller. What: Memory Read (MRd) of the SQE; checks ONCS support, NR against DMRL. Where: controller. Evidence: SQE CplD; an immediate error CQE if NR exceeds DMRL.</li>
+    <li><strong>Pull the list.</strong> Who: controller DMA. What: 8 MRds of 512 bytes (4 in each page, Max Read Request Size (MRRS) 512), answered by CplDs. Where: link. Evidence: MRd addresses at PRP1 and PRP2; CplD payloads are the ranges.</li>
+    <li><strong>Validate ranges.</strong> Who: controller. What: each range against Namespace Size (NSZE), DMRSL, total against DMSL. Where: controller. Evidence: error CQE (LBA Out of Range, Invalid Field) with no partial-progress indication.</li>
+    <li><strong>Unmap.</strong> Who: FTL. What: whole mapping units inside ranges are unmapped; partial units may be ignored, tracked, or zero-filled internally; large ranges may be journaled for lazy processing. Where: device DRAM map and NAND journal. Evidence: none directly; NUSE may drop; later reads.</li>
+    <li><strong>Complete.</strong> Who: completion engine. What: CQE status 0 in CQ1 slot 0x60, MSI-X. Where: host. Evidence: CQE MWr.</li>
+    <li><strong>Aftermath.</strong> Who: garbage collector and readers. What: cheaper reclaim; reads return DLFEAT data, old data (not deallocated), or a DULBE error if enabled. Evidence: write latency at steady state; read results.</li>
+  </ol>
+  <figure>
+    <ol class="seq" data-actors="fstrim / FS|NVMe driver|Root complex|Controller|FTL">
+      <li data-from="fstrim / FS" data-to="NVMe driver">discard: 256 extents</li>
+      <li data-from="NVMe driver" data-to="Controller" data-t="0 µs">MWr32 SQ1 tail = 0x61</li>
+      <li data-from="Controller" data-to="Root complex" data-t="0.75 µs">MRd 64 B: DSM SQE</li>
+      <li data-from="Root complex" data-to="Controller" class="dashed" data-t="1.3 µs">CplD: opc 09h NR=FFh AD=1</li>
+      <li data-from="Controller" data-to="Root complex" data-t="1.9 µs">8 × MRd 512 B (two pages)</li>
+      <li data-from="Root complex" data-to="Controller" class="dashed" data-t="2.5–3.8 µs">16 × CplD 256 B: ranges</li>
+      <li data-from="Controller" data-to="FTL">validate, unmap / journal</li>
+      <li data-from="FTL" data-to="Controller" class="dashed">done (lazy for big extents)</li>
+      <li data-from="Controller" data-to="NVMe driver" data-t="41 µs">MWr CQE + MSI-X</li>
+    </ol>
+    <figcaption>A 256-range deallocate with a page-crossing list. Synthetic example for teaching; timings illustrative.</figcaption>
+  </figure>
+  <h3>The central concept on the ladder: effective deallocation</h3>
+  <p>The central idea of this module is not "the command" but whether deallocation is <em>effective</em>: whether the information reaches the FTL, at a granularity it can act on, without harming latency, and with read-back semantics the host understands.</p>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Cards only help if they arrive, are big enough to clear a whole shelf-spot set, and are not so many that the librarian stops lending.</p></div>
+    <div class="rung" data-rung="B"><p>Discards must pass every layer, be aligned to the drive's preferred granularity, be batched sensibly, and be followed by reads whose result the host expects (DLFEAT or DULBE).</p></div>
+    <div class="rung" data-rung="C"><p>The FTL frees whole mapping units; partial units stay mapped or are tracked at extra cost; the map update is journaled and may be lazy; the list is fetched by DMA like write data.</p></div>
+    <div class="rung" data-rung="D"><p><cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3 — Dataset Management command; Identify Namespace (DLFEAT, NPDG, NPDA, NUSE); I/O Command Set specific Identify Controller (DMRL, DMRSL, DMSL)</cite>; <cite class="spec">NVM Express Base Specification, Revision 2.4 — ONCS; Error Recovery feature (DULBE)</cite>.</p></div>
+    <div class="rung" data-rung="E"><p>A DSM moves its list host-to-device with MRd/CplD; one CQE answers all ranges; no per-range status.</p></div>
+    <div class="rung" data-rung="F"><p>Opcode byte 09h, CDW11 bit 2 set, list MRds totalling (NR+1)×16 bytes, ranges in CplD payloads; absence of DSM in the device trace when the filesystem claims it trimmed.</p></div>
+    <div class="rung" data-rung="G"><p>"Trim didn't help": prove DSMs reach the device and match NPDG. "Latency storm": count DSMs per second and range sizes. "Reads fail after trim": check DULBE. "Old data after trim": check granularity and DLFEAT before blaming the device.</p></div>
+  </div>
+  <p>The sixteen questions for deallocation are answered in <a href="ch35.html#engineering">Chapter 35</a>.</p>
+</section>
+
+<section id="spec">
+  <h2>Specification discipline</h2>
+  <p>Applicable: <cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3</cite> (DSM, deallocation and its read behaviour, namespace fields, limits), <cite class="spec">NVM Express Base Specification, Revision 2.4</cite> (SQE/CQE, ONCS, Error Recovery feature, status codes), <cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite> (data pointer for the list).</p>
+  <table>
+    <caption>Classifying deallocation behaviour</caption>
+    <thead><tr><th>Behaviour</th><th>Class</th></tr></thead>
+    <tbody>
+      <tr><td>Command format: NR 0's based, AD/IDW/IDR bits, 16-byte ranges with Length as a count</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>DSM support itself (ONCS bit 2)</td><td><span class="badge optional">Optional</span></td></tr>
+      <tr><td>Read value of deallocated blocks as reported by DLFEAT; DULBE error when enabled</td><td><span class="badge normative">Normative</span> for what is reported; DULBE support <span class="badge optional">Optional</span></td></tr>
+      <tr><td>Whether every requested block is deallocated</td><td><span class="badge version">Version-dependent</span> wording; treat as advisory unless your revision says otherwise <span class="badge uncertain">Uncertain</span></td></tr>
+      <tr><td>DMRL/DMRSL/DMSL limits</td><td><span class="badge version">Version-dependent</span> (NVMe 2.0 onwards)</td></tr>
+      <tr><td>Mapping unit, honouring of partial units, lazy versus synchronous processing, NUSE tracking, latency</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+      <tr><td>"Treat deallocation like a write for power loss" and the batching cost model</td><td><span class="badge derived">Derived</span></td></tr>
+      <tr><td>Linux discard policy, granularity and segment limits</td><td><span class="badge impl">Implementation-dependent</span> (kernel)</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout notsaid">
+    <p>The specification does not say that deallocation erases data; that a DSM completes quickly; how much a sub-granular range is honoured; how DSM is ordered with concurrent reads or writes of the same LBAs; or whether a failed DSM processed some ranges. Check in the specification: the exact Error Recovery feature bit for DULBE and the Identify Namespace bit that reports DULBE support; the status code value for "Deallocated or Unwritten Logical Block" in the Media and Data Integrity Errors table; the Write Zeroes Deallocate bit position; whether a range Length of zero is permitted.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume a discard reached the drive because a tool reported bytes trimmed; never rely on DSM to produce zeros (use Write Zeroes); never deallocate as a security measure (use Sanitize or a cryptographic erase); never issue DSM concurrently with I/O to the same LBAs.</p>
+  </aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <table>
+    <caption>Hardware in deallocation</caption>
+    <thead><tr><th>Category</th><th>Components</th></tr></thead>
+    <tbody>
+      <tr><td>Must participate</td><td>CPU (list, SQE, doorbell), host DRAM (list buffer, queues), PCIe link, controller front end and DMA engine, FTL processor and mapping table</td></tr>
+      <tr><td>May participate</td><td>IOMMU (list address translation); Host Memory Buffer (map storage on DRAM-less drives, so unmapping causes device DMA to host memory unrelated to the list); NAND (journal writes for map changes); garbage collector (later)</td></tr>
+      <tr><td>Observable</td><td>DSM packets and list contents; DSM latency; effect on concurrent command latency; NUSE (if tracked); steady-state write performance; read-back results</td></tr>
+      <tr><td>Internal, unobservable</td><td>Mapping unit size (unless reported via NPDG), partial-unit handling, lazy trim queues, valid counts, when stale pages are physically erased</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw" data-title="Large mapping units change everything">
+    <p>High-density drives often map in units larger than 4 KiB (for example 16 KiB) to shrink their mapping tables. On such a drive a filesystem freeing scattered 4 KiB blocks may produce DSMs that free nothing, until three neighbouring blocks in the same unit are also freed. NPDG is the drive's way to say so; a host that ignores it sends work that has no effect <span class="badge impl">Implementation-dependent</span>.</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>Protocol elements of a DSM</caption>
+    <thead><tr><th>Element</th><th>Direction / class</th><th>Pairing</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Doorbell</td><td>Host→Device MWr32, posted</td><td>—</td><td>As for any command</td></tr>
+      <tr><td>SQE fetch</td><td>Device MRd64 → CplD</td><td>Tag</td><td>Opcode 09h, NR, attributes</td></tr>
+      <tr><td>List fetch</td><td>Device MRd64 → CplD(s)</td><td>Tag per request</td><td>(NR+1)×16 bytes; split at MRRS and 4 KiB boundaries; PRP2 needed if the list crosses a page</td></tr>
+      <tr><td>CQE</td><td>Device MWr64, posted</td><td>Command Identifier (CID)</td><td>One status for all ranges</td></tr>
+      <tr><td>MSI-X</td><td>Device MWr32</td><td>—</td><td>After CQE</td></tr>
+    </tbody>
+  </table>
+  <h3>Ordering and errors</h3>
+  <ul>
+    <li><strong>No ordering with I/O.</strong> A Read racing a DSM of the same LBA may return old data or the deallocated value; a Write racing it may be lost if the unmap is applied after it. Filesystems never discard blocks they might reuse until the discard completes; custom software must do the same.</li>
+    <li><strong>Error granularity.</strong> One status for the whole list; the host cannot know which ranges were processed. Because deallocation is idempotent, the safe retry is to resubmit only valid ranges.</li>
+    <li><strong>Typical statuses.</strong> Success; Invalid Field in Command (for example NR beyond DMRL, attribute problems — confirm which status your revision mandates for each); LBA Out of Range; Invalid Opcode if unsupported; Data Transfer Error if the list pull fails.</li>
+    <li><strong>Reads after deallocation.</strong> With DULBE enabled, a Read of a deallocated block completes with an error in the Media and Data Integrity Errors family and transfers no data for the command.</li>
+  </ul>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Four synthetic traces from the lab system (Gen4 x4, Max Payload Size (MPS) 256 B, MRRS 512 B; namespace 1 has 512-byte LBAs and NSZE 0x7470_6DB0; namespace 2 has 4 KiB LBAs). Times are illustrative; abbreviations as in <a href="ch35.html#trace">Chapter 35</a>.</p>
+
+  <h3>Normal: 256 ranges, list crossing a page boundary</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M33-N — DSM CID 0x0860, NR=FFh, list at IOVA 0x2_0002_0800">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000061 Req=RC</td><td>SQ1 tail: DSM in slot 0x60</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>750</td><td>MRd64</td><td>Addr=0x1_2340_1800 Len=16 Tag=0x60 Req=0x0100</td><td>SQE fetch (0x60 × 64 = 0x1800)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,310</td><td>CplD</td><td>BC=64 SC</td><td>opc 09h CID 0x0860 NSID 1 PRP1 0x2_0002_0800 PRP2 0x2_0007_4000 CDW10 0x000000FF CDW11 0x00000004</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,900</td><td>MRd64</td><td>Addr=0x2_0002_0800 Len=128 Tag=0x61</td><td>Ranges 0–31</td></tr>
+        <tr class="note"><td colspan="6">Rows 5–7: MRd64 at 0x2_0002_0A00, 0C00, 0E00 (ranges 32–127; the first page holds 2,048 bytes of list).</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>1,950</td><td>MRd64</td><td>Addr=0x2_0007_4000 Len=128 Tag=0x65</td><td>Ranges 128–159 from the second page (PRP2)</td></tr>
+        <tr class="note"><td colspan="6">Rows 9–11: MRd64 at 0x2_0007_4200, 4400, 4600 (ranges 160–255).</td></tr>
+        <tr class="dir-down"><td>12</td><td>Host→Dev</td><td>2,520</td><td>CplD</td><td>Len=64 Tag=0x61 BC=512 LA=0x00 SC Payload: 00000000 00000800 00120000 00000000 | 00000000 00001000 00140800 00000000 …</td><td>Range 0: Length 0x800 at SLBA 0x0012_0000; range 1: Length 0x1000 at SLBA 0x0014_0800</td></tr>
+        <tr class="note"><td colspan="6">Rows 13–27: 15 more CplDs of 256 B, two per tag, ending ≈3,800 ns. Total list = 4,096 B = 256 × 16.</td></tr>
+        <tr class="dir-up"><td>28</td><td>Dev→Host</td><td>41,200</td><td>MWr64</td><td>Addr=0x1_2341_0600 Len=4 SQHD=0x61 SQID=1 CID=0x0860 P=1 SC=00h</td><td>Success in ≈41 µs</td></tr>
+        <tr class="dir-up"><td>29</td><td>Dev→Host</td><td>41,360</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x00000041</td><td>MSI-X vector 1</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> The list sits at offset 0x800, so it touches two pages and the driver correctly supplied PRP2 as the second page; the controller's eight MRds split 4 + 4 at the page boundary. All ranges are multiples of 8 LBAs (4 KiB) and 8-aligned, matching an NPDG/NPDA of 8. The 37 µs between the last list CplD and the CQE covers validation of 256 ranges and journaling of the unmaps; a controller that processes large extents synchronously would take far longer (compare Trace 35-B). To verify the list fully you need CplD payloads in the capture; configure the analyzer to keep them for completions answering MRds to the PRP addresses.</p>
+  </div>
+
+  <h3>Slow: a continuous-discard storm</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M33-S — deleting a 40 GiB directory with continuous discard; database writes on the same queue">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ms)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Before row 1: database 4 KiB writes complete in ≈0.02 ms.</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.000</td><td>MWr32</td><td>SQ1 doorbells, ≈15 per ms</td><td>DSM commands, NR=00h (one range each), AD=1, CIDs 0x0A00…</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.001–0.003</td><td>MRd64 / CplD</td><td>16 B list per DSM</td><td>Each list is a single range of 1–4 MiB</td></tr>
+        <tr class="abnormal"><td>3</td><td>Dev→Host</td><td>0.410</td><td>MWr64</td><td>CQE for database Write CID 0x0B12 SC=00h</td><td>First abnormal event: a 4 KiB write took 0.39 ms (20× normal)</td></tr>
+        <tr class="note"><td colspan="6">For the next 1.3 s: ≈20,000 single-range DSMs, each completing in 0.06–0.1 ms; database writes interleaved on SQ1 complete in 0.2–0.6 ms; no errors.</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,302.5</td><td>MWr64</td><td>Last DSM CQE</td><td>Storm ends; write latency returns to 0.02 ms</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Each DSM is cheap; their number is the problem. With a fixed per-command cost and a controller that serialises DSM work with other commands on its FTL processor, 20,000 commands occupy it for over a second and every interleaved write queues behind a few of them (the advanced lab's model: about 1.3 s of device time for one range per command versus about 0.08 s at 256 ranges per command). Disambiguate: repeat the deletion with continuous discard disabled and run <code>fstrim</code> later; the database's latency during deletion should stay flat. Remedies: batched discard at quiet times, or a kernel and filesystem whose continuous discard is asynchronous and merged (behaviour differs between filesystems and kernel versions <span class="badge version">Version-dependent</span>).</p>
+  </div>
+
+  <h3>Failed: reads fail after trim because DULBE is enabled</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M33-F — backup tool reads the raw device; namespace 1 has DULBE enabled">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="note"><td colspan="6">Earlier: a validation script ran Set Features, Error Recovery (05h), with the DULBE enable bit set for namespace 1 and never cleared it. Last night's fstrim deallocated SLBA 0x0040_0000–0x0040_FFFF.</td></tr>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000111</td><td>Read CID 0x0910 in slot 0x110</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>750</td><td>MRd64</td><td>Addr=0x1_2340_4400 Len=16 Tag=0x12</td><td>SQE fetch</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,310</td><td>CplD</td><td>BC=64 SC</td><td>opc 02h NSID 1 SLBA 0x0040_0800 NLB 255 (128 KiB) PRP1 0x2_0090_0000 PRP2 = list</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,400</td><td>MRd64 / CplD</td><td>PRP list 248 B</td><td>Controller fetches the list…</td></tr>
+        <tr class="abnormal"><td>5</td><td>Dev→Host</td><td>6,900</td><td>MWr64</td><td>Addr=0x1_2341_1100 CID=0x0910 SCT=2h SC=(Deallocated or Unwritten Logical Block; value 87h in revisions the author has read — confirm) DNR=1</td><td>First abnormal event: error CQE with no data MWr for the command</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>7,050</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x00000041</td><td>MSI-X</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> No data was transferred and the status is in the Media and Data Integrity Errors family, so a quick reading says "media failure". The specific status says otherwise: the controller is reporting, as requested, that the blocks are deallocated. Evidence: <code>nvme get-feature -f 0x05 -n 1 -H</code> shows DULBE enabled; the range was in last night's trim list; SMART media-error counters did not move. The fix is to restore the intended Error Recovery setting (and make validation scripts restore features they change), or make the backup tool filesystem-aware so it does not read free space. DULBE is useful for thin-provisioning-aware software that wants to know a block was never written; it is hostile to tools that read the whole device.</p>
+  </div>
+
+  <h3>Ambiguous: old data after trim on a "zeros after trim" drive</h3>
+  <div class="trace" data-kind="synthetic" data-title="Trace M33-A — namespace 2 (4 KiB LBAs), DLFEAT 001b, NPDG = 4 (16 KiB)">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>SQ1 doorbell</td><td>DSM CID 0x0C01 NSID 2 NR=00h AD=1</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>2.4</td><td>CplD</td><td>BC=16 Payload: 00000000 00000001 00012345 00000000</td><td>One range: Length 1 at SLBA 0x0001_2345 (one 4 KiB block)</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>9.0</td><td>MWr64</td><td>CQE CID=0x0C01 SC=00h</td><td>Success</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>50.0</td><td>MWr32</td><td>SQ1 doorbell</td><td>Read CID 0x0C02 NSID 2 SLBA 0x0001_2345 NLB 0</td></tr>
+        <tr class="abnormal"><td>5</td><td>Dev→Host</td><td>128.0</td><td>MWr64 ×16</td><td>Data: old file contents (not zeros)</td><td>First abnormal event (relative to the tester's expectation): non-zero data</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>128.4</td><td>MWr64</td><td>CQE CID=0x0C02 SC=00h</td><td>Success</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Analysis.</strong> Two readings fit. (1) <em>Legal non-deallocation</em>: the range is one 4 KiB LBA inside a 16 KiB preferred unit (SLBA 0x12345 is not 4-aligned and Length 1 is less than NPDG); the controller may leave it mapped, and DLFEAT's zeros promise applies only to blocks it actually deallocated. (2) <em>Device bug</em>: the controller did deallocate (internally tracked the sub-unit) but returns stale data. The trace alone cannot separate them. Disambiguating experiment: deallocate the aligned unit SLBA 0x0001_2344, Length 4, then read 0x12345. Zeros → reading 1 is right and the host should align its discards (Linux does so when <code>discard_granularity</code> reflects NPDG). Old data again → the device breaks its DLFEAT promise for a fully deallocated unit: report it. Confidence before the experiment: medium that it is legal behaviour.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Read-only commands unless marked; output formats vary by version and are not reproduced.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Device capabilities: DSM support (ONCS bit 2), per-namespace deallocation features</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -iA12 '^oncs'
+sudo nvme id-ns /dev/nvme0n1 -H | grep -iE 'nsfeat|dlfeat|npdg|npda|nuse|ncap|nsze'
+
+<span class="cm"># NVM Command Set specific limits (DMRL, DMRSL, DMSL) - newer nvme-cli only</span>
+sudo nvme nvm-id-ctrl /dev/nvme0 2&gt;/dev/null
+
+<span class="cm"># Is DULBE enabled? Error Recovery feature (05h), per namespace</span>
+sudo nvme get-feature /dev/nvme0 -f 0x05 -n 1 -H
+
+<span class="cm"># What the block layer will send</span>
+lsblk -D /dev/nvme0n1
+grep . /sys/block/nvme0n1/queue/{discard_granularity,discard_max_bytes,discard_max_hw_bytes,max_discard_segments}
+
+<span class="cm"># Is discard continuous or batched here?</span>
+findmnt -no OPTIONS / | tr ',' '\n' | grep -i discard
+systemctl list-timers fstrim.timer 2&gt;/dev/null
+
+<span class="cm"># Does each stacked layer forward discards? (dm-crypt shows allow_discards in its table)</span>
+sudo dmsetup table 2&gt;/dev/null | grep -iE 'crypt|discard'
+
+<span class="cm"># Watch DSMs reach the driver (tracepoint enable changes kernel state; disable afterwards)</span>
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_setup_cmd/enable'
+sudo grep -m 10 nvme_cmd_dsm /sys/kernel/tracing/trace_pipe
+sudo sh -c 'echo 0 &gt; /sys/kernel/tracing/events/nvme/nvme_setup_cmd/enable'</code></pre>
+  <table>
+    <caption>What the outputs prove</caption>
+    <thead><tr><th>Output</th><th>Can prove</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td>ONCS, DLFEAT, NPDG/NPDA, NSFEAT</td><td>What the device claims to support and prefer</td><td>That small ranges are honoured; actual mapping unit</td></tr>
+      <tr><td>NUSE before/after a trim</td><td>On thin-provisioning-aware devices, that allocation dropped</td><td>Anything on devices that report NUSE statically</td></tr>
+      <tr><td>Feature 05h</td><td>Whether reads of deallocated blocks will error</td><td>Which blocks are deallocated</td></tr>
+      <tr><td><code>lsblk -D</code>, queue limits</td><td>Whether and how the kernel will issue discards to this device</td><td>Whether layers above forward them</td></tr>
+      <tr><td><code>fstrim -v</code> report</td><td>How much free space the filesystem asked to trim</td><td>That any DSM reached the SSD</td></tr>
+      <tr><td><code>nvme_cmd_dsm</code> tracepoints</td><td>DSMs left the driver with their NR and attributes</td><td>Range contents; what the device did</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout warn">
+    <p><code>blkdiscard</code>, <code>fstrim</code> and <code>nvme dsm --ad</code> destroy access to data in the ranges: <span class="badge caution">Caution lab</span> on scratch devices only. A wrong range in a hand-built DSM is silent data loss.</p>
+  </aside>
+</section>
+
+<section id="labs">
+  <h2>Labs</h2>
+
+  <h3>Beginner lab — encode a deallocation by hand</h3>
+  <p><span class="badge safe">Safe lab</span> Paper or Python prompt.</p>
+  <dl>
+    <dt>Objective</dt><dd>Turn byte extents into a correct DSM command and list.</dd>
+    <dt>Prerequisites</dt><dd><a href="ch35.html#engineering">Chapter 35 command format</a>.</dd>
+    <dt>Setup</dt><dd>Namespace 1 (512-byte LBAs), NPDG = NPDA = 8. Free extents (byte offsets on the namespace): [0x0100_0000, +64 KiB), [0x0300_0400, +3 KiB), [0x7_0000_0000, +1 MiB).</dd>
+    <dt>Procedure</dt><dd>Compute SLBA and Length for each; write CDW10 and CDW11; write the 48-byte list as little-endian Dwords; mark ranges that violate NPDG/NPDA.</dd>
+    <dt>Observations</dt><dd>Note which range a careful host would trim or round.</dd>
+    <dt>Questions</dt><dd>(1) Why is NR 2 and not 3? (2) What happens to the misaligned range on a drive that ignores sub-unit requests? (3) How many bytes will the controller fetch for the list?</dd>
+    <dt>Expected reasoning</dt><dd>Byte offset ÷ 512 = LBA; Length is a count; NR is 0's based.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>Range 0: SLBA 0x0000_8000, Length 128. Range 1: 0x0300_0400 / 512 = SLBA 0x0001_8002, Length 6 — not 8-aligned and not a multiple of 8: a careful host drops it or waits until the surrounding unit is free. Range 2: 0x7_0000_0000 / 512 = SLBA 0x0380_0000, Length 2048. CDW10 = 0x0000_0002 (three ranges), CDW11 = 0x0000_0004 (AD). List Dwords: (0, 0x80, 0x8000, 0), (0, 6, 0x18002, 0), (0, 0x800, 0x3800000, 0). (1) NR is 0's based. (2) Those 3 KiB stay mapped; reads return old data; garbage collection keeps copying them. (3) 48 bytes, one MRd.</p>
+  </details>
+  <p><strong>Extension.</strong> Recompute for namespace 2 (4 KiB LBAs, NPDG 4): which extents can be expressed at all?</p>
+
+  <h3>Intermediate lab — a range-list auditor</h3>
+  <p><span class="badge safe">Safe lab</span> Python 3, standard library.</p>
+  <dl>
+    <dt>Objective</dt><dd>Decode range lists as seen in CplD payloads and flag host mistakes before they reach a device.</dd>
+    <dt>Prerequisites</dt><dd>Beginner lab.</dd>
+    <dt>Setup</dt><dd>Save as <code>dsm_ranges.py</code>.</dd>
+  </dl>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="dsm_ranges.py"><code>#!/usr/bin/env python3
+"""dsm_ranges.py - decode and audit a Dataset Management range list.
+
+Synthetic teaching model (standard library only). Feed it the CDW10 value (NR, 0's based)
+and the bytes the controller fetched for the range list (as hex, little-endian, as the
+analyzer shows them). It decodes every 16-byte range and reports problems a host should
+never send: wrong list size, out-of-range LBAs, overlaps, and ranges the controller may
+not be able to deallocate because they ignore the preferred granularity/alignment.
+"""
+import struct
+
+NSZE = 0x7470_6DB0          # lab namespace 1, 512-byte LBAs
+NPDG, NPDA = 8, 8           # preferred deallocate granularity/alignment in LBAs (synthetic)
+
+def decode(cdw10, payload_hex):
+    nr = (cdw10 &amp; 0xFF) + 1
+    raw = bytes.fromhex(payload_hex.replace(" ", ""))
+    out = []
+    if len(raw) != nr * 16:
+        out.append(f"list is {len(raw)} B but NR={nr - 1} (0's based) needs {nr * 16} B")
+    ranges = []
+    for i in range(min(nr, len(raw) // 16)):
+        ctx, length, slba = struct.unpack_from("&lt;IIQ", raw, i * 16)
+        ranges.append((slba, length))
+        last = slba + length - 1
+        note = []
+        if length == 0:
+            note.append("Length 0 (check how your revision treats it)")
+        elif last &gt;= NSZE:
+            note.append(f"ends at 0x{last:X} beyond NSZE-1 = 0x{NSZE - 1:X} -&gt; LBA Out of Range")
+        if length and (slba % NPDA or length % NPDG):
+            note.append("not NPDG/NPDA aligned: may be only partly deallocated")
+        if ctx:
+            note.append(f"context attributes 0x{ctx:08X} (hints)")
+        out.append(f"range {i}: SLBA 0x{slba:X} Length {length} LBAs ({length * 512} B)"
+                   + ("; " + "; ".join(note) if note else ""))
+    spans = sorted((s, s + n) for s, n in ranges if n)
+    for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
+        if b0 &lt; a1:
+            out.append(f"overlap: [0x{a0:X},0x{a1:X}) and [0x{b0:X},0x{b1:X})")
+    return out
+
+if __name__ == "__main__":
+    payload = ("00000000 08000000 00100000 00000000"     # ctx 0, Length 8, SLBA 0x1000
+               "00000000 06000000 03200000 00000000"     # Length 6 at SLBA 0x2003
+               "00000000 00080000 00090000 00000000"     # Length 0x800 at SLBA 0x900 (!)
+               "00000000 10000000 00040000 00000000")    # Length 16 at SLBA 0x400
+    for line in decode(0x00000003, payload):
+        print(line)</code></pre>
+  <dl>
+    <dt>Procedure</dt><dd>(1) Run it. (2) Explain why range 2 is at SLBA 0x900 although its author meant 0x9000. (3) Feed it the payload of Trace 35-C's range 3 and confirm the out-of-range finding. (4) Add a DMRSL check (maximum Length per range) and a DMSL check (sum of Lengths).</dd>
+    <dt>Observations</dt><dd>Which finding would destroy live data on a real device?</dd>
+    <dt>Questions</dt><dd>(a) Why is the payload byte order the most common source of decoding errors? (b) Why is overlap not an error the device must reject?</dd>
+    <dt>Expected reasoning</dt><dd>Analyzers show bytes; ranges are little-endian fields.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>Output: ranges 0 and 3 clean; range 1 misaligned; range 2 at SLBA 0x900 Length 2048; an overlap between range 2 [0x900, 0x1100) and range 0 [0x1000, 0x1008). (2) The bytes <code>00 09 00 00</code> read little-endian are 0x0000_0900; 0x9000 would be <code>00 90 00 00</code>. That slip deallocates 0x900–0x10FF, which may include live data: the destructive finding. (3) Trace 35-C's range (Length 0x20 at 0x7470_6DA0) ends at 0x7470_6DBF ≥ NSZE. (b) Deallocating a block twice is idempotent; the problem is that one of the two ranges is probably wrong. For (4), add <code>if length &gt; DMRSL</code> and accumulate a total compared with DMSL, both skipped when the limit is zero (no limit reported); confirm the units in the NVM Command Set specification.</p>
+  </details>
+  <p><strong>Extension.</strong> Read a hex dump file of many DSM list payloads and output a heat map of deallocated LBAs per GiB.</p>
+
+  <h3>Advanced lab — discard policy and latency</h3>
+  <p><span class="badge safe">Safe lab</span> Python 3, standard library.</p>
+  <dl>
+    <dt>Objective</dt><dd>Quantify the trade-off between command count and per-command blocking.</dd>
+    <dt>Prerequisites</dt><dd>Trace M33-S and Trace 35-B.</dd>
+    <dt>Setup</dt><dd>Save as <code>discard_policy.py</code>.</dd>
+  </dl>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="discard_policy.py"><code>#!/usr/bin/env python3
+"""discard_policy.py - continuous, batched, or one huge discard?
+
+Synthetic teaching model (standard library only). A filesystem frees EXTENTS extents.
+The device charges a fixed cost per DSM command plus a cost per range and per GiB
+unmapped, and (in this model) serialises DSM work with other commands on the same
+internal FTL core, so a concurrent read waits for the DSM in progress.
+All costs are illustrative, not measured.
+"""
+EXTENTS, GIB_TOTAL = 20_000, 40.0
+T_CMD_US, T_RANGE_US, T_GIB_US = 60.0, 2.0, 900.0
+
+def policy(ranges_per_cmd, extents=EXTENTS):
+    cmds = -(-extents // ranges_per_cmd)              # ceiling division
+    gib_per_cmd = GIB_TOTAL / cmds
+    per_cmd = T_CMD_US + ranges_per_cmd * T_RANGE_US + gib_per_cmd * T_GIB_US
+    return cmds, cmds * per_cmd / 1000, per_cmd / 1000   # count, busy ms, worst read stall ms
+
+if __name__ == "__main__":
+    print(f"{'ranges/cmd':&gt;10} {'commands':&gt;9} {'device busy':&gt;12} {'worst read stall':&gt;17}")
+    for r in (1, 16, 256):
+        cmds, busy, stall = policy(r)
+        print(f"{r:&gt;10} {cmds:&gt;9} {busy:&gt;9.1f} ms {stall:&gt;14.3f} ms")
+    cmds, busy, stall = policy(1, extents=1)          # the same 40 GiB as ONE contiguous extent
+    print(f"{'1 (40 GiB)':&gt;10} {cmds:&gt;9} {busy:&gt;9.1f} ms {stall:&gt;14.3f} ms")</code></pre>
+  <dl>
+    <dt>Procedure</dt><dd>(1) Run it. (2) Set <code>T_GIB_US</code> to 50 (a controller that journals big extents lazily) and rerun. (3) Add a policy that splits any range above 1 GiB (a <code>discard_max_bytes</code> limit) and report the worst stall.</dd>
+    <dt>Observations</dt><dd>Which policy minimises total device time, and which minimises the worst stall?</dd>
+    <dt>Questions</dt><dd>(a) Why are those two different policies? (b) Which one does Trace 35-B correspond to, and which Trace M33-S?</dd>
+    <dt>Expected reasoning</dt><dd>Fixed per-command cost favours batching; per-GiB synchronous cost inside one command favours splitting.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>Default output: 1 range per command → 20,000 commands, ≈1,276 ms busy, 0.064 ms worst stall; 256 per command → 79 commands, ≈81 ms busy, ≈1.0 ms worst stall; one 40 GiB extent → 36 ms busy, but a 36 ms stall. (a) Batching amortises fixed cost; splitting bounds the time any one command holds the FTL. The best practice combines them: many ranges per command, each range capped in size. (b) Trace 35-B is the huge-extent stall; Trace M33-S is the many-small-commands storm. With <code>T_GIB_US</code> = 50, the huge extent becomes harmless — which is why the same fstrim is fine on one drive and painful on another.</p>
+  </details>
+  <p><strong>Extension.</strong> Add a concurrent read stream with Poisson arrivals and compute its 99th-percentile latency under each policy.</p>
+
+  <h3>Senior forensic lab — the thin pool that never shrinks</h3>
+  <p><span class="badge safe">Safe lab</span> Evidence analysis.</p>
+  <dl>
+    <dt>Objective</dt><dd>Find where discards die in a layered stack and weigh the security trade-off of fixing it.</dd>
+    <dt>Prerequisites</dt><dd>This module.</dd>
+    <dt>Setup (evidence pack, synthetic)</dt><dd>
+      <ul>
+        <li>Database hosts on encrypted volumes: filesystem → dm-crypt → LVM → NVMe namespace. Over months, steady-state write latency doubled and the drives' over-provisioning appears exhausted.</li>
+        <li>A weekly <code>fstrim</code> reports "trimmed 1.8 TiB" every week.</li>
+        <li>NVMe tracepoints during fstrim: zero <code>nvme_cmd_dsm</code> commands.</li>
+        <li><code>lsblk -D</code> shows non-zero discard granularity for the NVMe namespace but zero for the dm-crypt device.</li>
+        <li><code>dmsetup table</code> for the crypt mapping has no <code>allow_discards</code> option.</li>
+        <li>Identify Namespace: NPDG = 8; DLFEAT = 001b; NUSE equals NCAP and never changes.</li>
+      </ul></dd>
+    <dt>Procedure</dt><dd>Identify the first layer that drops discards; decide owner and fix; state the trade-off and the verification.</dd>
+    <dt>Observations</dt><dd>Contrast what <code>fstrim</code> reports with what reaches the driver.</dd>
+    <dt>Questions</dt><dd>(1) Why does fstrim report success? (2) What does enabling discards through encryption reveal to an attacker with the raw drive? (3) How do you verify the fix?</dd>
+    <dt>Expected reasoning</dt><dd>A layer that does not advertise discard support makes the block layer return without sending anything downstream.</dd>
+  </dl>
+  <details class="solution"><summary>Solution</summary>
+    <p>The dm-crypt mapping does not allow discards, so the discard stops there; the filesystem's fstrim reports the free space it <em>asked</em> to trim (and in some versions the kernel reports nothing sent). The SSD therefore believes almost all LBAs are live, garbage collection copies dead data, and write amplification rises — the latency doubling. Owner: platform storage configuration. Fix: enable discards on the crypt mapping (and any other stacked layer), then run fstrim once and verify with DSM tracepoints and steady-state write latency. NUSE gives no evidence here because this drive reports it statically. Trade-off: discards through encryption reveal which blocks are free (and thus file-size and allocation patterns) to someone with the raw device; many organisations accept that, some do not — document the decision. Confidence: high.</p>
+  </details>
+  <p><strong>Extension.</strong> Write the monitoring check that would have caught this: periodic comparison of filesystem-reported trims with device DSM counts.</p>
+</section>
+
+<section id="debugging">
+  <h2>Debugging</h2>
+  <p>Six patterns beyond <a href="ch35.html#debugging">Chapter 35</a>'s five.</p>
+
+  <h3>Trim reports success; drive performance keeps degrading</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Steady-state write latency rises over months despite weekly fstrim.</dd>
+    <dt>Possible causes</dt><dd>Discards dropped by a stacked layer; filesystem discard disabled; ranges below NPDG ignored; drive simply full.</dd>
+    <dt>Evidence</dt><dd>DSM tracepoints during fstrim; <code>lsblk -D</code> per layer; NPDG; filesystem fill level.</dd>
+    <dt>First check</dt><dd>Do any DSMs reach the NVMe driver during fstrim?</dd>
+    <dt>Second check</dt><dd>If yes, are range sizes and alignments compatible with NPDG?</dd>
+    <dt>Disambiguating experiment</dt><dd>On a test system, blkdiscard a large aligned scratch area and measure steady-state write latency before and after.</dd>
+    <dt>Likely conclusion</dt><dd>A non-forwarding layer (senior lab).</dd>
+    <dt>Confidence</dt><dd>High once tracepoints show zero DSMs.</dd>
+  </dl>
+
+  <h3>Latency storm during deletes</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Trace M33-S.</dd>
+    <dt>Possible causes</dt><dd>Continuous discard producing many small DSMs; synchronous controller unmap; queue sharing.</dd>
+    <dt>Evidence</dt><dd>DSM count per second, NR per DSM, DSM latency, interleaved write latency.</dd>
+    <dt>First check</dt><dd>Is the filesystem mounted with continuous discard?</dd>
+    <dt>Second check</dt><dd>Average ranges per DSM (tracepoint NR).</dd>
+    <dt>Disambiguating experiment</dt><dd>Same deletion with batched discard later.</dd>
+    <dt>Likely conclusion</dt><dd>Policy, not a defect.</dd>
+    <dt>Confidence</dt><dd>High.</dd>
+  </dl>
+
+  <h3>Reads fail on recently freed space</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Trace M33-F; errors look like media errors.</dd>
+    <dt>Possible causes</dt><dd>DULBE enabled; genuine media errors; reading unwritten LBAs after a namespace was formatted.</dd>
+    <dt>Evidence</dt><dd>Exact status code; feature 05h; SMART media-error counter; trim history.</dd>
+    <dt>First check</dt><dd>Decode the status precisely (not just the type).</dd>
+    <dt>Second check</dt><dd>Feature 05h DULBE for the namespace.</dd>
+    <dt>Disambiguating experiment</dt><dd>Write the LBA and read it again: success means it was a deallocated block, not damaged media.</dd>
+    <dt>Likely conclusion</dt><dd>Configuration leftover.</dd>
+    <dt>Confidence</dt><dd>High.</dd>
+  </dl>
+
+  <h3>Old data returned after trim</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Trace M33-A on a DLFEAT 001b drive.</dd>
+    <dt>Possible causes</dt><dd>Sub-granular range; discard not delivered; deallocation undone by power loss before Flush; read racing the DSM; device bug.</dd>
+    <dt>Evidence</dt><dd>Range alignment vs NPDG/NPDA; DSM tracepoint; power events; I/O timing.</dd>
+    <dt>First check</dt><dd>Was the range a whole aligned unit?</dd>
+    <dt>Second check</dt><dd>Did the DSM complete before the read was submitted?</dd>
+    <dt>Disambiguating experiment</dt><dd>Deallocate the aligned unit and re-read.</dd>
+    <dt>Likely conclusion</dt><dd>Usually granularity.</dd>
+    <dt>Confidence</dt><dd>Medium until the experiment.</dd>
+  </dl>
+
+  <h3>DSM rejected after a firmware update</h3>
+  <dl>
+    <dt>Symptom</dt><dd>Every large fstrim DSM fails with Invalid Field in Command (or similar) after updating the drive.</dd>
+    <dt>Possible causes</dt><dd>New firmware reports DMRL/DMRSL/DMSL limits the kernel does not yet honour; older kernels ignore those fields.</dd>
+    <dt>Evidence</dt><dd><code>nvme nvm-id-ctrl</code> before/after; NR and range sizes in failing commands.</dd>
+    <dt>First check</dt><dd>Compare failing NR with DMRL and range lengths with DMRSL.</dd>
+    <dt>Second check</dt><dd>Kernel version support for those limits.</dd>
+    <dt>Disambiguating experiment</dt><dd>Lower <code>discard_max_bytes</code> (writable on many kernels) and retry.</dd>
+    <dt>Likely conclusion</dt><dd>Host not honouring newly reported limits <span class="badge version">Version-dependent</span>.</dd>
+    <dt>Confidence</dt><dd>Medium to high.</dd>
+  </dl>
+
+  <h3>Space not reclaimed in a thin-provisioned namespace</h3>
+  <dl>
+    <dt>Symptom</dt><dd>A thin-provisioned namespace's NUSE stays high after deleting most data.</dd>
+    <dt>Possible causes</dt><dd>Discards not forwarded; sub-granular ranges; controller reclaims lazily and updates NUSE later; NUSE not dynamically tracked by this controller.</dd>
+    <dt>Evidence</dt><dd>NSFEAT thin-provisioning support; NUSE over time; DSM tracepoints.</dd>
+    <dt>First check</dt><dd>Does the namespace report thin provisioning at all?</dd>
+    <dt>Second check</dt><dd>Does NUSE change after a large aligned blkdiscard on a scratch range?</dd>
+    <dt>Disambiguating experiment</dt><dd>Measure NUSE immediately and an hour after a known DSM.</dd>
+    <dt>Likely conclusion</dt><dd>Either forwarding or lazy accounting; the experiment separates them.</dd>
+    <dt>Confidence</dt><dd>Medium.</dd>
+  </dl>
+</section>
+
+<section id="interview">
+  <h2>Interview</h2>
+  <h3>Beginner</h3>
+  <ol>
+    <li><p>What does Deallocate tell the drive?</p><details class="answer"><summary>Model answer</summary><p>That the host no longer needs the data in the listed LBA ranges, so the FTL may unmap them and garbage collection may stop preserving them.</p></details></li>
+    <li><p>Is NR 0's based? Is Length?</p><details class="answer"><summary>Model answer</summary><p>NR is 0's based; each range's Length is a plain count of LBAs.</p></details></li>
+    <li><p>Does a trimmed block read as zeros?</p><details class="answer"><summary>Model answer</summary><p>Only if DLFEAT reports 001b and the block was actually deallocated; with 000b nothing is promised.</p></details></li>
+    <li><p>Is deallocation a secure erase?</p><details class="answer"><summary>Model answer</summary><p>No; old pages persist until garbage collection erases them. Use Sanitize or cryptographic erase.</p></details></li>
+    <li><p>Which way does the range list travel on PCIe?</p><details class="answer"><summary>Model answer</summary><p>Host to device, pulled by the controller with Memory Reads, like write data.</p></details></li>
+  </ol>
+  <h3>Intermediate</h3>
+  <ol>
+    <li><p>A 4 KiB range list starts at offset 0x800 in a page. How is it described and fetched?</p><details class="answer"><summary>Model answer</summary><p>PRP1 at the list, PRP2 the second page; 8 MRds of 512 B, 4 per page.</p></details></li>
+    <li><p>Why does NPDG matter to Linux?</p><details class="answer"><summary>Model answer</summary><p>It sets discard_granularity so the block layer aligns and sizes discards to units the drive can free.</p></details></li>
+    <li><p>What is DULBE and when is it useful?</p><details class="answer"><summary>Model answer</summary><p>An Error Recovery setting making reads of deallocated blocks fail; useful for software that must distinguish never-written data, harmful to whole-device readers.</p></details></li>
+    <li><p>When should you use Write Zeroes instead of DSM?</p><details class="answer"><summary>Model answer</summary><p>When the host needs guaranteed zeros on read-back; Write Zeroes may still deallocate internally when allowed.</p></details></li>
+    <li><p>Why is a failed DSM hard to retry correctly?</p><details class="answer"><summary>Model answer</summary><p>One status covers all ranges; the host cannot know which were processed. Resubmit valid ranges; deallocation is idempotent.</p></details></li>
+  </ol>
+  <h3>Advanced</h3>
+  <ol>
+    <li><p>Explain continuous versus batched discard trade-offs.</p><details class="answer"><summary>Model answer</summary><p>Continuous informs the drive early but issues many small commands with fixed costs; batched amortises cost but delays information and can produce huge extents that stall synchronous controllers. Combine batching with range-size caps.</p></details></li>
+    <li><p>Why should deallocation be followed by Flush when it must survive power loss?</p><details class="answer"><summary>Model answer</summary><p>The map change may be in volatile memory like cached write data; without Flush a power loss can revert it, making old data reappear.</p></details></li>
+    <li><p>How do large mapping units affect deallocation?</p><details class="answer"><summary>Model answer</summary><p>Only whole units can be freed; scattered small frees accomplish nothing until neighbours are freed; NPDG reports the preferred unit.</p></details></li>
+    <li><p>What evidence proves a discard reached the SSD?</p><details class="answer"><summary>Model answer</summary><p>A DSM at the NVMe driver tracepoint or on the link with the expected ranges; filesystem reports are not proof.</p></details></li>
+    <li><p>Why might a DRAM-less drive show device-initiated host-memory traffic during big deallocations?</p><details class="answer"><summary>Model answer</summary><p>Its map lives partly in the Host Memory Buffer; updating map entries means DMA to host memory unrelated to the range list.</p></details></li>
+  </ol>
+  <h3>Senior</h3>
+  <ol>
+    <li><p>Design a validation plan for DSM.</p><details class="answer"><summary>Model answer</summary><p>NR 0, 255 and above DMRL; ranges at LBA 0, NSZE−1, beyond; zero-length and overlapping ranges; aligned/unaligned to NPDG/NPDA; read-back per DLFEAT; DULBE on/off; list at page offsets and via SGL; concurrent I/O latency; power loss after DSM with and without Flush; steady-state write performance before/after.</p></details></li>
+    <li><p>Should encrypted volumes pass discards?</p><details class="answer"><summary>Model answer</summary><p>It is a trade-off between SSD health/performance and leaking free-space patterns; decide explicitly per threat model and document it.</p></details></li>
+    <li><p>A customer says trim corrupted their data. How do you investigate?</p><details class="answer"><summary>Model answer</summary><p>Capture DSM ranges and compare with the files' extents; look for byte-order or 0's-based errors, stale extent maps after resize, racing writes; only then examine device unmap logic.</p></details></li>
+    <li><p>How would you set fleet-wide discard policy?</p><details class="answer"><summary>Model answer</summary><p>Batched trims at quiet times with range-size caps, verified by DSM counters; continuous discard only where filesystems implement it asynchronously and drives handle it well; monitoring that compares filesystem trims to device DSMs.</p></details></li>
+    <li><p>How does deallocation interact with ZNS?</p><details class="answer"><summary>Model answer</summary><p>Zoned namespaces reclaim space per zone with Zone Management reset; LBA-granular deallocation is not the mechanism there (see the ZNS module).</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>A 256-range list is at IOVA 0x2_0002_0F00. How many pages does it touch?</p>
+      <ul class="options" data-answer="2"><li>1</li><li>2</li><li>3</li><li>4</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>256 B in the first page, 3,840 B in the second: two pages.</p></details>
+    </li>
+    <li>
+      <p>DLFEAT bits 2:0 = 000b. After deallocating LBA X, a read returns:</p>
+      <ul class="options" data-answer="4"><li>Zeros</li><li>FFh bytes</li><li>An error</li><li>Unspecified data</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>000b means not reported; nothing may be assumed (DULBE would make it an error if enabled).</p></details>
+    </li>
+    <li>
+      <p>Which command guarantees zeros on read-back?</p>
+      <ul class="options" data-answer="1"><li>Write Zeroes</li><li>DSM with AD</li><li>Flush</li><li>DSM with IDW</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Write Zeroes is defined to return zeros.</p></details>
+    </li>
+    <li>
+      <p>A DSM fails with LBA Out of Range. Which ranges were processed?</p>
+      <ul class="options" data-answer="3"><li>None</li><li>All except the bad one</li><li>Unknown from the status</li><li>Those before the bad one</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>No per-range status exists.</p></details>
+    </li>
+    <li>
+      <p>The bytes <code>00 90 00 00 00 00 00 00</code> in a range's SLBA field mean SLBA =</p>
+      <ul class="options" data-answer="2"><li>0x0090_0000</li><li>0x0000_9000</li><li>0x9000_0000_0000_0000</li><li>0x0000_0090</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Little-endian: least significant byte first.</p></details>
+    </li>
+    <li>
+      <p>Twenty thousand single-range DSMs versus 79 DSMs of 256 ranges for the same extents: the main cost difference is</p>
+      <ul class="options" data-answer="1"><li>Fixed per-command overhead</li><li>PCIe bandwidth for the lists</li><li>NAND erase time</li><li>Interrupt count only</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Lists are tiny; per-command processing dominates.</p></details>
+    </li>
+    <li><p>Why is "fstrim trimmed 1.8 TiB" not evidence that the SSD learned anything?</p><details class="answer"><summary>Model answer</summary><p>It reports what the filesystem requested; a lower layer may have dropped the discards. Only DSMs at the driver or on the link prove delivery.</p></details></li>
+    <li><p>Name two legal reasons for old data after trim on a DLFEAT 001b drive.</p><details class="answer"><summary>Model answer</summary><p>The range did not cover a whole mapping unit so it was not deallocated; a power loss reverted an unflushed deallocation. (A racing write is a third.)</p></details></li>
+    <li><p>What does a Read error with the Deallocated or Unwritten Logical Block status tell you?</p><details class="answer"><summary>Model answer</summary><p>DULBE is enabled and the LBA is deallocated or never written; not a media failure.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back</h2>
+  <ol>
+    <li><p><strong>To a child:</strong> why telling the toy librarian about unwanted toys makes her faster.</p>
+      <details class="answer"><summary>Model explanation</summary><p>When she cleans a shelf she must carry every wanted toy to a new shelf first. If you tell her which toys you don't want, she carries fewer, so she has more time to lend toys.</p></details></li>
+    <li><p><strong>To a junior engineer:</strong> how to tell whether trim is working on a server.</p>
+      <details class="answer"><summary>Model explanation</summary><p>Check the drive supports DSM (ONCS bit 2) and its NPDG; check <code>lsblk -D</code> on every layer from the filesystem down; enable the NVMe setup tracepoint and run fstrim; you should see <code>nvme_cmd_dsm</code> commands. If you see none, a layer is dropping them. Then watch steady-state write latency over time.</p></details></li>
+    <li><p><strong>To a senior engineer:</strong> why deallocation is a cross-layer contract, not a command.</p>
+      <details class="answer"><summary>Model explanation</summary><p>Its value depends on information surviving every layer, matching the FTL's mapping unit, arriving at a rate and size the controller can process without stalling I/O, being made durable like any other metadata change, and being interpreted on read-back exactly as DLFEAT and DULBE say. Each property is owned by a different layer, so the review must cover filesystem policy, stacked-device configuration, block-layer limits, controller behaviour and the security posture of exposing free space.</p></details></li>
+  </ol>
+</section>
+
+<section id="mastery">
+  <h2>Mastery gate</h2>
+  <aside class="callout mastery">
+    <p>Do not consider this module mastered until you can:</p>
+    <ul class="checklist">
+      <li>explain effective deallocation: delivery, granularity, policy, durability and read-back semantics;</li>
+      <li>diagram the discard path through every software layer and the controller;</li>
+      <li>identify a DSM in a trace, decode its list from CplD payloads, and spot a DULBE completion;</li>
+      <li>debug the six patterns above with their disambiguating experiments;</li>
+      <li>distinguish deallocation from Write Zeroes and Sanitize (<a href="ch35.html#engineering">Chapter 35</a>), from Flush (<a href="dd32.html">Deep dive: FLUSH</a>), and from zone reset (<a href="dd44.html">Deep dive: ZNS</a>);</li>
+      <li>cite the NVM Command Set Specification 1.3 and NVMe Base Specification 2.4 sections by name for each claim.</li>
+    </ul>
+  </aside>
+  <p>Next: <a href="dd34.html">Deep dive: PRP</a>.</p>
+</section>

@@ -1,0 +1,1011 @@
+<p class="lead">A WRITE runs the end-to-end journey with the data flowing the other way. That one change rearranges the whole trace: the controller must <em>pull</em> the data with Memory Read requests and Completions, the flash work moves to after the completion, and a new question appears that a read never asks: when the drive says "done", is the data actually safe? This chapter follows an 8 KiB direct write on the lab system and then answers that question with write caching, Force Unit Access and Flush.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>In <a href="ch39.html">The Most Important Chapter</a> you followed a READ through seventeen stages. A WRITE shares the first eight stages almost exactly, so it is tempting to think of it as "a read in reverse." It is not. Three things change in ways that matter for trace analysis and for correctness:</p>
+  <ul>
+    <li><strong>The data path flips from posted to non-posted.</strong> For a read, the controller pushes data with posted Memory Write (MWr) Transaction Layer Packets (TLPs) on the Peripheral Component Interconnect Express (PCIe) link. For a write, it must ask for the data with non-posted Memory Read (MRd) requests, and the root complex answers with Completions with Data (CplD). Tags, <span class="g" data-term="mrrs">Maximum Read Request Size (MRRS)</span>, <span class="g" data-term="rcb">Read Completion Boundary (RCB)</span> and completion splitting suddenly matter.</li>
+    <li><strong>The flash work moves.</strong> A read must touch NAND before it can complete. A write usually completes as soon as the data is in the controller's write cache; the NAND program happens later, invisibly, and may take a thousand times longer than the command did.</li>
+    <li><strong>Durability becomes a protocol question.</strong> With a volatile write cache, a successful completion does not mean the data survives a power loss. <span class="g" data-term="fua">Force Unit Access (FUA)</span> and the Flush command are how the host closes that gap, and file systems depend on them for crash consistency.</li>
+  </ul>
+  <p>Engineers who understand reads but not these three differences misread write traces ("why are there so many completions?"), misjudge write latency ("why is a write faster than a read?") and miss a whole class of data-loss bugs. This chapter fixes that.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Narrate the seventeen stages of an 8 KiB NVM Express (NVMe) WRITE, and say for each how it differs from the READ.</li>
+    <li>Compute the Submission Queue Entry (SQE), doorbell and Completion Queue Entry (CQE) addresses and values for the write on the lab system.</li>
+    <li>Predict the controller's data-pull Memory Read requests from PRP1, PRP2 and MRRS, and the Completions the root complex may return under Max Payload Size (MPS) and RCB rules, including Byte Count and Lower Address.</li>
+    <li>Explain why a cached write typically completes faster than a read, and where the NAND program time goes.</li>
+    <li>Explain the Volatile Write Cache, FUA and Flush, how Linux maps <code>O_DSYNC</code> and <code>fsync()</code> onto them, and what each costs.</li>
+    <li>Read a write trace with an Input/Output Memory Management Unit (IOMMU) fault in the data pull, find the first abnormal event, and trace it back to the evidence that was already in the SQE.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <ul>
+      <li>The complete READ journey: <a href="ch39.html">The Most Important Chapter</a>. This chapter does not repeat what is identical.</li>
+      <li>The WRITE command fields: <a href="ch33.html">WRITE</a>; the Flush command: <a href="ch34.html">FLUSH</a>.</li>
+      <li>Non-posted reads, completions, tags: <a href="ch12.html">Posted vs Non-Posted Transactions</a>, <a href="ch13.html">PCIe Tags and Outstanding Requests</a>.</li>
+      <li>Completion splitting and RCB: <a href="ch52.html">Completion Rules</a> (forward reference; the essentials are repeated here).</li>
+      <li>Physical Region Page (PRP) rules for two-page transfers: <a href="ch36.html">Physical Region Pages</a>.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>This time Mia has drawn two pages of a comic and wants the library to keep them forever. The teacher writes a slip ("please file these two pages in shelf 1, starting at page 80; they are on table 6") and rings the buzzer.</p>
+    <p>The runner comes and takes the slip. But the pages are still on table 6 in the classroom, so the runner has to come back and ask for them. Because the runner's bag only fits a few sheets per trip-ticket, he writes sixteen little tickets ("give me sheets 1 and 2", "sheets 3 and 4"…) and the teacher's helpers hand the sheets over, sometimes in two handfuls per ticket.</p>
+    <p>Back at the library, the runner drops the pages into the "to be filed" tray right next to the front desk and immediately sends a "done!" card and flicks the lights. The librarian files them in the basement later, when there is a big stack to carry down. If the teacher says "file it in the basement <em>before</em> you say done," it takes much longer. And if the teacher says "please file everything in your tray right now," the librarian empties the whole tray before answering.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>Sending documents to a bank's archive. You fill in a deposit form (the command) and put it in the outgoing tray; you call the bank (doorbell). The bank's courier collects the form, sees "documents are on desk 6," and makes several collection runs, each with a numbered receipt, to bring the documents back (Memory Reads with tags, answered by Completions). At the branch, a clerk puts them in the branch safe (the volatile write cache) and phones you: "received" (completion and interrupt). Overnight, the branch sends everything to the central vault (the NAND program). If the branch catches fire before the overnight run, documents only in the branch safe are lost, unless the branch has a fire-proof safe with its own generator (power-loss protection). "Store this directly in the vault before you call me" is FUA; "send everything in your safe to the vault now and call me when done" is Flush.</p>
+  </aside>
+  <aside class="callout breaks">
+    <ul>
+      <li><strong>Collection runs overlap.</strong> The controller has many read requests outstanding at once, and completions for different tags can come back in any order. A courier making sequential trips hides this.</li>
+      <li><strong>The receipts are not the deposit number.</strong> PCIe tags identify read requests and are reused within microseconds; the NVMe Command Identifier identifies the command. The analogy tempts you to merge them.</li>
+      <li><strong>The "branch safe" is not one thing.</strong> Some drives have no volatile cache at all, some have cache backed by capacitors, some have a volatile cache that the host can disable. The specification lets the drive report which; the analogy suggests every bank works the same way.</li>
+      <li><strong>Nothing tells you when the overnight run happens.</strong> NVMe exposes no event for "data is now on NAND" except FUA and Flush completions.</li>
+      <li><strong>The customer must not touch the documents.</strong> Until the completion, the host buffer belongs to the controller, which may read it at any time, more than once. A real customer could rewrite the papers on the desk after the courier left; a host that changes the buffer mid-command gets a mixture on media.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>To write, the driver again places a 64-byte command in a submission queue and rings a doorbell. The command says "write 16 logical blocks starting at this logical block address (LBA), and the data is in host memory at these addresses." The controller fetches the command exactly as for a read.</p>
+  <p>Now the difference: the data is in host memory, and only the controller can move it. So the controller sends read requests to host memory ("give me 512 bytes from this address"), and host memory answers with completion packets that carry the bytes. When all the bytes have arrived inside the drive, the drive puts them in its fast internal memory (the write cache), writes a completion entry, and raises an interrupt (an MSI-X message: Message Signaled Interrupts eXtended). The driver tells the application the write succeeded.</p>
+  <p>The slow part, programming the flash, has not happened yet. The drive does it later, in the background, usually after collecting enough data to fill a large flash page. That is why a write can finish in about 11 µs on our lab system while a read took 65 µs. It is also why there are special ways to say "really make it permanent before you answer": the FUA bit on a write, or a separate Flush command.</p>
+  <figure>
+    <div class="flow">
+      <div>Application<small>pwrite(fd, buf, 8192, 0x80000) with O_DIRECT</small></div>
+      <div>File system and block layer<small>offset → sector 0x204000; REQ_OP_WRITE, tag 0x31</small></div>
+      <div class="hl">NVMe driver<small>Write SQE in SQ1 slot 6, PRP1 + PRP2, doorbell 7</small></div>
+      <div>PCIe link<small>doorbell MWr ↓, SQE MRd ↑ / CplD ↓, 16 data MRd ↑ / 32 CplD ↓, CQE + MSI-X ↑</small></div>
+      <div class="hl">NVMe controller<small>write cache → completion now; NAND program later</small></div>
+      <div>NAND flash<small>program when a full programming unit is gathered</small></div>
+    </div>
+    <figcaption>The write's vertical slice. The arrows on the link show the reversed data direction.</figcaption>
+  </figure>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+  <h3>The scenario and its numbers</h3>
+  <table>
+    <caption>Scenario parameters for the end-to-end WRITE (synthetic example for teaching)</caption>
+    <thead><tr><th>Item</th><th>Value</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Application call</td><td><code>pwrite(fd, buf, 8192, 0x80000)</code>, <code>O_DIRECT</code>, overwrite of already-allocated blocks</td><td>No file-system metadata change needed</td></tr>
+      <tr><td>Device location</td><td>sector 0x0020_4000 (512-byte), namespace 1</td><td>Starting LBA (SLBA) 0x0020_4000; Number of Logical Blocks (NLB) field 15 (16 blocks)</td></tr>
+      <tr><td>Block tag / Command Identifier (CID)</td><td>tag 0x31, CID 0x1031</td><td>CID encoding as in <a href="ch39.html">ch39</a> <span class="badge impl">Implementation-dependent</span></td></tr>
+      <tr><td>Buffer</td><td>two physically separate 4 KiB pages, mapped by the IOMMU to contiguous I/O virtual addresses (IOVA) 0x2_0000_8000–0x2_0000_9FFF</td><td>IOMMU direct memory access (DMA) mapping may merge pages into one IOVA range</td></tr>
+      <tr><td>PRP1 / PRP2</td><td>0x2_0000_8000 / 0x2_0000_9000</td><td>Two pages: PRP2 points directly at the second page, no PRP list</td></tr>
+      <tr><td>SQ1 slot / doorbell</td><td>slot 6 at 0x1_2340_0180; write 7 to 0xFE60_1008</td><td>Follows the READ in slot 5</td></tr>
+      <tr><td>CQ1 slot / head doorbell</td><td>slot 0x0C at 0x1_2341_00C0; later write 0x0D to 0xFE60_100C</td><td>Phase still 1</td></tr>
+      <tr><td>PCIe tags</td><td>SQE fetch 0x22; data reads 0x30–0x3F</td><td>Chosen by the controller</td></tr>
+      <tr><td>Link limits</td><td>MPS 256 B, MRRS 512 B, RCB 64 B</td><td>MRRS limits each data read; MPS limits each completion</td></tr>
+      <tr><td>Write cache</td><td><span class="g" data-term="vwc">Volatile Write Cache</span> present and enabled (the Volatile Write Cache field, VWC, set in Identify Controller)</td><td>Drive without <span class="g" data-term="plp">power-loss protection</span></td></tr>
+    </tbody>
+  </table>
+  <aside class="callout remember">
+    <p>PRP entries describe <em>memory pages</em>, not contiguous ranges. Even though the IOVA range here is contiguous, an 8 KiB transfer starting on a page boundary needs PRP1 for the first page and PRP2 for the second; the controller does not assume the second page follows the first.</p>
+  </aside>
+
+  <h3>The whole write in one sequence diagram</h3>
+  <figure>
+    <ol class="seq" data-col="168" data-actors="Application|Kernel + driver|Host memory|Root complex|NVMe controller|NAND">
+      <li data-from="Application" data-to="Kernel + driver" data-t="0.00 µs">pwrite(fd, buf, 8192, 0x80000)</li>
+      <li data-note="Kernel + driver">iomap: sector 0x204000; bio, tag 0x31</li>
+      <li data-from="Kernel + driver" data-to="Host memory" data-t="1.25 µs">Write SQE into SQ1 slot 6</li>
+      <li data-from="Root complex" data-to="NVMe controller" data-t="1.75 µs">MWr32 0xFE60_1008 = 7</li>
+      <li data-from="NVMe controller" data-to="Root complex" data-t="2.45 µs">MRd64 0x1_2340_0180, tag 0x22</li>
+      <li data-from="Root complex" data-to="NVMe controller" class="dashed" data-t="3.10 µs">CplD 64 B: Write, CID 0x1031</li>
+      <li data-note="NVMe controller">validate, allocate cache buffer</li>
+      <li data-from="NVMe controller" data-to="Root complex" data-t="3.95 µs">16 × MRd64 512 B, tags 0x30–0x3F</li>
+      <li data-from="Root complex" data-to="Host memory">read buffer pages (IOMMU)</li>
+      <li data-from="Root complex" data-to="NVMe controller" class="dashed" data-t="4.65 µs">32 × CplD 256 B (2 per tag)</li>
+      <li data-note="NVMe controller">8 KiB in volatile write cache</li>
+      <li data-from="NVMe controller" data-to="Root complex" data-t="6.15 µs">MWr64 CQE → 0x1_2341_00C0</li>
+      <li data-from="NVMe controller" data-to="Root complex" data-t="6.21 µs">MWr32 MSI-X → 0xFEE0_1000</li>
+      <li data-from="Root complex" data-to="Kernel + driver" data-t="7.80 µs">vector 1 handler</li>
+      <li data-from="Root complex" data-to="NVMe controller" data-t="8.70 µs">MWr32 0xFE60_100C = 0x0D</li>
+      <li data-from="Kernel + driver" data-to="Application" class="dashed" data-t="10.80 µs">pwrite returns 8192</li>
+      <li data-from="NVMe controller" data-to="NAND" data-t="later">program when unit is full</li>
+      <li data-note="NAND">tPROG: hundreds of µs to ms</li>
+    </ol>
+    <figcaption>The complete 8 KiB WRITE on the lab system with the volatile write cache enabled. Synthetic example for teaching; all timings are implementation- and platform-dependent.</figcaption>
+  </figure>
+
+  <h3>The central concept on the ladder</h3>
+  <p>The central concept is the <strong>controller-pulled write and its durability point</strong>: the data reaches the drive only because the drive asks for it, and "complete" means "accepted," not necessarily "permanent."</p>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>The runner has to come back to the classroom to collect the drawings, ticket by ticket, puts them in the library's front tray, says "done," and files them in the basement later. "File it in the basement first" is a special request.</p></div>
+    <div class="rung" data-rung="B"><p>The controller fetches the Write command, reads the data from host memory with DMA, stores it in its write cache and posts a completion. NAND programming is deferred. FUA forces this command's data to non-volatile media before completion; Flush forces everything previously completed.</p></div>
+    <div class="rung" data-rung="C"><p>The controller's DMA engine issues read requests sized by MRRS and tracks them with tags in a completion reassembly buffer. The data lands in dynamic or static RAM (DRAM or SRAM) inside the solid-state drive (SSD). A drive with power-loss protection has capacitors that can finish programming that buffer after power fails; a drive without it can lose the cache contents.</p></div>
+    <div class="rung" data-rung="D"><p>NVM Command Set Specification: Write opcode 01h, SLBA, NLB, FUA bit in CDW12. NVMe Base Specification: Flush opcode 00h, Volatile Write Cache field in Identify Controller and the Volatile Write Cache feature. PCI Express Base Specification: Memory Read requests, completions, MRRS, MPS, RCB, Byte Count and Lower Address.</p></div>
+    <div class="rung" data-rung="E"><p>Doorbell MWr down; SQE MRd up and CplD down; 16 data MRd up, 32 data CplD down; CQE MWr and MSI-X MWr up; CQ head doorbell MWr down. Seventeen non-posted requests (one SQE fetch, sixteen data reads) instead of the read's one.</p></div>
+    <div class="rung" data-rung="F"><p>An analyzer shows a tight cluster: fetch at 0.7 µs, data reads issued at 2.2 µs, completions streaming from 2.9 to 4.0 µs, CQE at 4.4 µs. No 50 µs silent gap as in the read. With FUA, a long gap appears between the last data completion and the CQE.</p></div>
+    <div class="rung" data-rung="G"><p>Lost data after power failure with no errors: check whether the file system or application issued Flush/FUA and whether the drive honored them. Write errors with Data Transfer Error status: look for a failed completion (Unsupported Request, UR, or Completer Abort, CA) on a data-pull read and the IOMMU log. Slow writes: check whether FUA is set on every write, or whether the cache is disabled.</p></div>
+  </div>
+
+  <h3>The sixteen questions, applied to the pulled write and its durability point</h3>
+  <table>
+    <caption>The controller-pulled write through the course's sixteen questions</caption>
+    <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>What is it?</td><td>A write in which the controller reads data from host memory, acknowledges it once it is in the drive's cache (or media), and programs NAND at a time of its choosing.</td></tr>
+      <tr><td>Why was it created?</td><td>Making the device the bus master keeps central processing unit (CPU) memory-mapped I/O (MMIO) out of the data path; caching hides NAND program time, which is far longer than read time.</td></tr>
+      <tr><td>What problem does it solve?</td><td>Low write latency and high write throughput despite program times of hundreds of microseconds or more.</td></tr>
+      <tr><td>What existed before?</td><td>Disk drives with volatile write caches and the same durability problem; the ATA and SCSI worlds had FUA and cache-flush commands, which NVMe carried over in its own form.</td></tr>
+      <tr><td>Why is the current design better?</td><td>Explicit, per-command durability control (FUA) and an explicit barrier (Flush), with the drive reporting whether a volatile cache exists at all.</td></tr>
+      <tr><td>Who creates it?</td><td>Application and file system decide the durability need; the driver encodes FUA or issues Flush; the controller performs the pull and the program.</td></tr>
+      <tr><td>Who consumes it?</td><td>The controller consumes the data; the host consumes the completion, and crash-recovery code later relies on what was durable.</td></tr>
+      <tr><td>Where does it live?</td><td>Host buffer until the pull completes; controller cache until programmed; NAND afterwards.</td></tr>
+      <tr><td>What memory/registers are involved?</td><td>Buffer pages at IOVA 0x2_0000_8000 and 0x2_0000_9000, SQ1 slot 6, CQ1 slot 0x0C, doorbells, the controller's cache and its Volatile Write Cache setting.</td></tr>
+      <tr><td>What happens before it?</td><td>The buffer is filled and pinned; for an allocating write, the file system may need to allocate blocks and journal metadata first.</td></tr>
+      <tr><td>What happens after it?</td><td>Background programming, garbage collection; the host may later issue Flush (for example from <code>fsync()</code>).</td></tr>
+      <tr><td>What happens if it is wrong?</td><td>Silent data loss on power failure (missing Flush/FUA), torn or mixed data (buffer modified before completion), Data Transfer Error (bad PRP), or data written to the wrong LBA.</td></tr>
+      <tr><td>What does the protocol analyzer show?</td><td>MRd/CplD pairs for the data, tags, Byte Count sequences, and the time from last data completion to CQE (short when cached, long with FUA).</td></tr>
+      <tr><td>What does Linux show?</td><td>Write tracepoints with the FUA flag, Flush commands, <code>write_cache</code> and <code>fua</code> queue attributes, error messages with status.</td></tr>
+      <tr><td>What would a validation engineer test?</td><td>Power-loss tests with and without FUA/Flush, completion splitting with various MRRS/MPS/RCB, unaligned PRP1 offsets, UR/CA injection on data reads, cache enable/disable.</td></tr>
+      <tr><td>What would a senior engineer suspect when it fails?</td><td>The durability contract between application, file system and drive; IOMMU mappings of the second page; completion reassembly in the controller; buffer reuse before completion.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="stages">
+  <h2>The journey, stage by stage</h2>
+  <p>The stages use the same template as <a href="ch39.html#stages">the READ's</a>. Where a stage is identical, the entry says so and gives only the values that change, so you can spend your attention on the differences. Note one deliberate reordering: in the read, the flash operation sits in the middle (stage 12); in a cached write, the flash program is the <em>last</em> stage and happens after the application has already been told the write succeeded.</p>
+
+  <h3>Application request</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>The application calls <code>pwrite(fd, buf, 8192, 0x80000)</code>. The kernel pins the two buffer pages for the duration of the I/O. t = 0.</dd>
+    <dt>Analogy</dt><dd>Mia hands over two drawn pages and says where they should be filed.</dd>
+    <dt>Technical</dt><dd>As for the read, <code>O_DIRECT</code> bypasses the page cache. If the file had been opened with <code>O_DSYNC</code> (or <code>O_SYNC</code>), the write would also have to be durable before returning; the file system then requests FUA on the data write if the overwrite needs no metadata update and the device supports FUA, or issues a cache flush afterwards <span class="badge impl">Implementation-dependent</span> (file system and kernel version).</dd>
+    <dt>Hardware / protocol</dt><dd>CPU only; no protocol yet.</dd>
+    <dt>Trace appearance</dt><dd>Nothing on the link; <code>syscalls:sys_enter_pwrite64</code> on the host.</dd>
+    <dt>Evidence</dt><dd><code>strace</code> shows flags at <code>open()</code> time, which decide whether FUA or Flush will follow.</dd>
+    <dt>What goes wrong</dt><dd>The application modifies the buffer from another thread before <code>pwrite()</code> returns: the controller may read some sheets before and some after the change, so the media gets a mixture. With buffered I/O, the kernel's "stable pages" mechanism prevents this for page-cache pages on devices that need it; with direct I/O the application owns the problem.</dd>
+  </dl>
+
+  <h3>Block request</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>File system and blk-mq: offset 0x80000 maps to sector 0x0020_4000; a bio with two segments (the two pages) becomes a request with tag 0x31, operation <code>REQ_OP_WRITE</code>, plus <code>REQ_FUA</code> or <code>REQ_PREFLUSH</code> if durability was requested. t ≈ 0.40–0.85 µs.</dd>
+    <dt>Analogy</dt><dd>The teacher writes "shelf 1, page 80" on the slip.</dd>
+    <dt>Technical</dt><dd>If the device reports no volatile write cache, the block layer strips FUA and pre-flush flags because they would be meaningless; if the cache exists but the device does not support FUA, the block layer emulates FUA with a Flush after the write. This flag handling lives in the block layer's flush machinery.</dd>
+    <dt>Trace appearance</dt><dd><code>block:block_rq_issue</code> with <code>W</code> (or <code>WFS</code>-style flag letters when FUA/sync are set; exact letters are version-dependent), sector 2113536 (0x204000), 16 sectors.</dd>
+    <dt>What goes wrong</dt><dd>An allocating write (to a hole or past end of file) is not a pure overwrite: the file system must journal metadata, so the trace shows extra writes and Flushes around the data write. Engineers expecting one command see five and suspect the drive.</dd>
+  </dl>
+
+  <h3>Driver command creation</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>The NVMe driver builds a Write command and maps two pages through the IOMMU: IOVA 0x2_0000_8000 and 0x2_0000_9000. t ≈ 0.85–1.10 µs.</dd>
+    <dt>Analogy</dt><dd>The slip now says "two sheets, on table 6, sheet 1 here and sheet 2 there."</dd>
+    <dt>Technical</dt><dd>Opcode 01h (Write), Namespace Identifier (NSID) 1, SLBA 0x0020_4000, NLB 15. For a two-page transfer the driver sets PRP1 to the first page and PRP2 to the second page directly; with more than two pages PRP2 would point to a PRP list. With <code>REQ_FUA</code>, the driver sets the FUA bit (bit 30 of CDW12).</dd>
+    <dt>Hardware / protocol</dt><dd>IOMMU page-table update for two pages; NVM Command Set Write format.</dd>
+    <dt>Trace appearance</dt><dd><code>nvme:nvme_setup_cmd</code>: <code>qid=1, cmdid=4145</code> (0x1031), <code>cmd=(nvme_cmd_write slba=2113536, len=15, ctrl=0x0, …)</code>; <code>ctrl=0x4000</code> would indicate FUA (the tracepoint prints the upper 16 bits of CDW12) <span class="badge version">Version-dependent</span>.</dd>
+    <dt>What goes wrong</dt><dd>PRP2 pointing at a page that was not mapped (or is off by one page) is accepted by the controller without complaint until it tries to read it (the abnormal trace below). NLB off by one writes one block too many, silently corrupting the next block on media.</dd>
+  </dl>
+
+  <h3>Command memory</h3>
+  <table>
+    <caption>The WRITE SQE for CID 0x1031 (synthetic example for teaching)</caption>
+    <thead><tr><th>Dword</th><th>Value</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>CDW0</td><td>0x1031_0001</td><td>CID 0x1031, PRP-or-Scatter-Gather-List (SGL) selector PSDT 0 (PRP), not fused, opcode 01h Write</td></tr>
+      <tr><td>CDW1</td><td>0x0000_0001</td><td>NSID 1</td></tr>
+      <tr><td>CDW2–CDW5</td><td>0</td><td>No metadata pointer</td></tr>
+      <tr><td>CDW6–CDW7</td><td>0x0000_8000, 0x0000_0002</td><td>PRP1 = 0x2_0000_8000</td></tr>
+      <tr><td>CDW8–CDW9</td><td>0x0000_9000, 0x0000_0002</td><td>PRP2 = 0x2_0000_9000 (second page, not a list)</td></tr>
+      <tr><td>CDW10–CDW11</td><td>0x0020_4000, 0</td><td>SLBA</td></tr>
+      <tr><td>CDW12</td><td>0x0000_000F (0x4000_000F with FUA)</td><td>NLB 15 → 16 blocks; FUA is bit 30</td></tr>
+      <tr><td>CDW13–CDW15</td><td>0</td><td>No dataset-management hints, no protection information</td></tr>
+    </tbody>
+  </table>
+  <dl>
+    <dt>Analogy</dt><dd>The completed slip in the teacher's hand.</dd>
+    <dt>Hardware / protocol</dt><dd>As for the read: one cache line, NVMe common command format plus the Write fields of the NVM Command Set Specification.</dd>
+    <dt>Trace appearance</dt><dd>These bytes will be the payload of the SQE fetch completion: first doubleword (DW) <code>0x10310001</code>.</dd>
+    <dt>What goes wrong</dt><dd>Reusing a command structure from a previous Read and forgetting to clear CDW12 bits: an inherited Limited Retry or FUA bit changes behaviour without any error.</dd>
+  </dl>
+
+  <h3>Submission queue</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>The driver copies the SQE into SQ1 slot 6 at 0x1_2340_0180; its tail becomes 7. t ≈ 1.10–1.25 µs.</dd>
+    <dt>Analogy / technical / hardware / protocol</dt><dd>Identical to the read (<a href="ch39.html#stages">ch39</a>), one slot further along.</dd>
+  </dl>
+  <div class="ring" data-label="I/O Submission Queue 1 (first 16 of 1024 slots), after the copy" data-size="16" data-head="6" data-tail="7" data-head-label="Head 6" data-tail-label="Tail 7"></div>
+
+  <h3>Doorbell</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>The driver writes 0x0000_0007 to 0xFE60_1008 after the copy. t ≈ 1.30 µs.</dd>
+    <dt>Analogy / technical</dt><dd>Same buzzer, new number. Same ordering rule: the SQE must be visible before the doorbell.</dd>
+    <dt>What goes wrong</dt><dd>As for the read. One write-specific trap: a driver that batches a Write and a Flush behind one doorbell must place the Flush after the Write in the queue, but even then the controller may execute commands out of order. Flush covers only commands that <em>completed</em> before the Flush was submitted; ordering by queue position alone is not a durability guarantee <span class="badge derived">Derived</span>. Confirm the exact scope of Flush in the NVMe Base Specification.</dd>
+  </dl>
+
+  <h3>PCIe Memory Write</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>Root port sends a posted MWr32 to 0xFE60_1008 with data 7. On the link at host t = 1.75 µs (analyzer t = 0).</dd>
+    <dt>Trace appearance</dt><dd><code>MWr(32) Host→Dev Addr=0xFE601008 Len=1 Data=0x00000007</code>. Identical in form to the read's doorbell.</dd>
+    <dt>Evidence</dt><dd>The value tells you the queue now holds commands up to slot 6; comparing with the previous doorbell value (6) shows exactly one new command.</dd>
+  </dl>
+
+  <h3>Controller command fetch</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>The controller fetches slot 6: MRd64 at 0x1_2340_0180, 16 DW, tag 0x22; the root complex returns a CplD with the 64 bytes. Analyzer t = 700 and 1,350 ns.</dd>
+    <dt>Analogy</dt><dd>The runner collects the slip.</dd>
+    <dt>Technical</dt><dd>Exactly as for the read; the controller learns only now that this is a write and that it must go back for the data.</dd>
+    <dt>Trace appearance</dt><dd><code>MRd(64) Dev→Host Addr=0x1_2340_0180 Len=16 Tag=0x22</code>; <code>CplD Host→Dev Tag=0x22 BC=64 LowAddr=0x00</code> (0x180 &amp; 0x7F = 0x00), payload <code>10310001 00000001 …</code>.</dd>
+    <dt>What goes wrong</dt><dd>Same as the read; see <a href="ch39.html#stages">ch39</a>.</dd>
+  </dl>
+
+  <h3>DMA request</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>The controller's data DMA engine plans the pull: it walks PRP1 and PRP2, allocates 8 KiB of write-cache buffer, splits the transfer into read requests and allocates tags 0x30 to 0x3F. Analyzer t ≈ 1,350–2,200 ns.</dd>
+    <dt>Analogy</dt><dd>The runner writes sixteen numbered tickets, one per handful of sheets, and makes room in his bag.</dd>
+    <dt>Technical</dt><dd>Each request may ask for at most MRRS = 512 bytes and must not cross a 4 KiB boundary: 8192 / 512 = 16 requests, eight per page. Before issuing a request, the device must have buffer space for its completion data (it advertised infinite completion credits), so the size of the reassembly buffer limits how many requests can be outstanding. Many controllers also start the pull only when cache space is available, which is where back-pressure from a full write cache shows up.</dd>
+    <dt>Hardware</dt><dd>Tag allocator, completion reassembly buffer, cache allocator. With 10-bit tags disabled the device has at most 256 tags; deep write workloads on fast links can be tag-limited (see <a href="ch13.html">PCIe Tags</a>).</dd>
+    <dt>Protocol</dt><dd>PCIe: MRRS (Device Control register) caps request size; the PRP rules (NVMe over PCIe Transport) define which addresses may be read.</dd>
+    <dt>Trace appearance</dt><dd>The gap between the SQE CplD and the first data MRd (about 850 ns here) is the controller's command-processing time for a write.</dd>
+    <dt>What goes wrong</dt><dd>A write cache that is full (sustained writes outrunning NAND) delays the pull by milliseconds; the trace shows the SQE fetched but no data MRd for a long time. This is normal steady-state behaviour, not a bug, but it is often reported as one.</dd>
+  </dl>
+
+  <h3>Memory Read TLPs</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>The device sends 16 MRd64 requests upstream, 512 bytes each, at 0x2_0000_8000, 0x2_0000_8200, … 0x2_0000_9E00. Analyzer t = 2,200–2,350 ns.</dd>
+    <dt>Analogy</dt><dd>The runner hands all sixteen tickets to the classroom helpers at once.</dd>
+    <dt>Technical</dt><dd>Each request: Fmt 001 (4-DW header, 64-bit address), Type 00000, Length 128 DW, First and Last BE 1111, Requester ID 0x0100, a distinct tag. The root complex translates each address through the IOMMU (two I/O translation lookaside buffer (IOTLB) entries, one per page) and reads memory coherently.</dd>
+    <dt>Hardware</dt><dd>Each request uses one non-posted header credit at the root port's receiver (no data credits: a read request carries no payload).</dd>
+    <dt>Protocol</dt><dd>Non-posted: each must be answered by one or more completions with the same Requester ID and tag, or by an error completion; otherwise the device times it out.</dd>
+    <dt>Trace appearance</dt><dd>Sixteen short TLPs about 10 ns apart, tags incrementing. On a real controller they may be interleaved with requests for other commands.</dd>
+    <dt>Evidence</dt><dd>Address ranges tie each request to this command's PRP pages; nothing else in the TLP refers to the command.</dd>
+    <dt>What goes wrong</dt><dd>A request larger than MRRS is a malformed request; a request crossing a 4 KiB boundary is also malformed. Both are rejected by the root port and reported through Advanced Error Reporting (AER).</dd>
+  </dl>
+
+  <h3>Completions with Data</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>The root complex returns the data in 32 CplD TLPs of 256 bytes, two per tag; the device places each payload into the cache buffer at the right offset. Analyzer t = 2,900–4,016 ns.</dd>
+    <dt>Analogy</dt><dd>The helpers hand back the sheets, sometimes two handfuls per ticket, each handful labelled with its ticket number and "how many sheets are still coming for this ticket."</dd>
+    <dt>Technical</dt><dd>A completion's payload may not exceed the MPS of the receiving device (256 B), so a 512-byte request is answered by at least two completions. When a completer splits, each split must end on an RCB-aligned address (64 B here), and completions for one request must be returned in increasing address order. Each completion carries <strong><span class="g" data-term="byte-count">Byte Count</span></strong>, the number of bytes still to be returned for the request including this completion (512 for the first, 256 for the second), and <strong>Lower Address</strong>, the low seven bits of the address of its first byte. Completions for <em>different</em> tags may arrive in any order. How a root complex chooses to split is implementation-dependent; the 2 × 256 pattern is common but not required <span class="badge impl">Implementation-dependent</span>.</dd>
+    <dt>Hardware</dt><dd>The device's reassembly logic uses (tag, Byte Count, Lower Address) to place each payload; the request is finished when a completion arrives whose Byte Count equals its own payload length.</dd>
+    <dt>Protocol</dt><dd>PCIe completion rules; see <a href="ch52.html">Completion Rules</a> and <a href="dd12.html">Deep dive: PCIe Completions</a>.</dd>
+    <dt>Trace appearance</dt><dd><code>CplD Host→Dev Tag=0x30 Len=64 BC=512 LowAddr=0x00</code>, then <code>CplD Tag=0x30 Len=64 BC=256 LowAddr=0x00</code>, and so on for each tag.</dd>
+    <dt>Evidence</dt><dd>Sum of payloads per tag must equal the request length; any tag with a missing final completion means a Completion Timeout is coming.</dd>
+    <dt>What goes wrong</dt><dd>Unsupported Request completion (IOMMU fault, wrong PRP); Completer Abort; poisoned data (Error Poisoned, EP, bit) from a host memory error, which a careful controller must not write to media as good data; Completion Timeout if the root complex never answers.</dd>
+  </dl>
+  <figure>
+    <pre class="diagram">
+ MRd tag 0x30: 0x2_0000_8000 … 0x2_0000_81FF (512 B)
+   ├─ CplD #1  Len=64 DW  BC=512  LowAddr=0x00   bytes 0x8000–0x80FF
+   └─ CplD #2  Len=64 DW  BC=256  LowAddr=0x00   bytes 0x8100–0x81FF   (BC == payload: last)
+
+ Unaligned variant: MRd at 0x2_0000_8830, 512 B
+   ├─ CplD #1  Len=52 DW  BC=512  LowAddr=0x30   bytes 0x8830–0x88FF   (cut at RCB boundary 0x8900)
+   ├─ CplD #2  Len=64 DW  BC=304  LowAddr=0x00   bytes 0x8900–0x89FF
+   └─ CplD #3  Len=12 DW  BC= 48  LowAddr=0x00   bytes 0x8A00–0x8A2F
+    </pre>
+    <figcaption>How one 512-byte data read is answered under MPS 256 and RCB 64. The unaligned case shows why the first completion is shortened. Synthetic example for teaching; produced by <code>e2e_write_pull.py</code> in Code / pseudocode.</figcaption>
+  </figure>
+
+  <h3>Write cache</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>The controller's cache manager. 8 KiB now sits in the drive's DRAM write cache, tagged with LBAs 0x0020_4000–0x0020_400F; the flash translation layer (FTL) marks these LBAs as "newest copy in cache" so a read would be served from cache. Analyzer t ≈ 4,016–4,400 ns.</dd>
+    <dt>Analogy</dt><dd>The drawings go into the "to be filed" tray at the front desk.</dd>
+    <dt>Technical</dt><dd>If the Volatile Write Cache is enabled and FUA is not set, the controller may complete the command now. If FUA is set, it must first make this command's data non-volatile (program it, or place it in a power-protected buffer). A controller that reports no volatile write cache (VWC field clear in Identify Controller) must already treat completed writes as non-volatile; drives with power-loss protection usually report it this way.</dd>
+    <dt>Hardware</dt><dd>DRAM or SRAM, often with internal error-correcting code (ECC); on enterprise drives, hold-up capacitors and firmware that dumps cache to NAND on power loss.</dd>
+    <dt>Protocol</dt><dd>NVM Command Set: FUA semantics. NVMe Base: Volatile Write Cache feature (the host can enable or disable the cache through Set Features when the drive supports changing it).</dd>
+    <dt>Trace appearance</dt><dd>A short gap (about 0.4 µs here) between the last data CplD and the CQE. A long gap (hundreds of microseconds) is the signature of FUA or of a disabled cache.</dd>
+    <dt>Evidence</dt><dd><code>nvme id-ctrl</code> (VWC field) and <code>nvme get-feature -f 6</code> (Volatile Write Cache feature) tell you which behaviour to expect.</dd>
+    <dt>What goes wrong</dt><dd>A drive that acknowledges FUA writes or Flush before data is non-volatile (firmware bug or misconfiguration): the trace looks fast and correct, and data is lost only on power failure. Only power-loss testing finds it.</dd>
+  </dl>
+
+  <h3>Completion entry</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>The controller writes the CQE into CQ1 slot 0x0C at 0x1_2341_00C0: DW2 = 0x0001_0007 (SQ Identifier (SQID) 1, SQ Head Pointer (SQHD) 7), DW3 = 0x0001_1031 (status 0, phase 1, CID 0x1031). Analyzer t = 4,400 ns.</dd>
+    <dt>Analogy</dt><dd>The "done" card in the answer box.</dd>
+    <dt>Technical</dt><dd>Same format as the read's. For a write, the ordering concern is reversed: the host already owns the data, so the controller must not post the CQE until it has <em>received</em> all data it needs from the buffer, because the host may reuse the buffer as soon as it sees the CQE.</dd>
+    <dt>Trace appearance</dt><dd><code>MWr(64) Dev→Host Addr=0x1_2341_00C0 Len=4</code> payload <code>00000000 00000000 00010007 00011031</code>.</dd>
+    <dt>What goes wrong</dt><dd>A controller that posts the CQE while data reads are still outstanding: the host frees and reuses the buffer, and the late completions deliver new contents. On the analyzer this is unmistakable: a data CplD for this command's addresses after its CQE.</dd>
+  </dl>
+
+  <h3>MSI-X</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>MWr32 to 0xFEE0_1000, data 0x41 (illustrative, vector 1). Analyzer t = 4,460 ns.</dd>
+    <dt>Analogy / technical / protocol</dt><dd>Identical to the read. See <a href="ch39.html#stages">ch39</a> and <a href="ch43.html">MSI-X</a>.</dd>
+  </dl>
+
+  <h3>Driver</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>Handler at host t ≈ 7.80 µs consumes the CQE (phase 1 matches), completes request tag 0x31 and writes 0x0000_000D to the CQ1 head doorbell at 0xFE60_100C (link analyzer t = 6,950 ns). The two pages are DMA-unmapped.</dd>
+    <dt>Technical</dt><dd>Identical to the read except that a non-zero status on a write is often more serious for the file system: a failed data write in a journaled file system may force it read-only.</dd>
+    <dt>Trace appearance</dt><dd><code>nvme:nvme_complete_rq</code> with <code>cmdid=4145, status=0x0</code>; <code>MWr(32) Host→Dev Addr=0xFE60100C Data=0x0000000D</code>.</dd>
+  </dl>
+
+  <h3>Application completion</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd><code>pwrite()</code> returns 8192 at host t ≈ 10.8 µs. The buffer may be reused.</dd>
+    <dt>Technical</dt><dd>Without <code>O_DSYNC</code>, success means "accepted by the drive," not "durable." The application must call <code>fsync()</code> or <code>fdatasync()</code> (which leads to a Flush command when the drive has a volatile write cache) if it needs durability.</dd>
+    <dt>Trace appearance</dt><dd><code>block:block_rq_complete</code> for sector 2113536 + 16, error 0.</dd>
+    <dt>What goes wrong</dt><dd>Assuming that a returned write survived a crash. Database and file-system authors build on precisely this distinction.</dd>
+  </dl>
+
+  <h3>Flash program (after completion)</h3>
+  <dl>
+    <dt>Who acts / what changes</dt><dd>The controller's back end, at a time of its choosing: the 8 KiB is combined with other cached data into a full programming unit (for example several 16 KiB pages across planes and, for triple-level-cell (TLC) NAND, a whole word line), written to a free location, and the FTL map is updated to point the LBAs at it. The old physical copy becomes stale and will be reclaimed by garbage collection.</dd>
+    <dt>Analogy</dt><dd>The librarian carries a full stack from the tray to the basement and updates the catalog cards.</dd>
+    <dt>Technical</dt><dd>NAND cannot overwrite in place: every write goes to a fresh page (out-of-place update), which is why an FTL and garbage collection exist. Program time (tPROG) is typically hundreds of microseconds to a few milliseconds per programming unit <span class="badge impl">Implementation-dependent</span>. Many drives first write to a single-level-cell (SLC) mode region (faster) and fold into TLC/QLC later.</dd>
+    <dt>Hardware</dt><dd>NAND channel controller, dies, the FTL's mapping table, and (on enterprise drives) the power-loss protection circuit that guarantees this stage completes even if power fails.</dd>
+    <dt>Protocol</dt><dd>Invisible to NVMe and PCIe. Only FUA and Flush give the host a protocol-level event tied to it.</dd>
+    <dt>Trace appearance</dt><dd>Nothing for this command. Indirectly: when the cache is full, later writes' data pulls are delayed (stage DMA request), and reads to busy dies take longer.</dd>
+    <dt>Evidence</dt><dd>Self-Monitoring, Analysis and Reporting Technology (SMART) / Health log data-units-written counters (<a href="ch57.html">SMART / Health</a>) and vendor logs; write-amplification estimates from host versus NAND write counters where the vendor exposes them.</dd>
+    <dt>What goes wrong</dt><dd>Program failure: the controller retries elsewhere transparently; repeated failures retire blocks and consume spare capacity (visible in SMART as reduced available spare). Power loss with no protection and no Flush: the cached 8 KiB is lost although the host saw success.</dd>
+  </dl>
+</section>
+
+<section id="durability">
+  <h2>Durability: write cache, FUA and Flush</h2>
+  <p>A read has one completion point. A write has two: <em>accepted</em> (the CQE) and <em>durable</em> (data on non-volatile media). NVMe gives the host three tools to relate them.</p>
+  <table>
+    <caption>Durability tools (NVMe Base 2.4 and NVM Command Set 1.3)</caption>
+    <thead><tr><th>Tool</th><th>Scope</th><th>What the completion means</th><th>Linux trigger</th><th>Typical cost</th></tr></thead>
+    <tbody>
+      <tr><td>Volatile Write Cache disabled (Set Features, Volatile Write Cache)</td><td>Whole controller</td><td>Every write completion means durable</td><td>Rarely changed by Linux; administrators may do it with <code>nvme set-feature</code></td><td>All writes pay program latency</td></tr>
+      <tr><td>FUA bit in Write CDW12</td><td>This command's data</td><td>This write is durable</td><td><code>REQ_FUA</code>, from <code>O_DSYNC</code> overwrites and journal commit blocks</td><td>One program (or protected-buffer) latency per write</td></tr>
+      <tr><td>Flush command (opcode 00h)</td><td>All data from writes completed before the Flush was submitted (per namespace, or all namespaces when broadcast is supported)</td><td>Everything previously acknowledged is durable</td><td><code>REQ_PREFLUSH</code>/flush requests from <code>fsync()</code>, journal commits, unmount</td><td>Proportional to dirty cache: can be milliseconds</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout spec">
+    <p>Whether Flush with a broadcast NSID is supported, and exactly how the scope of Flush is worded, should be confirmed in the NVMe Base Specification and NVM Command Set Specification of the revision you work with <span class="badge version">Version-dependent</span>. The principle is stable: Flush covers data from commands that completed before it; it is not an ordering barrier for commands still in flight.</p>
+  </aside>
+  <h3>Same write with FUA</h3>
+  <p>With <code>O_DSYNC</code> on a cached drive, the driver sets FUA (CDW12 = 0x4000_000F). Everything on the link up to the last data completion is identical. Then the controller must program (often into SLC-mode blocks) before posting the CQE. In our synthetic drive the CQE arrives about 240 µs later instead of 0.4 µs, and the write's end-to-end time becomes about 250 µs instead of 10.8 µs.</p>
+  <h3>Flush after the write</h3>
+  <p>With <code>fsync()</code> instead, the write completes in 10.8 µs and a separate Flush follows: one more SQE (opcode 00h, no data pointer, no data TLPs), and a CQE that arrives when the controller has made all previously completed writes durable. With a lot of dirty cache, that can take milliseconds; with little, much less.</p>
+  <aside class="callout insight" data-title="Why fsync latency is so variable">
+    <p>FUA cost depends on one command's data. Flush cost depends on everything other applications wrote before it. That is why one process calling <code>fsync()</code> can be slowed down by another process's bulk writes, and why drives with power-loss protection (no volatile cache, so Flush is nearly free) are preferred for databases.</p>
+  </aside>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>The same components as in the read participate, but the work shifts inside the SSD and inside the root complex.</p>
+  <table>
+    <caption>Hardware roles that differ between READ and WRITE</caption>
+    <thead><tr><th>Component</th><th>READ</th><th>WRITE</th></tr></thead>
+    <tbody>
+      <tr><td>Root complex</td><td>Receives 16 posted writes; no completions to generate for data</td><td>Services 16 read requests: IOMMU translation, coherent memory reads, generates 32 completions; its read latency is now on the critical path</td></tr>
+      <tr><td>SSD DMA engine</td><td>Push engine: posted writes, needs posted credits</td><td>Pull engine: non-posted reads, needs tags and reassembly buffer; must handle split completions and error completions</td></tr>
+      <tr><td>SSD buffer</td><td>Read buffer filled from NAND, drained to host</td><td>Write cache filled from host, drained to NAND later; must be protected (ECC, and power-loss protection on enterprise drives)</td></tr>
+      <tr><td>NAND</td><td>On the critical path (tR)</td><td>Off the critical path unless FUA, cache disabled, or cache full</td></tr>
+      <tr><td>Link direction usage</td><td>Data on upstream direction</td><td>Data on downstream direction; upstream carries only small request headers</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout hw">
+    <p>Because PCIe links are full duplex, a mixed workload uses both directions: reads fill the upstream direction with data writes, writes fill the downstream direction with completions. A Gen4 x4 link can carry close to its unidirectional bandwidth in each direction at the same time, which is why mixed read/write throughput can exceed either alone.</p>
+  </aside>
+  <figure>
+    <pre class="diagram">
+             upstream (Dev→Host)                         downstream (Host→Dev)
+ READ :  MRd(SQE) · MWr×16 data · MWr CQE · MWr MSI-X   |  MWr doorbell · CplD(SQE) · MWr head-doorbell
+ WRITE:  MRd(SQE) · MRd×16 (headers only) · CQE · MSI-X |  MWr doorbell · CplD(SQE) · CplD×32 data · MWr head-doorbell
+    </pre>
+    <figcaption>Which direction carries the bulk bytes. The data payload changes direction; requests stay with the device.</figcaption>
+  </figure>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <table>
+    <caption>Documents governing the WRITE</caption>
+    <thead><tr><th>Document (baseline)</th><th>What it governs here</th></tr></thead>
+    <tbody>
+      <tr><td><cite class="spec">NVM Command Set Specification, Revision 1.3 — Write command</cite></td><td>Write opcode 01h, SLBA, NLB, FUA, Limited Retry, protection information fields, write-specific status values</td></tr>
+      <tr><td><cite class="spec">NVM Express Base Specification, Revision 2.4</cite></td><td>Queues, SQE/CQE, Flush command, Volatile Write Cache field in Identify Controller and the Volatile Write Cache feature, status codes such as Data Transfer Error</td></tr>
+      <tr><td><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite></td><td>PRP usage for the data pointer, memory-based transport rules</td></tr>
+      <tr><td><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 family</cite></td><td>Memory Read requests, completion splitting, Byte Count, Lower Address, RCB, MRRS, MPS, error completions (UR, CA), Completion Timeout</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout verified">
+    <ul>
+      <li>Write is opcode 01h (NVM Command Set) and Flush is opcode 00h (an I/O command defined in the NVMe Base Specification); FUA is a bit in CDW12 of Read and Write.</li>
+      <li>Identify Controller reports whether a volatile write cache is present; the Volatile Write Cache feature enables or disables it.</li>
+      <li>A read request may not exceed MRRS or cross a 4 KiB boundary; a completion payload may not exceed MPS; split completions for one request are returned in address order and split at RCB-aligned addresses.</li>
+      <li>Byte Count is the number of bytes remaining for the request including the current completion; Lower Address carries the low address bits of the first byte returned.</li>
+    </ul>
+  </aside>
+  <aside class="callout derived">
+    <ul>
+      <li>16 data reads and at least 32 completions for 8 KiB with MRRS 512 and MPS 256.</li>
+      <li>"The controller must not post the CQE before it has received the data," from the host's right to reuse the buffer after completion.</li>
+      <li>The latency figures, which follow from the synthetic timing assumptions.</li>
+    </ul>
+  </aside>
+  <aside class="callout impl">
+    <ul>
+      <li>How the root complex splits completions (2 × 256, 8 × 64, or other legal patterns) and in which order it answers different tags.</li>
+      <li>How many data reads the controller keeps outstanding; when it starts the pull; how it sizes requests (it may use smaller requests than MRRS).</li>
+      <li>Write cache size, flush policy, SLC caching, program unit, power-loss protection.</li>
+      <li>Which NVMe status a controller returns when a data-pull read fails (Data Transfer Error is the natural choice, but check the controller's documentation).</li>
+    </ul>
+  </aside>
+  <aside class="callout version">
+    <p>Flush broadcast-NSID support and its reporting, and the Linux block layer's FUA and flush handling, have changed over revisions and kernel versions. Older NVMe revisions placed PCIe-specific material in the Base Specification.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <ul>
+      <li>NVMe does not say when cached data is programmed, or give the host any event for it.</li>
+      <li>NVMe does not order the execution of commands in a queue: a Write submitted before a Read of the same LBA may complete after it. Hosts that need ordering wait for completions.</li>
+      <li>PCIe does not require completions for different tags to come back in request order.</li>
+      <li>Check in the specification: the precise scope of Flush, and the controller's obligations for a Write with FUA when the namespace has no volatile cache.</li>
+    </ul>
+  </aside>
+  <aside class="callout warn">
+    <ul>
+      <li>Never assume a successful Write completion means power-safe data unless the drive reports no volatile write cache, the cache is disabled, FUA was set, or a later Flush completed.</li>
+      <li>Never assume completions arrive in request order.</li>
+      <li>Never assume the data reads come immediately after the SQE fetch: a full cache can delay them for a long time.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <table>
+    <caption>TLP summary of the 8 KiB WRITE (synthetic example for teaching)</caption>
+    <thead><tr><th>Rows</th><th>NVMe meaning</th><th>PCIe transaction</th><th>Direction</th><th>Matched by</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>SQ1 tail = 7</td><td>MWr32 0xFE60_1008</td><td>Host→Dev</td><td>Address</td></tr>
+      <tr><td>2–3</td><td>Fetch SQE slot 6</td><td>MRd64 16 DW + CplD</td><td>Up / down</td><td>Requester ID (RID) 0x0100 + Tag 0x22</td></tr>
+      <tr><td>4–19</td><td>Data pull requests</td><td>16 × MRd64 128 DW</td><td>Dev→Host</td><td>Address ∈ PRP pages</td></tr>
+      <tr><td>20–51</td><td>Data</td><td>32 × CplD 64 DW</td><td>Host→Dev</td><td>RID + Tag 0x30–0x3F, BC, Lower Address</td></tr>
+      <tr><td>52</td><td>CQE slot 0x0C</td><td>MWr64 4 DW</td><td>Dev→Host</td><td>Address; payload SQID 1 + CID 0x1031</td></tr>
+      <tr><td>53</td><td>Interrupt</td><td>MWr32 0xFEE0_1000</td><td>Dev→Host</td><td>MSI-X table entry 1</td></tr>
+      <tr><td>54</td><td>CQ1 head = 0x0D</td><td>MWr32 0xFE60_100C</td><td>Host→Dev</td><td>Address</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout proto" data-title="The ordering argument, reversed">
+    <p>For a read, PCIe posted-write ordering guaranteed data before CQE. For a write, there is no such link-level guarantee to lean on: completions travel downstream and the CQE upstream, so they are not even in the same ordering stream. Correctness depends entirely on the controller's internal rule "do not post the CQE until all data completions have arrived." This is a controller design obligation, and it is one of the things a validation engineer checks on the analyzer.</p>
+  </aside>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <h3>The normal cached write, every TLP</h3>
+  <p>Analyzer time 0 is the doorbell (host 1.75 µs). RC denotes the root complex as requester, BC the Byte Count and SC Successful Completion. Each 512-byte read is answered by two 256-byte completions; tags 0x34 and 0x35 are answered out of order, which is legal.</p>
+  <div class="trace" data-kind="synthetic" data-title="Normal 8 KiB WRITE, CID 0x1031, volatile write cache enabled">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Len=1 RID=RC Data=0x0000_0007</td><td>SQ1 tail doorbell = 7 (slot 6 is new)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>700</td><td>MRd64</td><td>Addr=0x1_2340_0180 Len=16 Tag=0x22 RID=0x0100</td><td>Fetch SQE slot 6</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,350</td><td>CplD</td><td>Len=16 Tag=0x22 BC=64 LowAddr=0x00 Status=SC; payload 10310001 00000001 0 0 0 0 00008000 00000002 00009000 00000002 00204000 00000000 0000000F 0 0 0</td><td>SQE: Write, CID 0x1031, PRP1 0x2_0000_8000, PRP2 0x2_0000_9000, SLBA 0x204000, NLB 15</td></tr>
+        <tr class="note"><td colspan="6">1,350 → 2,200 ns: controller validates the command and allocates 8 KiB of write cache.</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>2,200</td><td>MRd64</td><td>Addr=0x2_0000_8000 Len=128 Tag=0x30 RID=0x0100</td><td>Data pull, page 1, bytes 0x0000–0x01FF</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>2,210</td><td>MRd64</td><td>Addr=0x2_0000_8200 Len=128 Tag=0x31 RID=0x0100</td><td>Data pull, page 1, bytes 0x0200–0x03FF</td></tr>
+        <tr class="dir-up"><td>6</td><td>Dev→Host</td><td>2,220</td><td>MRd64</td><td>Addr=0x2_0000_8400 Len=128 Tag=0x32 RID=0x0100</td><td>Data pull, page 1, bytes 0x0400–0x05FF</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>2,230</td><td>MRd64</td><td>Addr=0x2_0000_8600 Len=128 Tag=0x33 RID=0x0100</td><td>Data pull, page 1, bytes 0x0600–0x07FF</td></tr>
+        <tr class="dir-up"><td>8</td><td>Dev→Host</td><td>2,240</td><td>MRd64</td><td>Addr=0x2_0000_8800 Len=128 Tag=0x34 RID=0x0100</td><td>Data pull, page 1, bytes 0x0800–0x09FF</td></tr>
+        <tr class="dir-up"><td>9</td><td>Dev→Host</td><td>2,250</td><td>MRd64</td><td>Addr=0x2_0000_8A00 Len=128 Tag=0x35 RID=0x0100</td><td>Data pull, page 1, bytes 0x0A00–0x0BFF</td></tr>
+        <tr class="dir-up"><td>10</td><td>Dev→Host</td><td>2,260</td><td>MRd64</td><td>Addr=0x2_0000_8C00 Len=128 Tag=0x36 RID=0x0100</td><td>Data pull, page 1, bytes 0x0C00–0x0DFF</td></tr>
+        <tr class="dir-up"><td>11</td><td>Dev→Host</td><td>2,270</td><td>MRd64</td><td>Addr=0x2_0000_8E00 Len=128 Tag=0x37 RID=0x0100</td><td>Data pull, page 1, bytes 0x0E00–0x0FFF</td></tr>
+        <tr class="dir-up"><td>12</td><td>Dev→Host</td><td>2,280</td><td>MRd64</td><td>Addr=0x2_0000_9000 Len=128 Tag=0x38 RID=0x0100</td><td>Data pull, page 2, bytes 0x1000–0x11FF</td></tr>
+        <tr class="dir-up"><td>13</td><td>Dev→Host</td><td>2,290</td><td>MRd64</td><td>Addr=0x2_0000_9200 Len=128 Tag=0x39 RID=0x0100</td><td>Data pull, page 2, bytes 0x1200–0x13FF</td></tr>
+        <tr class="dir-up"><td>14</td><td>Dev→Host</td><td>2,300</td><td>MRd64</td><td>Addr=0x2_0000_9400 Len=128 Tag=0x3A RID=0x0100</td><td>Data pull, page 2, bytes 0x1400–0x15FF</td></tr>
+        <tr class="dir-up"><td>15</td><td>Dev→Host</td><td>2,310</td><td>MRd64</td><td>Addr=0x2_0000_9600 Len=128 Tag=0x3B RID=0x0100</td><td>Data pull, page 2, bytes 0x1600–0x17FF</td></tr>
+        <tr class="dir-up"><td>16</td><td>Dev→Host</td><td>2,320</td><td>MRd64</td><td>Addr=0x2_0000_9800 Len=128 Tag=0x3C RID=0x0100</td><td>Data pull, page 2, bytes 0x1800–0x19FF</td></tr>
+        <tr class="dir-up"><td>17</td><td>Dev→Host</td><td>2,330</td><td>MRd64</td><td>Addr=0x2_0000_9A00 Len=128 Tag=0x3D RID=0x0100</td><td>Data pull, page 2, bytes 0x1A00–0x1BFF</td></tr>
+        <tr class="dir-up"><td>18</td><td>Dev→Host</td><td>2,340</td><td>MRd64</td><td>Addr=0x2_0000_9C00 Len=128 Tag=0x3E RID=0x0100</td><td>Data pull, page 2, bytes 0x1C00–0x1DFF</td></tr>
+        <tr class="dir-up"><td>19</td><td>Dev→Host</td><td>2,350</td><td>MRd64</td><td>Addr=0x2_0000_9E00 Len=128 Tag=0x3F RID=0x0100</td><td>Data pull, page 2, bytes 0x1E00–0x1FFF</td></tr>
+        <tr class="dir-down"><td>20</td><td>Host→Dev</td><td>2,900</td><td>CplD</td><td>Len=64 Tag=0x30 ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x0000–0x00FF</td></tr>
+        <tr class="dir-down"><td>21</td><td>Host→Dev</td><td>2,936</td><td>CplD</td><td>Len=64 Tag=0x30 ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x0100–0x01FF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>22</td><td>Host→Dev</td><td>2,972</td><td>CplD</td><td>Len=64 Tag=0x31 ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x0200–0x02FF</td></tr>
+        <tr class="dir-down"><td>23</td><td>Host→Dev</td><td>3,008</td><td>CplD</td><td>Len=64 Tag=0x31 ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x0300–0x03FF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>24</td><td>Host→Dev</td><td>3,044</td><td>CplD</td><td>Len=64 Tag=0x32 ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x0400–0x04FF</td></tr>
+        <tr class="dir-down"><td>25</td><td>Host→Dev</td><td>3,080</td><td>CplD</td><td>Len=64 Tag=0x32 ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x0500–0x05FF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>26</td><td>Host→Dev</td><td>3,116</td><td>CplD</td><td>Len=64 Tag=0x33 ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x0600–0x06FF</td></tr>
+        <tr class="dir-down"><td>27</td><td>Host→Dev</td><td>3,152</td><td>CplD</td><td>Len=64 Tag=0x33 ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x0700–0x07FF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>28</td><td>Host→Dev</td><td>3,188</td><td>CplD</td><td>Len=64 Tag=0x35 ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x0A00–0x0AFF; tag 0x35 answered before 0x34: legal</td></tr>
+        <tr class="dir-down"><td>29</td><td>Host→Dev</td><td>3,224</td><td>CplD</td><td>Len=64 Tag=0x35 ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x0B00–0x0BFF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>30</td><td>Host→Dev</td><td>3,260</td><td>CplD</td><td>Len=64 Tag=0x34 ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x0800–0x08FF</td></tr>
+        <tr class="dir-down"><td>31</td><td>Host→Dev</td><td>3,296</td><td>CplD</td><td>Len=64 Tag=0x34 ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x0900–0x09FF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>32</td><td>Host→Dev</td><td>3,332</td><td>CplD</td><td>Len=64 Tag=0x36 ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x0C00–0x0CFF</td></tr>
+        <tr class="dir-down"><td>33</td><td>Host→Dev</td><td>3,368</td><td>CplD</td><td>Len=64 Tag=0x36 ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x0D00–0x0DFF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>34</td><td>Host→Dev</td><td>3,404</td><td>CplD</td><td>Len=64 Tag=0x37 ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x0E00–0x0EFF</td></tr>
+        <tr class="dir-down"><td>35</td><td>Host→Dev</td><td>3,440</td><td>CplD</td><td>Len=64 Tag=0x37 ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x0F00–0x0FFF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>36</td><td>Host→Dev</td><td>3,476</td><td>CplD</td><td>Len=64 Tag=0x38 ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x1000–0x10FF</td></tr>
+        <tr class="dir-down"><td>37</td><td>Host→Dev</td><td>3,512</td><td>CplD</td><td>Len=64 Tag=0x38 ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x1100–0x11FF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>38</td><td>Host→Dev</td><td>3,548</td><td>CplD</td><td>Len=64 Tag=0x39 ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x1200–0x12FF</td></tr>
+        <tr class="dir-down"><td>39</td><td>Host→Dev</td><td>3,584</td><td>CplD</td><td>Len=64 Tag=0x39 ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x1300–0x13FF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>40</td><td>Host→Dev</td><td>3,620</td><td>CplD</td><td>Len=64 Tag=0x3A ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x1400–0x14FF</td></tr>
+        <tr class="dir-down"><td>41</td><td>Host→Dev</td><td>3,656</td><td>CplD</td><td>Len=64 Tag=0x3A ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x1500–0x15FF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>42</td><td>Host→Dev</td><td>3,692</td><td>CplD</td><td>Len=64 Tag=0x3B ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x1600–0x16FF</td></tr>
+        <tr class="dir-down"><td>43</td><td>Host→Dev</td><td>3,728</td><td>CplD</td><td>Len=64 Tag=0x3B ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x1700–0x17FF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>44</td><td>Host→Dev</td><td>3,764</td><td>CplD</td><td>Len=64 Tag=0x3C ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x1800–0x18FF</td></tr>
+        <tr class="dir-down"><td>45</td><td>Host→Dev</td><td>3,800</td><td>CplD</td><td>Len=64 Tag=0x3C ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x1900–0x19FF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>46</td><td>Host→Dev</td><td>3,836</td><td>CplD</td><td>Len=64 Tag=0x3D ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x1A00–0x1AFF</td></tr>
+        <tr class="dir-down"><td>47</td><td>Host→Dev</td><td>3,872</td><td>CplD</td><td>Len=64 Tag=0x3D ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x1B00–0x1BFF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>48</td><td>Host→Dev</td><td>3,908</td><td>CplD</td><td>Len=64 Tag=0x3E ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x1C00–0x1CFF</td></tr>
+        <tr class="dir-down"><td>49</td><td>Host→Dev</td><td>3,944</td><td>CplD</td><td>Len=64 Tag=0x3E ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x1D00–0x1DFF (last for this tag)</td></tr>
+        <tr class="dir-down"><td>50</td><td>Host→Dev</td><td>3,980</td><td>CplD</td><td>Len=64 Tag=0x3F ReqID=0x0100 BC=512 LowAddr=0x00 Status=SC</td><td>Data 0x1E00–0x1EFF</td></tr>
+        <tr class="dir-down"><td>51</td><td>Host→Dev</td><td>4,016</td><td>CplD</td><td>Len=64 Tag=0x3F ReqID=0x0100 BC=256 LowAddr=0x00 Status=SC</td><td>Data 0x1F00–0x1FFF (last for this tag)</td></tr>
+        <tr class="note"><td colspan="6">4,016 → 4,400 ns: data committed to the volatile write cache; no NAND activity required before completion.</td></tr>
+        <tr class="dir-up"><td>52</td><td>Dev→Host</td><td>4,400</td><td>MWr64</td><td>Addr=0x1_2341_00C0 Len=4; payload 00000000 00000000 00010007 00011031</td><td>CQE slot 0x0C: SQ1, SQHD 7, CID 0x1031, P=1, success</td></tr>
+        <tr class="dir-up"><td>53</td><td>Dev→Host</td><td>4,460</td><td>MWr32</td><td>Addr=0xFEE0_1000 Len=1 Data=0x0000_0041</td><td>MSI-X vector 1 (illustrative values)</td></tr>
+        <tr class="dir-down"><td>54</td><td>Host→Dev</td><td>6,950</td><td>MWr32</td><td>Addr=0xFE60_100C Len=1 RID=RC Data=0x0000_000D</td><td>CQ1 head doorbell = 0x0D</td></tr>
+      </tbody>
+    </table>
+    <p>Reading the trace: count first. 1 doorbell, 1 + 1 for the SQE, 16 reads, 32 completions, CQE, MSI-X, head doorbell = 54 TLPs. Check every tag 0x30–0x3F has completions summing to 512 bytes and ending with BC equal to the payload (256). Check the CQE comes after the last data completion (row 51 at 4,016 ns, CQE at 4,400 ns). The whole command occupies the link for about 4.5 µs; the program to NAND is not in the trace at all.</p>
+  </div>
+
+  <h3>A Flush that follows the write</h3>
+  <div class="trace" data-kind="synthetic" data-title="Flush command after fsync(), CID 0x1032">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 ns</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0008</td><td>SQ1 tail = 8 (slot 7)</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>690 ns</td><td>MRd64</td><td>Addr=0x1_2340_01C0 Len=16 Tag=0x23</td><td>Fetch slot 7</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,340 ns</td><td>CplD</td><td>Tag=0x23 BC=64; payload 10320000 00000001 0 …</td><td>Flush (opcode 00h), CID 0x1032, NSID 1, no data pointer</td></tr>
+        <tr class="note"><td colspan="6">No data TLPs. 1.34 µs → 1.82 ms: controller programs all dirty cache for namespace 1 (duration depends on how much was dirty).</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1.820 ms</td><td>MWr64</td><td>Addr=0x1_2341_00D0 Len=4; payload 0 0 00010008 00011032</td><td>CQE slot 0x0D: Flush complete, success</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1.820 ms</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x0000_0041</td><td>MSI-X vector 1</td></tr>
+        <tr class="dir-down"><td>6</td><td>Host→Dev</td><td>1.823 ms</td><td>MWr32</td><td>Addr=0xFE60_100C Data=0x0000_000E</td><td>CQ1 head = 0x0E</td></tr>
+      </tbody>
+    </table>
+    <p>A Flush is the cheapest command on the link and often the most expensive in time. If you see an application stall with this shape, the question is not "what is wrong with the PCIe link" but "how much dirty data was in the cache, and why is the application flushing so often."</p>
+  </div>
+
+  <h3>An abnormal write: the second page is not mapped</h3>
+  <p>A user-space driver under development computes PRP2 incorrectly as 0x2_0000_A000 (one page too far); only 0x2_0000_8000 and 0x2_0000_9000 are mapped for the device in the IOMMU.</p>
+  <div class="trace" data-kind="synthetic" data-title="8 KiB WRITE with an unmapped PRP2">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x0000_0007</td><td>SQ1 tail doorbell</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>700</td><td>MRd64</td><td>Addr=0x1_2340_0180 Len=16 Tag=0x22</td><td>SQE fetch</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,350</td><td>CplD</td><td>Tag=0x22 BC=64; payload … 00008000 00000002 <strong>0000A000 00000002</strong> …</td><td>SQE delivered. PRP2 = 0x2_0000_A000: the root cause is already visible, but nothing on the link is abnormal yet</td></tr>
+        <tr class="dir-up"><td>4–11</td><td>Dev→Host</td><td>2,200–2,270</td><td>MRd64 ×8</td><td>Addr=0x2_0000_8000…0x2_0000_8E00 Len=128 Tags 0x30–0x37</td><td>Pull page 1</td></tr>
+        <tr class="dir-up"><td>12–19</td><td>Dev→Host</td><td>2,280–2,350</td><td>MRd64 ×8</td><td>Addr=0x2_0000_A000…0x2_0000_AE00 Len=128 Tags 0x38–0x3F</td><td>Pull "page 2" at the wrong address</td></tr>
+        <tr class="dir-down"><td>20–35</td><td>Host→Dev</td><td>2,900–3,440</td><td>CplD ×16</td><td>Tags 0x30–0x37, BC 512/256, Status=SC</td><td>Page 1 data arrives normally</td></tr>
+        <tr class="abnormal"><td>36</td><td>Host→Dev</td><td>3,480</td><td>Cpl</td><td>Tag=0x38 ReqID=0x0100 Status=UR BC=512 (no data)</td><td>First abnormal event: Unsupported Request for 0x2_0000_A000 (IOMMU blocked the read)</td></tr>
+        <tr class="dir-down"><td>37–43</td><td>Host→Dev</td><td>3,500–3,620</td><td>Cpl ×7</td><td>Tags 0x39–0x3F Status=UR</td><td>Remaining page-2 reads also refused</td></tr>
+        <tr class="dir-up"><td>44</td><td>Dev→Host</td><td>4,900</td><td>MWr64</td><td>Addr=0x1_2341_00C0 Len=4; payload 0 0 00010007 00091031</td><td>CQE: CID 0x1031, status SCT 0 / SC 04h (Data Transfer Error), P=1</td></tr>
+        <tr class="dir-up"><td>45</td><td>Dev→Host</td><td>4,960</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x0000_0041</td><td>MSI-X</td></tr>
+        <tr class="dir-down"><td>46</td><td>Host→Dev</td><td>7,400</td><td>MWr32</td><td>Addr=0xFE60_100C Data=0x0000_000D</td><td>CQ head doorbell</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The first abnormal <em>event</em> is row 36: a completion with Unsupported Request status for tag 0x38. Match the tag to its request (row 12): address 0x2_0000_A000. Ask "which command's PRP range contains that address?" The decoded SQE in row 3 shows PRP2 = 0x2_0000_A000, so it belongs to CID 0x1031, and since PRP1 is 0x2_0000_8000 and the transfer is exactly two pages, a correct PRP2 would have been 0x2_0000_9000. The root cause (wrong PRP2) was in the trace from row 3; the link became abnormal only when the controller acted on it. The controller behaved well: it did not write partial data as success, it reported Data Transfer Error (DW3 status field 0x04 shifted into bits 24:17 gives 0x0008_0000, plus phase 0x0001_0000 and CID 0x1031 = 0x0009_1031).</p>
+    <p>On the host you would expect an IOMMU fault report naming device 0000:01:00.0, a read access and fault address 0x2_0000_A000 (exact log format is platform- and kernel-dependent), and an NVMe error message for the write at LBA 2113536 with status type 0 and status code 0x4. Some kernels decode this as "Data Transfer Error". Whether the root complex also logs the UR in AER depends on platform configuration <span class="badge impl">Implementation-dependent</span>.</p>
+  </div>
+  <aside class="callout trace">
+    <p>The general lesson: the first abnormal event and the root cause are often different rows. Always ask what earlier data the abnormal event depends on (here, the PRP2 value), and go back to where that data entered the trace.</p>
+  </aside>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>The commands below are read-only. Commands that change cache settings or write to the device are deliberately not shown here; the lab uses a file on a scratch file system instead of the raw device.</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Does the drive have a volatile write cache, and is it on?</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -i -A2 'vwc'
+sudo nvme get-feature /dev/nvme0 -f 6 -H          <span class="cm"># Volatile Write Cache feature (06h)</span>
+
+<span class="cm"># What the block layer believes</span>
+cat /sys/block/nvme0n1/queue/write_cache           <span class="cm"># "write back" or "write through"</span>
+cat /sys/block/nvme0n1/queue/fua                   <span class="cm"># 1 if FUA is passed to the device</span>
+
+<span class="cm"># Read request size limit seen by the controller's data pull</span>
+sudo lspci -vvv -s 01:00.0 | grep -E 'MaxPayload|MaxReadReq'
+
+<span class="cm"># Watch writes and flushes while something else runs (read-only tracing)</span>
+sudo trace-cmd record -e nvme:nvme_setup_cmd -e nvme:nvme_complete_rq \
+     -e block:block_rq_issue -e block:block_rq_complete sleep 5
+sudo trace-cmd report | grep -E 'nvme_cmd_(write|flush)|block_rq'</code></pre>
+  <p>Illustrative excerpt (synthetic; formats vary by kernel version). The first line is the cached write, the second the same write issued with FUA, the third the Flush from <code>fsync()</code>:</p>
+  <pre class="code" data-kind="read-only" data-lang="text"><code>nvme_setup_cmd: nvme0: disk=nvme0n1, qid=1, cmdid=4145, nsid=1, flags=0x0, meta=0x0, cmd=(nvme_cmd_write slba=2113536, len=15, ctrl=0x0, dsmgmt=0, reftag=0)
+nvme_setup_cmd: nvme0: disk=nvme0n1, qid=1, cmdid=4147, nsid=1, flags=0x0, meta=0x0, cmd=(nvme_cmd_write slba=2113536, len=15, ctrl=0x4000, dsmgmt=0, reftag=0)
+nvme_setup_cmd: nvme0: disk=nvme0n1, qid=1, cmdid=4146, nsid=1, flags=0x0, meta=0x0, cmd=(nvme_cmd_flush)</code></pre>
+  <table>
+    <caption>What host-side evidence proves for writes</caption>
+    <thead><tr><th>Source</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>write_cache</code>, <code>fua</code> attributes</td><td>What the block layer will send (FUA bits, flushes)</td><td>That the drive honours them</td></tr>
+      <tr><td><code>nvme_setup_cmd</code> with <code>ctrl=0x4000</code></td><td>FUA was set on this command</td><td>When data became durable</td></tr>
+      <tr><td><code>nvme_cmd_flush</code> completion</td><td>The drive claims prior completed writes are durable</td><td>That it is true; only power-loss testing proves it</td></tr>
+      <tr><td>Write latency from tracepoints</td><td>Whether completions wait for media (long) or cache (short)</td><td>Internal program timing</td></tr>
+      <tr><td>IOMMU fault messages</td><td>A device access was blocked, with address and direction</td><td>Which command it belonged to (needs the SQE)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <h3>Modelling the data pull</h3>
+  <p>This script reproduces the data-pull half of the normal trace and the unaligned example in the figure. Run it with no arguments for the chapter's 8 KiB write, or with <code>0x830 4096</code> for a 4 KiB write whose buffer starts at offset 0x830 in its page.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="e2e_write_pull.py"><code>#!/usr/bin/env python3
+"""Synthetic model of how a controller pulls WRITE data on the lab system.
+Walks the PRP entries, splits the pull into Memory Read requests (MRRS, no
+4 KiB crossing), and models how the root complex answers each one with
+Completions (payload &lt;= MPS, split only at RCB-aligned addresses).
+Standard library only. Splitting policy of the completer is an assumption.
+Usage: python3 e2e_write_pull.py [PRP1_OFFSET] [LENGTH]   e.g. 0x830 4096"""
+import sys
+
+MPS, MRRS, RCB, PAGE = 256, 512, 64, 4096
+
+def prp_ranges(prp1, prp2, length):
+    """PRP1 may carry an offset; PRP2 is the second page (no list for &lt;= 2 pages)."""
+    first = min(length, PAGE - (prp1 % PAGE))
+    out = [(prp1, first)]
+    if length &gt; first:
+        if length - first &gt; PAGE:
+            raise ValueError("needs a PRP list; not modelled here")
+        out.append((prp2, length - first))
+    return out
+
+def read_requests(ranges, first_tag=0x30):
+    tag = first_tag
+    for addr, n in ranges:
+        while n:
+            size = min(MRRS, n, PAGE - addr % PAGE)
+            yield tag, addr, size
+            tag, addr, n = tag + 1, addr + size, n - size
+
+def completions(addr, size, chunk=MPS):
+    """One assumed completer policy: MPS-sized pieces, cut at RCB-aligned addresses."""
+    remaining = size
+    while remaining:
+        n = min(chunk, remaining)
+        end = addr + n
+        if n &lt; remaining and end % RCB:          # cut must land on an RCB boundary
+            n -= end % RCB
+        yield addr, n, remaining                 # byte count = bytes still to come
+        addr, remaining = addr + n, remaining - n
+
+def main():
+    offset = int(sys.argv[1], 0) if len(sys.argv) &gt; 1 else 0
+    length = int(sys.argv[2], 0) if len(sys.argv) &gt; 2 else 8192
+    prp1, prp2 = 0x2_0000_8000 + offset, 0x2_0000_9000
+    reqs = list(read_requests(prp_ranges(prp1, prp2, length)))
+    cpls = 0
+    for tag, addr, size in reqs:
+        print(f"MRd64  tag={tag:#04x} addr={addr:#x} len={size // 4:3d} DW")
+        for a, n, bc in completions(addr, size):
+            cpls += 1
+            print(f"   CplD tag={tag:#04x} len={n // 4:3d} DW  BC={bc:3d}  LowAddr={a &amp; 0x7F:#04x}")
+    print(f"\n{len(reqs)} read requests, {cpls} completions for {length} bytes")
+    nlb = length // 512 - 1                      # 512-byte LBAs, zero-based
+    print(f"CDW12 without FUA = {nlb:#010x}, with FUA (bit 30) = {nlb | 1 &lt;&lt; 30:#010x}")
+
+if __name__ == "__main__":
+    main()</code></pre>
+  <p>Expected output with no arguments: sixteen <code>MRd64</code> lines with tags 0x30–0x3F, each followed by two <code>CplD</code> lines with BC 512 then 256; a summary line <code>16 read requests, 32 completions for 8192 bytes</code>; and the CDW12 values 0x0000000f and 0x4000000f.</p>
+
+  <h3>Driver choice between FUA and Flush, simplified</h3>
+  <pre class="code" data-kind="pseudocode" data-lang="c" data-title="durability handling, simplified"><code><span class="cm">/* Block layer: what reaches the driver (cf. blk-flush handling) */</span>
+if (!queue_has_volatile_cache(q))
+    rq-&gt;flags &amp;= ~(REQ_FUA | REQ_PREFLUSH);      <span class="cm">/* nothing to flush: strip */</span>
+else if (rq-&gt;flags &amp; REQ_FUA &amp;&amp; !queue_supports_fua(q))
+    emulate_with_post_flush(rq);                 <span class="cm">/* write, then a Flush command */</span>
+
+<span class="cm">/* NVMe driver: encoding (cf. nvme_setup_rw / nvme_setup_flush) */</span>
+if (req_op(rq) == REQ_OP_FLUSH) {
+    c.opcode = 0x00;                             <span class="cm">/* Flush */</span>
+    c.nsid   = ns-&gt;nsid;
+} else {
+    c.opcode = 0x01;                             <span class="cm">/* Write */</span>
+    c.cdw12  = nlb_zero_based;
+    if (rq-&gt;flags &amp; REQ_FUA)
+        c.cdw12 |= 1u &lt;&lt; 30;                     <span class="cm">/* Force Unit Access */</span>
+}</code></pre>
+
+  <h3>An application that needs durability</h3>
+  <pre class="code" data-kind="hardware-dependent" data-lang="c" data-title="durable_write.c"><code><span class="cm">/* Writes 8 KiB to a scratch FILE (never a raw device) and makes it durable.
+   Caution: overwrites the first 8 KiB of the named file. */</span>
+#define _GNU_SOURCE
+#include &lt;fcntl.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(int argc, char **argv)
+{
+    if (argc != 2) { fprintf(stderr, "usage: %s SCRATCH_FILE\n", argv[0]); return 2; }
+    int fd = open(argv[1], O_WRONLY | O_CREAT | O_DIRECT, 0600);
+    if (fd &lt; 0) { perror("open"); return 1; }
+    void *buf;
+    if (posix_memalign(&amp;buf, 4096, 8192)) return 1;
+    memset(buf, 0xA5, 8192);
+    if (pwrite(fd, buf, 8192, 0) != 8192) { perror("pwrite"); return 1; }  <span class="cm">/* accepted */</span>
+    if (fdatasync(fd) != 0) { perror("fdatasync"); return 1; }           <span class="cm">/* durable  */</span>
+    free(buf);
+    close(fd);
+    return 0;
+}</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <h3>Timeline</h3>
+  <table>
+    <caption>End-to-end timeline of the cached WRITE (synthetic example for teaching)</caption>
+    <thead><tr><th>Host time (µs)</th><th>Link time (ns)</th><th>Stage</th><th>Event</th></tr></thead>
+    <tbody>
+      <tr><td>0.00</td><td>—</td><td>Application request</td><td>pwrite() enters the kernel</td></tr>
+      <tr><td>0.40–0.85</td><td>—</td><td>Block request</td><td>extent lookup, bio with 2 segments, tag 0x31</td></tr>
+      <tr><td>0.85–1.25</td><td>—</td><td>Driver, command memory, SQ</td><td>2 pages DMA-mapped, SQE in slot 6</td></tr>
+      <tr><td>1.30</td><td>—</td><td>Doorbell</td><td>writel(7)</td></tr>
+      <tr><td>1.75</td><td>0</td><td>PCIe Memory Write</td><td>doorbell on link</td></tr>
+      <tr><td>2.45 / 3.10</td><td>700 / 1,350</td><td>Command fetch</td><td>SQE MRd / CplD</td></tr>
+      <tr><td>3.10–3.95</td><td>—</td><td>DMA request</td><td>validate, allocate cache, plan 16 reads</td></tr>
+      <tr><td>3.95–4.10</td><td>2,200–2,350</td><td>Memory Read TLPs</td><td>16 data MRd</td></tr>
+      <tr><td>4.65–5.77</td><td>2,900–4,016</td><td>Completions with Data</td><td>32 CplD</td></tr>
+      <tr><td>5.77–6.15</td><td>—</td><td>Write cache</td><td>data committed to cache</td></tr>
+      <tr><td>6.15</td><td>4,400</td><td>Completion entry</td><td>CQE</td></tr>
+      <tr><td>6.21</td><td>4,460</td><td>MSI-X</td><td>interrupt write</td></tr>
+      <tr><td>7.80</td><td>—</td><td>Driver</td><td>handler entry</td></tr>
+      <tr><td>8.25 / 8.70</td><td>6,950</td><td>Driver</td><td>CQ head doorbell issued / on link</td></tr>
+      <tr><td>10.80</td><td>—</td><td>Application completion</td><td>pwrite() returns 8192</td></tr>
+      <tr><td>later</td><td>—</td><td>Flash program</td><td>data programmed with other cached data</td></tr>
+    </tbody>
+  </table>
+  <h3>Latency budget, and the same write with FUA</h3>
+  <table>
+    <caption>Latency budget: cached write versus FUA write (synthetic example for teaching)</caption>
+    <thead><tr><th>Segment</th><th>Cached (µs)</th><th>Share</th><th>FUA (µs)</th><th>Owner</th></tr></thead>
+    <tbody>
+      <tr><td>Software submission</td><td>1.30</td><td>12.0%</td><td>1.30</td><td>Kernel</td></tr>
+      <tr><td>Doorbell transit</td><td>0.45</td><td>4.2%</td><td>0.45</td><td>CPU, root complex</td></tr>
+      <tr><td>SQE fetch round trip</td><td>1.35</td><td>12.5%</td><td>1.35</td><td>Controller, root complex</td></tr>
+      <tr><td>Controller front end (validate, allocate)</td><td>0.85</td><td>7.9%</td><td>0.85</td><td>Controller</td></tr>
+      <tr><td>Data pull (first MRd → last CplD)</td><td>1.82</td><td>16.9%</td><td>1.82</td><td>Controller, root complex, link</td></tr>
+      <tr><td>Commit before CQE</td><td>0.38</td><td>3.5%</td><td>240.00</td><td>Controller (cache vs media program)</td></tr>
+      <tr><td>CQE + MSI-X</td><td>0.06</td><td>0.6%</td><td>0.06</td><td>Controller, link</td></tr>
+      <tr><td>Interrupt delivery</td><td>1.59</td><td>14.7%</td><td>1.59</td><td>Platform</td></tr>
+      <tr><td>Completion processing</td><td>0.70</td><td>6.5%</td><td>0.70</td><td>Kernel</td></tr>
+      <tr><td>Wake-up and return</td><td>2.30</td><td>21.3%</td><td>2.30</td><td>Scheduler</td></tr>
+      <tr><td><strong>Total</strong></td><td><strong>10.80</strong></td><td>100%</td><td><strong>250.42</strong></td><td></td></tr>
+    </tbody>
+  </table>
+  <p>Observations:</p>
+  <ol>
+    <li><strong>A cached write is faster than a read</strong> (10.8 µs versus 64.6 µs) because no media operation is on its critical path. Host software and the platform are now about half of the total (submission, interrupt delivery, completion, wake-up: 5.89 µs of 10.8 µs).</li>
+    <li><strong>The data pull costs more than the read's data push</strong> (1.82 µs versus 0.6 µs for half the data) because the root complex's memory read latency is now on the critical path and the controller must wait for completions.</li>
+    <li><strong>FUA multiplies latency by about 23 times</strong> in this example. The program time dwarfs everything else, which is why FUA on every write is a performance disaster on drives without power-loss protection and nearly free on drives that report no volatile cache.</li>
+  </ol>
+  <div class="formula">
+    <div class="eq"><var>t</var><sub>pull</sub> ≈ <var>t</var><sub>RC</sub> + <var>N</var><sub>cpl</sub> × (<var>H</var><sub>cpl</sub> + <var>P</var> + <var>O</var>) / <var>B</var></div>
+    <dl class="vars">
+      <dt>t<sub>pull</sub></dt><dd>time from first data read request to last completion</dd>
+      <dt>t<sub>RC</sub></dt><dd>root-complex read latency for the first request (about 0.7 µs here)</dd>
+      <dt>N<sub>cpl</sub></dt><dd>number of completions (32)</dd>
+      <dt>H<sub>cpl</sub></dt><dd>completion header size, 12 bytes (3 DW)</dd>
+      <dt>P</dt><dd>payload per completion (256 bytes)</dd>
+      <dt>O</dt><dd>framing token plus link cyclic redundancy check (LCRC), 8 bytes</dd>
+      <dt>B</dt><dd>usable bandwidth, about 7.88 GB/s for Gen4 x4; 32 × 276 B ÷ 7.88 GB/s ≈ 1.12 µs, so t<sub>pull</sub> ≈ 1.8 µs</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Looking for MWr data in a write trace.</strong> Write data arrives at the device as Completions with Data, answering the device's own Memory Reads.</li>
+    <li><strong>Treating 32 completions as an error.</strong> Split completions are normal; check Byte Count sequences instead of counting TLPs per tag.</li>
+    <li><strong>Assuming completion order equals request order.</strong> Tags 0x34/0x35 in the normal trace show otherwise.</li>
+    <li><strong>Equating "write completed" with "data durable".</strong> Only true with no volatile cache, cache disabled, FUA, or a later Flush.</li>
+    <li><strong>Believing a Flush orders in-flight commands.</strong> It covers data from commands that already completed.</li>
+    <li><strong>Reusing the buffer early.</strong> The controller can read the buffer at any time until the CQE; it may even read it twice (for example after an internal retry).</li>
+    <li><strong>Blaming the drive for write-latency spikes caused by a full cache.</strong> Sustained writes eventually run at NAND speed; the spikes are the cache draining.</li>
+    <li><strong>Forgetting the file system.</strong> Allocating writes and journal commits add metadata writes and Flushes around your data write.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>Write-specific failure patterns</caption>
+    <thead><tr><th>Symptom</th><th>Likely stage</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th></tr></thead>
+    <tbody>
+      <tr><td>Write fails with Data Transfer Error</td><td>Completions with Data</td><td>IOMMU fault log for 01:00.0 and its address</td><td>Decode the SQE's PRPs (analyzer or driver debug) and compare</td><td>Repeat with the IOMMU in passthrough on a test machine: if it succeeds, the mapping is wrong, not the drive</td></tr>
+      <tr><td>Data lost after power cut, no errors</td><td>Write cache / durability</td><td><code>write_cache</code> attribute and VWC field</td><td>Whether the application or file system issued Flush/FUA (tracepoints)</td><td>Controlled power-loss test with and without <code>fdatasync()</code></td></tr>
+      <tr><td>Periodic multi-millisecond write stalls</td><td>DMA request (cache full) or Flush</td><td>Look for Flush commands at the stall times</td><td>Write latency versus write volume over time</td><td>Throttle write rate; stalls disappear if cache draining is the cause</td></tr>
+      <tr><td>Corrupted data on read-back, write reported success</td><td>Application request or completion entry</td><td>Did the application modify the buffer before completion?</td><td>Analyzer: any data CplD for the command's addresses after its CQE?</td><td>Write a pattern, freeze the buffer until completion; if corruption vanishes, it was buffer reuse</td></tr>
+      <tr><td>Completion Timeout logged by the device in AER</td><td>Memory Read TLPs</td><td>AER log on the device (uncorrectable, Completion Timeout)</td><td>Root-complex health, other devices' errors</td><td>Analyzer: which tag never received its final completion</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <ul>
+    <li><strong>Reads are latency-bound by media; cached writes are latency-bound by the host.</strong> Tuning advice for one is often wrong for the other.</li>
+    <li><strong>The durability contract is a chain.</strong> Application flags → file system → block layer flags → NVMe FUA/Flush → controller firmware → power-loss hardware. A break at any link loses data silently. When asked "is this durable?", walk the chain out loud.</li>
+    <li><strong>Read-request sizing is a controller design lever.</strong> Larger reads (up to MRRS) reduce header overhead; smaller reads reduce reassembly buffering and head-of-line blocking. Many controllers use 256 B or 512 B regardless of MRRS. Do not assume MRRS-sized requests.</li>
+    <li><strong>Tags can be the bottleneck for writes, never for reads.</strong> Read data uses posted writes and needs no tags; write data needs a tag per outstanding request. At Gen5 and beyond with long root-complex latencies, 8-bit tags can limit write throughput; this is a motivation for 10-bit and 14-bit tags.</li>
+    <li><strong>"First abnormal event" and "root cause" are different rows.</strong> In the unmapped-PRP2 trace the evidence was in the SQE long before the UR.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 40 — See the cost of durability</h3>
+  <h4>Objective</h4>
+  <p>Observe, with host tracepoints, the difference between a cached write, a write with FUA (via <code>O_DSYNC</code>) and a write followed by <code>fdatasync()</code>, and relate the latencies to the stages of this chapter.</p>
+  <h4>Skills</h4>
+  <p>Reading NVMe write and flush tracepoints; recognizing FUA in <code>ctrl</code>; measuring command latency; reasoning about durability.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge caution">Caution lab</span> This lab writes data. Use a scratch file on a file system you can afford to fill, never a raw block device, never a disk holding data you need. Do not change the drive's cache feature.</p></aside>
+  <h4>Hardware required</h4>
+  <p>Linux machine with an NVMe SSD and a scratch file system on it.</p>
+  <h4>Software required</h4>
+  <p><code>fio</code>, <code>trace-cmd</code>, <code>nvme-cli</code>, a C compiler (optional, for <code>durable_write.c</code>), Python 3.</p>
+  <h4>Input</h4>
+  <p>A scratch directory, for example <code>/scratch</code>, on the NVMe device.</p>
+  <h4>Expected output</h4>
+  <p>Three latency numbers (cached, O_DSYNC, write + fdatasync) and the matching tracepoint lines showing <code>ctrl=0x0</code>, <code>ctrl=0x4000</code> or a Flush.</p>
+  <h4>Background</h4>
+  <p><a href="#durability">Durability: write cache, FUA and Flush</a>; check <code>write_cache</code> and <code>fua</code> first.</p>
+  <h4>Step 1 — Know your drive</h4>
+  <p>Run the read-only commands in <a href="#linux">Linux view</a>. Record VWC, the Volatile Write Cache feature value, <code>write_cache</code> and <code>fua</code>.</p>
+  <h4>Step 2 — Three runs</h4>
+  <pre class="code" data-kind="hardware-dependent" data-lang="sh"><code><span class="cm"># Caution: writes to a scratch file only.</span>
+fio --name=cached --filename=/scratch/fio.dat --size=64M --rw=randwrite --bs=8k \
+    --direct=1 --iodepth=1 --runtime=10 --time_based
+fio --name=dsync  --filename=/scratch/fio.dat --size=64M --rw=randwrite --bs=8k \
+    --direct=1 --sync=dsync --iodepth=1 --runtime=10 --time_based
+fio --name=fdsync --filename=/scratch/fio.dat --size=64M --rw=randwrite --bs=8k \
+    --direct=1 --fdatasync=1 --iodepth=1 --runtime=10 --time_based</code></pre>
+  <h4>Step 3 — Trace one of each</h4>
+  <p>Repeat each run for one second under <code>trace-cmd record -e nvme -e block:block_rq_issue</code> and find one Write (and Flush) per run.</p>
+  <h4>Observation</h4>
+  <p>Record mean and 99th-percentile completion latency per run, and whether <code>ctrl</code> shows 0x4000.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Which run had the lowest latency and why?</li>
+    <li>Did the <code>dsync</code> run show FUA, Flushes, or neither? What does that tell you about the drive?</li>
+    <li>In the <code>fdsync</code> run, how many NVMe commands does one fio iteration produce?</li>
+    <li>If the three runs have nearly identical latency, what can you conclude?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Predict the TLP count on the lab system for one 8 KiB write with FUA followed by nothing, and for one 8 KiB write followed by a Flush.</p>
+  <details class="hint"><summary>Hints</summary><p>If <code>write_cache</code> says "write through", the block layer strips FUA and flushes. File-system journaling may add metadata writes in the fdatasync run if the file was extended.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>Q1: the cached run, because completion does not wait for media. Q2: on a drive with a volatile cache and FUA support, <code>ctrl=0x4000</code> on the writes (overwrites of allocated blocks); if FUA is unsupported, a Flush after each write; if the drive reports no volatile cache, neither, and the latencies match the cached run. Q3: typically two (Write, then Flush), more if metadata changed. Q4: the drive has no volatile write cache (typical of power-loss-protected drives) or the cache is disabled; every completion is already durable.</p>
+    <p>Challenge: FUA write: the same 54 TLPs as the normal trace (the only difference is timing and CDW12). Write + Flush: 54 + 6 = 60 TLPs (Flush doorbell, SQE MRd, CplD, CQE, MSI-X, head doorbell), assuming one interrupt and one head doorbell per command.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>The 99th percentile, not the mean: Flush latency depends on the cache state, so its tail is long. Also whether the file was preallocated: if not, the first pass measures file-system allocation as much as the drive.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li><code>fio</code> reports <code>EINVAL</code>: block size or alignment unsuitable for direct I/O on this file system.</li>
+    <li>No NVMe events: the scratch directory is on a different device (check with <code>df</code>).</li>
+    <li>Very high latency on all runs: thermal throttling or a full cache from a previous test; let the drive idle and repeat.</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>Run <code>e2e_write_pull.py</code> with MRRS set to 256 and to 4096 (edit the constant) and compare request and completion counts. With an analyzer, capture an 8 KiB write and check the completion splitting your root complex actually uses.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li><p>Redo the data-pull plan for MRRS = 256 and MPS = 256. How many reads and completions?</p>
+      <details class="answer"><summary>Answer</summary><p>8192 / 256 = 32 reads; each fits in one completion (256 ≤ MPS), so at least 32 completions. Same completion count, twice the request count and tags.</p></details></li>
+    <li><p>A 12 KiB write starts at a page-aligned buffer. What are PRP1 and PRP2?</p>
+      <details class="answer"><summary>Answer</summary><p>Three pages: PRP1 is the first page; PRP2 is the address of a PRP list containing the second and third page addresses. The controller will first issue an MRd for the PRP list (at 0x1_5000_xxxx on the lab system) before or while pulling data.</p></details></li>
+    <li><p>Decode CQE DW3 = 0x0009_1031.</p>
+      <details class="answer"><summary>Answer</summary><p>CID 0x1031 (bits 15:0); phase 1 (bit 16); status field 0x0009_1031 &gt;&gt; 17 = 0x4: Status Code 04h with Status Code Type 0 (generic), More 0, Do Not Retry 0: Data Transfer Error.</p></details></li>
+    <li><p>In the normal trace, which completion finishes tag 0x35, and how do you know without counting bytes?</p>
+      <details class="answer"><summary>Answer</summary><p>Row 29: its Byte Count (256) equals its payload length (64 DW = 256 B), which marks the last completion of the request.</p></details></li>
+    <li><p>Why does a write need tags for its data while a read does not?</p>
+      <details class="answer"><summary>Answer</summary><p>Write data is fetched by non-posted Memory Reads, whose completions must be matched by Requester ID and tag. Read data is pushed with posted Memory Writes, which need no completion and therefore no tag matching.</p></details></li>
+    <li><p>A drive reports VWC = 0. An application uses <code>O_DSYNC</code>. What NVMe commands do you expect, and what is the write latency compared with no <code>O_DSYNC</code>?</p>
+      <details class="answer"><summary>Answer</summary><p>Plain Writes without FUA and no Flushes (the block layer strips them because there is no volatile cache). Latency is the same as without <code>O_DSYNC</code>, apart from any file-system metadata work.</p></details></li>
+  </ol>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>How does WRITE data travel from host memory to the SSD?</p>
+      <ul class="options" data-answer="3">
+        <li>The CPU writes it to the SSD's Base Address Register (BAR) window with Memory Writes</li>
+        <li>The SSD receives posted Memory Writes from the root complex</li>
+        <li>The SSD issues Memory Reads and the root complex returns Completions with Data</li>
+        <li>The data is inside the SQE</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The controller is the bus master for data in both directions. For a write it reads the PRP pages, and the data comes back as completions.</p></details></li>
+    <li><p>With MRRS 512 and MPS 256, what is the minimum number of completions for 8 KiB?</p>
+      <ul class="options" data-answer="3">
+        <li>8</li><li>16</li><li>32</li><li>64</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Each completion carries at most MPS = 256 bytes; 8192 / 256 = 32, regardless of how many requests there are.</p></details></li>
+    <li><p>What does Byte Count = 256 on a 256-byte completion tell you?</p>
+      <details class="answer"><summary>Answer</summary><p>It is the last completion for that request: the remaining byte count equals this completion's own payload.</p></details></li>
+    <li><p>Which bit makes a Write durable before completion?</p>
+      <ul class="options" data-answer="2">
+        <li>Limited Retry, CDW12 bit 31</li>
+        <li>Force Unit Access, CDW12 bit 30</li>
+        <li>PSDT in CDW0</li>
+        <li>The phase tag</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>FUA (bit 30 of CDW12) requires the data to be on non-volatile media before the command completes.</p></details></li>
+    <li><p>Why is a cached write faster than a read on the lab system?</p>
+      <details class="answer"><summary>Answer</summary><p>The write completes once data is in the controller's cache; NAND programming is deferred. The read must wait for the NAND array read (tR) before any data can be returned.</p></details></li>
+    <li><p>What does a Flush command guarantee?</p>
+      <details class="answer"><summary>Answer</summary><p>That data from write commands completed before the Flush was submitted is on non-volatile media when the Flush completes (scope per the specification: the namespace, or all namespaces when broadcast). It does not order or cover commands still in flight.</p></details></li>
+    <li><p>In the abnormal trace, what is the first abnormal event and where is the root-cause evidence?</p>
+      <details class="answer"><summary>Answer</summary><p>First abnormal event: the UR completion for tag 0x38 (row 36). Root-cause evidence: the PRP2 value 0x2_0000_A000 in the SQE payload (row 3).</p></details></li>
+    <li><p>Can completions for tag 0x35 arrive before those for tag 0x34?</p>
+      <ul class="options" data-answer="1">
+        <li>Yes</li><li>No</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Yes. Ordering between completions for different requests is not guaranteed; only completions of a single request come in address order.</p></details></li>
+    <li><p>Why must the controller not post the CQE before the last data completion arrives?</p>
+      <details class="answer"><summary>Answer</summary><p>The host may reuse or free the buffer as soon as it sees the CQE; late reads would then fetch new contents, writing wrong data to media. The PCIe link cannot enforce this, so the controller must.</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>(Beginner)</strong> What is the main difference on the PCIe link between an NVMe read and write?</p>
+      <details class="answer"><summary>Model answer</summary><p>Read data goes device-to-host as posted Memory Writes. Write data goes host-to-device as Completions to the device's Memory Read requests.</p></details></li>
+    <li><p><strong>(Beginner)</strong> What is a volatile write cache, and why can it lose data?</p>
+      <details class="answer"><summary>Model answer</summary><p>DRAM in the SSD where accepted write data waits before being programmed into NAND. DRAM loses contents on power loss, so without power-loss protection, acknowledged data not yet programmed is lost.</p></details></li>
+    <li><p><strong>(Intermediate)</strong> Explain Byte Count and Lower Address in a split completion.</p>
+      <details class="answer"><summary>Model answer</summary><p>Byte Count is the number of bytes remaining to be returned for the request, including this completion. Lower Address gives the low bits of the address of this completion's first byte, so the requester can place the payload and check alignment. The last completion has Byte Count equal to its payload size.</p></details></li>
+    <li><p><strong>(Intermediate)</strong> How does Linux turn <code>fsync()</code> into NVMe commands?</p>
+      <details class="answer"><summary>Model answer</summary><p>The file system writes dirty data and metadata (possibly journal commits with pre-flush and FUA flags), then issues a cache flush; the block layer turns the flush into an NVMe Flush command if the device has a volatile write cache, and strips it otherwise.</p></details></li>
+    <li><p><strong>(Advanced)</strong> A write workload shows good average latency but 5 ms spikes every few seconds. What do you investigate?</p>
+      <details class="answer"><summary>Model answer</summary><p>Flush commands from journal commits or fsync; write-cache saturation and SLC-cache folding; garbage collection; thermal throttling. Correlate spikes with Flush tracepoints and write volume; on an analyzer, check whether the delay is between SQE fetch and data pull (cache full) or between data and CQE (FUA/program).</p></details></li>
+    <li><p><strong>(Advanced)</strong> Why can write throughput be tag-limited when read throughput is not?</p>
+      <details class="answer"><summary>Model answer</summary><p>Each outstanding write data read needs a tag until all its completions arrive. Throughput ≤ tags × request size ÷ round-trip latency. With 256 tags, 512-byte requests and a 2 µs round trip, that is about 65 GB/s, but with smaller requests or longer latency (switches, remote memory) the limit can fall below link bandwidth. Reads use posted writes and need no tags.</p></details></li>
+    <li><p><strong>(Senior)</strong> How would you validate that a drive honours FUA and Flush?</p>
+      <details class="answer"><summary>Model answer</summary><p>Automated power-loss testing: write known patterns with sequence numbers, with FUA and with write+Flush, cut power at random points after completions, then verify that every write acknowledged durable is present and correct. Combine with analyzer captures to time power cuts relative to CQEs. Test with the cache enabled and disabled, and with near-full cache.</p></details></li>
+    <li><p><strong>(Senior)</strong> A customer's database loses its last committed transactions after power failure on a new drive model. Walk through your investigation.</p>
+      <details class="answer"><summary>Model answer</summary><p>Walk the durability chain: database settings (fsync/O_DSYNC usage), file system mount options (barriers), block-layer <code>write_cache</code>/<code>fua</code>, NVMe tracepoints to confirm Flush/FUA are issued, the drive's VWC report and firmware version, then reproduce with controlled power-loss tests. A drive that reports VWC = 0 but has a volatile cache, or completes Flush early, is the classic firmware culprit.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain why the runner has to come back for the drawings, and what "file it in the basement first" means.</li>
+    <li><strong>To a junior engineer:</strong> list the TLPs of an 8 KiB write and explain why there are twice as many completions as reads.</li>
+    <li><strong>To a senior engineer:</strong> explain the durability chain from <code>O_DSYNC</code> to NAND, and how you would prove on an analyzer that a controller never posts a CQE before its data completions.</li>
+  </ul>
+  <details class="answer"><summary>Model answer for the senior-engineer version</summary>
+    <p><code>O_DSYNC</code> makes the file system request durability; for a pure overwrite it marks the bio <code>REQ_FUA</code>, otherwise it journals metadata and issues flushes. The block layer keeps FUA only if the queue has a volatile cache and FUA support, otherwise it emulates with a post-flush or strips it. The NVMe driver sets CDW12 bit 30 or issues a Flush (opcode 00h). The controller must program the data (or protect it) before completion. To prove CQE-after-data on the analyzer, for each Write CQE find the command's PRP ranges from its SQE fetch completion, collect all data-read requests in those ranges and their completions, and assert every final completion (BC equal to payload) precedes the CQE. Run with many queues, unaligned buffers and an exerciser injecting completion delays.</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>An NVMe WRITE shares its submission half with the READ, then reverses the data direction: the controller pulls data with Memory Read requests (MRRS-sized, one tag each) and the root complex answers with Completions (MPS-sized, split at RCB boundaries, identified by tag, Byte Count and Lower Address). With a volatile write cache, the controller posts the CQE once the data is in cache, so a write completes much faster than a read, and the NAND program happens later. Durability then needs FUA (this command), Flush (everything already completed), or a drive with no volatile cache. Correctness on the link rests on the controller holding the CQE until all data has arrived, not on PCIe ordering.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>list every TLP of the 8 KiB write and say which are posted and which need tags;</li>
+      <li>split a data pull into requests and completions for any MRRS, MPS, RCB and buffer offset;</li>
+      <li>use Byte Count and Lower Address to recognise the last completion of a request;</li>
+      <li>explain why a cached write completes faster than a read, and what FUA does to the budget;</li>
+      <li>explain what Flush does and does not guarantee;</li>
+      <li>find the first abnormal event in the unmapped-PRP2 trace and trace it to the SQE.</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Command Set Specification, Revision 1.3 — Write command</cite>.</li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Flush command; Identify Controller (Volatile Write Cache); Volatile Write Cache feature; generic command status</cite>.</li>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — completion rules, Read Completion Boundary, Max Read Request Size</cite>.</li>
+    <li>Linux kernel source: <code>block/blk-flush.c</code>, <code>drivers/nvme/host/core.c</code> (command setup), kernel documentation on writeback cache control.</li>
+    <li>In this course: <a href="dd31.html">Deep dive: WRITE</a>, <a href="dd32.html">Deep dive: FLUSH</a>, <a href="dd12.html">Deep dive: PCIe Completions</a>, <a href="dd13.html">Deep dive: PCIe Tags</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch41.html">Command-to-TLP Correlation</a> turns the two journeys you have now seen into a method for untangling many commands interleaved in one trace.</p>
+</section>

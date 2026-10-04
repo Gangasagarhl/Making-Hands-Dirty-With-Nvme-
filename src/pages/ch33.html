@@ -1,0 +1,852 @@
+<p class="lead">A WRITE looks like a READ run backwards, and that is exactly where people go wrong. In a WRITE the controller <em>pulls</em> the data out of host memory with read requests, holds it somewhere you cannot see, and may tell you it is finished long before the data is safe from a power cut. This chapter follows one 4 KiB write from the application to the flash cell and back, and teaches you what "completion" really promises.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>Writes are where storage systems keep their promises or break them. A database commit, a filesystem journal, a log line in a payment system: each is a write that someone, somewhere, is relying on. If you misunderstand what a Non-Volatile Memory Express (NVMe) Write command guarantees, you will design software that loses data on power failure, or you will add so many safety barriers that performance collapses.</p>
+  <p>Writes are also where Peripheral Component Interconnect Express (PCIe) traces surprise beginners. In <a href="ch32.html">Chapter 32 (READ)</a> the controller pushed data to the host with posted Memory Write requests. In a WRITE the same controller has to <em>ask</em> for the data with non-posted Memory Read requests and wait for Completions with Data. The direction of the data is host-to-device, but the direction of the requests is device-to-host. If you look for "writes" on the analyzer during an NVMe WRITE, you will find almost none.</p>
+  <p>Finally, writes reveal the gap between the protocol and the medium. Programming a NAND (Not-AND gate based) flash page takes hundreds of microseconds to milliseconds; a well-behaved solid-state drive (SSD) completes a 4 KiB write in tens of microseconds. That gap is filled by a write cache, and the write cache is the subject of half the arguments you will ever have about durability.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Trace a single NVMe Write command through every layer: application, filesystem, block layer, driver, Submission Queue Entry (SQE), doorbell, controller, Direct Memory Access (DMA), controller buffer, NAND program, Completion Queue Entry (CQE), interrupt.</li>
+    <li>Decode the Write command fields that matter: opcode 01h, Namespace Identifier (NSID), Starting Logical Block Address (SLBA), <span class="g" data-term="nlb">Number of Logical Blocks (NLB, 0's based)</span>, <span class="g" data-term="fua">Force Unit Access (FUA)</span>, Limited Retry (LR), and the data pointer (PRP or Scatter Gather List (SGL)).</li>
+    <li>Predict the PCIe footprint of a write: how many Memory Read (MRd) requests and Completions with Data (CplD) a given size produces, given <span class="g" data-term="mrrs">Max Read Request Size (MRRS)</span>, Max Payload Size (MPS) and the root complex's completion behavior.</li>
+    <li>Explain precisely what a successful completion means for durability with and without a volatile write cache, and what FUA changes.</li>
+    <li>Read a normal, a slow and a failed synthetic WRITE trace, find the first abnormal event, and reason to a root cause.</li>
+    <li>Inspect write-path behavior safely on Linux and know what that output can and cannot prove.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>You should be comfortable with: posted versus non-posted transactions (<a href="ch12.html">Chapter 12</a>), tags and outstanding requests (<a href="ch13.html">Chapter 13</a>), DMA (<a href="ch20.html">Chapter 20</a>), doorbells (<a href="ch28.html">Chapter 28</a>), the 64-byte command layout (<a href="ch29.html">Chapter 29</a>), the non-volatile memory (NVM) Command Set (<a href="ch31.html">Chapter 31</a>) and, most importantly, the READ path (<a href="ch32.html">Chapter 32</a>). Physical Region Pages are covered fully in <a href="ch36.html">Chapter 36</a>; here we use only the simple single-page case.</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Imagine a bakery that takes cake orders. You (the teacher) write an order slip — "please store this recipe in the vault, shelf 4096" — and drop it in the order box. You ring the bell. The baker's helper (the librarian from our earlier chapters) comes to your desk, reads the slip, and then walks over to <em>your</em> kitchen table to copy the recipe page by page. When the helper has every page in their apron pocket, they shout "Got it!" and put a ticket in your answer box.</p>
+    <p>But here is the secret: the recipe is still in the helper's apron, not in the vault. Getting into the vault takes a long time, so the helper waits and carries many recipes in together. If the helper trips and the apron catches fire before reaching the vault, the recipe is gone — even though you heard "Got it!". If you really need to know it is in the vault, you must either say "put it straight in the vault before you shout" (that is FUA) or later say "empty your apron into the vault now" (that is FLUSH, the next chapter).</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>A moving company that offers "we've collected your boxes" receipts. You book a job (the command), point to where the boxes are in your house (the data pointer), and the movers come and load them into their truck (DMA reads from host memory). They hand you a receipt as soon as the truck is loaded (the completion). The boxes reach the warehouse later (NAND program). The receipt is real, and the movers will deliver if nothing goes wrong, but if the truck crashes before the warehouse, the receipt does not bring your furniture back. A premium "warehouse-signed receipt" (FUA) costs you a longer wait.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What it hides.</strong> Movers carry everything in one trip; a controller asks for data in many small read requests (often 512 bytes each in our lab system), each with its own tag, and receives the data in even smaller completion packets. The analogy hides that pipelining entirely, and pipelining is what decides write throughput.</p>
+    <p><strong>Where it misleads.</strong> A moving truck is a physical place; a controller's write cache may be dynamic random-access memory (DRAM), static random-access memory (SRAM), or a region of host memory, and some SSDs protect it with capacitors (power-loss protection) so that "in the truck" is effectively "in the warehouse". The analogy also suggests boxes arrive in order; NVMe imposes no ordering between separate commands, so two overlapping writes in flight at the same time can land in either order.</p>
+    <p><strong>What it gets right.</strong> The receipt (completion) and the warehouse (non-volatile media) are different events, and you can buy a stronger receipt at the cost of time.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>When a program saves data, the bytes start in the computer's main memory (RAM). The SSD cannot see the program; it only sees memory addresses. So the operating system does three things:</p>
+  <ol>
+    <li>It makes sure the bytes sit in memory pages that the SSD is allowed to reach.</li>
+    <li>It writes a 64-byte instruction — a <span class="g" data-term="sqe">Submission Queue Entry</span> — saying "write these logical blocks of namespace 1, starting at block number X, and the data is at memory address Y".</li>
+    <li>It rings the SSD's doorbell by writing a number into a register on the SSD.</li>
+  </ol>
+  <p>The SSD then does the work: it fetches the instruction, copies the data out of memory by itself (this is Direct Memory Access, DMA), stores it, and writes a 16-byte <span class="g" data-term="cqe">Completion Queue Entry</span> back into memory saying "done, success". It usually also sends an interrupt so the central processing unit (CPU) notices.</p>
+  <p>Two ideas make WRITE different from READ:</p>
+  <ul>
+    <li><strong>The SSD reads to write.</strong> To get the data, the SSD must <em>read</em> host memory. On the PCIe link you see the SSD sending read requests and the host answering with data.</li>
+    <li><strong>"Done" is not "permanent".</strong> Many SSDs keep recently written data in a fast but volatile buffer and copy it to flash later. A successful completion means the SSD has accepted the data and will return it on a later read; it does not by itself mean the data would survive a power cut. Whether it would depends on the write cache, the FUA bit, Flush commands and the drive's power-loss protection.</li>
+  </ul>
+  <figure>
+    <div class="flow">
+      <div>Application<small>write(fd, buf, 4096); fsync(fd)</small></div>
+      <div>Filesystem<small>maps file offset → LBA, journals metadata</small></div>
+      <div>Block layer (blk-mq)<small>REQ_OP_WRITE, maybe REQ_FUA / REQ_PREFLUSH</small></div>
+      <div class="hl">NVMe driver<small>builds Write SQE, sets PRP/SGL, rings Submission Queue (SQ) tail doorbell</small></div>
+      <div>PCIe link<small>Memory Write (MWr) doorbell ↓ · MRd SQE ↑ · CplD ↓ · MRd data ↑ · CplD data ↓ · MWr CQE ↑ · MWr Message Signaled Interrupts – Extended (MSI-X) ↑</small></div>
+      <div class="hl">NVMe controller<small>parses, DMA-reads data, buffers, acknowledges</small></div>
+      <div>Flash translation layer<small>picks a physical page, updates the map</small></div>
+      <div>NAND flash<small>program operation: hundreds of µs or more</small></div>
+    </div>
+    <figcaption>The layers a single write passes through. Arrows on the PCIe line: ↓ host-to-device, ↑ device-to-host. Conceptual.</figcaption>
+  </figure>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>Application, filesystem and block layer</h3>
+  <p>An application calls <code>write()</code> or <code>pwrite()</code>. With buffered I/O the kernel copies the bytes into the page cache and returns immediately; nothing has reached the SSD yet. Later, writeback (or an explicit <code>fsync()</code>) turns dirty pages into block I/O requests. With <code>O_DIRECT</code> the user buffer itself (after pinning) becomes the DMA source and the write is issued synchronously or asynchronously from the application's own memory.</p>
+  <p>The filesystem translates a file offset into logical block addresses (LBAs) on the namespace and, for journaling filesystems, emits metadata writes too. When it needs ordering or durability — a journal commit, for example — it marks requests with <code>REQ_PREFLUSH</code> (flush the cache before this write) and/or <code>REQ_FUA</code> (this write must be on stable media before completing). The block layer (blk-mq) merges and splits requests to respect the device's limits (maximum transfer size, segment limits) and hands each request to a hardware queue context that maps to an NVMe I/O Submission Queue.</p>
+  <aside class="callout linux" data-title="Implementation detail, not specification">
+    <p>The flag names above are Linux kernel names. If the device reports no volatile write cache, the Linux block layer drops <code>REQ_PREFLUSH</code> and <code>REQ_FUA</code> because they would be meaningless. If it reports a cache, the NVMe driver translates <code>REQ_FUA</code> into the Write command's FUA bit and <code>REQ_PREFLUSH</code> into a separate Flush command. This translation is <span class="badge impl">Implementation-dependent</span> and has changed across kernel versions; read the driver source for the kernel you run.</p>
+  </aside>
+
+  <h3>The driver builds the command</h3>
+  <p>The NVMe driver allocates a Command Identifier (CID) unique among the commands outstanding on that Submission Queue, fills a 64-byte SQE in the next free slot of the ring, and describes the data buffer. For a 4 KiB write whose buffer starts on a page boundary, a single PRP entry (PRP1) is enough. For two pages, PRP1 and PRP2 both hold page addresses. For more, PRP2 points to a PRP list (<a href="ch36.html">Chapter 36</a>). If the controller supports Scatter Gather Lists and the driver chooses them, the data pointer holds an SGL descriptor instead (<a href="ch37.html">Chapter 37</a>).</p>
+  <p>The 64-byte command is described as sixteen 32-bit Command Dwords, CDW0 to CDW15.</p>
+  <table>
+    <caption>NVM Write (opcode 01h) — the fields you will decode most often</caption>
+    <thead><tr><th>Dword</th><th>Bits</th><th>Field</th><th>Owner</th><th>Purpose</th><th>What breaks if wrong</th></tr></thead>
+    <tbody>
+      <tr><td>CDW0</td><td>7:0</td><td>Opcode = 01h</td><td>Driver</td><td>Selects Write in the NVM Command Set</td><td>Wrong opcode → Invalid Command Opcode, or a different command runs</td></tr>
+      <tr><td>CDW0</td><td>9:8</td><td>FUSE</td><td>Driver</td><td>Fused operation (Compare-and-Write); normally 00b</td><td>Unexpected fusing → Invalid Field or command aborted</td></tr>
+      <tr><td>CDW0</td><td>15:14</td><td>PRP or SGL for Data Transfer (PSDT)</td><td>Driver</td><td>PRP (00b) or SGL for the data pointer</td><td>Controller interprets Data Pointer (DPTR) wrongly → DMA from wrong addresses</td></tr>
+      <tr><td>CDW0</td><td>31:16</td><td>CID</td><td>Driver</td><td>Matches the CQE back to this command</td><td>Duplicate CID → completion matched to the wrong request</td></tr>
+      <tr><td>CDW1</td><td>31:0</td><td>NSID</td><td>Driver</td><td>Which namespace</td><td>Invalid Namespace or Format; or worse, writes to the wrong namespace</td></tr>
+      <tr><td>CDW4–5</td><td>63:0</td><td>Metadata Pointer (MPTR)</td><td>Driver</td><td>Separate metadata buffer (only when metadata is not interleaved)</td><td>Protection information fetched from the wrong place</td></tr>
+      <tr><td>CDW6–9</td><td>127:0</td><td>DPTR (PRP1/PRP2 or SGL)</td><td>Driver</td><td>Where the data to write lives</td><td>Writes garbage, or the controller's reads fault in the input–output memory management unit (IOMMU)</td></tr>
+      <tr><td>CDW10–11</td><td>63:0</td><td>SLBA</td><td>Driver</td><td>First LBA to write</td><td>LBA Out of Range, or silent corruption of the wrong blocks</td></tr>
+      <tr><td>CDW12</td><td>15:0</td><td>NLB (0's based)</td><td>Driver</td><td>Number of LBAs minus one</td><td>Off-by-one: one block too many (overwrites a neighbor) or too few</td></tr>
+      <tr><td>CDW12</td><td>30</td><td>FUA</td><td>Driver</td><td>Data must be on non-volatile media before completion</td><td>Durability assumption violated, or needless latency</td></tr>
+      <tr><td>CDW12</td><td>31</td><td>LR</td><td>Driver</td><td>Limited Retry: prefer fast failure over heroic error recovery</td><td>Unexpected latency or unexpected failures</td></tr>
+      <tr><td>CDW12</td><td>29:26</td><td>Protection Information field (PRINFO)</td><td>Driver</td><td>Protection information action and checks</td><td>End-to-end protection errors</td></tr>
+      <tr><td>CDW13</td><td>7:0 / 31:16</td><td>Dataset Management (DSM) hints / Directive Specific (DSPEC)</td><td>Driver</td><td>Access-frequency and latency hints; directive-specific value (e.g. stream or placement handle)</td><td>Usually only performance or placement effects</td></tr>
+      <tr><td>CDW14–15</td><td>—</td><td>Reference/application tag fields</td><td>Driver</td><td>Initial values for end-to-end protection checks</td><td>Guard/Reference tag check errors</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout notsaid" data-title="Confirm these in the NVM Command Set specification">
+    <p>CDW12 bits 25:16 hold further fields whose layout has grown across revisions (for example Directive Type and storage-tag related controls). Bits 23:16 and 25:24 are <span class="badge uncertain">Uncertain</span> in this course: decode them only from the "Write command" figures in the NVM Command Set Specification revision that matches your device. The same applies to the exact content of CDW14–15 when extended protection information formats are in use.</p>
+  </aside>
+
+  <h3>Opcode bits tell you the direction</h3>
+  <p>For NVMe I/O commands the two low bits of the opcode encode the data transfer direction: <code>00b</code> no data, <code>01b</code> host-to-controller, <code>10b</code> controller-to-host, <code>11b</code> bidirectional. Write is 01h → <code>01b</code>, host-to-controller. Read is 02h → <code>10b</code>. Flush is 00h → no data. Dataset Management is 09h → <code>01b</code>, because the controller reads a list of ranges from host memory. This is a quick sanity check when decoding an unfamiliar trace: if a 01b-class command is followed by the controller <em>writing</em> large amounts of data to the host, something is wrong with your decoding or with the device.</p>
+
+  <h3>Submission and the doorbell</h3>
+  <p>After writing the SQE into host memory, the driver issues a memory barrier and writes the new tail index into the SQ tail doorbell. On our lab system I/O SQ 1's tail doorbell is BAR0 + 0x1008 = <code>0xFE60_1008</code>. That single 4-byte posted Memory Write (MWr) is the only thing the host sends to the device for the whole command. Everything else is the device's initiative.</p>
+
+  <h3>The controller fetches and parses the command</h3>
+  <p>The controller sees the tail move, issues an MRd for the 64 bytes at <code>SQ base + slot × 64</code>, and receives a CplD carrying the SQE. It checks opcode, NSID, LBA range against the namespace size (NSZE), the data pointer format, and whether the namespace is write-protected or reserved by someone else. Errors found here complete the command immediately without any data transfer — a useful clue in traces: an error CQE with no data MRd before it points at a parameter problem, not a media problem.</p>
+
+  <h3>DMA: the controller reads the data</h3>
+  <p>For a WRITE, DMA means the controller issues Memory Read requests to the host addresses given by PRP or SGL. Each MRd is non-posted: it consumes a tag (<a href="ch13.html">Chapter 13</a>) and waits for completions. Three PCIe limits shape the stream:</p>
+  <ul>
+    <li><strong>MRRS</strong> (Max Read Request Size, 512 bytes on our lab system) caps how much one MRd may ask for. A 4 KiB write therefore needs at least 8 MRds.</li>
+    <li><strong>4 KiB address boundary.</strong> A PCIe memory request must not cross a 4 KiB address boundary. With page-aligned PRPs this never bites; with an SGL pointing at an odd offset, it adds requests.</li>
+    <li><strong>MPS and Read Completion Boundary (RCB).</strong> The root complex returns the data in one or more CplDs, each no larger than MPS (256 bytes here); it may split a completion at RCB-aligned addresses (64 bytes here). Many root complexes return 64-byte or 128-byte completions regardless of MPS — <span class="badge impl">Implementation-dependent</span>. One 512-byte MRd can come back as two, four or eight CplDs.</li>
+  </ul>
+  <p>Because each MRd has a round trip of roughly a microsecond on a typical server, the controller must keep many reads outstanding to fill the link. This is the single most important performance difference between WRITE and READ: READ data leaves the device as posted writes, so the device only needs flow-control credits; WRITE data must be requested, so the device needs tags, completion buffer space, and a host that answers quickly.</p>
+  <div class="formula">
+    <div class="eq"><var>N</var><sub>out</sub> ≥ (<var>B</var> × <var>T</var><sub>rt</sub>) ÷ <var>S</var><sub>req</sub></div>
+    <dl class="vars">
+      <dt>N<sub>out</sub></dt><dd>number of Memory Read requests the controller must keep outstanding at once</dd>
+      <dt>B</dt><dd>target data rate in bytes per second (for example 7 × 10<sup>9</sup> B/s on Gen4 x4)</dd>
+      <dt>T<sub>rt</sub></dt><dd>average round-trip time from MRd issue to the last CplD of that request, in seconds (for example 1 × 10<sup>-6</sup> s)</dd>
+      <dt>S<sub>req</sub></dt><dd>bytes requested per MRd (bounded by MRRS, here 512 bytes)</dd>
+    </dl>
+  </div>
+  <p>With those example numbers, <var>N</var><sub>out</sub> ≥ 7 000 B ÷ 512 B ≈ 14 outstanding MRds. With 8-bit tags the device has up to 256 tag values, so tags are not the limit here; the device's internal completion buffering, the root complex's latency under load and the IOMMU's translation cache usually are. This is <span class="badge derived">Derived</span> from Little's Law (see <a href="tool-calculators.html">the calculators</a>); the real numbers depend on the platform.</p>
+
+  <h3>The controller stores the data</h3>
+  <p>Once all CplDs have arrived the controller has the data in an internal buffer. What happens next is entirely inside the device and invisible on the PCIe link:</p>
+  <ul>
+    <li>The flash translation layer (FTL) picks a free physical page — never the page that held the old version, because flash cannot be overwritten in place — and records the new logical-to-physical mapping.</li>
+    <li>If a volatile write cache is enabled, the controller may complete the command now and program the NAND later, typically after accumulating enough data to fill a multi-plane program unit.</li>
+    <li>If FUA is set, or there is no volatile write cache, the controller must not report completion until the data and its metadata are on non-volatile media. "Non-volatile media" may include capacitor-protected DRAM on drives with power-loss protection; the specification does not say how durability is achieved, only what the host can rely on.</li>
+  </ul>
+
+  <h3>Flash programming</h3>
+  <p>NAND is programmed in pages (commonly 16 KiB per plane on modern triple-level cell (TLC), implementation-dependent) and erased in much larger blocks. A program operation on TLC NAND takes on the order of hundreds of microseconds up to a few milliseconds depending on the technology and mode (SLC-cache programs are faster). A controller hides this by striping across many dies and planes and by caching. The consequences for the host:</p>
+  <ul>
+    <li>Small writes are absorbed by the cache; their latency is the PCIe and firmware path, not the NAND.</li>
+    <li>Sustained writes eventually exceed what the cache and the dies can absorb. Latency then rises to the NAND's real rate, and when free blocks run low, garbage collection competes for the same dies (<a href="ch35.html">Chapter 35</a>).</li>
+    <li>A write that is smaller than the flash page, or not aligned to it, may require read-modify-write inside the device, increasing write amplification.</li>
+  </ul>
+
+  <h3>Completion</h3>
+  <p>The controller posts a 16-byte CQE to the Completion Queue with a posted MWr: Dword 2 carries the SQ Head Pointer (SQHD) and SQ Identifier, Dword 3 carries the CID, the Phase tag and the Status field. If interrupts are enabled for that Completion Queue (CQ), the controller then sends an MSI-X message — another posted MWr to the address in its MSI-X table — subject to interrupt coalescing. The driver reads the CQE, matches the CID, completes the block request, and eventually writes the CQ head doorbell (<code>0xFE60_100C</code> for CQ 1 on our lab system) to release the slots.</p>
+  <p>The host must not modify or free the data buffer until the completion arrives. The controller is allowed to read the buffer at any time between the doorbell and the completion, and some controllers re-read data (for example on an internal retry). An application that reuses its buffer early has a race that may pass every test on one SSD and corrupt data on another.</p>
+
+  <h3>What "completion" means for durability</h3>
+  <table>
+    <caption>What a successful Write completion lets the host rely on</caption>
+    <thead><tr><th>Configuration</th><th>Read-after-write returns new data?</th><th>Survives sudden power loss?</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>No volatile write cache present (Identify Controller Volatile Write Cache (VWC) indicates none)</td><td>Yes</td><td>Yes, by the time of completion</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>Volatile write cache present but disabled (Set Features, Volatile Write Cache feature)</td><td>Yes</td><td>Yes, by the time of completion</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>Volatile write cache enabled, FUA = 0</td><td>Yes</td><td><strong>Not guaranteed</strong> until a later Flush completes</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>Volatile write cache enabled, FUA = 1</td><td>Yes</td><td>Yes for <em>this</em> command's data and metadata</td><td><span class="badge normative">Normative</span></td></tr>
+      <tr><td>Drive with power-loss protection that reports no volatile cache</td><td>Yes</td><td>Yes; protection is how it earns the right to report none</td><td><span class="badge impl">Implementation-dependent</span> design choice</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout warn">
+    <p>FUA covers only the data of the command that carries it. It does not flush other cached writes. A journal commit block written with FUA is only safe if the journal blocks it refers to were made durable first — which is why Linux pairs <code>REQ_PREFLUSH</code> with <code>REQ_FUA</code> on commit records.</p>
+  </aside>
+
+  <h3>Atomicity and ordering</h3>
+  <p>Two further guarantees are easy to assume and often absent:</p>
+  <ul>
+    <li><strong>Ordering.</strong> NVMe does not order the execution or completion of separate commands, even in the same Submission Queue. If a host submits two overlapping writes without waiting, the final content of the overlap is undefined from the host's point of view. Software that needs order waits for the first completion before submitting the second.</li>
+    <li><strong>Atomicity.</strong> Identify Controller reports Atomic Write Unit Normal (AWUN) and <span class="g" data-term="awupf">Atomic Write Unit Power Fail (AWUPF)</span>; namespaces may report their own values (Namespace Atomic Write Unit Normal, NAWUN, and Namespace Atomic Write Unit Power Fail, NAWUPF). A write no larger than the power-fail atomic unit, and not crossing an atomic boundary if one is reported, is either entirely old or entirely new after a power failure. Larger writes may be torn. These fields are 0's based counts of logical blocks; confirm the exact boundary rules (for example Namespace Atomic Boundary Size Power Fail (NABSPF) and Namespace Atomic Boundary Offset (NABO)) in the NVM Command Set specification for your revision. <span class="badge version">Version-dependent</span></li>
+  </ul>
+
+  <h3>The central concept on the ladder: the WRITE data path</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>You leave a note saying "copy the recipe on my table into the vault". The helper comes and copies it, says "got it", and takes it to the vault later.</p></div>
+    <div class="rung" data-rung="B"><p>The driver writes a Write SQE pointing at a host buffer and rings the doorbell. The controller DMA-reads the buffer, acknowledges with a CQE, and commits the data to flash at its own pace unless told otherwise (FUA or Flush).</p></div>
+    <div class="rung" data-rung="C"><p>Host memory holds the SQ ring and the data pages; the SSD's BAR0 holds the doorbell register; the controller's DMA engine issues read requests; its DRAM/SRAM buffers data; the FTL maps LBA to NAND page; NAND dies program the page.</p></div>
+    <div class="rung" data-rung="D"><p>NVM Command Set: Write (01h) with SLBA, NLB (0's based), FUA, LR, PRINFO, DSM and directive fields. NVMe Base: SQE/CQE formats, PRP/SGL rules, Volatile Write Cache feature and the VWC field of Identify Controller. NVMe over PCIe Transport: doorbells, memory-based queues, MSI-X.</p></div>
+    <div class="rung" data-rung="E"><p>Host→device: one MWr (doorbell). Device→host: MRd (SQE), MRds (data), MWr (CQE), MWr (MSI-X). Host→device: CplDs (SQE and data), MWr (CQ head doorbell). Data flows downstream; requests flow upstream.</p></div>
+    <div class="rung" data-rung="F"><p>In an analyzer: a doorbell write, a 64-byte read, then a burst of 512-byte MRds with consecutive tags, a storm of CplDs on the downstream side, a 16-byte MWr to the CQ address, a 4-byte MWr to <code>0xFEE…</code>, and later a CQ head doorbell write.</p></div>
+    <div class="rung" data-rung="G"><p>A slow write with an idle link points inside the device (cache full, garbage collection, FUA). A CplD with Unsupported Request status points at a bad address or IOMMU mapping. A completion with success after data that never reached the media points at an unflushed cache, not at a protocol fault.</p></div>
+  </div>
+
+  <h3>The sixteen questions for the WRITE command</h3>
+  <table>
+    <caption>The WRITE command through the course's sixteen questions</caption>
+    <thead><tr><th>#</th><th>Question</th><th>Answer for WRITE</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>What is it?</td><td>An NVM Command Set I/O command (opcode 01h) that stores NLB+1 logical blocks starting at SLBA in a namespace, taking data from host memory.</td></tr>
+      <tr><td>2</td><td>Why was it created?</td><td>To let a host persist data with minimal CPU involvement and parallel queues, replacing register-heavy legacy interfaces.</td></tr>
+      <tr><td>3</td><td>What problem does it solve?</td><td>Moving data host→media at high throughput with one doorbell write per batch and DMA instead of programmed I/O.</td></tr>
+      <tr><td>4</td><td>What existed before?</td><td>AT Attachment (ATA) WRITE DMA / WRITE FPDMA QUEUED (NCQ, 32 tags, one queue) through an Advanced Host Controller Interface (AHCI) host controller; Small Computer System Interface (SCSI) WRITE(10/16) over Serial Attached SCSI (SAS).</td></tr>
+      <tr><td>5</td><td>Why is the current design better?</td><td>Up to 64 Ki queues of up to 64 Ki entries, no register reads in the fast path, explicit FUA and cache control, per-CPU queues.</td></tr>
+      <tr><td>6</td><td>Who creates it?</td><td>The host driver, on behalf of the block layer.</td></tr>
+      <tr><td>7</td><td>Who consumes it?</td><td>The NVMe controller's command processor, then its FTL and NAND back end.</td></tr>
+      <tr><td>8</td><td>Where does it live?</td><td>In an I/O Submission Queue slot in host memory (or controller memory buffer if used).</td></tr>
+      <tr><td>9</td><td>What memory/registers are involved?</td><td>SQ ring, data buffer, PRP list or SGL segments, CQ ring, SQ tail and CQ head doorbells in BAR0, MSI-X table.</td></tr>
+      <tr><td>10</td><td>What happens before it?</td><td>Filesystem allocation, page cache writeback or O_DIRECT pinning, IOMMU mapping, possibly a preceding Flush.</td></tr>
+      <tr><td>11</td><td>What happens after it?</td><td>CQE, interrupt, block-layer completion, possibly a Flush or FUA commit record; inside the device, NAND program and later garbage collection.</td></tr>
+      <tr><td>12</td><td>What if it is wrong?</td><td>Wrong SLBA/NLB corrupts neighbors; wrong PRP writes garbage or faults; missing FUA/Flush loses data on power failure.</td></tr>
+      <tr><td>13</td><td>What does the analyzer show?</td><td>Doorbell MWr, SQE MRd/CplD, data MRds/CplDs, CQE MWr, MSI-X MWr. Never the NAND program.</td></tr>
+      <tr><td>14</td><td>What does Linux show?</td><td>Block statistics, <code>nvme</code> tracepoints with opcode and CID, write-cache and FUA settings in sysfs, error messages on failure.</td></tr>
+      <tr><td>15</td><td>What would validation test?</td><td>Boundary LBAs, NLB limits vs Maximum Data Transfer Size (MDTS), PRP alignment cases, FUA latency, power-cycle durability with and without Flush, overlapping writes, protection information.</td></tr>
+      <tr><td>16</td><td>What would a senior suspect on failure?</td><td>Buffer reuse before completion, IOMMU mapping, unflushed cache on power loss, MRRS/completion stalls for throughput, garbage collection (GC) for latency spikes.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>Inside an NVMe SSD the write path crosses several hardware blocks. Their names vary by vendor, but every controller has something playing each role:</p>
+  <table>
+    <caption>Hardware participants in a WRITE (generic SSD architecture)</caption>
+    <thead><tr><th>Block</th><th>Role in a write</th><th>Observable from the host?</th></tr></thead>
+    <tbody>
+      <tr><td>PCIe endpoint core</td><td>Receives the doorbell MWr, sends MRds, absorbs CplDs, sends CQE and MSI-X MWrs</td><td>Yes, on a protocol analyzer</td></tr>
+      <tr><td>Doorbell/queue manager</td><td>Detects tail movement, schedules SQE fetches across queues (arbitration)</td><td>Indirectly, through fetch timing</td></tr>
+      <tr><td>Command processor (firmware on embedded cores)</td><td>Validates fields, splits the command into internal units, allocates buffer</td><td>Only through latency and status</td></tr>
+      <tr><td>DMA engine</td><td>Walks PRP/SGL, issues MRds, reassembles CplDs by tag</td><td>Yes, MRd/CplD stream</td></tr>
+      <tr><td>Write buffer (DRAM or SRAM)</td><td>Holds data until programmed; may be the volatile write cache</td><td>Only through VWC reporting and behavior</td></tr>
+      <tr><td>Power-loss protection (capacitors)</td><td>Keeps the device alive long enough to program buffered data after power loss</td><td>No; inferred from product documentation and VWC reporting</td></tr>
+      <tr><td>FTL and mapping table</td><td>Chooses physical location, updates the LBA→physical map</td><td>No</td></tr>
+      <tr><td>error-correcting code (ECC)/encryption engines</td><td>Encode data with error correction, encrypt with the media key</td><td>No</td></tr>
+      <tr><td>Flash interface and NAND dies</td><td>Program pages across channels, dies and planes</td><td>No; only via latency, Self-Monitoring, Analysis and Reporting Technology (SMART) and vendor logs</td></tr>
+    </tbody>
+  </table>
+  <p>On the host side, the participants are the CPU (writes the SQE and doorbell), the memory controller (serves the device's reads), the IOMMU (translates device-visible I/O virtual addresses to physical addresses) and the root complex (turns MRds into memory reads and returns CplDs). A slow IOMMU translation or a congested memory controller shows up on the trace as long MRd→CplD gaps — a host problem that looks like a device problem if you only measure command latency.</p>
+  <aside class="callout hw" data-title="Why the write buffer exists">
+    <p>Without a buffer, every 4 KiB write would wait for a NAND program and each die could only service one program at a time. With a buffer, the controller gathers writes into full program units, stripes them across dies, and returns completions in microseconds. The price is the durability window, which the controller closes either with capacitors or by honoring FUA and Flush.</p>
+  </aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>Three NVMe documents meet in a WRITE. In the 2026 baseline these are the <cite class="spec">NVM Express Base Specification, Revision 2.4</cite>, the <cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3</cite>, and the <cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4</cite>. The PCIe side is governed by the <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0</cite> (a PCI Special Interest Group (PCI-SIG) members' document).</p>
+  <ul>
+    <li>The <strong>NVM Command Set</strong> specification defines the Write command itself: its fields, the FUA semantics, protection information handling, and the command-specific status values. Look for the section named for the Write command and the figures describing its command Dwords.</li>
+    <li>The <strong>Base</strong> specification defines the common command format, the CQE, PRP and SGL rules, generic status codes, the Volatile Write Cache feature, Identify Controller (including VWC, AWUN, AWUPF, MDTS) and the Flush command.</li>
+    <li>The <strong>PCIe Transport</strong> specification defines how queues live in memory, doorbell registers and interrupts over PCIe.</li>
+  </ul>
+  <p>The specification text that matters most here is <span class="badge normative">Normative</span>: FUA requires data and metadata to be committed to non-volatile media before the command completes; the controller indicates presence of a volatile write cache in Identify Controller; and with the cache enabled, the host uses Flush (or FUA) to get durability.</p>
+
+  <aside class="callout verified">
+    <p>Write is NVM Command Set opcode 01h; its data direction is host-to-controller. SLBA occupies CDW10–11; NLB is a 0's based value in CDW12 bits 15:0; FUA is CDW12 bit 30 and Limited Retry bit 31. The data pointer is in CDW6–9 and its format is selected by PSDT in CDW0 bits 15:14. A CQE is 16 bytes and carries SQHD, Submission Queue Identifier (SQID), CID, Phase tag and Status.</p>
+  </aside>
+  <aside class="callout derived">
+    <p>The number of MRds and CplDs for a write, the outstanding-request requirement from Little's Law, and the claim that WRITE throughput is more sensitive to host read latency than READ throughput are reasoned from PCIe rules, not stated by any NVMe document.</p>
+  </aside>
+  <aside class="callout impl">
+    <p>Cache size, destage policy, whether the cache is power-loss-protected, the NAND program unit, how the controller paces its MRds, whether it fetches data before or after reserving buffer space, and how the root complex splits completions are all implementation-dependent.</p>
+  </aside>
+  <aside class="callout version">
+    <p>CDW12 and CDW13 have gained fields over revisions (directives in 1.3, storage tags and extended protection formats later, further placement-related use of the directive fields in 2.x). Status codes have been added over time. The split of the specification into Base, command sets and transports happened with NVMe 2.0; in 1.x everything lived in one document. When reading a device's behavior, match it to the revision it reports in the Version (VS) register and Identify data.</p>
+  </aside>
+  <aside class="callout notsaid">
+    <p>The specification does not say how fast a write must complete, how long data may stay in a volatile cache before destaging, what technology "non-volatile media" is, or whether data that completed without FUA will in practice survive a power cut on a particular product. It does not define ordering between separate commands. Check in the specification: the exact layout of CDW12 bits 25:16 and CDW13 for your revision; the AWUPF/NAWUPF boundary rules; the command-specific status codes for Write.</p>
+  </aside>
+  <aside class="callout warn">
+    <p>Never assume: that completion means durable; that commands complete in submission order; that the controller reads the data buffer exactly once; that an SSD with "power-loss protection" in its datasheet reports VWC as absent (some do, some report a cache and treat Flush as cheap); that a write smaller than a sector is possible (it is not; the unit is the LBA).</p>
+  </aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>The complete exchange for one 4 KiB write on our lab system (Gen4 x4, MPS 256 bytes, MRRS 512 bytes, 512-byte LBAs, I/O queue pair 1):</p>
+  <figure>
+    <ol class="seq" data-actors="Driver (CPU)|Host memory|Root complex|NVMe controller">
+      <li data-from="Driver (CPU)" data-to="Host memory">write SQE in SQ1 slot 5</li>
+      <li data-from="Driver (CPU)" data-to="NVMe controller" data-t="0 ns">MWr: SQ1 tail doorbell = 6</li>
+      <li data-from="NVMe controller" data-to="Root complex" data-t="0.75 µs">MRd 64 B: fetch SQE (tag 10h)</li>
+      <li data-from="Root complex" data-to="Host memory">memory read</li>
+      <li data-from="Root complex" data-to="NVMe controller" class="dashed" data-t="1.3 µs">CplD 64 B: SQE</li>
+      <li data-note="NVMe controller">parse: Write, NSID 1, NLB 7, PRP1</li>
+      <li data-from="NVMe controller" data-to="Root complex" data-t="1.8 µs">8 × MRd 512 B (tags 11h–18h)</li>
+      <li data-from="Root complex" data-to="NVMe controller" class="dashed" data-t="2.4–3.6 µs">16 × CplD 256 B: data</li>
+      <li data-note="NVMe controller">data in write buffer (cache)</li>
+      <li data-from="NVMe controller" data-to="Host memory" data-t="5.9 µs">MWr 16 B: CQE to CQ1 slot 5</li>
+      <li data-from="NVMe controller" data-to="Driver (CPU)" data-t="6.1 µs">MWr 4 B: MSI-X vector 1</li>
+      <li data-from="Driver (CPU)" data-to="NVMe controller" data-t="9.0 µs">MWr: CQ1 head doorbell = 6</li>
+      <li data-note="NVMe controller">later: NAND program (invisible)</li>
+    </ol>
+    <figcaption>Synthetic example for teaching: a cached 4 KiB WRITE. Times are illustrative.</figcaption>
+  </figure>
+  <table>
+    <caption>Who sends what during a WRITE</caption>
+    <thead><tr><th>Packet</th><th>Direction</th><th>PCIe class</th><th>Carries</th><th>Requester ID</th></tr></thead>
+    <tbody>
+      <tr><td>SQ tail doorbell</td><td>Host→Device</td><td>MWr, posted</td><td>4-byte tail value</td><td>root complex (RC)</td></tr>
+      <tr><td>SQE fetch</td><td>Device→Host</td><td>MRd, non-posted</td><td>Request for 64 bytes</td><td>0x0100</td></tr>
+      <tr><td>SQE return</td><td>Host→Device</td><td>CplD</td><td>64 bytes of command</td><td>Completer = RC; Requester ID 0x0100 echoed</td></tr>
+      <tr><td>Data fetch</td><td>Device→Host</td><td>MRd, non-posted</td><td>Requests ≤ MRRS</td><td>0x0100</td></tr>
+      <tr><td>Data return</td><td>Host→Device</td><td>CplD</td><td>≤ MPS each, split at RCB</td><td>Completer = RC</td></tr>
+      <tr><td>CQE post</td><td>Device→Host</td><td>MWr, posted</td><td>16 bytes</td><td>0x0100</td></tr>
+      <tr><td>MSI-X</td><td>Device→Host</td><td>MWr, posted</td><td>4-byte message data</td><td>0x0100</td></tr>
+      <tr><td>CQ head doorbell</td><td>Host→Device</td><td>MWr, posted</td><td>4-byte head value</td><td>RC</td></tr>
+    </tbody>
+  </table>
+  <h3>Ordering on the wire</h3>
+  <p>PCIe ordering rules (<a href="ch14.html">Chapter 14</a>) matter at two points. First, the CQE MWr must not be observed by the host before the data it describes; for a WRITE this is trivially true because the data flowed the other way. (For a READ it is the key rule: posted data MWrs must not be passed by the posted CQE MWr.) Second, the MSI-X MWr is posted after the CQE MWr in the same direction, so by the time the interrupt handler runs the CQE is visible — provided nobody set Relaxed Ordering on the CQE write in a way the platform honors. Controllers generally do not use Relaxed Ordering for CQE and MSI-X writes. <span class="badge impl">Implementation-dependent</span></p>
+  <h3>No ordering between commands</h3>
+  <p>If the driver submits Write A (LBA 100) and Write B (LBA 100) back to back, the controller may fetch both, read both data buffers, and commit them in either order. NVMe offers fused operations only for the specific Compare-and-Write case, and no general "barrier" command. Ordering is the host's job.</p>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Three synthetic traces from our lab system. Each is labeled synthetic; times are illustrative and real values depend on the platform and the device. Rows are listed in time order across both directions of the link. Field abbreviations used in the tables: RC root complex; Req Requester ID; Tag PCIe tag; Len length in Dwords; BC Byte Count; Status=SC Successful Completion and UR Unsupported Request (PCIe completion status); in CQEs, SQHD Submission Queue Head Pointer, SQID Submission Queue Identifier, CID Command Identifier, P Phase tag, SCT Status Code Type, SC Status Code, DNR Do Not Retry.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 33-A — normal cached 4 KiB WRITE, Gen4 x4">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Len=1 Data=0x00000006 Req=RC</td><td>SQ1 tail doorbell: slot 5 now valid</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>750</td><td>MRd64</td><td>Addr=0x1_2340_0140 Len=16 Tag=0x10 Req=0x0100</td><td>Fetch SQE at SQ1 base + 5×64</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,310</td><td>CplD</td><td>Len=16 Tag=0x10 BC=64 Status=SC Cpl=RC</td><td>SQE: opc=01h CID=0x0045 NSID=1 SLBA=0x100000 NLB=7 PRP1=0x2_0000_0000</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,820</td><td>MRd64</td><td>Addr=0x2_0000_0000 Len=128 Tag=0x11</td><td>Data bytes 0–511</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1,836</td><td>MRd64</td><td>Addr=0x2_0000_0200 Len=128 Tag=0x12</td><td>Data bytes 512–1023</td></tr>
+        <tr class="note"><td colspan="6">Rows 6–11: six more MRd64, Len=128, tags 0x13–0x18, addresses +0x400 … +0xE00, about 16 ns apart.</td></tr>
+        <tr class="dir-down"><td>12</td><td>Host→Dev</td><td>2,410</td><td>CplD</td><td>Len=64 Tag=0x11 BC=512 Status=SC</td><td>First 256 bytes for tag 0x11</td></tr>
+        <tr class="dir-down"><td>13</td><td>Host→Dev</td><td>2,452</td><td>CplD</td><td>Len=64 Tag=0x11 BC=256 Status=SC</td><td>Last 256 bytes for tag 0x11; tag 0x11 retires</td></tr>
+        <tr class="note"><td colspan="6">Rows 14–27: fourteen more CplDs, two per tag, Byte Count 512 then 256, ending ~3,600 ns. Downstream link busy ≈ 1.2 µs for 4 KiB.</td></tr>
+        <tr class="dir-up"><td>28</td><td>Dev→Host</td><td>5,920</td><td>MWr64</td><td>Addr=0x1_2341_0050 Len=4 Data: SQHD=6 SQID=1 CID=0x0045 P=1 SC=00h</td><td>CQE in CQ1 slot 5: success</td></tr>
+        <tr class="dir-up"><td>29</td><td>Dev→Host</td><td>6,080</td><td>MWr32</td><td>Addr=0xFEE0_1000 Len=1 Data=vector 1 message</td><td>MSI-X interrupt</td></tr>
+        <tr class="dir-down"><td>30</td><td>Host→Dev</td><td>9,020</td><td>MWr32</td><td>Addr=0xFE60_100C Len=1 Data=0x00000006 Req=RC</td><td>CQ1 head doorbell</td></tr>
+        <tr class="note"><td colspan="6">The NAND program of these 4 KiB happens later, with other data, and never appears on the link.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reading it.</strong> Note the direction pattern: after the doorbell, almost every <em>request</em> travels upstream and almost all <em>data</em> travels downstream. The Byte Count (BC) field of CplD counts the bytes remaining for the request including the current completion; seeing BC=512 then BC=256 tells you the root complex split each 512-byte read into two 256-byte completions. The gap between the last CplD (~3.6 µs) and the CQE (5.9 µs) is controller firmware time: buffer allocation, FTL bookkeeping, deciding the data is safely in cache.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 33-B — slow WRITE: device-internal stall under sustained load">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.00</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000281</td><td>SQ1 tail doorbell</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>0.74</td><td>MRd64</td><td>Addr=0x1_2340_A000 Len=16 Tag=0x40</td><td>Fetch SQE slot 0x280 (CID 0x0311, 128 KiB write)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.29</td><td>CplD</td><td>Len=16 Tag=0x40 BC=64 SC</td><td>SQE delivered</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1.70</td><td>MRd64</td><td>Addr=0x1_5000_0000 Len=62 Tag=0x41</td><td>Fetch PRP list: 31 entries × 8 B = 248 B (PRP1 covers the first page)</td></tr>
+        <tr class="dir-down"><td>5</td><td>Host→Dev</td><td>2.25</td><td>CplD</td><td>Len=62 Tag=0x41 BC=248 SC</td><td>PRP list returned</td></tr>
+        <tr class="abnormal"><td>6</td><td>—</td><td>2.3 → 3,812</td><td>(none)</td><td>No MRd for data from this command; link idle except other queues' traffic and DLLPs</td><td>First abnormal event: ≈3.8 ms with no data fetch</td></tr>
+        <tr class="dir-up"><td>7</td><td>Dev→Host</td><td>3,812.4</td><td>MRd64</td><td>Addr=0x2_0040_0000 Len=128 Tag=0x42</td><td>Data fetch finally starts</td></tr>
+        <tr class="note"><td colspan="6">Rows 8–774: 255 more MRds and 512 CplDs, completing in ~19 µs at near line rate.</td></tr>
+        <tr class="dir-up"><td>775</td><td>Dev→Host</td><td>3,840.7</td><td>MWr64</td><td>Addr=0x1_2341_2800 Len=4 CID=0x0311 SC=00h</td><td>Success, 3.84 ms after the doorbell</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The command was fetched promptly, so arbitration and doorbells are fine. The PRP list was fetched promptly, so the host memory path is fine. Once the controller decided to move data, it did so at line rate, so the link and the root complex are fine. The 3.8 ms hole sits between "command understood" and "data requested": the controller had no buffer space to receive the data. On a drive under sustained random writes the classic cause is that the write cache is full and destaging is limited by NAND program and garbage collection throughput. Confirm by checking whether the stalls appear only after minutes of sustained writes (steady state), whether they disappear with lower write rate or after an idle period, and whether the drive's free space or over-provisioning is low. Nothing here is a protocol error; the completion is a success. This is a performance investigation, and the protocol trace's contribution is to prove that the host and link are innocent.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Trace 33-C — failed WRITE: data fetch hits an unmapped IOVA">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x00000013</td><td>SQ1 tail doorbell</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>760</td><td>MRd64</td><td>Addr=0x1_2340_0480 Len=16 Tag=0x22</td><td>Fetch SQE slot 0x12</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,320</td><td>CplD</td><td>Len=16 Tag=0x22 BC=64 SC</td><td>SQE: Write CID=0x0050 NLB=7 PRP1=0x2_7FFF_3000</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1,840</td><td>MRd64</td><td>Addr=0x2_7FFF_3000 Len=128 Tag=0x23</td><td>Data bytes 0–511</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1,856</td><td>MRd64</td><td>Addr=0x2_7FFF_3200 Len=128 Tag=0x24</td><td>Data bytes 512–1023</td></tr>
+        <tr class="abnormal"><td>6</td><td>Host→Dev</td><td>2,610</td><td>Cpl</td><td>Tag=0x23 Status=UR BC=512 Cpl=RC (no data)</td><td>First abnormal event: Unsupported Request completion — the RC refused the read</td></tr>
+        <tr class="dir-down"><td>7</td><td>Host→Dev</td><td>2,640</td><td>Cpl</td><td>Tag=0x24 Status=UR (no data)</td><td>Same for the second read</td></tr>
+        <tr class="note"><td colspan="6">Remaining MRds (tags 0x25–0x2A) also complete with UR. No CplD with data arrives.</td></tr>
+        <tr class="dir-up"><td>14</td><td>Dev→Host</td><td>4,900</td><td>MWr64</td><td>Addr=0x1_2341_0120 CID=0x0050 SCT=0h SC=04h</td><td>CQE: Data Transfer Error (status chosen by the controller)</td></tr>
+        <tr class="dir-up"><td>15</td><td>Dev→Host</td><td>5,060</td><td>MWr32</td><td>Addr=0xFEE0_1000 vector 1</td><td>MSI-X</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The first abnormal event is row 6, not row 14. The device asked for data at an I/O virtual address and the root complex answered with Unsupported Request. With an IOMMU enabled the most likely reason is that this I/O virtual address (IOVA) is not mapped for this device (driver unmapped the buffer early, a use-after-free in a DMA mapping, or a stale PRP). Evidence to collect: the kernel log should show an IOMMU fault naming device 0000:01:00.0 and an address in the 0x2_7FFF_3000 page at the same time; the NVMe driver will log a write error for the request. Which NVMe status the controller reports after a failed DMA read is <span class="badge impl">Implementation-dependent</span>; Data Transfer Error (generic status 04h) is a common and reasonable choice. Whether the device also signals an error message to the root port (and thus Advanced Error Reporting (AER) logs) depends on its error-reporting configuration (<a href="ch46.html">Chapter 46</a>). The fix belongs on the host: the buffer's DMA mapping lifetime.</p>
+  </div>
+
+  <aside class="callout trace" data-title="Write versus Read: what to look for">
+    <p>A READ trace is dominated by upstream MWrs with payload; a WRITE trace by upstream MRds without payload and downstream CplDs with payload. If you filter an analyzer on "MWr with payload &gt; 64 bytes" to find a write, you will find reads instead. Filter on MRd from the device's Requester ID and on CplD to it.</p>
+  </aside>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>All commands in this section are read-only. Device names assume the lab system's <code>/dev/nvme0</code> (controller) and <code>/dev/nvme0n1</code> (namespace 1).</p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Does the controller report a volatile write cache, and what atomic write units?</span>
+sudo nvme id-ctrl /dev/nvme0 -H | grep -iE 'vwc|awun|awupf|mdts|oncs'
+
+<span class="cm"># Is the volatile write cache currently enabled? (Feature ID 06h, Volatile Write Cache)</span>
+sudo nvme get-feature /dev/nvme0 -f 0x06 -H
+
+<span class="cm"># How the block layer treats the device</span>
+cat /sys/block/nvme0n1/queue/write_cache     <span class="cm"># "write back" or "write through"</span>
+cat /sys/block/nvme0n1/queue/fua             <span class="cm"># 1 if FUA writes are passed down (newer kernels)</span>
+cat /sys/block/nvme0n1/queue/max_hw_sectors_kb /sys/block/nvme0n1/queue/max_sectors_kb
+cat /sys/block/nvme0n1/queue/logical_block_size
+
+<span class="cm"># Watch NVMe commands being set up and completed (tracefs; read-only observation)</span>
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_setup_cmd/enable'
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_complete_rq/enable'
+sudo cat /sys/kernel/tracing/trace_pipe | grep -m 20 'nvme_cmd_write'
+sudo sh -c 'echo 0 &gt; /sys/kernel/tracing/events/nvme/enable'
+
+<span class="cm"># Per-device write statistics</span>
+cat /sys/block/nvme0n1/stat
+iostat -x 1 nvme0n1</code></pre>
+  <aside class="callout warn" data-title="The trace enable lines change kernel state">
+    <p>Enabling tracepoints does not touch the SSD, but it does change kernel state and adds overhead. Turn them off afterwards (the last line). Do not run write benchmarks against a device holding data you care about.</p>
+  </aside>
+  <table>
+    <caption>What Linux output can and cannot prove about writes</caption>
+    <thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>id-ctrl</code> VWC</td><td>The controller claims a volatile write cache is present (and, in newer revisions, how Flush with NSID FFFFFFFFh is supported)</td><td>Whether the cache is power-loss protected; whether it is enabled now</td></tr>
+      <tr><td><code>get-feature -f 6</code></td><td>Whether the cache is enabled at this moment</td><td>Whether the setting persists across power cycles (check the feature's saveable capability)</td></tr>
+      <tr><td><code>queue/write_cache</code></td><td>Whether the block layer will issue flushes</td><td>What the device actually does with them</td></tr>
+      <tr><td>nvme tracepoints</td><td>Which commands the driver built, with CID, NSID, opcode and CDW10–15; their completion status</td><td>When the device fetched or executed them; anything on the PCIe link</td></tr>
+      <tr><td><code>iostat</code> await</td><td>Average time requests spent in the block layer and device</td><td>Where in the path the time went</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>First, the driver-side logic of a write, as pseudocode modeled loosely on what Linux's NVMe driver does (function names in comments are real Linux names; the body is simplified and is not the kernel code).</p>
+  <pre class="code" data-kind="pseudocode" data-lang="c"><code>/* nvme_setup_rw(): fill a Write SQE from a block request */
+sqe.opcode    = 0x01;                       /* Write */
+sqe.cid       = alloc_cid(sq);              /* unique among outstanding on this SQ */
+sqe.nsid      = ns-&gt;nsid;
+sqe.slba      = sector_to_lba(rq-&gt;sector);  /* 512-byte sectors to namespace LBAs */
+sqe.cdw12     = (nr_lbas - 1) &amp; 0xFFFF;     /* NLB is 0's based */
+if (rq-&gt;flags &amp; REQ_FUA)
+    sqe.cdw12 |= 1u &lt;&lt; 30;                  /* FUA */
+map_data(rq, &amp;sqe.dptr);                    /* dma_map_*, build PRP1/PRP2 or PRP list or SGL */
+
+/* nvme_submit_cmd(): copy into ring, then ring the doorbell */
+memcpy(&amp;sq-&gt;ring[sq-&gt;tail], &amp;sqe, 64);
+sq-&gt;tail = (sq-&gt;tail + 1) % sq-&gt;depth;
+wmb();                                      /* SQE visible before the doorbell */
+writel(sq-&gt;tail, sq-&gt;db_tail);              /* MWr on PCIe */
+
+/* nvme_irq() / nvme_poll_cq(): later */
+while (cqe_phase(&amp;cq-&gt;ring[cq-&gt;head]) == cq-&gt;phase) {
+    cqe = cq-&gt;ring[cq-&gt;head];
+    req = lookup(sq, cqe.cid);
+    unmap_data(req);                        /* only now may the buffer be reused */
+    complete(req, cqe.status);
+    advance(cq);
+}
+writel(cq-&gt;head, cq-&gt;db_head);</code></pre>
+
+  <p>Second, a runnable model that builds a Write SQE byte by byte, decodes it, and predicts the PCIe footprint for different root-complex completion sizes. It is the basis of the lab below.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="write_footprint.py"><code>#!/usr/bin/env python3
+"""write_footprint.py - build an NVMe Write SQE and predict its PCIe footprint.
+
+Synthetic teaching model (standard library only). It is NOT a driver and touches no hardware.
+Assumptions come from the course lab system: MPS 256 B, MRRS 512 B, 4 KiB host pages.
+"""
+import struct
+
+MPS, MRRS, PAGE = 256, 512, 4096
+
+
+def build_write_sqe(cid, nsid, prp1, prp2, slba, nlb0, fua=False, lr=False):
+    """Return the 64-byte SQE for NVM Write (opcode 01h), PRP data pointer (PSDT=00b)."""
+    cdw0 = 0x01 | (0 &lt;&lt; 8) | (0 &lt;&lt; 14) | (cid &lt;&lt; 16)      # opcode, FUSE=0, PSDT=0, CID
+    cdw12 = (nlb0 &amp; 0xFFFF) | (int(fua) &lt;&lt; 30) | (int(lr) &lt;&lt; 31)
+    return struct.pack("&lt;IIIIQQQQIIII",
+                       cdw0, nsid, 0, 0,          # CDW0, NSID, CDW2, CDW3
+                       0,                         # MPTR (CDW4-5)
+                       prp1, prp2,                # DPTR (CDW6-9)
+                       slba,                      # SLBA (CDW10-11)
+                       cdw12, 0, 0, 0)            # CDW12..CDW15
+
+
+def decode_sqe(sqe):
+    (cdw0, nsid, _c2, _c3, _mptr, prp1, prp2, slba,
+     cdw12, cdw13, cdw14, cdw15) = struct.unpack("&lt;IIIIQQQQIIII", sqe)
+    return {
+        "opcode": cdw0 &amp; 0xFF, "fuse": (cdw0 &gt;&gt; 8) &amp; 3, "psdt": (cdw0 &gt;&gt; 14) &amp; 3,
+        "cid": cdw0 &gt;&gt; 16, "nsid": nsid, "prp1": prp1, "prp2": prp2, "slba": slba,
+        "nlb": (cdw12 &amp; 0xFFFF) + 1,            # NLB is 0's based
+        "fua": (cdw12 &gt;&gt; 30) &amp; 1, "lr": (cdw12 &gt;&gt; 31) &amp; 1,
+    }
+
+
+def prp_segments(prp1, length):
+    """Split a transfer into host-page segments, as PRP entries describe it (PRP list fetch ignored)."""
+    segs, addr, left = [], prp1, length
+    while left:
+        room = PAGE - (addr % PAGE)
+        n = min(room, left)
+        segs.append((addr, n))
+        left -= n
+        addr += n          # model: contiguous IOVA; real PRP entries may point anywhere
+    return segs
+
+
+def mrd_requests(segs):
+    """Memory Read requests the controller could issue: &lt;= MRRS, never crossing a 4 KiB boundary."""
+    reqs = []
+    for addr, n in segs:
+        while n:
+            room = PAGE - (addr % PAGE)
+            size = min(MRRS, n, room)
+            reqs.append((addr, size))
+            addr += size
+            n -= size
+    return reqs
+
+
+def completions(addr, size, chunk):
+    """Completions with data (CplD) the root complex might return for one MRd.
+    chunk = how the root complex splits (implementation-dependent: 64, 128, 256...)."""
+    out, byte_count = [], size
+    while byte_count:
+        n = min(chunk, MPS, byte_count)
+        out.append((addr, n, byte_count))   # Byte Count = bytes remaining including this one
+        addr += n
+        byte_count -= n
+    return out
+
+
+def footprint(length, prp1, rc_chunk):
+    segs = prp_segments(prp1, length)
+    reqs = mrd_requests(segs)
+    cpls = [c for a, s in reqs for c in completions(a, s, rc_chunk)]
+    return segs, reqs, cpls
+
+
+if __name__ == "__main__":
+    sqe = build_write_sqe(cid=0x0045, nsid=1, prp1=0x2_0000_0000, prp2=0,
+                          slba=0x10_0000, nlb0=7, fua=False)
+    print("SQE bytes :", sqe.hex(" ", 4))
+    d = decode_sqe(sqe)
+    print("Decoded   : opcode=%02Xh cid=%04Xh nsid=%d slba=%#x nlb=%d fua=%d psdt=%d"
+          % (d["opcode"], d["cid"], d["nsid"], d["slba"], d["nlb"], d["fua"], d["psdt"]))
+    length = d["nlb"] * 512                      # namespace 1 uses 512-byte LBAs
+    for chunk in (256, 64):
+        segs, reqs, cpls = footprint(length, d["prp1"], chunk)
+        print(f"\n{length} B write, root complex completion chunk = {chunk} B")
+        print(f"  host pages touched : {len(segs)}")
+        print(f"  MRd requests       : {len(reqs)} (each needs its own tag while outstanding)")
+        print(f"  CplD completions   : {len(cpls)}")
+        for a, s in reqs[:3]:
+            print(f"    MRd addr={a:#014x} len={s // 4} DW")
+    # A larger, unaligned transfer to show page-boundary effects
+    segs, reqs, cpls = footprint(128 * 1024, 0x2_0000_0100, 256)
+    print(f"\n128 KiB write starting 0x100 into a page: pages={len(segs)} MRd={len(reqs)} CplD={len(cpls)}")
+    print("  (a transfer spanning more than two pages also needs a PRP list fetch: extra MRd/CplD not modeled)")</code></pre>
+  <p>Expected output (deterministic, produced by the script itself):</p>
+  <pre class="code" data-kind="simulation" data-lang="text"><code>SQE bytes : 01004500 01000000 00000000 00000000 00000000 00000000 00000000 02000000 00000000 00000000 00001000 00000000 07000000 00000000 00000000 00000000
+Decoded   : opcode=01h cid=0045h nsid=1 slba=0x100000 nlb=8 fua=0 psdt=0
+
+4096 B write, root complex completion chunk = 256 B
+  host pages touched : 1
+  MRd requests       : 8 (each needs its own tag while outstanding)
+  CplD completions   : 16
+    MRd addr=0x000200000000 len=128 DW
+    MRd addr=0x000200000200 len=128 DW
+    MRd addr=0x000200000400 len=128 DW
+
+4096 B write, root complex completion chunk = 64 B
+  host pages touched : 1
+  MRd requests       : 8 (each needs its own tag while outstanding)
+  CplD completions   : 64
+    MRd addr=0x000200000000 len=128 DW
+    MRd addr=0x000200000200 len=128 DW
+    MRd addr=0x000200000400 len=128 DW
+
+128 KiB write starting 0x100 into a page: pages=33 MRd=257 CplD=512
+  (a transfer spanning more than two pages also needs a PRP list fetch: extra MRd/CplD not modeled)</code></pre>
+  <p>Note the little-endian layout: the first Dword <code>01004500</code> is opcode 01h in byte 0 and CID 0x0045 in bytes 2–3. The PRP1 value 0x2_0000_0000 appears as <code>00000000 02000000</code> because the high Dword follows the low one.</p>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Scenario (synthetic).</strong> A database on the lab system writes a 16 KiB page with <code>O_DIRECT</code> to file offset 1 MiB, which the filesystem maps to LBA 0x0040_0000 of namespace 1 (512-byte LBAs). The buffer is 4 KiB-aligned at IOVA 0x2_0010_0000 and physically spans four pages at 0x2_0010_0000, 0x2_0010_1000, 0x2_0010_2000 and 0x2_0010_3000 (contiguous for simplicity). The volatile write cache is enabled. The database then commits.</p>
+  <h4>Step 1 — Build the command</h4>
+  <ul>
+    <li>16 KiB ÷ 512 B = 32 LBAs → NLB = 31 = 0x1F (0's based). CDW12 = <code>0x0000001F</code>.</li>
+    <li>SLBA = 0x0040_0000 → CDW10 = <code>0x00400000</code>, CDW11 = <code>0x00000000</code>.</li>
+    <li>Four pages → PRP1 = 0x2_0010_0000 and PRP2 points to a PRP list in memory at 0x1_5000_0000 holding three entries: 0x2_0010_1000, 0x2_0010_2000, 0x2_0010_3000.</li>
+  </ul>
+  <h4>Step 2 — Predict the link traffic</h4>
+  <ul>
+    <li>1 doorbell MWr down; 1 SQE MRd up and 1 CplD down.</li>
+    <li>PRP list: 3 × 8 = 24 bytes → 1 MRd up (6 DW) and 1 CplD down. Controllers may prefetch more of the list; that is allowed.</li>
+    <li>Data: 16 KiB ÷ 512 B MRRS = 32 MRds up; with a root complex returning 256-byte completions, 64 CplDs down.</li>
+    <li>CQE MWr (16 B) up, MSI-X MWr up, CQ head doorbell down.</li>
+  </ul>
+  <h4>Step 3 — Estimate time on the downstream link</h4>
+  <p>Gen4 x4 carries 16 gigatransfers per second (GT/s) × 4 lanes × 128/130 ≈ 63.0 Gbit/s ≈ 7.88 GB/s of raw symbols per direction. Each 256-byte CplD carries roughly 20–28 bytes of framing, sequence number, header and Link Cyclic Redundancy Check (LCRC) overhead (exact amount depends on header size and End-to-end CRC (ECRC)). Taking ~24 bytes: 64 × 280 B = 17,920 B → ≈ 2.3 µs of downstream wire time. Compared to a NAND program of hundreds of microseconds, the link is not where the time goes for a cached write. <span class="badge derived">Derived</span></p>
+  <h4>Step 4 — The commit</h4>
+  <p>For the commit record, the database calls <code>fdatasync()</code>. The filesystem issues its log/commit write with <code>REQ_PREFLUSH | REQ_FUA</code>. On the wire you will see a Flush command (opcode 00h, no data) complete <em>before</em> the commit write is submitted, then the commit Write with CDW12 bit 30 set. Its CQE will typically arrive later than an ordinary cached write — how much later is implementation-dependent and can range from barely measurable (power-loss-protected drives) to milliseconds.</p>
+  <h4>Step 5 — What the host may now rely on</h4>
+  <p>After the Flush completed, every write that completed before the Flush was submitted is on non-volatile media. After the FUA write completed, the commit record is on non-volatile media. The 16 KiB page write is durable only if it completed before the Flush was submitted — which is precisely why the database waits for it before calling <code>fdatasync()</code>.</p>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <table>
+    <caption>Mistakes engineers make about WRITE</caption>
+    <thead><tr><th>Mistake</th><th>Why it is wrong</th><th>Correct model</th></tr></thead>
+    <tbody>
+      <tr><td>"A write trace shows the device receiving MWr data."</td><td>Only the doorbells are host MWrs. Data arrives in CplDs answering the device's MRds.</td><td>WRITE = device pulls with MRd; READ = device pushes with MWr.</td></tr>
+      <tr><td>"Success means it is on flash."</td><td>With a volatile cache enabled and FUA clear, success means accepted, not durable.</td><td>Durability needs FUA, Flush, a disabled cache, or a cache the device does not report as volatile.</td></tr>
+      <tr><td>"NLB is the number of blocks."</td><td>NLB is 0's based.</td><td>Blocks = NLB + 1. NLB = 7 writes 8 LBAs.</td></tr>
+      <tr><td>"Two writes to the same LBA land in submission order."</td><td>No ordering between NVMe commands.</td><td>Wait for completion of the first before submitting the second.</td></tr>
+      <tr><td>"I can reuse my buffer once the doorbell is rung."</td><td>The controller reads it any time until completion.</td><td>Buffer ownership returns to the host only at completion.</td></tr>
+      <tr><td>"FUA flushes the cache."</td><td>FUA affects only that command's data.</td><td>Use Flush for previously completed writes.</td></tr>
+      <tr><td>"Write latency is NAND program time."</td><td>With a cache, latency is mostly firmware and link; NAND appears only under sustained load or FUA.</td><td>Measure with and without FUA, at burst and at steady state.</td></tr>
+      <tr><td>"MPS limits how much a device can read in one request."</td><td>MRRS limits request size; MPS limits each completion's payload.</td><td>Know which parameter governs which packet.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>Write problems fall into four families. For each, the first question is "which layer produced the first abnormal event?"</p>
+  <table>
+    <caption>WRITE failure families</caption>
+    <thead><tr><th>Symptom</th><th>Likely layer</th><th>First evidence to collect</th><th>Disambiguating experiment</th></tr></thead>
+    <tbody>
+      <tr><td>Write returns an error status</td><td>NVMe command or media</td><td>Status Code Type and Status Code in the CQE (kernel log decodes them), Error Information log page</td><td>Repeat with a known-good LBA and buffer: parameter error vs. media error</td></tr>
+      <tr><td>Write error with IOMMU fault in the kernel log</td><td>Host DMA mapping</td><td>Faulting address vs. the PRP entries of the failed command (tracepoint)</td><td>Run with the IOMMU in passthrough on a test machine: if errors vanish, mapping lifetime is suspect</td></tr>
+      <tr><td>Data correct until power loss, then old/zero data</td><td>Durability semantics</td><td>VWC enabled? Did the application fsync? Was Flush issued (tracepoints)?</td><td>Power-cut test with and without Flush/FUA</td></tr>
+      <tr><td>Latency spikes of milliseconds under sustained writes</td><td>Device internals (cache, GC)</td><td>Trace: gap between SQE fetch and data MRd; SMART media and temperature data</td><td>Reduce write rate or increase free space / deallocate unused space; spikes should move</td></tr>
+      <tr><td>Throughput below link rate for large writes</td><td>Read-request pipelining</td><td>Number of outstanding MRds, MRd→CplD latency, MRRS setting</td><td>Compare with READ throughput on the same link; check MRRS in the Device Control register (DevCtl) shown by <code>lspci -vvv</code></td></tr>
+      <tr><td>Corrupted data with success status</td><td>Host (buffer reuse, overlapping writes) or device</td><td>Pattern of corruption (whole LBAs? page-sized? offset?), timing relative to other writes</td><td>Write unique signatures per LBA and per write; re-read immediately and after a delay</td></tr>
+    </tbody>
+  </table>
+  <p>For the general method see <a href="debug-method.html">Debugging Methodology</a>; for NVMe status decoding see <a href="ch44.html">Chapter 44</a>; for the trace-to-command matching technique see <a href="ch41.html">Chapter 41</a>.</p>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <aside class="callout insight" data-title="Three things a senior engineer checks first">
+    <p><strong>1. Whose time is it?</strong> Split write latency into host submission, SQE fetch, data fetch (MRd→last CplD), firmware (last CplD→CQE) and host completion (CQE→doorbell). Only the firmware segment belongs to the SSD alone. Most "slow SSD" write reports I have seen were split between IOMMU and memory latency, interrupt coalescing, and real device stalls — and the trace tells you which in minutes.</p>
+    <p><strong>2. What did the application ask for?</strong> Before blaming durability on a drive, prove the stack issued Flush or FUA. A surprising number of "the SSD lost data" incidents are applications that never called fsync, filesystems mounted with barriers disabled, or virtualization layers that acknowledged flushes without passing them down.</p>
+    <p><strong>3. Is this a burst or a steady state?</strong> SSD write performance has at least two regimes. Fresh-out-of-box and burst numbers measure the cache; sustained numbers after the drive has been filled and overwritten measure the NAND and garbage collection. Validation that only measures the first regime ships products that disappoint in production.</p>
+  </aside>
+  <p>A further point that separates senior engineers: the asymmetry between READ and WRITE on PCIe means mixed workloads can exceed the one-direction bandwidth of the link, because read data uses the upstream direction and write data the downstream direction. A 50/50 mix on Gen4 x4 can move noticeably more than 7 GB/s in total if the device back end keeps up. Conversely, a write-heavy workload stresses the host's ability to answer reads from the device — root complex completion latency becomes a first-class performance parameter.</p>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 33 — Predict, then observe, the footprint of a write</h3>
+  <dl>
+    <dt>Objective</dt><dd>Predict the SQE contents and the PCIe packet counts of WRITE commands from first principles, then observe the host-side view of real writes on Linux.</dd>
+    <dt>Skills</dt><dd>SQE encoding, 0's based fields, MRRS/MPS/RCB reasoning, tracepoint reading, durability configuration inspection.</dd>
+    <dt>Safety</dt><dd><span class="badge safe">Safe lab</span> for parts 1–3 (simulation and read-only inspection). Part 4 writes to a scratch file on a filesystem; use a test machine or a disposable file. <span class="badge caution">Caution lab</span> if you choose to write to a raw block device: only ever a device with no data you need.</dd>
+    <dt>Hardware required</dt><dd>Any computer with Python 3. Optional: a Linux machine with an NVMe SSD.</dd>
+    <dt>Software required</dt><dd>Python 3 (standard library only); optional nvme-cli, tracefs access (root).</dd>
+    <dt>Input</dt><dd><code>write_footprint.py</code> from the Code section; the lab system parameters (MPS 256, MRRS 512, 512-byte LBAs).</dd>
+    <dt>Expected output</dt><dd>A table of predicted packet counts for 4 KiB, 16 KiB, 128 KiB and unaligned writes; a captured tracepoint line for a real write with decoded fields; a statement of your device's durability configuration.</dd>
+    <dt>Background</dt><dd>Engineering explanation above, especially "DMA: the controller reads the data" and "What completion means for durability".</dd>
+  </dl>
+  <h4>Step 1 — Run and modify the model</h4>
+  <p>Save <code>write_footprint.py</code> and run <code>python3 write_footprint.py</code>. Confirm the output matches the Code section. Then change <code>nlb0</code> to 31 (16 KiB) and to 255 (128 KiB), and change <code>prp1</code> to <code>0x2_0000_0800</code>. Record pages touched, MRds and CplDs for each, with <code>rc_chunk</code> 256 and 64.</p>
+  <h4>Step 2 — Explain every count</h4>
+  <p>For each result, write one sentence explaining the number from MRRS, the 4 KiB boundary rule and the completion chunk. If any count surprises you, find the code line responsible.</p>
+  <h4>Step 3 — Inspect your device's durability configuration (read-only)</h4>
+  <p>Run the <code>id-ctrl</code>, <code>get-feature -f 0x06</code> and <code>queue/write_cache</code> commands from the Linux view. Write down: VWC present? enabled? does the block layer issue flushes? FUA passed down?</p>
+  <h4>Step 4 — Observe writes at the driver boundary</h4>
+  <p>Enable the <code>nvme_setup_cmd</code> tracepoint, then in another terminal run, in a directory on the NVMe filesystem: <code>dd if=/dev/zero of=./lab33.bin bs=16k count=1 oflag=direct,dsync</code>. Capture the lines mentioning <code>nvme_cmd_write</code> and <code>nvme_cmd_flush</code>. Disable the tracepoint and delete <code>lab33.bin</code>.</p>
+  <h4>Observation</h4>
+  <p>Note the <code>slba</code>, <code>len</code> (the kernel prints NLB as encoded or decoded depending on version — check), and <code>control</code> fields of the write; whether a flush appeared; and whether the write's control field shows FUA.</p>
+  <h4>Questions</h4>
+  <ol>
+    <li>Does moving <code>prp1</code> to offset 0x800 change the MRd count for a 4 KiB write? What about offset 0x100? Why?</li>
+    <li>For the 128 KiB case, how many outstanding tags would the controller need to cover a 1 µs round trip at 7 GB/s?</li>
+    <li>With <code>oflag=direct,dsync</code>, why might you see a flush command on a device with a volatile write cache but not on one without?</li>
+    <li>Did your write's <code>len</code> field show 31 or 32? What does that tell you about the tracepoint's formatting?</li>
+  </ol>
+  <h4>Challenge</h4>
+  <p>Extend the model to include the PRP list fetch for transfers that span more than two pages, and to model a controller that limits itself to <var>k</var> outstanding MRds with a fixed round-trip time; plot (or print) throughput against <var>k</var>.</p>
+  <details class="hint"><summary>Hints</summary><p>An unaligned 4 KiB buffer spans two pages, so it needs PRP2 and is split at the page boundary. Throughput with <var>k</var> outstanding requests of <var>S</var> bytes and round trip <var>T</var> is at most <var>k</var>·<var>S</var>/<var>T</var>, capped by link rate.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p><strong>Counts (rc_chunk 256).</strong> 4 KiB aligned: 1 page, 8 MRd, 16 CplD. 16 KiB aligned: 4 pages, 32 MRd, 64 CplD. 128 KiB aligned: 32 pages, 256 MRd, 512 CplD (plus a PRP list fetch not modeled). 4 KiB at offset 0x800: 2 pages (2 KiB in each), MRds: 4 in the first page and 4 in the second = 8 — the count is unchanged because 0x800 is a multiple of 512; try offset 0x100 instead to see 9 MRds (3,840 bytes in page one need 8 requests: 7 × 512 + 256; 256 bytes in page two need 1). With rc_chunk 64, every CplD count multiplies by four relative to 256.</p>
+    <p><strong>Question 1.</strong> Not for 0x800 (a 512-multiple, so the page boundary falls on a request boundary); it does for offsets that are not 512-aligned because requests are cut at the 4 KiB boundary, leaving a partial request on each side. <strong>Question 2.</strong> 7 × 10<sup>9</sup> × 10<sup>-6</sup> ÷ 512 ≈ 14 outstanding MRds. <strong>Question 3.</strong> With <code>dsync</code> the filesystem must make the data durable; with a volatile cache it issues a flush (or FUA), without one the block layer suppresses flushes as unnecessary. <strong>Question 4.</strong> Kernel versions differ in whether the tracepoint prints the raw 0's based field; the honest answer is "verify against the request size in bytes" — 16 KiB = 32 LBAs.</p>
+  </details>
+  <h4>What a senior engineer notices</h4>
+  <p>Whether the flush appears before or after the data write in the tracepoint stream, and whether the data write completes before the flush is <em>submitted</em>. If the stack submitted a flush while the data write was still outstanding, the flush does not cover it — a classic ordering bug in custom storage stacks.</p>
+  <h4>Failure variants</h4>
+  <ul>
+    <li>No <code>nvme_cmd_write</code> lines: the file is on a different device, or the write was satisfied from the page cache because <code>oflag=direct</code> was dropped.</li>
+    <li>Write split into several commands: the request exceeded <code>max_sectors_kb</code> or segment limits.</li>
+    <li>Tracepoint directory missing: kernel built without NVMe tracepoints or tracefs mounted elsewhere (<code>/sys/kernel/debug/tracing</code>).</li>
+  </ul>
+  <h4>Extension</h4>
+  <p>If you have access to a PCIe protocol analyzer, capture the same 16 KiB write and compare the MRd/CplD counts with your prediction. Differences usually reveal the root complex's completion size and the controller's PRP prefetch behavior. See <a href="trace-lab.html">Trace Analysis Laboratory</a>.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Encode CDW10, CDW11 and CDW12 for a FUA write of 64 KiB starting at LBA 0x1_0000_0000 on a namespace with 4 KiB LBAs.</li>
+    <li>A trace shows a Write CQE with success but no MRds for data between the SQE fetch and the CQE. List three explanations and how you would tell them apart.</li>
+    <li>Explain why a WRITE workload might be limited by the root complex's completion latency while the READ workload on the same link is not.</li>
+    <li>Your device reports VWC present. A colleague disables the cache with Set Features to "make it safe". What performance effect do you predict, and what is a better alternative?</li>
+    <li>Draw the sequence diagram for a 4 KiB write with FUA set on a drive with no power-loss protection. Where does the extra time appear?</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p><strong>1.</strong> 64 KiB ÷ 4 KiB = 16 LBAs → NLB = 15 = 0x0F. CDW10 = 0x00000000, CDW11 = 0x00000001, CDW12 = 0x4000000F (bit 30 FUA).</p>
+    <p><strong>2.</strong> (a) The analyzer missed packets (filter, trigger window, or a second link in the path); check sequence numbers and capture settings. (b) The data came from a Controller Memory Buffer on the device (PRP pointed into the device's own Base Address Register (BAR)), so no host read was needed; check the PRP address against BAR ranges. (c) You misdecoded the command: it is actually a Write Zeroes (08h) or another command that carries no data; re-check the opcode byte in the SQE CplD. A firmware bug that completes without reading is the last explanation, not the first.</p>
+    <p><strong>3.</strong> READ data travels as posted MWrs; the device needs only credits. WRITE data must be requested with non-posted MRds; each waits a round trip. If the device cannot keep enough reads outstanding to cover that round trip, throughput drops in proportion.</p>
+    <p><strong>4.</strong> Write latency rises toward NAND program time and throughput for small writes collapses; endurance may also suffer from smaller program units. Better: keep the cache enabled and make software issue Flush/FUA where durability is needed; or choose a drive with power-loss protection.</p>
+    <p><strong>5.</strong> Same as the normal diagram, but the CQE MWr is delayed until after the internal NAND program (hundreds of µs to ms). The PCIe portion is unchanged; the gap between the last CplD and the CQE grows.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>During an NVMe WRITE over PCIe, how does the data travel from host memory to the controller?</p>
+      <ul class="options" data-answer="3">
+        <li>The host sends posted MWr Transaction Layer Packets (TLPs) containing the data to the device's BAR</li>
+        <li>The controller sends MWr TLPs that pull the data</li>
+        <li>The controller sends MRd TLPs and the root complex returns CplD TLPs carrying the data</li>
+        <li>The CPU copies the data into the doorbell register</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The controller is the DMA master; it requests the data with non-posted reads and receives completions with data. Host MWrs carry only doorbell values.</p></details>
+    </li>
+    <li>
+      <p>A Write command has CDW12 = 0x4000_0003 on a namespace with 512-byte LBAs. What does it do?</p>
+      <ul class="options" data-answer="2">
+        <li>Writes 3 LBAs (1,536 bytes) with FUA</li>
+        <li>Writes 4 LBAs (2,048 bytes) with FUA</li>
+        <li>Writes 4 LBAs with Limited Retry</li>
+        <li>Writes 3 LBAs with Limited Retry</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>NLB = 3 is 0's based → 4 LBAs. Bit 30 (0x4000_0000) is FUA; Limited Retry is bit 31.</p></details>
+    </li>
+    <li>
+      <p>The volatile write cache is enabled and FUA is clear. The CQE reports success. Which statement is guaranteed?</p>
+      <ul class="options" data-answer="1">
+        <li>A subsequent Read of those LBAs returns the new data</li>
+        <li>The data will survive a sudden power loss</li>
+        <li>The data has been programmed to NAND</li>
+        <li>All earlier writes are also durable</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Completion guarantees the command took effect for subsequent commands; durability against power loss requires Flush or FUA (or no volatile cache).</p></details>
+    </li>
+    <li>
+      <p>Which PCIe parameter limits the size of each Memory Read request the controller issues for write data?</p>
+      <ul class="options" data-answer="2">
+        <li>Max Payload Size</li>
+        <li>Max Read Request Size</li>
+        <li>Read Completion Boundary</li>
+        <li>The NVMe MDTS field</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>MRRS bounds read requests. MPS bounds each completion's payload; RCB governs where completions may be split; MDTS bounds the whole NVMe command's transfer.</p></details>
+    </li>
+    <li>
+      <p>Two writes to LBA 500 are submitted back to back on the same SQ without waiting. What final content can the host assume?</p>
+      <ul class="options" data-answer="4">
+        <li>The second write's data, because SQs are first-in, first-out (FIFO)</li>
+        <li>The first write's data, because it was fetched first</li>
+        <li>A mix of both at sector granularity</li>
+        <li>Nothing specific; NVMe does not order separate commands</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Fetch order is not execution or commit order. The host must serialize dependent writes.</p></details>
+    </li>
+    <li>
+      <p>In a WRITE trace, a device MRd to host data receives a completion with status UR. What is the first suspect on an IOMMU-enabled host?</p>
+      <ul class="options" data-answer="1">
+        <li>The IOVA is not mapped for the device (DMA mapping lifetime or wrong PRP)</li>
+        <li>NAND program failure</li>
+        <li>Wrong CQ head doorbell</li>
+        <li>MSI-X table misconfiguration</li>
+      </ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Unsupported Request for a memory read from the device indicates the host side refused that address; with an IOMMU, an unmapped or revoked mapping is the most common cause. Confirm with the kernel's IOMMU fault log.</p></details>
+    </li>
+    <li>
+      <p>Why does the opcode value 01h tell you Write transfers data host-to-controller?</p>
+      <details class="answer"><summary>Model answer</summary><p>For NVMe I/O command opcodes the two least significant bits encode data direction; 01b means host-to-controller, 10b controller-to-host, 00b no data, 11b bidirectional. 01h ends in 01b.</p></details>
+    </li>
+    <li>
+      <p>Explain why FUA on a journal commit record is not enough on its own, and what Linux adds.</p>
+      <details class="answer"><summary>Model answer</summary><p>FUA makes only the commit record durable. The journal blocks it refers to may still sit in the volatile cache. The filesystem therefore issues a preflush (an NVMe Flush) before the commit write, after the journal writes have completed, so that the earlier blocks are durable before the record that declares them valid.</p></details>
+    </li>
+    <li>
+      <p>A sustained random-write test shows occasional 4 ms completions. The trace shows the SQE fetched promptly and the data MRds delayed by 4 ms. Where is the problem, and what is your next experiment?</p>
+      <details class="answer"><summary>Model answer</summary><p>Inside the device: it accepted the command but had no buffer to receive data, typically because the cache is full and destage is limited by NAND/GC. Next: vary write rate and free space (or deallocate unused space), compare fresh vs steady state, check temperature/throttling data in SMART. The host and link are exonerated by the prompt fetches and line-rate data transfer.</p></details>
+    </li>
+    <li>
+      <p>When may the host safely reuse the data buffer of a Write command?</p>
+      <details class="answer"><summary>Model answer</summary><p>Only after it has consumed the command's CQE. Until then the controller may read (or re-read) the buffer at any time.</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner.</strong> Walk me through what happens when Linux writes 4 KiB to an NVMe SSD.</p>
+      <details class="answer"><summary>Model answer</summary><p>The block layer hands a write request to the NVMe driver, which writes a 64-byte Write SQE (opcode 01h, NSID, SLBA, NLB=7 for 512-byte LBAs, PRP1 = buffer address) into an I/O SQ and writes the new tail to the SQ doorbell. The controller fetches the SQE with a PCIe memory read, reads the data from host memory with more memory reads, stores it (in cache or media), writes a 16-byte CQE into the CQ and sends an MSI-X interrupt. The driver processes the CQE, completes the request and updates the CQ head doorbell.</p></details></li>
+    <li><p><strong>Beginner.</strong> What is FUA?</p>
+      <details class="answer"><summary>Model answer</summary><p>Force Unit Access, CDW12 bit 30 of Write: the controller must commit this command's data and metadata to non-volatile media before completing it, bypassing the durability window of a volatile write cache.</p></details></li>
+    <li><p><strong>Intermediate.</strong> Why does an NVMe WRITE generate non-posted traffic from the device, and why does that matter for performance?</p>
+      <details class="answer"><summary>Model answer</summary><p>The device is the DMA master and must read host memory; PCIe reads are non-posted and require completions. Each read occupies a tag and completion buffer until answered, so throughput depends on how many reads the device keeps in flight versus the read round-trip latency (Little's Law). READ data, by contrast, is pushed with posted writes limited only by flow-control credits.</p></details></li>
+    <li><p><strong>Intermediate.</strong> How would you determine whether a given SSD's write cache is volatile and enabled?</p>
+      <details class="answer"><summary>Model answer</summary><p>Identify Controller's VWC field reports presence; Get Features for the Volatile Write Cache feature (FID 06h) reports whether it is enabled. On Linux, <code>nvme id-ctrl -H</code>, <code>nvme get-feature -f 6 -H</code> and <code>/sys/block/…/queue/write_cache</code>. Whether the cache is power-loss protected is not reported by these; a drive with full protection typically reports no volatile cache, but confirm with vendor documentation and power-cut testing.</p></details></li>
+    <li><p><strong>Advanced.</strong> A customer reports corrupted data after power failure even though their application uses O_DIRECT. Investigate.</p>
+      <details class="answer"><summary>Model answer</summary><p>O_DIRECT bypasses the page cache but not the device's volatile write cache. Check whether the application calls fsync/fdatasync or uses O_DSYNC; whether the filesystem or virtualization layer passes flushes down (tracepoints showing Flush commands); VWC state; and whether the drive honors Flush (power-cut tests). Also check atomicity: torn writes larger than AWUPF can corrupt structures even with flushes if the application assumes atomic multi-block writes.</p></details></li>
+    <li><p><strong>Advanced.</strong> Two consecutive writes to the same LBA came back in the opposite order. Bug?</p>
+      <details class="answer"><summary>Model answer</summary><p>Not a device bug by itself. NVMe imposes no ordering on completions or execution between commands. If the final data on media is the first write's, the host violated its own ordering requirement by not waiting. The host stack must serialize overlapping writes.</p></details></li>
+    <li><p><strong>Senior.</strong> Design a validation plan for write durability on a new SSD.</p>
+      <details class="answer"><summary>Model answer</summary><p>Matrix over cache enabled/disabled, FUA on/off, Flush before cut or not, write sizes around AWUPF and the atomic boundary, sequential and random, burst and steady state. Use a host that writes unique, verifiable signatures (LBA, write generation, checksum) and records which completions and Flush completions it observed before a controlled power cut (programmable power supply unit (PSU), at random points including during Flush). After power-up, verify: every write completed before a completed Flush, and every FUA write, must be present; no write may be torn within AWUPF; data not covered may be old or new but never garbage. Repeat thousands of times, include temperature extremes and nearly-full drives, and correlate failures with time-since-last-flush.</p></details></li>
+    <li><p><strong>Senior.</strong> Write throughput is 20% below READ throughput on the same Gen4 x4 link. Where do you look?</p>
+      <details class="answer"><summary>Model answer</summary><p>First confirm whether it is a back-end (NAND/GC) limit by checking if the link has idle periods. If the link is the limit: count outstanding MRds and measure MRd→CplD latency; check MRRS (a 128-byte MRRS multiplies request overhead), root complex completion size (64-byte completions cost more framing), IOMMU translation latency (IOTLB misses for scattered buffers), and whether the device uses enough tags (10-bit tags on Gen5). Compare with IOMMU passthrough on a test system and with larger, page-contiguous buffers.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain why the helper saying "got it" does not mean the recipe is in the vault, and what two things you can ask the helper to do about it.</li>
+    <li><strong>To a junior engineer:</strong> explain why an analyzer shows the device sending read requests during a write, and how to count them for 4 KiB with a 512-byte MRRS.</li>
+    <li><strong>To a senior engineer:</strong> argue whether a write cache with power-loss protection should report itself as volatile, considering Flush cost, FUA latency and host software behavior.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "The helper copies your recipe into their apron and says got it. The vault is far, so they wait and take many recipes at once. If you need it in the vault for sure, say 'put this one straight in the vault' or later 'empty your apron into the vault now'."</p>
+    <p><strong>Junior:</strong> "The controller does the copying, so it has to read our memory. Reads on PCIe are requests answered by completions. With a 512-byte maximum read request, 4 KiB needs eight reads, and the host answers each with one or more completions with data, up to 256 bytes each here."</p>
+    <p><strong>Senior:</strong> "If the cache is genuinely protected, reporting no volatile cache lets hosts skip flushes and FUA, saving latency and avoiding unnecessary firmware work; but it shifts all trust to the protection circuit and its health monitoring. Reporting a volatile cache keeps the host's durability protocol intact and makes Flush effectively free on the device. Both are legitimate; what matters is that the device's behavior matches what it reports, verified by power-cut testing."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>An NVMe Write (01h) is built by the driver, announced with one doorbell write, and then executed entirely on the controller's initiative: it fetches the SQE, pulls the data with PCIe Memory Read requests answered by Completions with Data, stores the data, posts a CQE and raises an interrupt. The request traffic flows upstream and the data flows downstream — the mirror image of READ — which makes write throughput sensitive to read-request pipelining and host read latency. A successful completion guarantees that later commands see the data; it guarantees durability against power loss only when the volatile write cache is absent or disabled, or when FUA was set, or after a subsequent Flush. NAND programming is slow and invisible on the link; the write cache hides it until sustained load exposes it.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>encode and decode CDW10–12 of a Write, including 0's based NLB and the FUA bit</li>
+      <li>draw the WRITE sequence over PCIe with the correct direction for every packet</li>
+      <li>predict MRd and CplD counts from MRRS, MPS and the root complex's completion size</li>
+      <li>state exactly what a success completion guarantees with and without a volatile write cache and FUA</li>
+      <li>find the first abnormal event in a failed write trace and name the responsible layer</li>
+      <li>inspect VWC, the Volatile Write Cache feature and the block layer's write-cache mode on Linux</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3 — Write command; Force Unit Access; Atomic operations</cite></li>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Submission Queue Entry; Completion Queue Entry; Volatile Write Cache feature; Identify Controller data structure</cite></li>
+    <li><cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4 — queue and doorbell mechanisms</cite></li>
+    <li><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Memory Read requests, completion rules, Max Read Request Size</cite></li>
+    <li>Linux kernel documentation: <code>Documentation/block/writeback_cache_control.rst</code> (how REQ_PREFLUSH and REQ_FUA are used), and the NVMe host driver source (<code>drivers/nvme/host/core.c</code>).</li>
+    <li>Deeper treatment: <a href="dd31.html">Deep-Dive Module 31 — WRITE</a>; end-to-end view: <a href="ch40.html">Chapter 40 — End-to-End Write</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch34.html">Chapter 34 — FLUSH</a>, where the volatile write cache gets its own command and we find out exactly what Flush promises.</p>
+</section>

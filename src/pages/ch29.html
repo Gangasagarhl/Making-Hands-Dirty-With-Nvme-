@@ -1,0 +1,820 @@
+<p class="lead">Every NVMe command, from a 4 KiB read to a firmware activation, is a 64-byte record the host writes into memory, and every answer is a 16-byte record the controller writes back. This chapter teaches you to read both records byte by byte, so that a hex dump of a Submission Queue Entry or a Completion Queue Entry stops being noise and becomes a sentence you can say out loud.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>In <a href="ch25.html">Queue Architecture</a> you learned that the host and the controller talk through rings in host memory. In <a href="ch28.html">Doorbells</a> you learned how the host announces new work. What you have not yet studied closely is the <em>thing</em> that sits in each slot of those rings. That thing is the command, and its reply is the completion.</p>
+  <p>The fixed layout of these two records is the most stable contract in NVMe. Opcodes are added, command sets come and go, transports change from PCI Express (PCIe) to TCP, but the 64-byte <span class="g" data-term="sqe">Submission Queue Entry (SQE)</span> and the 16-byte <span class="g" data-term="cqe">Completion Queue Entry (CQE)</span> have kept the same skeleton since NVMe 1.0. If you know the skeleton, you can decode commands you have never seen before, because you know where the opcode, the identifier, the namespace and the data pointers live even before you know what the command does.</p>
+  <p>For trace analysis this is the bridge between two worlds. A protocol analyzer shows you a PCIe Memory Read completion carrying 64 bytes. Only when you can split those 64 bytes into Command Dwords do you know that the controller just fetched a READ of eight blocks for namespace 1 with Command Identifier 7. Every later chapter on commands, PRP/SGL, errors and end-to-end correlation stands on this one.</p>
+
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Draw the 64-byte SQE as sixteen Command Dwords (CDW0–CDW15) and name every field of the common command format.</li>
+    <li>Decode CDW0 into opcode, fused operation, PRP-or-SGL selector and Command Identifier, and explain who chooses each value.</li>
+    <li>Explain the role of the Namespace Identifier, the Metadata Pointer and the Data Pointer, and when each is ignored.</li>
+    <li>Draw the 16-byte CQE and decode SQ Head Pointer, SQ Identifier, Command Identifier, Phase Tag and the Status Field (Status Code, Status Code Type, Command Retry Delay, More, Do Not Retry).</li>
+    <li>Decode a complete synthetic READ SQE and its CQE from raw little-endian hex, by hand and with a script.</li>
+    <li>Recognise the common command formats (admin with no data, admin with data, NVM I/O with LBA range) and where their command-specific fields sit.</li>
+    <li>Identify in a PCIe trace the TLPs that carry an SQE and a CQE, and correlate them using SQID and CID.</li>
+    <li>List what goes wrong when each field is wrong, and how each failure shows up in a trace and in Linux.</li>
+  </ul>
+
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq">
+    <p>You should be comfortable with: queues as rings in host memory, head and tail, and the Phase Tag (<a href="ch25.html">Queue Architecture</a>, <a href="ch27.html">I/O Queues</a>); the admin queue and why it exists (<a href="ch26.html">Admin Queue</a>); doorbell writes as PCIe posted Memory Writes (<a href="ch28.html">Doorbells</a>); little-endian byte order and DMA (<a href="ch20.html">DMA</a>); and the shape of a Memory Read / Completion with Data pair (<a href="ch12.html">Posted vs Non-Posted Transactions</a>).</p>
+  </aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Imagine the school library has a box of request slips. Every slip is printed on exactly the same size of card, with boxes in exactly the same places. The top-left box says <em>what kind of job</em> it is ("bring me books", "put these books away", "tell me about yourself"). Next to it is a <em>ticket number</em> you write yourself, so you can recognise the answer later. Another box says <em>which shelf section</em> the job is about. Two boxes say <em>which table in the classroom</em> the books should go to or come from. And at the bottom there is a big space whose meaning depends on the kind of job: for "bring me books" it says which books and how many.</p>
+    <p>When the librarian finishes, she does not write a whole letter back. She drops a tiny answer card into the answer box. The card has your ticket number, a word that means "done" or "problem", a note saying "I have read slips up to number 6", and a little coloured dot that flips colour every time she goes round the box, so you can tell new cards from old ones.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>An adult version: a standardised shipping manifest at a container port. Every manifest is the same size and has the same header boxes — a form code that says what kind of shipment it is, a reference number chosen by the shipper, a destination warehouse code, and two address fields for where the goods physically are. Below the header is a free-form "commodity details" area whose layout is defined by the form code. The port's answer is a short receipt stamped with the shipper's reference number, the number of the last manifest the port has processed, an outcome code from a published list, and a "do not resubmit" box.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>What the analogy hides.</strong> The slip is not handed over; it sits in host memory and the controller <em>fetches</em> it with a PCIe Memory Read when it chooses. Nothing physically moves until the doorbell rings, and the slip can be fetched long after it was written. The "table addresses" are not single locations but pointers that may describe a list of scattered memory pages (<a href="ch36.html">PRP</a>) or a linked list of descriptors (<a href="ch37.html">SGL</a>).</p>
+    <p><strong>Where it misleads.</strong> The ticket number (Command Identifier) is only unique among commands <em>outstanding on the same Submission Queue</em>; two queues can use the same number at the same time. The colour dot (Phase Tag) is not a status; it says "this card is new", not "this card is good". And the receipt's "slips read up to number 6" (SQ Head Pointer) tells the host which slots it may reuse — it does not mean commands 0–5 have completed; completions may arrive in any order.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>A computer that wants an NVMe SSD to do something writes a small, fixed-size record into a ring of memory called a <span class="g" data-term="submission-queue">Submission Queue (SQ)</span>. That record is the command. It is always 64 bytes. The SSD's controller later reads the record, does the work, and writes a 16-byte reply into a different ring called a <span class="g" data-term="completion-queue">Completion Queue (CQ)</span>.</p>
+  <p>The 64 bytes are grouped into sixteen 32-bit words. NVMe calls each 32-bit word a <em>Dword</em> (double word), and the words of a command are called <em>Command Dwords</em>, numbered CDW0 to CDW15. Some words have the same meaning in every command: which operation, which ticket number, which namespace, where the data is in memory. The last six words (CDW10–CDW15) change meaning depending on the operation.</p>
+  <p>The reply has four Dwords. The first is a small result value whose meaning depends on the command (for example, how many queues the controller granted). The third says which queue the command came from and how far the controller has read in that queue. The fourth carries the ticket number, a flip-flopping "new entry" bit, and the status: success, or a coded reason for failure.</p>
+  <table>
+    <caption>The two records in one glance</caption>
+    <thead><tr><th>Record</th><th>Size</th><th>Written by</th><th>Read by</th><th>Lives in</th></tr></thead>
+    <tbody>
+      <tr><td>Submission Queue Entry (command)</td><td>64 bytes (16 Dwords)</td><td>Host driver (CPU store instructions)</td><td>Controller (DMA read over PCIe)</td><td>Submission Queue in host memory (or controller memory buffer if used)</td></tr>
+      <tr><td>Completion Queue Entry (completion)</td><td>16 bytes (4 Dwords)</td><td>Controller (DMA write over PCIe)</td><td>Host driver (CPU loads)</td><td>Completion Queue in host memory</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout remember"><p>Commands go host → memory → controller. Completions go controller → memory → host. Neither record ever travels inside a doorbell write; doorbells carry only a queue index.</p></aside>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+  <p>The NVM Express Base Specification defines a <em>common command format</em> that every admin and I/O command uses. Individual command definitions then say how they use the command-specific Dwords and whether they use the namespace or data pointer fields at all. The Base Specification also defines the completion queue entry layout and the status field encoding that every command returns.</p>
+
+  <h3>The 64-byte Submission Queue Entry, Dword by Dword</h3>
+  <p>All multi-byte fields are little-endian. Byte 0 of the SQE is the least significant byte of CDW0, which is the opcode. The table below draws each Dword with bit 31 on the left.</p>
+  <figure>
+  <table class="packet">
+    <thead><tr><th class="row-label">Dword (bytes)</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">CDW0 (0–3)</td><td colspan="16" class="hl">Command Identifier (CID) [31:16]</td><td colspan="2">PSDT [15:14]</td><td colspan="4" class="rsvd">Reserved [13:10]</td><td colspan="2">FUSE [9:8]</td><td colspan="8" class="hl">Opcode (OPC) [7:0]</td></tr>
+      <tr><td class="row-label">CDW1 (4–7)</td><td colspan="32">Namespace Identifier (NSID)</td></tr>
+      <tr><td class="row-label">CDW2 (8–11)</td><td colspan="32">Command Dword 2 — reserved or command specific (version-dependent)</td></tr>
+      <tr><td class="row-label">CDW3 (12–15)</td><td colspan="32">Command Dword 3 — reserved or command specific (version-dependent)</td></tr>
+      <tr><td class="row-label">CDW4 (16–19)</td><td colspan="32">Metadata Pointer (MPTR) bits 31:0</td></tr>
+      <tr><td class="row-label">CDW5 (20–23)</td><td colspan="32">Metadata Pointer (MPTR) bits 63:32</td></tr>
+      <tr><td class="row-label">CDW6 (24–27)</td><td colspan="32" class="hl">Data Pointer (DPTR): PRP Entry 1 bits 31:0 — or SGL Entry 1 bytes 0–3</td></tr>
+      <tr><td class="row-label">CDW7 (28–31)</td><td colspan="32" class="hl">DPTR: PRP Entry 1 bits 63:32 — or SGL Entry 1 bytes 4–7</td></tr>
+      <tr><td class="row-label">CDW8 (32–35)</td><td colspan="32" class="hl">DPTR: PRP Entry 2 bits 31:0 — or SGL Entry 1 bytes 8–11</td></tr>
+      <tr><td class="row-label">CDW9 (36–39)</td><td colspan="32" class="hl">DPTR: PRP Entry 2 bits 63:32 — or SGL Entry 1 bytes 12–15</td></tr>
+      <tr><td class="row-label">CDW10 (40–43)</td><td colspan="32">Command Dword 10 — command specific</td></tr>
+      <tr><td class="row-label">CDW11 (44–47)</td><td colspan="32">Command Dword 11 — command specific</td></tr>
+      <tr><td class="row-label">CDW12 (48–51)</td><td colspan="32">Command Dword 12 — command specific</td></tr>
+      <tr><td class="row-label">CDW13 (52–55)</td><td colspan="32">Command Dword 13 — command specific</td></tr>
+      <tr><td class="row-label">CDW14 (56–59)</td><td colspan="32">Command Dword 14 — command specific</td></tr>
+      <tr><td class="row-label">CDW15 (60–63)</td><td colspan="32">Command Dword 15 — command specific</td></tr>
+    </tbody>
+  </table>
+  <figcaption>Common command format of the 64-byte SQE (NVM Express Base Specification, "Submission Queue Entry"). Highlighted fields are the ones you read first in any trace.</figcaption>
+  </figure>
+
+  <h4>CDW0 — the command's identity card</h4>
+  <table>
+    <caption>Fields of Command Dword 0</caption>
+    <thead><tr><th>Bits</th><th>Field</th><th>Owner</th><th>Purpose</th><th>What breaks if wrong</th></tr></thead>
+    <tbody>
+      <tr><td>7:0</td><td>Opcode (OPC)</td><td>Driver, from the command it intends</td><td>Selects the command. Interpreted against the queue type: the same value means different things on the admin queue and on an I/O queue.</td><td>Controller completes with Invalid Command Opcode (generic status 01h), or — far worse — executes a different command than intended.</td></tr>
+      <tr><td>9:8</td><td>Fused Operation (FUSE)</td><td>Driver</td><td>00b normal command; 01b first command of a fused pair; 10b second command of a fused pair; 11b reserved. Used for Compare and Write as an atomic pair.</td><td>A lone "first fused" command waits for a partner or is aborted with a missing-fused status; a reserved value is an invalid field.</td></tr>
+      <tr><td>13:10</td><td>Reserved</td><td>—</td><td>Must be zero.</td><td>Controllers may reject non-zero reserved bits with Invalid Field in Command; others ignore them. Never rely on either.</td></tr>
+      <tr><td>15:14</td><td><span class="g" data-term="psdt">PRP or SGL for Data Transfer (PSDT)</span></td><td>Driver</td><td>00b: the Data Pointer holds PRP entries. 01b: SGLs are used, MPTR is the address of a contiguous metadata buffer. 10b: SGLs are used, MPTR is the address of an SGL segment describing metadata. 11b reserved.</td><td>Controller interprets the 16-byte DPTR the wrong way: pointers read as descriptors or vice versa, leading to Invalid SGL statuses, data transfer errors, or DMA to wrong addresses.</td></tr>
+      <tr><td>31:16</td><td>Command Identifier (CID)</td><td>Driver</td><td>A 16-bit tag the host chooses. Together with the SQ Identifier it uniquely identifies the command while it is outstanding. Returned unchanged in the CQE.</td><td>Duplicate CIDs on one SQ make completions ambiguous; the host may complete the wrong request (silent data corruption risk). Some controllers report Command ID Conflict.</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout insight" data-title="Opcode bits carry the data direction">
+    <p>For the standard admin and NVM I/O opcodes, bits 1:0 of the opcode encode the data transfer direction: 00b no data, 01b host to controller, 10b controller to host, 11b bidirectional. That is why Write is 01h and Read is 02h, why Identify (06h) moves data to the host and Set Features (09h) moves data to the controller. Bit 7 distinguishes standard from vendor-specific ranges (admin vendor-specific opcodes are C0h–FFh, I/O vendor-specific opcodes are 80h–FFh). Use this as a reading aid, and confirm the direction for a specific command in its own definition: the convention describes the opcode table, it does not override a command's text. <span class="badge derived">Derived</span></p>
+  </aside>
+
+  <h4>CDW1 — Namespace Identifier (NSID)</h4>
+  <p>The <span class="g" data-term="nsid">Namespace Identifier (NSID)</span> names the namespace the command acts on. Valid active NSIDs start at 1; NSID 0 is not a valid namespace; FFFFFFFFh is the broadcast value meaning "all namespaces" where a command allows it (for example some Get Log Page, Format NVM or Set Features uses). Admin commands that do not concern a namespace — Create I/O SQ, Abort, Keep Alive — define NSID as reserved or unused and expect zero.</p>
+  <p>NSID is checked by the controller before it touches media. An I/O command with an inactive or invalid NSID completes with Invalid Namespace or Format (generic status 0Bh). That status appears before any data transfer, so in a trace you see the SQE fetch followed directly by a CQE write, with no data TLPs in between.</p>
+
+  <h4>CDW2 and CDW3</h4>
+  <p>In early revisions these Dwords were reserved. Later revisions allow commands to use them for command-specific purposes (for example, some command sets place extended fields here). Treat them as "zero unless the command definition you are reading says otherwise" and check the definition for the revision you target. <span class="badge version">Version-dependent</span></p>
+
+  <h4>CDW4–5 — Metadata Pointer (MPTR)</h4>
+  <p><span class="g" data-term="metadata">Metadata</span> is extra per-block information (for example end-to-end <a href="ch31.html#pi">protection information</a>) that can travel either interleaved with the data ("extended LBA") or in a separate buffer. MPTR is used only when the namespace is formatted with metadata in a separate buffer and the command transfers data. With PSDT = 00b or 01b it is the address of one contiguous metadata buffer; with PSDT = 10b it points to an SGL segment that describes the metadata buffer. For namespaces without separate metadata, MPTR is ignored and should be zero.</p>
+
+  <h4>CDW6–9 — Data Pointer (DPTR)</h4>
+  <p>The 16-byte <span class="g" data-term="dptr">Data Pointer (DPTR)</span> tells the controller where the data buffer is in host memory. It has two interpretations selected by PSDT:</p>
+  <ul>
+    <li><strong>PRP mode (PSDT = 00b).</strong> PRP Entry 1 (PRP1) is the address of the first memory page of the buffer; it may carry an offset within that page. PRP Entry 2 (PRP2) is either the address of the second page (if the transfer spans exactly two pages) or the address of a PRP List (if it spans more), or unused if the transfer fits in the first page. Physical Region Pages are taught fully in <a href="ch36.html">Physical Region Pages</a>.</li>
+    <li><strong>SGL mode (PSDT = 01b or 10b).</strong> The 16 bytes are one SGL descriptor, SGL Entry 1: an 8-byte address, a 4-byte length and a descriptor type byte. It may describe the data directly or point to a segment of further descriptors. Scatter Gather Lists are taught in <a href="ch37.html">Scatter Gather Lists</a>.</li>
+  </ul>
+  <p>Admin commands sent over the PCIe transport must use PRPs; SGLs are an I/O-command option that the controller advertises in the Identify Controller SGL Support field. <span class="badge verified">Verified</span> (NVMe over PCIe: admin commands use PRP). Commands that transfer no data ignore DPTR.</p>
+
+  <h4>CDW10–15 — command-specific Dwords</h4>
+  <p>The final 24 bytes belong to the command. A READ places its starting LBA in CDW10–11 and its block count in CDW12; Identify places its Controller or Namespace Structure (CNS) value in CDW10; Create I/O CQ places the queue identifier and size in CDW10 and its interrupt settings in CDW11. When you decode an unfamiliar command, you know CDW0–9 already; you only need the command's own table for CDW10–15.</p>
+
+  <h3>Common command formats</h3>
+  <p>Commands fall into a handful of shapes. Learning the shapes lets you guess what a capture is doing before you look up the opcode.</p>
+  <table>
+    <caption>Typical shapes of the common command format</caption>
+    <thead><tr><th>Shape</th><th>Examples</th><th>NSID</th><th>DPTR</th><th>CDW10–15 carry</th></tr></thead>
+    <tbody>
+      <tr><td>Admin, no data, no namespace</td><td>Create I/O SQ/CQ, Delete I/O SQ/CQ, Abort, Keep Alive</td><td>0 / reserved</td><td>Create: PRP1 = queue base (queue memory, not a data buffer); others unused</td><td>Queue IDs, sizes, flags, interrupt vector, target CID</td></tr>
+      <tr><td>Admin, data in</td><td>Identify, Get Log Page, Get Features (some)</td><td>Depends on the structure requested</td><td>PRP1/PRP2 for a 4 KiB (Identify) or variable-size buffer</td><td>Which structure / log, size, offset</td></tr>
+      <tr><td>Admin, data out</td><td>Firmware Image Download, Set Features (some), Namespace Management create</td><td>Varies</td><td>PRP1/PRP2</td><td>Size, offset, selector</td></tr>
+      <tr><td>Admin, long-running media operation</td><td>Format NVM, Sanitize, Device Self-test</td><td>Target namespace or broadcast</td><td>Unused</td><td>Operation selector and options</td></tr>
+      <tr><td>I/O, LBA range with data</td><td>Read, Write, Compare</td><td>Target namespace</td><td>PRP or SGL</td><td>SLBA (CDW10–11), NLB and flags (CDW12), hints and protection fields (CDW13–15)</td></tr>
+      <tr><td>I/O, LBA range without data</td><td>Write Zeroes, Verify, Write Uncorrectable</td><td>Target namespace</td><td>Unused</td><td>SLBA, NLB, flags</td></tr>
+      <tr><td>I/O, range list</td><td>Dataset Management</td><td>Target namespace</td><td>Buffer containing range descriptors</td><td>Number of ranges, attributes</td></tr>
+      <tr><td>I/O, no data</td><td>Flush</td><td>Namespace or broadcast (where supported)</td><td>Unused</td><td>Nothing</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout insight"><p>Notice that Create I/O SQ and Create I/O CQ use PRP1, but not to move data: it carries the base address of the new queue. The controller does not DMA anything when it receives the command; it records the address for later. In a trace, a Create I/O CQ command is followed by its CQE with no data TLPs. A junior engineer who sees "PRP1 non-zero" and expects a data transfer will be confused here.</p></aside>
+
+  <h3>The 16-byte Completion Queue Entry</h3>
+  <figure>
+  <table class="packet">
+    <thead><tr><th class="row-label">Dword (bytes)</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">DW0 (0–3)</td><td colspan="32">Command specific (result value)</td></tr>
+      <tr><td class="row-label">DW1 (4–7)</td><td colspan="32">Reserved / command specific (version-dependent)</td></tr>
+      <tr><td class="row-label">DW2 (8–11)</td><td colspan="16" class="hl">SQ Identifier (SQID) [31:16]</td><td colspan="16" class="hl">SQ Head Pointer (SQHD) [15:0]</td></tr>
+      <tr><td class="row-label">DW3 (12–15)</td><td colspan="1">DNR</td><td colspan="1">M</td><td colspan="2">CRD</td><td colspan="3">SCT</td><td colspan="8" class="hl">Status Code (SC)</td><td colspan="1" class="hl">P</td><td colspan="16" class="hl">Command Identifier (CID) [15:0]</td></tr>
+    </tbody>
+  </table>
+  <figcaption>Completion Queue Entry (NVM Express Base Specification, "Completion Queue Entry"). In DW3: CID bits 15:0, Phase Tag bit 16, SC bits 24:17, SCT bits 27:25, CRD bits 29:28, M bit 30, DNR bit 31.</figcaption>
+  </figure>
+  <table>
+    <caption>Fields of the CQE</caption>
+    <thead><tr><th>Location</th><th>Field</th><th>Owner</th><th>Purpose</th><th>What breaks if wrong</th></tr></thead>
+    <tbody>
+      <tr><td>DW0</td><td>Command specific</td><td>Controller</td><td>Small result: e.g. the number of queues allocated (Set Features Number of Queues), the async event type/info/log page (Asynchronous Event Request), the feature value (Get Features).</td><td>Host configures the wrong number of queues, misreads an event.</td></tr>
+      <tr><td>DW1</td><td>Reserved / command specific</td><td>Controller</td><td>Reserved in early revisions; some later commands return data here. <span class="badge version">Version-dependent</span></td><td>Usually nothing, unless a command defines it.</td></tr>
+      <tr><td>DW2 [15:0]</td><td><span class="g" data-term="sqhd">SQ Head Pointer (SQHD)</span></td><td>Controller</td><td>The controller's current head of the SQ named by SQID: slots before it have been consumed and may be reused by the host.</td><td>Host overwrites SQ slots the controller has not fetched (lost or corrupt commands), or believes the SQ is full forever (stall).</td></tr>
+      <tr><td>DW2 [31:16]</td><td>SQ Identifier (SQID)</td><td>Controller</td><td>Which SQ the completed command came from. Needed because several SQs may share one CQ.</td><td>Host matches the CID against the wrong queue's outstanding commands.</td></tr>
+      <tr><td>DW3 [15:0]</td><td><span class="g" data-term="cid">Command Identifier (CID)</span></td><td>Controller copies host value</td><td>Identifies which command completed.</td><td>Host completes the wrong request, or reports a "completion for unknown command".</td></tr>
+      <tr><td>DW3 [16]</td><td><span class="g" data-term="phase-tag">Phase Tag (P)</span></td><td>Controller</td><td>Inverts each time the controller wraps the CQ. Host uses it to tell a new entry from a stale one without the controller needing to clear entries.</td><td>Host misses completions (timeouts) or processes stale ones twice.</td></tr>
+      <tr><td>DW3 [31:17]</td><td>Status Field</td><td>Controller</td><td>Outcome of the command; zero means success.</td><td>Errors go unnoticed or successful commands are retried.</td></tr>
+    </tbody>
+  </table>
+
+  <h4>The Status Field</h4>
+  <p>The Status Field is 15 bits. Seen as a 16-bit "status word" including the Phase Tag in bit 0 (the way many tools and the Linux driver print it), it is laid out as below.</p>
+  <table>
+    <caption>Status Field sub-fields (bit positions inside DW3 and inside the 16-bit status word)</caption>
+    <thead><tr><th>DW3 bits</th><th>Status word bits</th><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>24:17</td><td>8:1</td><td>Status Code (SC)</td><td>The specific outcome, interpreted within the Status Code Type.</td></tr>
+      <tr><td>27:25</td><td>11:9</td><td><span class="g" data-term="sct">Status Code Type (SCT)</span></td><td>0h Generic Command Status; 1h Command Specific Status; 2h Media and Data Integrity Errors; 3h Path Related Status; 7h Vendor Specific; others reserved.</td></tr>
+      <tr><td>29:28</td><td>13:12</td><td>Command Retry Delay (CRD)</td><td>0 = retry immediately if retrying; 1–3 select one of three retry-delay times the host configured/learned (Command Retry Delay Times in Identify Controller), used when the host enables the feature.</td></tr>
+      <tr><td>30</td><td>14</td><td>More (M)</td><td>More status information is available in the Error Information log page (Get Log Page, log identifier 01h).</td></tr>
+      <tr><td>31</td><td>15</td><td><span class="g" data-term="dnr">Do Not Retry (DNR)</span></td><td>1 = resubmitting the same command is expected to fail again. 0 = a retry may succeed.</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>A few status values worth knowing by heart (all stated plainly in the NVM Express Base / NVM Command Set specifications)</caption>
+    <thead><tr><th>SCT</th><th>SC</th><th>Name</th><th>Typical cause</th><th>Linux encoding (SCT&lt;&lt;8 | SC)</th></tr></thead>
+    <tbody>
+      <tr><td>0h</td><td>00h</td><td>Successful Completion</td><td>—</td><td>0x000</td></tr>
+      <tr><td>0h</td><td>01h</td><td>Invalid Command Opcode</td><td>Opcode not supported on this queue type / command set</td><td>0x001</td></tr>
+      <tr><td>0h</td><td>02h</td><td>Invalid Field in Command</td><td>Reserved bit set, unsupported option, bad selector</td><td>0x002</td></tr>
+      <tr><td>0h</td><td>04h</td><td>Data Transfer Error</td><td>DMA problem moving data (e.g. a PCIe completion error on a data fetch)</td><td>0x004</td></tr>
+      <tr><td>0h</td><td>06h</td><td>Internal Error</td><td>Controller-internal failure</td><td>0x006</td></tr>
+      <tr><td>0h</td><td>0Bh</td><td>Invalid Namespace or Format</td><td>NSID not active / not valid for the command</td><td>0x00B</td></tr>
+      <tr><td>0h</td><td>80h</td><td>LBA Out of Range</td><td>SLBA + NLB beyond namespace size (NVM command set status in the generic range)</td><td>0x080</td></tr>
+      <tr><td>2h</td><td>81h</td><td>Unrecovered Read Error</td><td>Media could not return correct data</td><td>0x281</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout notsaid"><p>This page lists only status values the course treats as well established. The full generic, command-specific, media and path-related tables are long and grow with each revision. When you see an unfamiliar SC/SCT pair, look it up in the NVM Express Base Specification status tables (and the I/O command set specification for set-specific values) for the revision your device claims in its Version register; never guess from a neighbouring value.</p></aside>
+
+  <h3>How SQID and CID make a command unique</h3>
+  <p>The CID is chosen by the host and only needs to be unique among commands outstanding on one SQ. A CQ may serve several SQs, so the controller reports SQID with every completion. The pair (SQID, CID) is therefore the command's unique key at any instant. Once a completion is consumed, the CID may be reused immediately.</p>
+  <p>Linux, for example, derives the CID from the block-layer request tag, and recent kernels add a small generation counter in the upper bits so that a stale or duplicated completion for a re-used tag can be detected. <span class="badge impl">Implementation-dependent</span> — another host may allocate CIDs sequentially, randomly, or by slot index. Never assume a CID pattern from one host applies to another.</p>
+
+  <h3>The ladder for the central concept: the command record</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>A request slip of a fixed size with boxes in fixed places, dropped in a request box; a tiny answer card comes back with your ticket number on it.</p></div>
+    <div class="rung" data-rung="B"><p>A 64-byte SQE in a Submission Queue; a 16-byte CQE in a Completion Queue; the CID ties them together; the Status Field says what happened.</p></div>
+    <div class="rung" data-rung="C"><p>The CPU stores 64 bytes into a cache-coherent DRAM ring; the controller's DMA engine fetches them over the PCIe link into its internal command buffer, parses CDW0 in hardware or firmware, and later DMA-writes 16 bytes into the CQ ring.</p></div>
+    <div class="rung" data-rung="D"><p>The NVM Express Base Specification defines the common command format, the completion queue entry, the Status Field and its tables; each command's definition (in the Base or an I/O command set specification) assigns CDW10–15 and the CQE DW0 meaning.</p></div>
+    <div class="rung" data-rung="E"><p>Over PCIe: the doorbell is a posted Memory Write (MWr) from the root complex; the SQE travels as the data of a Completion with Data (CplD) answering the controller's Memory Read (MRd); the CQE travels as a posted MWr from the controller to the CQ address.</p></div>
+    <div class="rung" data-rung="F"><p>In an analyzer: an MRd of 16 Dwords to SQ base + slot × 64, a CplD with 64 bytes whose first byte is the opcode, then later an MWr of 4 Dwords to CQ base + slot × 16 whose last Dword contains the CID and phase.</p></div>
+    <div class="rung" data-rung="G"><p>When a command "never completes", first find its SQE fetch (was it fetched at all?), then the CQE write for that SQID/CID (was it written, with which phase?), then the interrupt. The first missing or malformed record localises the fault to host, link or controller.</p></div>
+  </div>
+
+  <h3>The sixteen questions, answered for the SQE/CQE pair</h3>
+  <dl>
+    <dt>1. What is it?</dt><dd>A fixed 64-byte command record and a fixed 16-byte completion record exchanged through memory-resident queues.</dd>
+    <dt>2. Why was it created?</dt><dd>To give a high-performance, low-overhead, lock-friendly command interface between host software and a non-volatile memory controller.</dd>
+    <dt>3. What problem does it solve?</dt><dd>Fixed-size, cache-line-friendly entries allow the host to build a command with a few stores and the controller to fetch it with one read, with no register-by-register handshake; many commands may be in flight across many queues.</dd>
+    <dt>4. What existed before it?</dt><dd>AHCI command tables and FIS structures (SATA), SCSI Command Descriptor Blocks carried by SAS HBAs: variable formats, a single command queue of limited depth (32 for AHCI), and more register traffic. See <a href="ch03.html">From SATA/SAS to NVMe</a>.</dd>
+    <dt>5. Why is the current design better?</dt><dd>Every field sits at a known offset, the opcode alone defines the meaning of the rest, a single 64-byte fetch carries everything the controller needs for most commands, and the 16-byte completion is small enough to write atomically and cheaply.</dd>
+    <dt>6. Who creates it?</dt><dd>The SQE: the host driver. The CQE: the controller.</dd>
+    <dt>7. Who consumes it?</dt><dd>The SQE: the controller's command fetch and parse logic. The CQE: the host driver's completion handler.</dd>
+    <dt>8. Where does it live?</dt><dd>In host memory in the SQ and CQ rings (an SQ may also live in a Controller Memory Buffer when supported).</dd>
+    <dt>9. What memory/registers are involved?</dt><dd>SQ/CQ base addresses (ASQ/ACQ registers for admin; Create I/O SQ/CQ PRP1 for I/O), CC.IOSQES/IOCQES entry sizes (2<sup>6</sup> = 64 and 2<sup>4</sup> = 16), SQ tail and CQ head doorbells.</dd>
+    <dt>10. What happens before it?</dt><dd>The driver allocates a CID, maps the data buffer (PRP/SGL), fills the 64 bytes, then writes the SQ tail doorbell.</dd>
+    <dt>11. What happens after it?</dt><dd>The controller executes, transfers data, writes the CQE, optionally signals an interrupt; the host consumes the CQE and writes the CQ head doorbell.</dd>
+    <dt>12. What happens if it is wrong?</dt><dd>Invalid opcode/field statuses, DMA to wrong addresses, completion of the wrong request, lost or duplicated completions, hangs.</dd>
+    <dt>13. What does the protocol analyzer show?</dt><dd>The SQE in a CplD payload, the CQE in an MWr payload; good analyzers decode both into fields.</dd>
+    <dt>14. What does Linux show?</dt><dd>The nvme tracepoints (<code>nvme_setup_cmd</code>, <code>nvme_complete_rq</code>) print opcode, CID, NSID, CDW10–15 and status; error messages print the status in SCT&lt;&lt;8|SC form.</dd>
+    <dt>15. What would a validation engineer test?</dt><dd>Reserved-bit handling, every opcode on the wrong queue type, CID reuse and duplicates, PSDT values, NSID 0 / inactive / broadcast, phase-tag wrap, SQHD correctness under reordering, every status path.</dd>
+    <dt>16. What would a senior engineer suspect when it fails?</dt><dd>A host-side ring or CID bookkeeping bug before a controller bug; then IOMMU mapping of the SQ/CQ; then entry-size configuration (IOSQES/IOCQES); then controller firmware.</dd>
+  </dl>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>On the host side, building an SQE is nothing more than 64 bytes of CPU stores into ordinary write-back DRAM. On x86 that is one cache line. Because the line is cache-coherent and the controller's later read is snooped, the driver does not need to flush caches; it does need a memory barrier so that the SQE stores are globally visible before the doorbell store (an uncached MMIO write) leaves the CPU. On architectures with weaker ordering, the barrier is explicit in the driver's code path. <span class="badge impl">Implementation-dependent</span> (barrier instruction differs by CPU architecture).</p>
+  <p>On the controller side, a typical design has:</p>
+  <ul>
+    <li><strong>A doorbell register file</strong> in BAR0 space (from offset 1000h) that latches the new tail for each SQ and raises an internal "work available" event.</li>
+    <li><strong>A command fetch engine</strong> that computes <code>SQ base + head × 64</code>, issues PCIe Memory Read requests (one per entry, or one larger read covering several consecutive entries — an implementation choice), and places the returned bytes in an on-chip command buffer.</li>
+    <li><strong>A parser / dispatcher</strong> — hardware for the hot path (Read/Write), firmware for the rest — that checks the opcode against the queue type, validates NSID, reserved bits and PSDT, and dispatches the command.</li>
+    <li><strong>A DMA engine</strong> that walks PRP or SGL structures and moves data.</li>
+    <li><strong>A completion engine</strong> that builds the 16-byte CQE, sets the phase tag for the current pass of the CQ, writes it with a PCIe Memory Write, and then decides whether to send an interrupt (MSI-X Memory Write), subject to interrupt coalescing.</li>
+  </ul>
+  <figure>
+<pre class="diagram">
+  CPU / driver                     Host DRAM                           NVMe controller
+  ------------                     ---------                           ---------------
+  build 64 B SQE  --- stores ---&gt;  SQ1[5]  (0x1_2340_0140)
+  wmb()
+  MMIO store ---------------------------------------------------------&gt;  SQ1 tail doorbell = 6
+                                                                          fetch engine: head=5
+                                   SQ1[5] &lt;--- MRd 64 B ---------------  (PCIe Memory Read)
+                                   SQ1[5] ---- CplD 64 B ------------&gt;   command buffer
+                                                                          parse CDW0: OPC=02h CID=7
+                                                                          ... media + data DMA ...
+                                   CQ1[3] &lt;--- MWr 16 B ---------------  CQE: SQID=1 SQHD=6 CID=7 P=1
+  interrupt handler &lt;-- MSI-X MWr (to LAPIC window) ------------------  vector 1
+  read CQ1[3], check P, CID=7
+  MMIO store ---------------------------------------------------------&gt;  CQ1 head doorbell = 4
+</pre>
+    <figcaption>Where the two records live and how they move. Synthetic example for teaching, using the course's reference lab system (<a href="ch24.html">BAR0 = 0xFE60_0000</a>).</figcaption>
+  </figure>
+  <aside class="callout hw"><p>Entry sizes are not hard-coded on the controller side: the host programs CC.IOSQES and CC.IOCQES (as powers of two) before enabling the controller, and the controller reports the required and maximum entry sizes in Identify Controller (SQES and CQES bytes). For the NVM Command Set over PCIe these are 64 and 16 bytes. The admin queue entries are always 64 and 16 bytes. If a driver programs a different I/O size than the controller expects, every I/O queue creation fails — a classic bring-up bug.</p></aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <p>The common command format, the completion queue entry and the status field are defined in the <cite class="spec">NVM Express Base Specification, Revision 2.4 — Submission Queue Entry; Completion Queue Entry; Status Field Definition</cite>. Command-specific Dwords for I/O commands of the NVM Command Set (Read, Write, Compare, …) are defined in the <cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3 — I/O Commands for the NVM Command Set</cite>. How SQEs and CQEs are carried by PCIe memory transactions, doorbells and PRP rules for admin commands are in the <cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4</cite>. These three documents are separate on purpose: NVMe defines the record, the transport defines how it moves, and PCIe itself (the <cite class="spec">PCI Express Base Specification, Revision 6.x/7.0</cite>) defines the Memory Read/Write and Completion packets that do the moving.</p>
+  <p>The normative text is in the field tables and "shall" statements of those sections. Figures showing example commands, and informative notes, are explanatory only.</p>
+
+  <aside class="callout verified"><p>The SQE is 64 bytes and the CQE is 16 bytes for NVMe over PCIe. CDW0 holds the opcode (bits 7:0), FUSE (9:8), PSDT (15:14) and CID (31:16). NSID is in bytes 4–7, MPTR in bytes 16–23, DPTR in bytes 24–39, CDW10–15 in bytes 40–63. In the CQE, DW2 holds SQHD (15:0) and SQID (31:16); DW3 holds CID (15:0), the Phase Tag (16) and the Status Field (31:17) with SC, SCT, CRD, M and DNR as tabulated above. Status Code Type values 0h, 1h, 2h, 3h and 7h are as listed.</p></aside>
+  <aside class="callout derived"><p>That the (SQID, CID) pair is the unique key of an outstanding command follows from two normative facts: CID must be unique among outstanding commands on its SQ, and every CQE reports SQID. That the opcode's low two bits predict data direction is a property of how the opcode tables were assigned, and is reasoned from them rather than quoted as a rule for every future command.</p></aside>
+  <aside class="callout impl"><p>How the controller fetches SQEs (one 64-byte read per entry, or a burst covering several entries), the order in which it executes and completes commands, the CQE write coalescing, how a host assigns CIDs, and whether non-zero reserved bits are rejected or ignored are implementation choices.</p></aside>
+  <aside class="callout version"><p>The use of CDW2–3 and of CQE DW1 by specific commands, the list of status codes, the set of opcodes and the existence of Command Retry Delay (added in the 1.4 era) vary with revision. In the 2.x family, command definitions were split between the Base Specification and the I/O command set specifications; older 1.x documents put everything in one book. When you read an older datasheet or driver, check which revision it was written against.</p></aside>
+  <aside class="callout notsaid">
+    <p>What must be checked in the specification for any command you decode:</p>
+    <ul>
+      <li>Which command-specific Dwords it uses, and their bit fields.</li>
+      <li>Whether NSID is used, required to be zero, or may be the broadcast value.</li>
+      <li>Whether it transfers data, in which direction, and whether SGLs are allowed.</li>
+      <li>What CQE DW0 (and DW1, if any) returns.</li>
+      <li>Which command-specific status values it may return.</li>
+    </ul>
+    <p>The specification does not say how fast a command must complete, in what order commands from one SQ are executed, or that completions appear in submission order. It does not define how a host allocates CIDs.</p>
+  </aside>
+  <aside class="callout warn"><p>Never assume completions arrive in submission order. Never assume a CID is unique across queues. Never assume a reserved field is ignored. Never assume a non-zero PRP1 means data will move. Never assume the Phase Tag starts at 0 — it starts at 1 for the first pass, because the host zeroes the CQ memory and looks for P = 1.</p></aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>Over the PCIe transport, the life of one command crosses the link as four kinds of Transaction Layer Packet (TLP). Directions are stated from the point of view of the SSD ("downstream" = towards the device).</p>
+  <table>
+    <caption>What crosses the link for one command</caption>
+    <thead><tr><th>Step</th><th>TLP</th><th>Requester → Completer</th><th>Posted?</th><th>Payload</th></tr></thead>
+    <tbody>
+      <tr><td>Doorbell</td><td>MWr (32- or 64-bit address into BAR0)</td><td>Root complex → controller</td><td>Posted</td><td>1 Dword: new SQ tail index</td></tr>
+      <tr><td>SQE fetch request</td><td>MRd</td><td>Controller → root complex (host memory)</td><td>Non-posted</td><td>none; Length = 16 Dwords per entry</td></tr>
+      <tr><td>SQE delivery</td><td>CplD</td><td>Root complex → controller</td><td>Completion</td><td>64 bytes = the SQE (split at the Read Completion Boundary if the completer chooses)</td></tr>
+      <tr><td>Data (read direction)</td><td>MWr</td><td>Controller → host memory</td><td>Posted</td><td>Data, in packets no larger than Max Payload Size</td></tr>
+      <tr><td>Data (write direction)</td><td>MRd + CplD</td><td>Controller requests, host completes</td><td>Non-posted</td><td>Data in completions, bounded by Max Read Request Size and RCB</td></tr>
+      <tr><td>CQE</td><td>MWr</td><td>Controller → host memory</td><td>Posted</td><td>4 Dwords = the CQE</td></tr>
+      <tr><td>Interrupt</td><td>MWr (MSI-X)</td><td>Controller → interrupt controller address</td><td>Posted</td><td>1 Dword message data</td></tr>
+      <tr><td>CQ head doorbell</td><td>MWr</td><td>Root complex → controller</td><td>Posted</td><td>1 Dword: new CQ head index</td></tr>
+    </tbody>
+  </table>
+  <p>Ordering matters in exactly one place you must remember: PCIe ordering rules guarantee that posted writes from the controller are not passed by later posted writes on the same path, so the data MWr TLPs of a read command arrive in host memory before the CQE MWr that the controller sends after them, and the CQE before the MSI-X MWr. This is why the host can trust data once it sees the CQE. (See <a href="ch14.html">PCIe Ordering</a>; relaxed ordering attributes can change this, which is why NVMe controllers are careful about where they use them.) <span class="badge derived">Derived</span></p>
+  <figure>
+    <ol class="seq" data-actors="Driver (CPU)|Host memory|NVMe controller">
+      <li data-from="Driver (CPU)" data-to="Host memory">store 64-byte SQE in SQ1 slot 5</li>
+      <li data-from="Driver (CPU)" data-to="NVMe controller" data-t="0 ns">MWr: SQ1 tail doorbell = 6</li>
+      <li data-from="NVMe controller" data-to="Host memory" data-t="610 ns">MRd 16 DW @ SQ1 + 0x140, tag 0x21</li>
+      <li data-from="Host memory" data-to="NVMe controller" class="dashed" data-t="1,290 ns">CplD 64 B: the SQE</li>
+      <li data-note="NVMe controller">parse CDW0: OPC 02h, CID 0007h</li>
+      <li data-from="NVMe controller" data-to="Host memory">MWr ×16: 4 KiB data (256 B each)</li>
+      <li data-from="NVMe controller" data-to="Host memory" data-t="74,900 ns">MWr 4 DW: CQE to CQ1 slot 3</li>
+      <li data-from="NVMe controller" data-to="Driver (CPU)" data-t="75,050 ns">MSI-X MWr, vector 1</li>
+      <li data-from="Driver (CPU)" data-to="NVMe controller">MWr: CQ1 head doorbell = 4</li>
+    </ol>
+    <figcaption>Request/response view of one READ: the command and the completion are both carried as memory transactions. Synthetic example for teaching; times are illustrative only.</figcaption>
+  </figure>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>The two traces below use the reference lab system: device Requester ID 0x0100, BAR0 at 0xFE60_0000, SQ1 at IOVA 0x1_2340_0000, CQ1 at 0x1_2341_0000, data buffer at 0x2_0000_0000, Max Payload Size 256 bytes. The "Fields" column shows what a protocol analyzer decodes from the TLP header and, for the SQE and CQE, from the payload.</p>
+
+  <div class="trace" data-kind="synthetic" data-title="Normal: one 4 KiB READ, SQ1 slot 5 → CQ1 slot 3 (Gen4 x4)">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Len=1 Data=0x00000006</td><td>SQ1 tail doorbell: tail moves 5 → 6</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>610</td><td>MRd64</td><td>Req=0x0100 Tag=0x21 Addr=0x1_2340_0140 Len=16</td><td>Fetch SQE at slot 5 (0x140 = 5 × 64)</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1,290</td><td>CplD</td><td>Cpl=RC Req=0x0100 Tag=0x21 Status=SC ByteCnt=64 Len=16</td><td>Payload is the SQE: <code>02 00 07 00 01 00 00 00 …</code></td></tr>
+        <tr class="note"><td colspan="6">SQE decode: OPC=02h (Read), FUSE=00b, PSDT=00b (PRP), CID=0x0007, NSID=1, PRP1=0x2_0000_0000, PRP2=0, CDW10=0x00100000 (SLBA low), CDW11=0, CDW12=0x00000007 (NLB = 8 blocks).</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>71,200</td><td>MWr64</td><td>Req=0x0100 Addr=0x2_0000_0000 Len=64</td><td>First 256 bytes of data</td></tr>
+        <tr class="note"><td colspan="6">… 14 more MWr64, Len=64, addresses advancing by 0x100 …</td></tr>
+        <tr class="dir-up"><td>19</td><td>Dev→Host</td><td>74,700</td><td>MWr64</td><td>Req=0x0100 Addr=0x2_0000_0F00 Len=64</td><td>Last 256 bytes of data</td></tr>
+        <tr class="dir-up"><td>20</td><td>Dev→Host</td><td>74,900</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_2341_0030 Len=4 Data=00000000 00000000 00010006 00010007</td><td>CQE in CQ1 slot 3: SQID=1 SQHD=6 CID=0x0007 P=1 status 0</td></tr>
+        <tr class="dir-up"><td>21</td><td>Dev→Host</td><td>75,050</td><td>MWr32</td><td>Req=0x0100 Addr=0xFEE0_1000 Len=1 Data=0x00000041</td><td>MSI-X vector 1 (illustrative address/data)</td></tr>
+        <tr class="dir-down"><td>22</td><td>Host→Dev</td><td>77,800</td><td>MWr32</td><td>Req=RC Addr=0xFE60_100C Len=1 Data=0x00000004</td><td>CQ1 head doorbell: host consumed slot 3</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reading it.</strong> Row 2's address minus the SQ1 base gives 0x140; divided by 64 that is slot 5, which matches the previous tail (5) before the doorbell moved it to 6. Row 3's payload starts with byte 0x02: the opcode. Row 20's last Dword, 0x00010007, splits into CID 0x0007 (bits 15:0), P = 1 (bit 16) and Status Field 0: success. Its third Dword, 0x00010006, says SQID 1, SQHD 6 — the controller has consumed slot 5, so the host may reuse it. The CID in the CQE equals the CID in the SQE: the pair is closed.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: SGL requested on a controller without SGL support">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MWr32</td><td>Req=RC Addr=0xFE60_1008 Len=1 Data=0x0000000D</td><td>SQ1 tail doorbell: 12 → 13</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>590</td><td>MRd64</td><td>Req=0x0100 Tag=0x22 Addr=0x1_2340_0300 Len=16</td><td>Fetch SQE at slot 12</td></tr>
+        <tr class="abnormal"><td>3</td><td>Host→Dev</td><td>1,270</td><td>CplD</td><td>Cpl=RC Req=0x0100 Tag=0x22 Status=SC ByteCnt=64 Payload DW0=0x000C4002</td><td>First abnormal event: CDW0 has PSDT = 01b (SGL), but Identify Controller reported no SGL support for this controller</td></tr>
+        <tr class="dir-up"><td>4</td><td>Dev→Host</td><td>3,100</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_2341_0080 Len=4 Data=00000000 00000000 0001000D 8005000C</td><td>CQE: SQID=1 SQHD=13 CID=0x000C P=1 SCT=0h SC=02h (Invalid Field in Command) DNR=1</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>3,240</td><td>MWr32</td><td>Req=0x0100 Addr=0xFEE0_1000 Len=1 Data=0x00000041</td><td>MSI-X vector 1</td></tr>
+        <tr class="note"><td colspan="6">No data MWr TLPs between the SQE fetch and the CQE: the controller rejected the command during parsing.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> The CQE (row 4) is where the failure becomes visible, but it is not the first abnormal event. Decode its DW3: 0x8005000C → CID 0x000C, P = 1, status word 0x8005 → SC = (0x8005 &gt;&gt; 1) &amp; 0xFF = 0x02, SCT = 0, DNR = 1. "Invalid Field in Command" tells you <em>a</em> field is wrong, not which one. Go back to the SQE delivered in row 3: CDW0 = 0x000C4002 → OPC 02h, CID 0x000C, and bits 15:14 = 01b, so PSDT selects SGL. Identify Controller's SGL Support field (checked separately) says SGLs are not supported. The first abnormal event is therefore the host's choice of PSDT, visible in the command bytes; the controller behaved correctly. The time gap (1.8 µs from fetch to CQE, against ~70 µs for a real read) is supporting evidence that no media access happened.</p>
+    <p><strong>Caveat.</strong> Which status a given controller returns for an unsupported data-pointer mode should be confirmed in the specification's command and SGL rules for your revision; Invalid Field in Command is the common outcome, but treat the exact code as something to check rather than assume. <span class="badge uncertain">Uncertain</span></p>
+  </div>
+  <aside class="callout trace"><p>A good habit: when you see a non-zero status in a CQE, scroll <em>back</em> to the CplD that delivered the matching SQE (same SQID, same CID, most recent fetch before the CQE) and decode the whole command before forming any hypothesis about the device.</p></aside>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <p>Linux gives you three safe windows onto SQEs and CQEs: the identify data that tells you what the controller accepts, the kernel's NVMe tracepoints that print each command and completion, and the error messages printed when a command fails. All commands below are read-only inspection. <span class="badge safe">Safe lab</span></p>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Entry sizes, SGL support, max transfer size, version</span>
+sudo nvme id-ctrl /dev/nvme0 | grep -E '^(sqes|cqes|sgls|mdts|ver|oacs|oncs) '
+
+<span class="cm"># Commands Supported and Effects log: which opcodes this controller implements</span>
+sudo nvme effects-log /dev/nvme0
+
+<span class="cm"># Enable the nvme tracepoints and watch commands and completions</span>
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_setup_cmd/enable'
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_complete_rq/enable'
+sudo cat /sys/kernel/tracing/trace_pipe     <span class="cm"># Ctrl-C to stop</span>
+
+<span class="cm"># Turn them off again</span>
+sudo sh -c 'echo 0 &gt; /sys/kernel/tracing/events/nvme/enable'</code></pre>
+  <p>The tracepoint output shows, per command, the controller and queue, the CID, the NSID, the opcode name, and the command-specific Dwords decoded for common commands (for a read: starting LBA and length); the completion event shows the CID, the result (CQE DW0) and the status. The exact text format depends on the kernel version. <span class="badge version">Version-dependent</span> If <code>/sys/kernel/tracing</code> is absent, tracefs may be mounted at <code>/sys/kernel/debug/tracing</code>.</p>
+  <table>
+    <caption>What Linux evidence can and cannot prove</caption>
+    <thead><tr><th>Evidence</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+    <tbody>
+      <tr><td><code>nvme_setup_cmd</code> event</td><td>The driver built a command with these fields for this CID</td><td>That the SQE reached memory correctly, that the doorbell was rung, or that the controller fetched it</td></tr>
+      <tr><td><code>nvme_complete_rq</code> event</td><td>The driver processed a CQE with this CID and status</td><td>When the controller wrote it; whether an interrupt or polling found it; whether the data in memory is correct</td></tr>
+      <tr><td>Kernel log I/O error with status</td><td>The controller (or the driver, for host-side timeouts/aborts) reported that status</td><td>Root cause; the first abnormal event</td></tr>
+      <tr><td><code>id-ctrl</code> fields</td><td>What the controller advertises</td><td>That the advertised behaviour is implemented correctly</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout linux"><p>In the Linux driver the request path is roughly: block layer → <code>nvme_queue_rq()</code> → <code>nvme_setup_cmd()</code> (builds the 64-byte <code>struct nvme_command</code>) → data mapping → copy into the SQ slot → doorbell. Completions go <code>nvme_irq()</code> → CQ processing → <code>nvme_handle_cqe()</code> → request completion. Function names move between kernel versions; read them as landmarks in <code>drivers/nvme/host/</code>, not as a stable API. <span class="badge version">Version-dependent</span></p></aside>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <p>The script below decodes an SQE and a CQE from raw bytes using only the Python standard library. It encodes exactly the field positions taught in this chapter, and the Read/Write command-specific fields from <a href="ch32.html">READ</a>. Run it as is; then paste your own captured payloads in place of the examples.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="nvme_decode.py"><code>#!/usr/bin/env python3
+"""Decode a 64-byte NVMe Submission Queue Entry and a 16-byte Completion Queue Entry.
+Standard library only. Teaching tool: field positions follow the NVMe Base
+Specification common command format; command-specific fields are decoded
+only for the NVM Command Set Read/Write layout."""
+import struct
+
+ADMIN = {0x00: "Delete I/O SQ", 0x01: "Create I/O SQ", 0x02: "Get Log Page",
+         0x04: "Delete I/O CQ", 0x05: "Create I/O CQ", 0x06: "Identify",
+         0x08: "Abort", 0x09: "Set Features", 0x0A: "Get Features",
+         0x0C: "Asynchronous Event Request"}
+NVM = {0x00: "Flush", 0x01: "Write", 0x02: "Read", 0x08: "Write Zeroes",
+       0x09: "Dataset Management"}
+SCT = {0: "Generic Command Status", 1: "Command Specific Status",
+       2: "Media and Data Integrity Errors", 3: "Path Related Status",
+       7: "Vendor Specific"}
+GENERIC = {0x00: "Successful Completion", 0x01: "Invalid Command Opcode",
+           0x02: "Invalid Field in Command", 0x04: "Data Transfer Error",
+           0x0B: "Invalid Namespace or Format", 0x80: "LBA Out of Range"}
+MEDIA = {0x81: "Unrecovered Read Error"}
+
+def decode_sqe(raw, admin=False):
+    assert len(raw) == 64, "an SQE is exactly 64 bytes"
+    dw = struct.unpack("&lt;16I", raw)          # 16 little-endian dwords
+    opc = dw[0] &amp; 0xFF
+    fuse = (dw[0] &gt;&gt; 8) &amp; 0x3
+    psdt = (dw[0] &gt;&gt; 14) &amp; 0x3
+    cid = dw[0] &gt;&gt; 16
+    table = ADMIN if admin else NVM
+    print(f"CDW0  0x{dw[0]:08X}  OPC=0x{opc:02X} ({table.get(opc, 'not in this table')})"
+          f"  FUSE={fuse:02b}  PSDT={psdt:02b}  CID=0x{cid:04X}")
+    print(f"      data direction bits[1:0] = {opc &amp; 3:02b}"
+          " (00 none, 01 host-&gt;ctrl, 10 ctrl-&gt;host, 11 bidirectional)")
+    print(f"NSID  0x{dw[1]:08X}")
+    print(f"CDW2  0x{dw[2]:08X}  CDW3 0x{dw[3]:08X}")
+    mptr = dw[4] | dw[5] &lt;&lt; 32
+    prp1 = dw[6] | dw[7] &lt;&lt; 32
+    prp2 = dw[8] | dw[9] &lt;&lt; 32
+    print(f"MPTR  0x{mptr:016X}")
+    if psdt == 0:
+        print(f"PRP1  0x{prp1:016X}  (offset in 4 KiB page = 0x{prp1 &amp; 0xFFF:03X})")
+        print(f"PRP2  0x{prp2:016X}")
+    else:
+        print(f"SGL1  {raw[24:40].hex(' ')}")
+    for i in range(10, 16):
+        print(f"CDW{i:&lt;2d} 0x{dw[i]:08X}")
+    if not admin and opc in (0x01, 0x02):
+        slba = dw[10] | dw[11] &lt;&lt; 32
+        nlb = (dw[12] &amp; 0xFFFF) + 1          # 0's based on the wire
+        print(f"  SLBA={slba}  NLB(field)={nlb - 1} -&gt; {nlb} blocks"
+              f"  PRINFO=0x{(dw[12] &gt;&gt; 26) &amp; 0xF:X}"
+              f"  FUA={(dw[12] &gt;&gt; 30) &amp; 1}  LR={(dw[12] &gt;&gt; 31) &amp; 1}")
+    return cid
+
+def decode_cqe(raw):
+    assert len(raw) == 16, "a CQE is exactly 16 bytes"
+    dw0, dw1, dw2, dw3 = struct.unpack("&lt;4I", raw)
+    sqhd, sqid = dw2 &amp; 0xFFFF, dw2 &gt;&gt; 16
+    cid, p = dw3 &amp; 0xFFFF, (dw3 &gt;&gt; 16) &amp; 1
+    sc, sct = (dw3 &gt;&gt; 17) &amp; 0xFF, (dw3 &gt;&gt; 25) &amp; 0x7
+    crd, m, dnr = (dw3 &gt;&gt; 28) &amp; 0x3, (dw3 &gt;&gt; 30) &amp; 1, dw3 &gt;&gt; 31
+    name = (GENERIC if sct == 0 else MEDIA if sct == 2 else {}).get(sc, "see spec")
+    print(f"DW0 0x{dw0:08X}  DW1 0x{dw1:08X}")
+    print(f"DW2 0x{dw2:08X}  SQHD={sqhd}  SQID={sqid}")
+    print(f"DW3 0x{dw3:08X}  CID=0x{cid:04X}  P={p}")
+    print(f"    SCT={sct} ({SCT.get(sct, 'reserved')})  SC=0x{sc:02X} ({name})"
+          f"  CRD={crd}  M={m}  DNR={dnr}")
+    return cid
+
+if __name__ == "__main__":
+    sqe = bytes.fromhex(
+        "02000700" "01000000" "00000000" "00000000"   # CDW0 NSID CDW2 CDW3
+        "00000000" "00000000"                         # MPTR
+        "00000000" "02000000"                         # PRP1 = 0x2_0000_0000
+        "00000000" "00000000"                         # PRP2
+        "00001000" "00000000" "07000000"              # CDW10 CDW11 CDW12
+        "00000000" "00000000" "00000000")             # CDW13 CDW14 CDW15
+    ok = bytes.fromhex("00000000" "00000000" "06000100" "07000100")
+    bad = bytes.fromhex("00000000" "00000000" "06000100" "07000385")
+    print("== SQE =="); a = decode_sqe(sqe)
+    print("== CQE (success) =="); b = decode_cqe(ok)
+    print("== CQE (failure) =="); decode_cqe(bad)
+    print("CID match:", a == b)</code></pre>
+  <p>Expected output (abridged): the SQE decodes to OPC 0x02 (Read), CID 0x0007, NSID 1, PRP1 0x0000000200000000, SLBA 1048576, 8 blocks; the success CQE to SQHD 6, SQID 1, CID 0x0007, P 1, SCT 0, SC 0x00; the failure CQE to SCT 2 (Media and Data Integrity Errors), SC 0x81 (Unrecovered Read Error), DNR 1; and "CID match: True".</p>
+
+  <p>The host-side build of a command, as pseudocode:</p>
+  <pre class="code" data-kind="pseudocode" data-lang="c"><code>struct sqe { u32 cdw0, nsid, cdw2, cdw3; u64 mptr, prp1, prp2; u32 cdw10_15[6]; };
+
+submit_read(q, nsid, slba, nblocks, buf):
+    cid  = alloc_cid(q)                         <span class="cm">// unique among q's outstanding commands</span>
+    e    = &amp;q.sq[q.tail]
+    zero(e, 64)                                 <span class="cm">// reserved fields must be zero</span>
+    e.cdw0  = 0x02 | (0 &lt;&lt; 8) | (0 &lt;&lt; 14) | (cid &lt;&lt; 16)   <span class="cm">// Read, no fuse, PRP</span>
+    e.nsid  = nsid
+    e.prp1, e.prp2 = map_prps(buf, nblocks * lba_size)
+    e.cdw10_15[0] = lo32(slba);  e.cdw10_15[1] = hi32(slba)
+    e.cdw10_15[2] = (nblocks - 1) &amp; 0xFFFF      <span class="cm">// NLB is 0's based</span>
+    q.pending[cid] = request
+    q.tail = (q.tail + 1) % q.size
+    write_barrier()                             <span class="cm">// SQE visible before doorbell</span>
+    mmio_write32(sq_tail_doorbell(q), q.tail)
+
+on_completion(cq):
+    while (cq.ring[cq.head].dw3 &gt;&gt; 16) &amp; 1 == cq.phase:
+        e = cq.ring[cq.head]
+        read_barrier()                          <span class="cm">// read rest of CQE after seeing phase</span>
+        sq = sq_by_id(e.dw2 &gt;&gt; 16);   sq.head = e.dw2 &amp; 0xFFFF
+        req = sq.pending.pop(e.dw3 &amp; 0xFFFF)    <span class="cm">// key = (SQID, CID)</span>
+        complete(req, status = e.dw3 &gt;&gt; 17, result = e.dw0)
+        cq.head += 1; if cq.head == cq.size: cq.head = 0; cq.phase ^= 1
+    mmio_write32(cq_head_doorbell(cq), cq.head)</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p>Synthetic example for teaching. The driver wants to read 4 KiB from namespace 1 (512-byte LBAs) starting at LBA 1,048,576 (0x10_0000) into the page-aligned buffer at IOVA 0x2_0000_0000, on SQ1. It picks CID 7. SQ1's tail is 5.</p>
+  <h4>Step 1 — build each Dword</h4>
+  <table>
+    <caption>Field values for the READ</caption>
+    <thead><tr><th>Dword</th><th>Calculation</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>CDW0</td><td>OPC 02h | FUSE 0 &lt;&lt; 8 | PSDT 0 &lt;&lt; 14 | CID 0007h &lt;&lt; 16</td><td>0x0007_0002</td></tr>
+      <tr><td>NSID</td><td>namespace 1</td><td>0x0000_0001</td></tr>
+      <tr><td>CDW2–3</td><td>unused</td><td>0</td></tr>
+      <tr><td>MPTR</td><td>namespace has no separate metadata</td><td>0</td></tr>
+      <tr><td>PRP1</td><td>buffer address (offset 0 in its 4 KiB page)</td><td>0x0000_0002_0000_0000</td></tr>
+      <tr><td>PRP2</td><td>4 KiB fits entirely in the first page → unused</td><td>0</td></tr>
+      <tr><td>CDW10</td><td>SLBA bits 31:0</td><td>0x0010_0000</td></tr>
+      <tr><td>CDW11</td><td>SLBA bits 63:32</td><td>0</td></tr>
+      <tr><td>CDW12</td><td>NLB = 8 − 1 = 7; FUA = 0; LR = 0; PRINFO = 0</td><td>0x0000_0007</td></tr>
+      <tr><td>CDW13–15</td><td>no hints, no protection information</td><td>0</td></tr>
+    </tbody>
+  </table>
+  <h4>Step 2 — lay out the 64 bytes as they sit in memory</h4>
+  <figure>
+<pre class="diagram">
+offset  bytes (little-endian)                              meaning
+0x00    02 00 07 00  01 00 00 00  00 00 00 00  00 00 00 00   CDW0 | NSID | CDW2 | CDW3
+0x10    00 00 00 00  00 00 00 00  00 00 00 00  02 00 00 00   MPTR (8 B) | PRP1 low, PRP1 high
+0x20    00 00 00 00  00 00 00 00  00 00 10 00  00 00 00 00   PRP2 (8 B) | CDW10 | CDW11
+0x30    07 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00   CDW12 | CDW13 | CDW14 | CDW15
+</pre>
+    <figcaption>The READ SQE as 64 bytes in SQ1 slot 5 (IOVA 0x1_2340_0140). Synthetic example for teaching.</figcaption>
+  </figure>
+  <p>Two traps when reading this by eye: PRP1 = 0x0000_0002_0000_0000 appears as <code>00 00 00 00 02 00 00 00</code>, the 02 being byte 28 (bits 39:32); and CDW10 = 0x0010_0000 appears as <code>00 00 10 00</code>, not <code>00 10 00 00</code>.</p>
+  <h4>Step 3 — decode the CQE</h4>
+  <p>The controller later writes these 16 bytes into CQ1 slot 3: <code>00 00 00 00 00 00 00 00 06 00 01 00 07 00 01 00</code>.</p>
+  <ul>
+    <li>DW0 = 0, DW1 = 0: Read returns no result value.</li>
+    <li>DW2 = 0x0001_0006: SQID = 1, SQHD = 6.</li>
+    <li>DW3 = 0x0001_0007: CID = 0x0007; bit 16 = 1 → P = 1; bits 31:17 = 0 → success.</li>
+  </ul>
+  <p>The host's current CQ phase for this pass is 1 (first pass), so the entry is new. CID 7 on SQ1 is outstanding, so it is the READ we sent. Status 0 means the 4 KiB at 0x2_0000_0000 is valid.</p>
+  <h4>Step 4 — the same CQE, but failed</h4>
+  <p>If instead DW3 were 0x8503_0007: CID 0x0007, P = 1, status word 0x8503. SC = (0x8503 &gt;&gt; 1) &amp; 0xFF = 0x81; SCT = (0x8503 &gt;&gt; 9) &amp; 0x7 = 2; CRD = 0; M = 0; DNR = 1. That is Media and Data Integrity Errors / Unrecovered Read Error, do not retry. Linux would print it as status 0x281. The buffer contents must not be used.</p>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li><strong>Reading the SQE big-endian.</strong> The opcode is the first byte in memory, not the fourth. Analyzer "Dword" views and memory "byte" views look different; always know which one you are reading.</li>
+    <li><strong>Forgetting that NLB is 0's based.</strong> NLB = 0 means one block. A driver that writes the count instead of count − 1 reads one block too many — often into the next buffer.</li>
+    <li><strong>Assuming CID is globally unique.</strong> It is unique per SQ. Correlating by CID alone across a multi-queue trace pairs the wrong commands.</li>
+    <li><strong>Treating SQHD as "commands done".</strong> SQHD says what was fetched, not what completed.</li>
+    <li><strong>Misplacing the phase bit.</strong> P is bit 16 of DW3, bit 0 of the status word. Shifting the status word by 1 before extracting SC is required; forgetting it doubles every status code you print (02h becomes 04h — which happens to be a real, different status: Data Transfer Error).</li>
+    <li><strong>Leaving stale bytes in a reused slot.</strong> If the driver does not zero the entry, CDW13–15 from the previous command can carry hints or protection settings into the new one.</li>
+    <li><strong>Expecting data TLPs for every non-zero PRP1.</strong> Create I/O SQ/CQ use PRP1 for queue memory.</li>
+    <li><strong>Interpreting an admin opcode as an I/O opcode.</strong> 01h on the admin queue is Create I/O SQ; on an I/O queue it is Write.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <p>The SQE and CQE are the first place to look whenever a command misbehaves, because they are the only two records that both sides agree on. A debugging pass looks like this:</p>
+  <ol>
+    <li><strong>Find the command.</strong> In the trace, locate the CplD carrying the SQE (match SQ base + slot × 64). If there is none, the controller never fetched it: look at the doorbell (<a href="ch28.html">Doorbells</a>).</li>
+    <li><strong>Decode every field.</strong> Opcode valid for this queue type? NSID active? PSDT supported? Reserved bits zero? PRP alignment correct? CDW10–15 sensible for this opcode?</li>
+    <li><strong>Find the completion.</strong> MWr to CQ base + slot × 16 with the same SQID and CID. If there is none: controller hang, or the host is looking at the wrong CQ.</li>
+    <li><strong>Decode the status.</strong> SCT tells you which family; SC tells you the specific condition; DNR tells you whether retrying is pointless; M tells you to read the Error Information log.</li>
+    <li><strong>Check the phase.</strong> A CQE written with the wrong phase is invisible to the host and looks like a timeout.</li>
+    <li><strong>Correlate with time.</strong> Microseconds between SQE fetch and CQE suggests rejection in parsing; tens of microseconds suggests media access; seconds suggests error recovery or a stuck controller.</li>
+  </ol>
+  <aside class="callout debug" data-title="Symptom → first field to check">
+    <table>
+      <thead><tr><th>Symptom</th><th>First field</th></tr></thead>
+      <tbody>
+        <tr><td>Invalid Command Opcode</td><td>OPC and which queue the SQE was on</td></tr>
+        <tr><td>Invalid Field in Command</td><td>Reserved bits, PSDT, FUSE, CDW10–15 selectors</td></tr>
+        <tr><td>Invalid Namespace or Format</td><td>NSID, namespace attachment state</td></tr>
+        <tr><td>Wrong request completed / data in wrong buffer</td><td>CID uniqueness, SQID in CQE</td></tr>
+        <tr><td>Timeout with CQE visibly written in trace</td><td>Phase Tag, CQ base address, CQ head bookkeeping</td></tr>
+        <tr><td>Data Transfer Error</td><td>PRP1/PRP2 or SGL contents; IOMMU faults; PCIe completion status on data reads</td></tr>
+      </tbody>
+    </table>
+  </aside>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <p>Experienced engineers treat the SQE and the CQE as <em>contracts with witnesses</em>. The trace is the witness. When software and firmware teams argue about who broke a command, the bytes of the SQE as fetched (not as the driver thinks it wrote them) settle the question. That is why a senior engineer always asks for the payload of the CplD, not the driver's log of what it built: an IOMMU mapping error, a cache-coherency problem on a non-coherent platform, or a missing barrier can make the two differ.</p>
+  <p>Second insight: <strong>the status code describes the controller's view, not the root cause.</strong> "Data Transfer Error" may mean a PCIe Unsupported Request on a PRP fetch caused by a stale IOMMU entry — a host bug. "Invalid Field" may hide a host using a feature the controller does not advertise. Use the status as a pointer to which field and which phase of execution to examine, then go to the evidence one layer down.</p>
+  <p>Third: <strong>the CQE is the commit point.</strong> Because of PCIe posted-write ordering, everything the controller DMA-wrote for a command is in memory before the CQE that the controller sends after it. Designs that break this (for example, careless use of relaxed ordering on data writes, or a host bridge that reorders) produce the rarest and nastiest bugs: a successful completion with stale data. If you ever see "status 0 but data wrong", look at ordering attributes in the trace before anything else.</p>
+</section>
+
+<section id="lab">
+  <h2>Lab: decode commands and completions from raw bytes</h2>
+  <aside class="callout safety"><p><span class="badge safe">Safe lab</span> Part A is pure computation on synthetic bytes. Part B only reads identify data and enables kernel tracepoints on a running system; it issues no writes to the device. Do not run any <code>nvme</code> command with a write, format, sanitize or firmware sub-command during this lab.</p></aside>
+  <h3>Objective</h3>
+  <p>Decode SQEs and CQEs by hand and with a script, and correlate commands with completions using (SQID, CID).</p>
+  <h3>Skills</h3>
+  <ul><li>Little-endian Dword extraction</li><li>Bit-field decoding of CDW0 and DW3</li><li>Command/completion correlation</li><li>Reading Linux NVMe tracepoints</li></ul>
+  <h3>Hardware required</h3>
+  <p>Part A: none. Part B: any Linux machine with an NVMe SSD (optional).</p>
+  <h3>Software required</h3>
+  <p>Python 3 (standard library), <code>nvme-cli</code>, a kernel with tracefs (most distributions).</p>
+  <h3>Input</h3>
+  <p>The three synthetic SQEs and four synthetic CQEs below, all on the reference lab system. CQ1 is shared by SQ1 and SQ2.</p>
+<pre class="code" data-kind="simulation" data-lang="text" data-title="lab-input.txt (synthetic)"><code>SQE-A (SQ1 slot 9):  02 00 2a 00 01 00 00 00 00 00 00 00 00 00 00 00
+                     00 00 00 00 00 00 00 00 00 30 00 00 02 00 00 00
+                     00 00 00 00 00 00 00 00 00 20 00 00 00 00 00 00
+                     0f 00 00 40 00 00 00 00 00 00 00 00 00 00 00 00
+SQE-B (SQ2 slot 0):  01 00 2a 00 01 00 00 00 00 00 00 00 00 00 00 00
+                     00 00 00 00 00 00 00 00 00 50 00 00 02 00 00 00
+                     00 00 00 00 00 00 00 00 80 00 00 00 00 00 00 00
+                     00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+SQE-C (admin slot 4): 06 00 03 00 00 00 00 00 00 00 00 00 00 00 00 00
+                     00 00 00 00 00 00 00 00 00 00 01 00 01 00 00 00
+                     00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00
+                     00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+CQE-1 (CQ1): 00 00 00 00 00 00 00 00 01 00 02 00 2a 00 01 00
+CQE-2 (CQ1): 00 00 00 00 00 00 00 00 0a 00 01 00 2a 00 01 01
+CQE-3 (CQ1): 00 00 00 00 00 00 00 00 0a 00 01 00 2a 00 00 00
+CQE-4 (ACQ): 00 00 00 00 00 00 00 00 05 00 00 00 03 00 01 00</code></pre>
+  <h3>Expected output</h3>
+  <p>A table with, for each SQE: opcode name, CID, NSID, PRP1, PRP2, and decoded command-specific fields; for each CQE: SQID, SQHD, CID, P, SCT, SC, DNR; and a pairing of every CQE with its SQE (or a reason it cannot be paired).</p>
+  <h3>Background</h3>
+  <p>This chapter's field tables. Recall that NLB is 0's based, CDW12 bit 30 is FUA (taught in <a href="ch32.html">READ</a>), and Identify's CNS value is in CDW10 bits 7:0 (taught in <a href="ch30.html">Admin Commands</a>).</p>
+  <h3>Step 1 — decode the SQEs by hand</h3>
+  <p>For each SQE write CDW0, NSID, PRP1, PRP2, CDW10, CDW11, CDW12 as 32-bit or 64-bit values, then split CDW0. Name the opcode using the queue type.</p>
+  <h3>Step 2 — decode the CQEs by hand</h3>
+  <p>For each CQE split DW2 and DW3. Pay attention to the phase bit and to the byte that contains it.</p>
+  <h3>Step 3 — check with the script</h3>
+  <p>Feed the bytes to <code>nvme_decode.py</code> (pass <code>admin=True</code> for SQE-C) and compare.</p>
+  <h3>Step 4 (optional, real system) — watch the driver</h3>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/enable'
+sudo dd if=/dev/nvme0n1 of=/dev/null bs=4k count=1 iflag=direct
+sudo sh -c 'echo 0 &gt; /sys/kernel/tracing/events/nvme/enable'
+sudo cat /sys/kernel/tracing/trace | grep -E 'nvme_setup_cmd|nvme_complete_rq' | tail -n 4</code></pre>
+  <p>(The <code>dd</code> only reads from the device and writes to <code>/dev/null</code>.)</p>
+  <h3>Observation</h3>
+  <p>Record which CQE belongs to which SQE, which CQE the host should ignore, and what the trace output on your system shows for opcode, CID and the read's starting LBA and length.</p>
+  <h3>Questions</h3>
+  <ol>
+    <li>SQE-A and SQE-B have the same CID. Is that legal?</li>
+    <li>CQE-2 and CQE-3 have the same SQID and CID. How can the host tell which is meaningful?</li>
+    <li>What does CQE-4 DW2 tell you about the admin queue?</li>
+    <li>Which SQE uses PRP2, and why?</li>
+  </ol>
+  <h3>Challenge</h3>
+  <p>Extend the script to read a file of hex lines, keep a table of outstanding (SQID, CID) pairs from SQEs, and flag every CQE that matches nothing, matches twice, or has a stale phase.</p>
+  <h3>Hints</h3>
+  <details class="hint"><summary>Hint for SQE-A CDW12</summary><p>The bytes are <code>0f 00 00 40</code>. Read them as 0x4000000F; bit 30 is 0x40000000.</p></details>
+  <details class="hint"><summary>Hint for CQE-2</summary><p>The last byte is 0x01: that is bits 31:24 of DW3, so bit 24 is set. Which status sub-field contains bit 24?</p></details>
+  <details class="hint"><summary>Hint for SQE-A PRP2</summary><p>Look at bytes 32–39 and remember the buffer is 8 KiB if NLB = 15 with 512-byte blocks.</p></details>
+  <h3>Solution</h3>
+  <details class="solution"><summary>Solution</summary>
+    <p><strong>SQE-A</strong>: CDW0 = 0x002A0002 → Read (02h, on an I/O queue), CID 0x002A, FUSE 0, PSDT 0. NSID = 1. PRP1 = 0x0000_0002_0000_3000. Bytes 32–39 are all zero, so PRP2 = 0 (do not confuse it with the next four bytes); bytes 40–43 <code>00 20 00 00</code> are CDW10 = 0x00002000 → SLBA = 0x2000 = 8192. CDW12 = 0x4000000F → NLB field 15 → 16 blocks (8 KiB with 512-byte LBAs), FUA = 1 (bit 30). Note: an 8 KiB transfer starting at a page-aligned PRP1 spans two pages, so PRP2 should hold the second page address. With PRP2 = 0 this command is malformed — a deliberate defect. A controller would typically fail it (often Invalid Field or a data transfer error, depending on implementation), or worse, DMA to address 0.</p>
+    <p><strong>SQE-B</strong>: CDW0 = 0x002A0001 → Write (01h), CID 0x002A on SQ2. NSID 1. PRP1 = 0x2_0000_5000, PRP2 = 0; CDW10 = 0x00000080 → SLBA 128; CDW12 = 0 → 1 block (512 bytes), fits in one page, so PRP2 = 0 is correct.</p>
+    <p><strong>SQE-C</strong>: CDW0 = 0x00030006 on the admin queue → Identify, CID 0x0003. NSID 0. PRP1 = 0x0000_0001_0001_0000 (bytes 24–31: <code>00 00 01 00 01 00 00 00</code>). CDW10 = 1 → CNS 01h, Identify Controller (4096-byte data structure; NSID not used).</p>
+    <p><strong>CQE-1</strong>: DW2 = 0x00020001 → SQID 2, SQHD 1; DW3 = 0x0001002A → CID 0x002A, P 1, success. Pairs with SQE-B (SQ2, CID 0x2A). SQHD 1 matches: slot 0 consumed.</p>
+    <p><strong>CQE-2</strong>: DW2 = 0x0001000A → SQID 1, SQHD 10; DW3 = 0x0101002A → CID 0x002A, P 1, status word 0x0101 → SC = (0x0101 &gt;&gt; 1) &amp; 0xFF = 0x80, SCT = 0h, DNR 0: LBA Out of Range. Pairs with SQE-A (SQ1, CID 0x2A). On the reference namespace LBA 8192 is in range, so a real controller would not return this for SQE-A — but a controller that read PRP2 = 0 might fail differently. The lesson is pairing, not plausibility; in a real investigation this mismatch between status and command would itself be a finding.</p>
+    <p><strong>CQE-3</strong>: same SQID/CID as CQE-2 but P = 0. On the first pass of CQ1 the host expects P = 1, so CQE-3 is a stale (or not-yet-written) entry and must be ignored.</p>
+    <p><strong>CQE-4</strong>: DW2 = 0x00000005 → SQID 0 (admin), SQHD 5; DW3 = 0x00010003 → CID 3, P 1, success. Pairs with SQE-C. Admin SQ head is now 5, so slot 4 is free.</p>
+    <p>Answers: (1) Yes — CIDs need only be unique per SQ. (2) By the phase tag relative to the host's expected phase for that pass. (3) The controller has consumed admin SQ entries up to slot 4. (4) None correctly: SQE-A needed PRP2 and omitted it.</p>
+  </details>
+  <h3>What a senior engineer notices</h3>
+  <p>The duplicate CID across SQ1 and SQ2 is a deliberate trap — legal but dangerous for any tool or person correlating by CID alone. The missing PRP2 in SQE-A is the real defect, and it would not be visible in a driver log that prints only opcode, LBA and length. The status in CQE-2 does not match the defect, which is a reminder that a status is the controller's interpretation, not a diagnosis.</p>
+  <h3>Failure variants</h3>
+  <ul>
+    <li>Change SQE-C's CNS to 02h: the data becomes the Active Namespace ID list.</li>
+    <li>Set FUSE = 01b on SQE-B with no following fused command: expect an aborted-missing-fused status.</li>
+    <li>Make CQE-1's SQID 1 instead of 2: the host completes SQE-A's request with SQE-B's result.</li>
+  </ul>
+  <h3>Extension</h3>
+  <p>Teach the script the Create I/O CQ and Create I/O SQ CDW10/CDW11 fields from <a href="ch30.html">Admin Commands</a>, then decode the admin traffic captured during driver initialisation.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Write out CDW0 in hex for: Identify, CID 0x0100; Write, CID 0xFFFE with PSDT = 01b; Flush, CID 0, FUSE = 00b.</li>
+    <li>A CQE's DW3 is 0xC0050011. Decode every sub-field.</li>
+    <li>A trace shows MRd to 0x1_2340_FFC0 with Length 16. Given SQ1 is 1024 entries at 0x1_2340_0000, which slot is it, and what slot comes next?</li>
+    <li>Explain in three sentences why Create I/O CQ uses PRP1 and yet no data moves.</li>
+    <li>For a 12 KiB read into a buffer starting at offset 0x200 in a page, how many pages does the buffer touch, and is PRP2 a page address or a PRP List pointer?</li>
+    <li>List every SQE field that a controller must check before it starts any DMA.</li>
+  </ol>
+  <details class="answer"><summary>Answers</summary>
+    <p>1: Identify = 0x0100_0006; Write with SGL = 0xFFFE_4001; Flush = 0x0000_0000.</p>
+    <p>2: CID 0x0011; P = 1 (bit 16); status word = 0xC005 → SC = (0xC005 &gt;&gt; 1) &amp; 0xFF = 0x02, SCT = 0, CRD = 0, M = 1 (bit 14 of word = bit 30), DNR = 1. Invalid Field in Command, more information in the Error Information log, do not retry.</p>
+    <p>3: (0xFFC0) / 64 = 1023, the last slot. The next fetch wraps to slot 0 at 0x1_2340_0000.</p>
+    <p>4: The PRP1 of Create I/O CQ holds the base of the queue's memory, which the controller records. Data is not transferred by the command itself. The CQ memory is only written later, one CQE at a time, as commands complete.</p>
+    <p>5: 0x200 + 12288 = 0x3200 bytes from the page start → spans 4 pages (0x0000–0x0FFF, 0x1000–0x1FFF, 0x2000–0x2FFF, 0x3000–0x31FF). More than two pages, so PRP2 points to a PRP List (see <a href="ch36.html">Physical Region Pages</a>).</p>
+    <p>6: Opcode validity for the queue type; FUSE; PSDT and SGL support; reserved bits (if it checks them); NSID validity; command-specific range checks (SLBA + NLB within namespace, NLB within MDTS); data pointer offset and alignment rules.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li>
+      <p>How large is an NVMe over PCIe Submission Queue Entry?</p>
+      <ul class="options" data-answer="3"><li>16 bytes</li><li>32 bytes</li><li>64 bytes</li><li>128 bytes</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>64 bytes: sixteen Command Dwords, CDW0–CDW15. 16 bytes is the CQE.</p></details>
+    </li>
+    <li>
+      <p>Where is the Command Identifier in an SQE?</p>
+      <ul class="options" data-answer="2"><li>CDW0 bits 15:0</li><li>CDW0 bits 31:16</li><li>CDW1</li><li>CDW10 bits 15:0</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>CDW0 bits 31:16. Bits 7:0 are the opcode; CDW1 is the NSID.</p></details>
+    </li>
+    <li>
+      <p>Which pair uniquely identifies an outstanding command?</p>
+      <ul class="options" data-answer="4"><li>CID alone</li><li>CID and NSID</li><li>CQID and CID</li><li>SQID and CID</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>The CID is unique only per SQ; several SQs may share a CQ, so the CQE reports SQID. NSID is irrelevant to identity.</p></details>
+    </li>
+    <li>
+      <p>A CQE has DW3 = 0x0001_0000. What does it mean?</p>
+      <ul class="options" data-answer="1"><li>CID 0, phase 1, success</li><li>CID 1, phase 0, success</li><li>CID 0, Invalid Command Opcode</li><li>CID 0, phase 1, DNR set</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Bit 16 is the phase tag; bits 15:0 (CID) are 0; bits 31:17 (status) are 0.</p></details>
+    </li>
+    <li>
+      <p>PSDT = 00b means:</p>
+      <ul class="options" data-answer="2"><li>No data transfer</li><li>The Data Pointer contains PRP entries</li><li>The Data Pointer contains one SGL descriptor</li><li>Metadata is interleaved</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>00b selects PRPs. 01b and 10b select SGLs (with two different MPTR interpretations). Whether data moves at all depends on the opcode.</p></details>
+    </li>
+    <li>
+      <p>What does the SQ Head Pointer in a CQE tell the host?</p>
+      <ul class="options" data-answer="3"><li>Which commands have completed</li><li>Where the next CQE will be written</li><li>Which SQ slots the controller has consumed and may be reused</li><li>The doorbell value the host must write</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>SQHD reports consumption (fetch) of SQ entries, letting the host free slots. Completion of a specific command is reported by its own CQE.</p></details>
+    </li>
+    <li>
+      <p>Status word 0x0005 (as printed with P in bit 0) means:</p>
+      <ul class="options" data-answer="2"><li>SC 05h</li><li>SC 02h, P = 1</li><li>SC 0Ah</li><li>SCT 5</li></ul>
+      <details class="answer"><summary>Answer and reasoning</summary><p>Bit 0 is P = 1; (0x0005 &gt;&gt; 1) = 0x02 → SC 02h, Invalid Field in Command, SCT 0.</p></details>
+    </li>
+    <li>
+      <p>Why can the host trust read data in its buffer as soon as it sees the CQE?</p>
+      <details class="answer"><summary>Model answer</summary><p>Because the controller sends the data Memory Writes before the CQE Memory Write, and PCIe ordering rules do not let a later posted write pass an earlier posted write in the same direction (absent relaxed ordering). The data therefore reaches memory first. The host must still use a read barrier after seeing the phase bit before reading the rest of the CQE and the data.</p></details>
+    </li>
+    <li>
+      <p>Name two commands that use PRP1 without transferring data.</p>
+      <details class="answer"><summary>Model answer</summary><p>Create I/O Submission Queue and Create I/O Completion Queue: PRP1 is the base address of the queue (or of a PRP list describing a non-contiguous queue).</p></details>
+    </li>
+    <li>
+      <p>What is the first thing you check if a trace shows a CQE written for a command but the host times out?</p>
+      <details class="answer"><summary>Model answer</summary><p>The phase tag versus the host's expected phase, and that the CQE address is in the CQ the host is polling (correct CQ, correct slot). A wrong phase or wrong CQ makes a correctly written CQE invisible.</p></details>
+    </li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner.</strong> What are the sizes of an SQE and a CQE, and who writes each?</p>
+      <details class="answer"><summary>Model answer</summary><p>64 and 16 bytes for NVMe over PCIe. The host writes SQEs into the submission queue; the controller writes CQEs into the completion queue. Each is read by the other side.</p></details></li>
+    <li><p><strong>Beginner.</strong> What is the Command Identifier for?</p>
+      <details class="answer"><summary>Model answer</summary><p>It lets the host match a completion to the command that caused it. The host chooses it; the controller returns it unchanged in the CQE. It is unique per SQ while the command is outstanding.</p></details></li>
+    <li><p><strong>Intermediate.</strong> Walk me through the Status Field.</p>
+      <details class="answer"><summary>Model answer</summary><p>Fifteen bits in DW3 above the phase tag: Status Code (8 bits) qualified by Status Code Type (3 bits: generic, command-specific, media/data integrity, path-related, vendor-specific), Command Retry Delay (2 bits) choosing a retry delay, More (1 bit) saying the Error Information log has details, Do Not Retry (1 bit). All zero is success.</p></details></li>
+    <li><p><strong>Intermediate.</strong> Why does a CQE carry SQID and SQHD?</p>
+      <details class="answer"><summary>Model answer</summary><p>SQID because a CQ can be shared by multiple SQs, so the CID alone is ambiguous. SQHD because the host has no other way to learn how far the controller has consumed the SQ; it needs that to avoid overwriting unfetched entries and to know when the queue is full.</p></details></li>
+    <li><p><strong>Advanced.</strong> How would you prove whether a corrupted command came from the driver or from the path to the controller?</p>
+      <details class="answer"><summary>Model answer</summary><p>Compare three things: the driver's view (tracepoint or a debug dump of the SQ slot after the doorbell), the bytes on the wire (CplD payload in a PCIe trace for the MRd of that slot) and the controller's view (its error log or debug interface, if any). If the driver view and wire bytes differ, look at memory ordering, cache coherency and IOMMU mapping; if wire and controller differ, look at the link (LCRC/replays) and controller internals; if all agree, the driver built it wrong.</p></details></li>
+    <li><p><strong>Advanced.</strong> A controller occasionally reports Command ID Conflict under heavy load. What do you suspect?</p>
+      <details class="answer"><summary>Model answer</summary><p>The host reused a CID before consuming the previous command's completion — e.g. a timeout/abort path freed a tag while the command was still alive, or a race between completion and requeue. I would trace CID allocation and free events against CQE arrival and check the abort/timeout handling.</p></details></li>
+    <li><p><strong>Senior.</strong> Design a check in a protocol-analysis tool that catches host bugs in SQE construction.</p>
+      <details class="answer"><summary>Model answer</summary><p>Decode every CplD that answers an SQ-region MRd into an SQE; validate opcode against queue type and the Commands Supported and Effects log; check reserved bits, PSDT against SGL support, FUSE pairing, NSID against the active list, SLBA + NLB against NSZE and NLB against MDTS, PRP alignment and PRP2 presence against transfer size; track (SQID, CID) for duplicates while outstanding; report the first violation with the SQE bytes. Keep rules versioned by the controller's VS register.</p></details></li>
+    <li><p><strong>Senior.</strong> When is "status 0 but wrong data" possible, and how do you investigate?</p>
+      <details class="answer"><summary>Model answer</summary><p>Wrong PRPs (data landed elsewhere), CID mismatch (a different command's success), ordering violations (CQE observed before data), IOMMU mapping to the wrong page, or firmware mapping the wrong LBA. Investigate by correlating data MWr addresses with the PRPs in the fetched SQE, checking relaxed-ordering attributes and the order of data vs CQE TLPs, and verifying CID bookkeeping on the host.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>To a child:</strong> explain the request slip and the answer card, why every slip is the same size, and why the answer card has your ticket number on it.</li>
+    <li><strong>To a junior engineer:</strong> draw CDW0 and DW3 from memory, then decode 0x0007_0002 and 0x8503_0007 aloud.</li>
+    <li><strong>To a senior engineer:</strong> argue why (SQID, CID) and not CID is the correlation key, and explain why the CQE is a safe commit point for read data over PCIe and what could break that guarantee.</li>
+  </ul>
+  <details class="answer"><summary>Model explanation for the junior engineer</summary><p>"CDW0 is four bytes: the low byte is the opcode, then two bits of fused-operation, four reserved bits, two bits saying PRP or SGL, and the top sixteen bits are the command ID. 0x00070002 is opcode 02h — Read on an I/O queue — no fuse, PRP mode, CID 7. On the completion side, DW3 is the CID in the low half, then the phase bit, then fifteen status bits. 0x85030007 is CID 7, phase 1, and the status word 0x8503 shifted right once gives SC 0x81 with SCT 2 — Unrecovered Read Error — and the top bit, DNR, is set, so don't retry."</p></details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>An NVMe command is a 64-byte SQE in sixteen Dwords. CDW0 carries the opcode, fused-operation bits, the PRP/SGL selector and the host-chosen Command Identifier. CDW1 is the namespace. CDW4–5 point to separate metadata, CDW6–9 to the data buffer as PRP1/PRP2 or one SGL descriptor, and CDW10–15 belong to the command. A completion is a 16-byte CQE: a command-specific result, the SQ head and SQ identifier, the CID, the phase tag and a Status Field made of SC, SCT, CRD, M and DNR. Over PCIe the SQE is fetched by a controller Memory Read and the CQE is posted with a controller Memory Write; ordering makes the CQE a commit point. Correlate with (SQID, CID), always decode the fetched bytes rather than the driver's intent, and treat the status as a pointer to evidence, not a diagnosis.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>draw the 64-byte SQE and the 16-byte CQE from memory with every common field and its bit range</li>
+      <li>decode CDW0 and CQE DW3 from hex without a tool</li>
+      <li>explain PSDT and when MPTR and DPTR are ignored</li>
+      <li>explain why (SQID, CID) is the key and why SQHD is not "completed"</li>
+      <li>find the SQE fetch and the CQE write for one command in a PCIe trace</li>
+      <li>use the status sub-fields to choose the next piece of evidence to look at</li>
+      <li>name the documents that define the SQE, the NVM command fields and the PCIe transport mapping</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Submission Queue Entry; Completion Queue Entry; Status Field Definition; Command Identifier rules</cite></li>
+    <li><cite class="spec">NVM Express NVM Command Set Specification, Revision 1.3 — Read command; Write command</cite></li>
+    <li><cite class="spec">NVM Express NVMe over PCIe Transport Specification, Revision 1.4 — Submission Queue and Completion Queue mapping; PRP rules</cite></li>
+    <li><cite class="spec">NVM Express Revision Changes (2026.07.30)</cite> — for what changed in each field across revisions</li>
+    <li>Linux kernel source: <code>include/linux/nvme.h</code> (command and status definitions), <code>drivers/nvme/host/</code> (driver), and the nvme tracepoints under <code>include/trace/events/</code> or <code>drivers/nvme/host/trace.h</code> depending on version.</li>
+    <li>The interactive <a href="tool-nvme-decoder.html">NVMe Command Decoder</a> for practice, and the deep-dive <a href="dd28.html">NVMe Command Structure</a> module.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch30.html">Admin Commands</a> — the commands that build queues, discover the controller and manage the device, and the order a driver sends them during initialisation.</p>
+</section>

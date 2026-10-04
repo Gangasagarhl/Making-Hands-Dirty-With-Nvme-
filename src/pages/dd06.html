@@ -1,0 +1,818 @@
+<p class="lead">This module takes the Base Address Register (BAR) and memory-mapped I/O (MMIO) past the sizing algorithm of Chapter 19 and into the places where real systems break: CPU memory types and write combining, the 32-bit-only non-prefetchable bridge window, how a 64-bit register read turns into two packets, why a doorbell must never be merged, what happens to BAR decode across D3hot, resets and hot-plug, and how to tell "device gone" from "decode off" from "nobody routed the address" when the CPU reads all ones.</p>
+
+<section id="orientation">
+<h2>Orientation</h2>
+<p>Chapter 19 taught what a BAR is, how firmware sizes and assigns it, and how a CPU store to BAR0 + 1008h becomes a posted Memory Write (MWr) Transaction Layer Packet (TLP) that rings an NVM Express (NVMe) doorbell. Chapter 24 taught the NVMe register file that sits behind BAR0. This module assumes both and goes into the machinery between them: the CPU side (page attributes, store buffers, write-combining buffers, barriers), the fabric side (bridge windows, address routing, ordering), the device side (decode, side effects, power and reset state) and the evidence each one leaves. The goal is that, given a symptom such as "CSTS reads 0xFFFFFFFF" or "doorbells are written but no command is fetched", you can name every place the access could have died and design the experiment that tells them apart.</p>
+<aside class="callout prereq">
+<p>Read first: <a href="ch19.html">Chapter 19 (BARs and MMIO)</a> for BAR formats, the sizing algorithm, bridge windows and the basic MMIO path; <a href="ch24.html">Chapter 24 (NVMe Registers)</a> for CAP, CC, CSTS, the doorbell stride and the controller enable sequence; <a href="ch12.html">Chapter 12 (Posted vs Non-Posted)</a> for why a write is fire-and-forget and a read stalls; <a href="ch18.html">Chapter 18 (Configuration Space)</a> for the Command register. Afterwards: <a href="dd10.html">Module 10 (PCIe Transaction Layer)</a> for the Transaction Layer (with <a href="ch14.html">Chapter 14</a> and <a href="dd14.html">Module 14</a> for the full ordering rules), <a href="ch20.html">Chapter 20 (DMA)</a> for the opposite direction, and <a href="ch28.html">Chapter 28 (Doorbells)</a> and <a href="dd27.html">Module 27</a> for doorbells in the queue model.</p>
+</aside>
+</section>
+
+<section id="objectives">
+<h2>Required learning objectives</h2>
+<table>
+<caption>Objectives by level</caption>
+<thead><tr><th>Level</th><th>You will be able to…</th></tr></thead>
+<tbody>
+<tr><td>Beginner</td><td>Say what a BAR holds, what MMIO is, and why a store to a BAR address reaches a device instead of DRAM; find BAR0 of an NVMe SSD with Linux tools.</td></tr>
+<tr><td>Intermediate</td><td>Follow one MMIO access through every translation and decision point: virtual address → physical address and memory type → root complex decode → bridge windows → device decode → register side effect; predict the TLP (MRd/MWr, 3 DW or 4 DW header, length, byte enables).</td></tr>
+<tr><td>Advanced</td><td>Explain uncached versus write-combining mappings, why NVMe doorbells use uncached mappings, how a 64-bit register read is split, how posted-write ordering and read-to-flush work, and how BAR decode behaves across D3hot, Function Level Reset and hot-plug.</td></tr>
+<tr><td>Senior</td><td>Design or review a BAR layout for an NVMe controller (register file, doorbells, MSI-X table, Controller Memory Buffer), anticipating virtualization traps, 32-bit firmware windows and resource exhaustion on hot-plug.</td></tr>
+<tr><td>Trace analysis</td><td>Recognise MMIO in an analyzer capture by requester, address range and size; identify merged writes, split 64-bit reads, unanswered reads and Unsupported Request completions, and mark the first abnormal event.</td></tr>
+<tr><td>Debugging</td><td>Separate the five causes of an all-ones read (link down, decode disabled, address not routed, completion timeout, device in D3hot or reset) with two or three read-only checks.</td></tr>
+<tr><td>Validation</td><td>Write test cases for BAR behaviour: sizing read-back, decode enable/disable, access widths and byte enables, accesses to unimplemented offsets, behaviour in each power state, and BAR restoration after reset.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="kid">
+<h2>Kid story</h2>
+<aside class="callout kid">
+<p>In the school hall there is a big wall of light switches and little dials. None of them light up the hall. Each switch is connected by a long wire to a machine in the basement: one starts the boiler, one rings the kitchen bell, one opens the gym shutters. When the school bought a new machine, the caretaker asked it "how many switches do you need?", then screwed a new panel onto the wall at a free spot, with a label: "Panel 7: the new boiler".</p>
+<p>Flipping a switch is quick: you flip it and walk away, trusting the wire. But reading a dial is slow, because the dial is not really on the wall: when you look at it, someone runs down to the basement, reads the real gauge, and runs back to tell you. While you wait you cannot do anything else. And some dials are tricky: reading the "letters waiting" dial also empties the letter box, so you must never read it "just to check".</p>
+<p>One day the caretaker unscrews panel 7 to clean it. Now flipping its switches does nothing, and every dial you look at says "all lights on, everything at maximum!" — which is the hall's way of saying "nobody answered".</p>
+</aside>
+</section>
+
+<section id="boundary">
+<h2>Analogy boundary</h2>
+<table>
+<caption>What the switch-wall analogy maps, hides and gets wrong</caption>
+<thead><tr><th>Analogy element</th><th>Represents</th><th>What it hides</th><th>Where it misleads</th></tr></thead>
+<tbody>
+<tr><td>Wall of switches and dials</td><td>The physical address map; a panel is one BAR's region</td><td>There are several address spaces (virtual, physical, bus, IOVA) and several translations</td><td>The wall suggests one fixed address per register; in reality the CPU virtual address, the physical address and the PCIe address can all differ</td></tr>
+<tr><td>Caretaker places the panel</td><td>Firmware or the OS sizing and assigning the BAR, and programming bridge windows</td><td>Bridges above the device must also be told to forward that range</td><td>Placing a panel is one action; assigning a BAR without fixing the bridge windows produces a panel whose wires lead nowhere</td></tr>
+<tr><td>Flip and walk away</td><td>Posted MWr: no completion returns</td><td>Writes can be held in CPU buffers, merged, or reordered relative to other writes before they leave the CPU</td><td>"Walk away" sounds like the write has happened; it has only been issued</td></tr>
+<tr><td>Runner to the basement</td><td>Non-posted MRd with a Completion with Data (CplD)</td><td>The CPU core stalls on the load; the runner can be lost (completion timeout)</td><td>One runner at a time is too simple: many reads can be outstanding from different cores</td></tr>
+<tr><td>Dial that empties the letter box</td><td>Read side effects; the reason for "non-prefetchable"</td><td>NVMe controller registers are designed to be side-effect-free on read, but other devices' are not</td><td>Suggests all device registers are dangerous to read; NVMe's mostly are not, yet the BAR is still non-prefetchable</td></tr>
+<tr><td>"Everything at maximum"</td><td>All-ones (0xFFFFFFFF) returned to the CPU when a read fails</td><td>All-ones is synthesised by the root complex, not sent by the device</td><td>It does not tell you which of several failures happened</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="vocabulary">
+<h2>Vocabulary</h2>
+<table>
+<caption>Terms this module uses</caption>
+<thead><tr><th>Term</th><th>Plain meaning</th><th>Engineering meaning</th><th>Relationship to adjacent terms</th><th>Common confusion</th></tr></thead>
+<tbody>
+<tr><td><span class="g" data-term="bar">Base Address Register (BAR)</span></td><td>The "where does this device live" setting</td><td>A configuration-space register (Type 0 header offsets 10h–24h) that reports a region's type and size and holds its assigned base address</td><td>Sized during enumeration (<a href="ch17.html">Chapter 17</a>); enabled by Memory Space Enable; forwarded by bridge windows</td><td>A BAR is not the region itself; it is the register that points at it</td></tr>
+<tr><td><span class="g" data-term="mmio">Memory-mapped I/O (MMIO)</span></td><td>Talking to a device with ordinary loads and stores</td><td>CPU accesses to physical addresses decoded by a device rather than by DRAM; stores become MWr, loads become MRd + CplD</td><td>Opposite direction of <span class="g" data-term="dma">Direct Memory Access (DMA)</span>, where the device reads and writes host memory</td><td>MMIO is CPU→device; DMA is device→memory. A trace contains both, from different requesters</td></tr>
+<tr><td>Memory Space Enable (MSE)</td><td>The "panel switched on" bit</td><td>Command register (04h) bit 1: when 0 the function does not decode memory BARs</td><td>Bus Master Enable (bit 2) controls the opposite direction (the device issuing DMA)</td><td>Clearing MSE does not clear the BAR; the address stays, decode stops</td></tr>
+<tr><td><span class="g" data-term="prefetchable">Prefetchable</span></td><td>Safe to read early or extra</td><td>BAR bit 3: reads have no side effects and writes may be merged, so bridges and CPUs may prefetch or combine</td><td>Determines which bridge window (prefetchable or non-prefetchable) may hold the BAR</td><td>Prefetchable does not mean "cached by the CPU"; the CPU memory type is chosen by the OS</td></tr>
+<tr><td><span class="g" data-term="bridge-window">Bridge window</span></td><td>"Send these addresses down this road"</td><td>Base/limit registers in a Type 1 header defining which memory addresses a bridge forwards downstream</td><td>Every BAR must fall inside the windows of all bridges above it</td><td>The non-prefetchable window is 32-bit only; only the prefetchable window can be above 4 GiB</td></tr>
+<tr><td>Memory type (UC, WC, WB)</td><td>How the CPU is allowed to treat an address</td><td>Uncached (UC): each access goes out in program order, unmerged; write-combining (WC): stores may be buffered and merged into larger writes; write-back (WB): normal cached memory</td><td>Set by page attributes (on x86 the Page Attribute Table, PAT, and Memory Type Range Registers, MTRRs)</td><td>The BAR's prefetchable bit does not set the memory type; the driver's mapping call does</td></tr>
+<tr><td><span class="g" data-term="write-combining">Write combining</span></td><td>Bundling several small writes into one trip</td><td>A CPU buffer that collects stores to a WC region and emits them as one larger MWr, possibly out of program order</td><td>Useful for Controller Memory Buffer (CMB) submission queue entries; forbidden for doorbells</td><td>Merged writes look like one 64-byte MWr in a trace, not sixteen 4-byte ones</td></tr>
+<tr><td>Byte enables</td><td>Which bytes of a word are really being written</td><td>First DW BE and Last DW BE header fields (4 bits each) marking valid bytes in the first and last DWORD</td><td>A 1-DW request has Last DW BE = 0000b</td><td>A 2-byte store is a 1-DW MWr with two BE bits set, not a 2-byte packet</td></tr>
+<tr><td><span class="g" data-term="bir">BAR Indicator (BIR)</span></td><td>"Which BAR is this thing in?"</td><td>A small field in a capability or register (MSI-X Table BIR, CMBLOC.BIR, PMRCAP.BIR) naming which BAR holds a structure, plus an offset</td><td>Lets one BAR hold several structures, or spread them</td><td>BIR is an index, not an address</td></tr>
+<tr><td>MLBAR / MUBAR</td><td>Lower and upper halves of BAR0</td><td>Names the NVMe over PCIe Transport specification gives to BAR0 (Memory Register Base Address, lower) and BAR1 (upper) forming the controller's 64-bit register BAR</td><td>Same registers lspci reports as "Region 0"</td><td>BAR1 is not a second region; it is the upper 32 address bits of BAR0's region</td></tr>
+<tr><td><span class="g" data-term="resizable-bar">Resizable BAR</span></td><td>A BAR whose size software may choose</td><td>An extended capability listing supported sizes and letting software pick one before assignment</td><td>Interacts with bridge window sizing and firmware "above 4G decoding" options</td><td>NVMe register BARs are small; resizing matters for CMB or GPU-style apertures</td></tr>
+<tr><td>All-ones read</td><td>"Nobody answered"</td><td>The data the root complex returns to the CPU when an MMIO read completes with an error or never completes (common platform behaviour)</td><td>Paired with Unsupported Request (UR), Completer Abort (CA) or Completion Timeout logs</td><td>The device did not send 0xFFFFFFFF; it usually sent nothing or a status-only completion</td></tr>
+<tr><td><span class="g" data-term="ecam">Enhanced Configuration Access Mechanism (ECAM)</span></td><td>Configuration space through memory addresses</td><td>A physical address window where CPU loads/stores are turned by the root complex into configuration requests (CfgRd/CfgWr)</td><td>Also MMIO from the CPU's point of view, but never a BAR</td><td>ECAM accesses appear as CfgRd/CfgWr on the link, not MRd/MWr</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="architecture">
+<h2>Architecture</h2>
+<p>An MMIO access touches four domains, each with its own state and its own way of failing.</p>
+<figure>
+<pre class="diagram">
+  CPU core                    Root complex / host bridge          Fabric                       NVMe SSD (01:00.0)
+ +------------------+        +---------------------------+      +---------------------+      +------------------------------+
+ | VA 0xffffc900... |  page  | physical address decode:  | TLP  | Root Port 00:01.1   | TLP  | BAR0 decode (MSE=1?)         |
+ | store buffer     |------->|  DRAM? ECAM? MMIO hole?   |----->| window fe600000-    |----->|  0000-0FFF  registers        |
+ | WC buffers       | memory |  -> which root port       |      |        fe6fffff     |      |  1000-1FFF  doorbells        |
+ | (memory type     |  type  | builds MRd/MWr, tags,     |      | (non-prefetchable)  |      |  2000-2FFF  MSI-X table      |
+ |  UC/WC/WB from   |        | completion timer; on      |      |                     |      |  3000-3FFF  MSI-X PBA        |
+ |  PAT/MTRR)       |&lt;-------| error returns all ones    |&lt;-----|                     |&lt;-----| side effects, power state,   |
+ +------------------+  data  +---------------------------+ CplD +---------------------+ CplD |  reset state                 |
+                                                                                            +------------------------------+
+</pre>
+<figcaption>The four domains of one MMIO access on the lab system. BAR0 = 0xFE60_0000, 16 KiB, 64-bit non-prefetchable. The MSI-X table and PBA placement is this synthetic device's choice. Synthetic example for teaching.</figcaption>
+</figure>
+<table>
+<caption>Architecture inventory</caption>
+<thead><tr><th>Aspect</th><th>Contents</th></tr></thead>
+<tbody>
+<tr><td>Inputs</td><td>CPU load/store instructions with an address and width; configuration writes that set BARs, windows and Command bits; power-state and reset requests.</td></tr>
+<tr><td>Outputs</td><td>Register side effects in the device (a doorbell write starts a fetch, a CC write enables the controller); read data returned to the CPU; error logs (AER, NVMe CSTS) when things fail.</td></tr>
+<tr><td>Actors</td><td>CPU core and its memory-ordering hardware; OS memory manager (page tables, memory types); firmware and the PCI core (BAR and window assignment); root complex; root port and any switches; the device's PCIe core and register block; the driver.</td></tr>
+<tr><td>State</td><td>BAR values; Command register MSE; bridge base/limit registers; device power state (D0/D3hot); link state; CPU page attributes; device register values.</td></tr>
+<tr><td>Memory</td><td>No host DRAM is involved in the MMIO itself. The doorbell write <em>refers</em> to host memory (the SQ the controller will then read with DMA), which is why ordering between DRAM writes and the doorbell matters.</td></tr>
+<tr><td>Registers</td><td>Type 0 header: Command (04h), BAR0–BAR5 (10h–24h), Capabilities Pointer; Type 1 header: Memory Base/Limit, Prefetchable Base/Limit and their Upper 32 Bits registers; MSI-X capability (Table and PBA BIR/offset); Resizable BAR capability; NVMe CAP.DSTRD, CMBLOC/CMBSZ, PMRCAP.</td></tr>
+<tr><td>Interfaces</td><td>CPU memory bus; PCIe link (Transaction, Data Link and Physical Layers); the device's internal register bus.</td></tr>
+<tr><td>Dependencies</td><td>Link up (<a href="dd08.html">Module 08</a>); enumeration complete; MSE set; device in D0 and not in reset; for DMA triggered by doorbells, Bus Master Enable and IOMMU mappings (a different path).</td></tr>
+</tbody>
+</table>
+<h3>The three windows that must agree</h3>
+<p>For the lab system, three ranges must nest: the root port's non-prefetchable window (0xFE60_0000–0xFE6F_FFFF), BAR0's region (0xFE60_0000–0xFE60_3FFF), and the driver's mapping of that region (16 KiB, uncached). If the BAR moves (after a hot-plug rebalance) but the bridge window does not, or the driver keeps a mapping of an old address, accesses go to the wrong place without any error at the moment of the store.</p>
+<h3>Why a 64-bit non-prefetchable BAR still lives below 4 GiB</h3>
+<p>A Type 1 bridge has a non-prefetchable memory window described by Memory Base and Memory Limit, which only carry 32-bit addresses (bits 31:20, 1 MiB granularity). Only the prefetchable window has Upper 32 Bits registers. So a 64-bit BAR that is <em>non-prefetchable</em> — which is what NVMe controllers expose — can only be reached through bridges if it is assigned below 4 GiB. The 64-bit type merely allows a higher address on a flat bus with no bridges. <span class="badge verified">Verified</span> against the Type 1 header layout of the PCI Express Base Specification.</p>
+<aside class="callout insight" data-title="Why this matters on big systems">
+<p>The space below 4 GiB that firmware reserves for MMIO (the "MMIO hole", often only one or two GiB) is shared by every non-prefetchable BAR in the machine. A server with many NVMe drives behind switches, each switch port reserving whole 1 MiB granules, can run out. The symptom is a device whose BAR0 is "unassigned" with a kernel message about no space, while plenty of address space exists above 4 GiB. The fix lives in firmware or in kernel resource reassignment, not in the NVMe driver.</p>
+</aside>
+</section>
+
+<section id="mechanism">
+<h2>Mechanism</h2>
+<p>The mechanism has two halves: setting up the path (once) and using it (millions of times per second). Each step names who acts, what changes, where it changes and what evidence exists.</p>
+<h3>Setup</h3>
+<ol>
+<li><strong>Size.</strong> Firmware or the OS PCI core writes all ones to BAR0 and BAR1 and reads back. <em>Changes:</em> nothing permanent. <em>Where:</em> configuration space. <em>Evidence:</em> CfgWr/CfgRd on the analyzer; nothing in Linux unless debug logging is on.</li>
+<li><strong>Allocate.</strong> The allocator picks a naturally aligned range inside the parent bridge's window, growing windows if it may. <em>Changes:</em> the kernel's resource tree. <em>Where:</em> host memory (software). <em>Evidence:</em> <code>/proc/iomem</code>, dmesg "BAR 0: assigned" or "no space".</li>
+<li><strong>Program windows and BAR.</strong> CfgWr to the bridges' Memory Base/Limit and to BAR0/BAR1. <em>Changes:</em> routing state in every bridge, decode address in the device. <em>Where:</em> Type 1 headers and the Type 0 header. <em>Evidence:</em> <code>lspci -vv</code> "Memory behind bridge" and "Region 0".</li>
+<li><strong>Enable decode.</strong> CfgWr Command.MSE = 1 (and later Bus Master Enable for DMA). <em>Changes:</em> the device starts claiming memory TLPs in its range. <em>Evidence:</em> "Control: Mem+" in <code>lspci -vv</code>.</li>
+<li><strong>Map.</strong> The driver calls an I/O remap function, which creates kernel page-table entries for the physical range with an uncached memory type. <em>Changes:</em> CPU page tables and page attributes. <em>Where:</em> host memory and the CPU's translation caches. <em>Evidence:</em> on x86 with debugfs, the PAT memtype list; otherwise only the driver's behaviour.</li>
+</ol>
+<h3>Use: one doorbell write</h3>
+<ol start="6">
+<li><strong>Prepare memory.</strong> The driver writes the 64-byte Submission Queue Entry (SQE) into the SQ in host DRAM. <em>Changes:</em> cache lines in the CPU. <em>Evidence:</em> none on the link yet (DRAM writes are invisible to a PCIe analyzer).</li>
+<li><strong>Order.</strong> The driver's MMIO write primitive includes (or is preceded by) a barrier so that the SQE stores are visible to device DMA before the doorbell store can be observed. <em>Changes:</em> CPU ordering state. <em>Evidence:</em> none directly; its absence shows up as a controller reading a stale SQE.</li>
+<li><strong>Store.</strong> The CPU executes a 32-bit store to the doorbell's virtual address. Because the page is uncached, the store is not merged and leaves in program order. <em>Changes:</em> store buffer → uncore. <em>Evidence:</em> none until it reaches the link.</li>
+<li><strong>Decode and route.</strong> The root complex sees a physical address inside the PCIe MMIO range claimed by root port 00:01.1, builds a 3-DW-header MWr (address below 4 GiB), Length = 1, First DW BE = 1111b, Last DW BE = 0000b, Requester ID of the root complex. <em>Evidence:</em> the MWr on the analyzer.</li>
+<li><strong>Device decode.</strong> The SSD's PCIe core matches the address to BAR0, offset 1008h, and delivers the 4 bytes to the doorbell logic. <em>Changes:</em> SQ1 tail register. <em>Evidence:</em> the device's next action — an MRd for the SQE — is the only external proof the write landed in the right register.</li>
+</ol>
+<h3>Use: one register read</h3>
+<ol start="11">
+<li><strong>Load.</strong> The CPU executes a 32-bit load from CSTS. The core cannot retire the load until data returns. <em>Evidence:</em> CPU stall time (visible in profilers as time in the read accessor).</li>
+<li><strong>Request.</strong> The root complex issues MRd, Length = 1, a tag, and starts a completion timer. Ordering rules guarantee this read does not pass earlier posted writes from the same requester on the same path, so it also "flushes" them. <em>Evidence:</em> MRd on the analyzer.</li>
+<li><strong>Complete.</strong> The device returns CplD with Successful Completion and 4 bytes, or a completion with UR or CA status, or nothing. <em>Evidence:</em> CplD (or Cpl with error status) on the analyzer; AER logs at the device or root port on errors.</li>
+<li><strong>Return.</strong> The root complex hands the data to the core; on error or timeout most platforms return all ones. <em>Evidence:</em> the value the driver sees; AER or platform error logs.</li>
+</ol>
+<figure>
+<ol class="seq" data-actors="Driver (CPU)|Host DRAM|Root complex|Root Port 00:01.1|SSD BAR0">
+<li data-from="Driver (CPU)" data-to="Host DRAM">store SQE (64 B) into SQ1 slot 5</li>
+<li data-note="Driver (CPU)">barrier: SQE before doorbell</li>
+<li data-from="Driver (CPU)" data-to="Root complex" data-t="0 ns">UC store 0xFE60_1008 = 6</li>
+<li data-from="Root complex" data-to="Root Port 00:01.1">MWr32 Len=1 BE=1111/0000</li>
+<li data-from="Root Port 00:01.1" data-to="SSD BAR0" data-t="~300 ns">in window: forward</li>
+<li data-note="SSD BAR0">decode: offset 1008h = SQ1 tail</li>
+<li data-from="SSD BAR0" data-to="Host DRAM" data-t="~800 ns">MRd64 SQE fetch (DMA, not MMIO)</li>
+<li data-from="Driver (CPU)" data-to="Root complex">UC load 0xFE60_001C (CSTS)</li>
+<li data-from="Root complex" data-to="SSD BAR0">MRd32 Len=1 Tag=0x11</li>
+<li data-from="SSD BAR0" data-to="Root complex" class="dashed" data-t="~1 µs">CplD SC data=0x00000001</li>
+<li data-from="Root complex" data-to="Driver (CPU)" class="dashed">load retires: RDY=1</li>
+</ol>
+<figcaption>A doorbell write and a status read on the lab system. Times are illustrative and platform-dependent. Synthetic example for teaching.</figcaption>
+</figure>
+<h3>The ladder for MMIO</h3>
+<div class="ladder">
+<div class="rung" data-rung="A"><p>A wall of switches in the hall wired to machines in the basement; flipping is quick, reading a dial needs a runner.</p></div>
+<div class="rung" data-rung="B"><p>The device's registers are given addresses in the system's physical address map. Stores to those addresses become write packets; loads become read packets whose answers come back later.</p></div>
+<div class="rung" data-rung="C"><p>The CPU's memory type decides whether stores are merged or reordered; the root complex decodes the physical address and builds TLPs; bridges forward by window; the device's PCIe core decodes against its BARs and drives an internal register bus. Reads stall a core for about a microsecond.</p></div>
+<div class="rung" data-rung="D"><p>The PCI Express Base Specification defines BAR format, the Command register, Type 1 windows, TLP formats and ordering. The NVMe over PCIe Transport specification says BAR0/BAR1 hold the controller registers; the NVMe Base Specification defines the registers and their access rules.</p></div>
+<div class="rung" data-rung="E"><p>MWr (posted, no completion) and MRd + CplD (non-posted). 3-DW headers below 4 GiB, 4-DW above. Byte enables carry sub-DWORD widths. Reads do not pass earlier posted writes on the same path.</p></div>
+<div class="rung" data-rung="F"><p>On the analyzer: Requester ID of the root complex, addresses inside BAR0, Length 1 or 2, a steady pattern of doorbell MWrs followed by device MRds, occasional MRd/CplD pairs during initialisation and error handling.</p></div>
+<div class="rung" data-rung="G"><p>An unanswered MRd, a UR completion, an MWr with no subsequent device fetch, a 64-byte write where 4 bytes were expected, or all-ones in the driver: each points at a different domain of the architecture above.</p></div>
+</div>
+<h3>The sixteen questions, answered for an MMIO register access</h3>
+<table>
+<caption>Master-prompt section 4, applied to MMIO</caption>
+<thead><tr><th>#</th><th>Question</th><th>Answer</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>What is it?</td><td>A CPU load or store to an address decoded by a device's BAR, carried as MRd/MWr TLPs.</td></tr>
+<tr><td>2</td><td>Why was it created?</td><td>To let drivers use ordinary instructions and the existing memory system instead of a separate, slow I/O instruction space.</td></tr>
+<tr><td>3</td><td>What problem does it solve?</td><td>Large, fast, flexibly placed device register and memory apertures, reachable with any width the CPU supports.</td></tr>
+<tr><td>4</td><td>What existed before?</td><td>Port I/O (x86 IN/OUT) with a 64 KiB space, and fixed legacy addresses; PCI introduced relocatable BARs for both.</td></tr>
+<tr><td>5</td><td>Why is the current design better?</td><td>Huge address space, 64-bit placement, cacheable or combinable when safe, no special instructions, works across bridges.</td></tr>
+<tr><td>6</td><td>Who creates it?</td><td>The device declares BAR size/type; firmware or OS assigns the address; the driver creates the mapping and issues the accesses.</td></tr>
+<tr><td>7</td><td>Who consumes it?</td><td>The device's register logic (and firmware behind it for slow registers).</td></tr>
+<tr><td>8</td><td>Where does it live?</td><td>In the device; only its address lives in the host's physical map.</td></tr>
+<tr><td>9</td><td>What memory/registers are involved?</td><td>BARs, Command.MSE, bridge windows, CPU page tables and memory types, the device's registers.</td></tr>
+<tr><td>10</td><td>What happens before?</td><td>Enumeration, BAR assignment, window programming, decode enable, driver mapping.</td></tr>
+<tr><td>11</td><td>What happens after?</td><td>A register side effect: a doorbell starts DMA, a CC write starts initialisation, a read returns state.</td></tr>
+<tr><td>12</td><td>What if it is wrong?</td><td>Writes vanish silently; reads return all ones or hang until completion timeout; wrong registers get written; merged writes corrupt state.</td></tr>
+<tr><td>13</td><td>What does the analyzer show?</td><td>MWr/MRd from the root complex into the BAR range, CplD from the device, or UR/CA completions, or missing completions.</td></tr>
+<tr><td>14</td><td>What does Linux show?</td><td><code>lspci</code> regions and Mem+/-, <code>/proc/iomem</code>, <code>resource</code> files, dmesg assignment and error messages, the driver's CSTS reports.</td></tr>
+<tr><td>15</td><td>What would validation test?</td><td>Sizing read-back, decode enable/disable, access widths, unimplemented offsets, power-state behaviour, BAR restoration after reset, behaviour under merged writes.</td></tr>
+<tr><td>16</td><td>What would a senior suspect on failure?</td><td>First: is the link up and is decode on? Then: is the address routed? Then: device state (D3hot, reset). Then: CPU-side mapping type and ordering.</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="spec">
+<h2>Specification discipline</h2>
+<table>
+<caption>Which document owns which part of BAR/MMIO behaviour</caption>
+<thead><tr><th>Topic</th><th>Owning document</th><th>Kind</th></tr></thead>
+<tbody>
+<tr><td>BAR format, sizing, prefetchable bit, Command register, Type 1 windows, Resizable BAR capability</td><td><cite class="spec">PCI Express Base Specification, Revision 6.x/7.0 — Configuration Space (Type 0/Type 1 headers)</cite></td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>TLP formats, 32-bit versus 64-bit addressing, byte enable rules, ordering, completion status and timeout</td><td><cite class="spec">PCI Express Base Specification — Transaction Layer</cite></td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Power-state decode rules (what a function responds to in D3hot) and No_Soft_Reset</td><td><cite class="spec">PCI Express Base Specification — Power Management</cite></td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Which BARs the NVMe controller uses (BAR0/BAR1 as the 64-bit register BAR; optional additional BARs)</td><td><cite class="spec">NVMe over PCIe Transport Specification 1.4 — PCI header / PCI Express register sections</cite></td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>Controller registers, doorbell stride, CMB/PMR location registers, register access widths</td><td><cite class="spec">NVMe Base Specification 2.4 — Controller Registers</cite> (with the PCIe transport-specific register details in the PCIe Transport specification)</td><td><span class="badge normative">Normative</span></td></tr>
+<tr><td>CPU memory types (UC, WC), barriers, MMIO ordering primitives</td><td>CPU architecture manuals; Linux <code>Documentation/driver-api/device-io.rst</code> and <code>Documentation/memory-barriers.txt</code></td><td>Outside PCIe/NVMe; <span class="badge impl">Implementation-dependent</span> by architecture</td></tr>
+<tr><td>All-ones on failed reads</td><td>Platform convention, not PCIe-mandated data</td><td><span class="badge impl">Implementation-dependent</span></td></tr>
+</tbody>
+</table>
+<aside class="callout verified">
+<p>BAR bit 0 selects memory (0) or I/O (1); memory BAR bits 2:1 select 32-bit (00b) or 64-bit (10b); bit 3 is Prefetchable. Command register bit 1 is Memory Space Enable. Requests to addresses below 4 GiB use the 32-bit (3 DW header) format. A request must not cross a 4 KiB address boundary. A function in D3hot responds to configuration requests; memory decode is not available until it returns to D0. NVMe BAR0 offset 0h holds CAP, doorbells start at 1000h with stride 4 &lt;&lt; CAP.DSTRD.</p>
+</aside>
+<aside class="callout derived">
+<p>A 64-bit non-prefetchable BAR behind any bridge must be below 4 GiB (derived from the 32-bit non-prefetchable window). A doorbell write and a read to the same device from the same CPU are ordered on the wire (derived from the read-does-not-pass-posted-write rule plus uncached mapping). A merged write that covers two doorbells delivers both values in one TLP (derived from WC behaviour plus byte enables) — whether the controller handles that correctly is a separate question.</p>
+</aside>
+<aside class="callout impl">
+<p>Which BAR holds the MSI-X table and PBA, how large BAR0 is beyond the minimum, whether register reads are answered by hardware or by firmware (and therefore how long they take), how the root complex splits a 64-bit CPU access, and what the CPU receives on a failed read are all implementation-dependent. The lab SSD's choices (16 KiB BAR0, MSI-X at 2000h/3000h) are synthetic.</p>
+</aside>
+<aside class="callout version">
+<p>Resizable BAR and the Flit Mode TLP header formats are later additions to the PCIe Base Specification; Controller Memory Buffer and Persistent Memory Region registers were added to NVMe in 1.2 and 1.4 respectively and evolved since; doorbell-buffer ("shadow doorbell") support is an NVMe feature intended for virtual controllers. Confirm the revision your device claims (VS register, and the PCIe capability version) before assuming any of these.</p>
+</aside>
+<aside class="callout notsaid">
+<p>Neither specification says how fast an MMIO read must complete (only that a completion timeout eventually fires, with ranges chosen by the requester), what data the CPU sees after an error, or that a driver must use an uncached mapping. The exact NVMe rules for access width (whether a 64-bit register may be read with one 64-bit access or two 32-bit accesses, and in which order) are stated in the NVMe Base Specification's register section: <span class="badge uncertain">Uncertain</span> confirm the wording there before relying on a split-read order. Whether a controller must accept a single TLP spanning two doorbell registers is not something this course can quote; check the register access rules and treat it as a compatibility risk.</p>
+</aside>
+<aside class="callout warn">
+<p>Never assume: that a BAR's address equals the CPU physical address on every architecture (some platforms apply a fixed offset between CPU physical and PCIe bus addresses); that the IOMMU protects MMIO (it translates device-initiated DMA, not CPU-to-device MMIO); that a write has reached the device because the store instruction retired; that all-ones means "device removed"; that prefetchable means cached.</p>
+</aside>
+</section>
+
+<section id="hardware">
+<h2>Hardware view</h2>
+<table>
+<caption>Who participates in an MMIO access</caption>
+<thead><tr><th>Category</th><th>Hardware</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td>Must participate</td><td>CPU core (load/store unit, store buffer)</td><td>Issues the access with a width and memory type</td></tr>
+<tr><td>Must participate</td><td>Root complex / host bridge</td><td>Decodes the physical address to a root port, builds the TLP, assigns tags for reads, runs the completion timer</td></tr>
+<tr><td>Must participate</td><td>Device PCIe core and register block</td><td>Decodes BAR hits, applies byte enables, performs side effects, returns completions</td></tr>
+<tr><td>May participate</td><td>Switches and retimers</td><td>Switches route by window; retimers are transparent to TLPs but add latency</td></tr>
+<tr><td>May participate</td><td>Write-combining buffers</td><td>Only for WC-mapped regions (CMB, some GPU apertures)</td></tr>
+<tr><td>May participate</td><td>Device firmware</td><td>Serves some register reads/writes in slow paths (vendor choice)</td></tr>
+<tr><td>May participate</td><td>Hypervisor / virtualization hardware</td><td>Traps or passes through guest MMIO (second-level page tables mark BAR pages as present or as trapping)</td></tr>
+<tr><td>Not involved</td><td>IOMMU</td><td>Applies to DMA from the device, not to MMIO from the CPU</td></tr>
+</tbody>
+</table>
+<h3>Observable versus internal</h3>
+<ul>
+<li><strong>Observable on the link:</strong> every MRd, MWr and completion, with address, length, byte enables, tag and status. A protocol analyzer between root port and SSD sees all MMIO to the SSD.</li>
+<li><strong>Observable in configuration space:</strong> BAR values, MSE, bridge windows, power state (PMCSR), AER status bits.</li>
+<li><strong>Observable in software:</strong> the values the driver reads, timing of reads, kernel resource tree, AER log messages.</li>
+<li><strong>Internal, generally unobservable:</strong> the CPU's store buffer and WC buffer state; the exact moment a posted write reaches the device; which internal register a write actually hit (you infer it from behaviour); whether a read was answered by hardware or firmware (you infer it from latency).</li>
+</ul>
+<h3>Inside the SSD: why some reads are slow</h3>
+<p>A typical controller decodes BAR hits in its PCIe core and forwards them over an internal bus to a register block. Doorbells are usually plain hardware registers feeding the command-fetch engine, so they absorb writes at line rate. Some registers (or reads during certain internal states) may be routed to firmware running on an embedded core. A read that needs firmware attention can take far longer than one served by logic. This is <span class="badge impl">Implementation-dependent</span> and the reason the "slow trace" below is worth knowing: a completion arriving in 30 µs instead of 1 µs is not a link problem.</p>
+<h3>Inside the CPU: memory types decide what leaves the chip</h3>
+<table>
+<caption>How the CPU's memory type shapes MMIO traffic (x86 terms; other architectures have equivalents)</caption>
+<thead><tr><th>Type</th><th>Loads</th><th>Stores</th><th>Typical use</th><th>On the wire</th></tr></thead>
+<tbody>
+<tr><td>UC (uncached)</td><td>One TLP per load, in order, no speculation</td><td>One TLP per store, in program order</td><td>Device registers, NVMe BAR0</td><td>MRd/MWr of the exact access width</td></tr>
+<tr><td>WC (write-combining)</td><td>Uncached, may be speculative on some CPUs</td><td>Buffered and merged up to a buffer (commonly a cache line), drained on fence or when full, possibly out of order</td><td>Frame buffers, CMB-resident submission queues, prefetchable apertures</td><td>Fewer, larger MWr; order between separate buffers not guaranteed without a fence</td></tr>
+<tr><td>WB (write-back)</td><td>Cached</td><td>Cached</td><td>DRAM; not used for device registers</td><td>Would produce cache-line reads and evictions to the device: wrong for registers</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="protocol">
+<h2>Protocol view</h2>
+<h3>Messages and transactions</h3>
+<table>
+<caption>TLPs involved in MMIO to an NVMe controller</caption>
+<thead><tr><th>CPU action</th><th>TLP</th><th>Direction</th><th>Response</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>32-bit store to a doorbell</td><td>MWr, 3 DW header (address &lt; 4 GiB), Length 1</td><td>Host→Dev</td><td>None (posted)</td><td>BE 1111b/0000b</td></tr>
+<tr><td>32-bit load from CSTS</td><td>MRd, Length 1</td><td>Host→Dev</td><td>CplD, Length 1</td><td>Tag from the root complex's pool</td></tr>
+<tr><td>64-bit load from CAP</td><td>One MRd Length 2, or two MRd Length 1</td><td>Host→Dev</td><td>One or two CplD</td><td>Depends on CPU instruction and root complex; Linux NVMe uses two 32-bit reads, low half first</td></tr>
+<tr><td>8-bit or 16-bit store</td><td>MWr Length 1 with partial byte enables</td><td>Host→Dev</td><td>None</td><td>Legal TLP; whether the register accepts it depends on the register's access rules</td></tr>
+<tr><td>WC burst of 64 bytes to a CMB SQ slot</td><td>MWr Length 16 (one TLP) or several smaller</td><td>Host→Dev</td><td>None</td><td>Only if the region is mapped WC</td></tr>
+<tr><td>Access to a BAR when MSE = 0 or in D3hot</td><td>MRd/MWr reach the device but are not claimed</td><td>Host→Dev</td><td>MRd: Cpl with UR; MWr: dropped (and may be logged as UR)</td><td>The CPU sees all ones for the read</td></tr>
+<tr><td>Access to an address no bridge claims</td><td>Never leaves the root complex (or is handled by it)</td><td>—</td><td>Root complex synthesises the error result</td><td>Nothing appears on the SSD's link</td></tr>
+</tbody>
+</table>
+<h3>Request/response and ordering</h3>
+<p>For MMIO, the requester is the root complex and the completer is the device. The relevant ordering facts, taught in full in <a href="dd10.html">Module 10</a>:</p>
+<ul>
+<li>Posted writes from the same requester, in the same traffic class, without Relaxed Ordering, stay in order through the fabric. Two doorbell writes from one core arrive in issue order. <span class="badge verified">Verified</span></li>
+<li>A read request may not pass a posted write in the same direction (in the default ordering model). That is why "write, then read the same device" flushes the write: when the read's completion returns, the write has been delivered to the completer. <span class="badge verified">Verified</span></li>
+<li>Different CPU cores writing to the same device have no guaranteed mutual order on the wire unless software synchronises them; each core's stores enter the root complex independently. <span class="badge derived">Derived</span></li>
+<li>The doorbell must not become visible to the device before the SQE it announces is visible in memory to device reads. That ordering is a CPU-side obligation (barriers in the driver's MMIO write primitive), not something PCIe can provide. <span class="badge derived">Derived</span></li>
+</ul>
+<h3>Completion and errors</h3>
+<table>
+<caption>Where MMIO errors arise and who logs them</caption>
+<thead><tr><th>Failure</th><th>Layer</th><th>Wire evidence</th><th>Who logs</th><th>CPU sees</th></tr></thead>
+<tbody>
+<tr><td>Device not decoding (MSE = 0, D3hot)</td><td>Transaction</td><td>Cpl Status = UR for reads</td><td>Device AER (UR, often reported as advisory non-fatal for non-posted), root port receives UR completion</td><td>All ones</td></tr>
+<tr><td>Device decodes but refuses (internal error)</td><td>Transaction</td><td>Cpl Status = CA</td><td>Device AER (Completer Abort)</td><td>All ones</td></tr>
+<tr><td>Read never completed</td><td>Transaction</td><td>MRd with no matching completion</td><td>Root port AER Completion Timeout (if enabled and supported for root-complex reads)</td><td>All ones after the timeout, or a machine-check on some platforms</td></tr>
+<tr><td>Link down mid-access</td><td>Physical / Data Link</td><td>Link goes to Recovery then Detect</td><td>Root port: Surprise Down or DPC trigger</td><td>All ones</td></tr>
+<tr><td>Poisoned completion</td><td>Transaction</td><td>CplD with EP bit set</td><td>Root port AER Poisoned TLP</td><td>Platform-dependent (poison consumption)</td></tr>
+<tr><td>Doorbell to wrong offset</td><td>None (above PCIe)</td><td>Valid MWr, no device reaction</td><td>NVMe: possibly an Invalid Doorbell asynchronous event, or nothing</td><td>Command timeout later</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="trace">
+<h2>Trace view</h2>
+<p>Four synthetic traces from the lab system (Gen4 x4, BAR0 = 0xFE60_0000, root complex requester shown as RC). Chapter 19 already showed sizing, initialisation, a wrong-stride doorbell and an all-ones read after decode was disabled; these traces cover different ground.</p>
+<h3>Normal: MSI-X table programming and a split CAP read</h3>
+<div class="trace" data-kind="synthetic" data-title="Driver reads CAP as two halves, then programs MSI-X vector 1 in BAR0">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0</td><td>MRd32</td><td>Addr=0xFE60_0000 Len=1 Tag=0x20 BE=1111/0000 ReqID=RC</td><td>CAP bits 31:0</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>880</td><td>CplD</td><td>Tag=0x20 SC ByteCount=4 Data=0x14010FFF</td><td>Low half: MQES 0FFFh (4096 entries), CQR=1, TO=14h (10 s)</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1 010</td><td>MRd32</td><td>Addr=0xFE60_0004 Len=1 Tag=0x21</td><td>CAP bits 63:32, issued only after the first returned (UC load, in order)</td></tr>
+<tr class="dir-up"><td>4</td><td>Dev→Host</td><td>1 890</td><td>CplD</td><td>Tag=0x21 SC Data=0x00400830</td><td>High half: DSTRD = 0, NSSRS = 1, CSS bits 37 and 43, MPSMAX 64 KiB</td></tr>
+<tr class="dir-down"><td>5</td><td>Host→Dev</td><td>40 000</td><td>MWr32</td><td>Addr=0xFE60_2010 Len=1 Data=0xFEE0_1000</td><td>MSI-X table entry 1, Message Address low (entry = 16 bytes, so entry 1 starts at table + 10h)</td></tr>
+<tr class="dir-down"><td>6</td><td>Host→Dev</td><td>40 060</td><td>MWr32</td><td>Addr=0xFE60_2014 Data=0x0000_0000</td><td>Message Upper Address</td></tr>
+<tr class="dir-down"><td>7</td><td>Host→Dev</td><td>40 120</td><td>MWr32</td><td>Addr=0xFE60_2018 Data=0x0000_0041</td><td>Message Data (vector value chosen by the OS)</td></tr>
+<tr class="dir-down"><td>8</td><td>Host→Dev</td><td>40 180</td><td>MWr32</td><td>Addr=0xFE60_201C Data=0x0000_0000</td><td>Vector Control: Mask bit cleared last</td></tr>
+<tr class="dir-down"><td>9</td><td>Host→Dev</td><td>40 300</td><td>MRd32</td><td>Addr=0xFE60_201C Len=1 Tag=0x22</td><td>Read-back flushes the four posted writes</td></tr>
+<tr class="dir-up"><td>10</td><td>Dev→Host</td><td>41 150</td><td>CplD</td><td>Tag=0x22 SC Data=0x0000_0000</td><td>Entry live</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Two independent MMIO users share BAR0: the NVMe driver (CAP) and the interrupt subsystem (MSI-X table at the location the MSI-X capability's Table BIR/offset gives). The two CAP reads are serial because each UC load must complete before the next issues; their order (low, then high) is the driver's choice. The MSI-X entry is written field by field with the mask bit cleared last, and a read-back flushes the posted writes before the entry is relied on. All requests come from the root complex; none crosses a 4 KiB boundary; all use 3-DW headers because the BAR is below 4 GiB.</p>
+</div>
+
+<h3>Slow: a status poll answered in tens of microseconds</h3>
+<div class="trace" data-kind="synthetic" data-title="CSTS polling during shutdown: completions take 1 µs, then 35 µs, then 1 µs">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>MWr32</td><td>Addr=0xFE60_0014 Data=0x00464061</td><td>CC.SHN = 01b (normal shutdown), EN stays 1</td></tr>
+<tr class="dir-down"><td>2</td><td>Host→Dev</td><td>0.2</td><td>MRd32</td><td>Addr=0xFE60_001C Tag=0x30</td><td>Poll CSTS</td></tr>
+<tr class="dir-up"><td>3</td><td>Dev→Host</td><td>1.1</td><td>CplD</td><td>Tag=0x30 Data=0x00000005</td><td>RDY=1, SHST=01b (shutdown in progress)</td></tr>
+<tr class="dir-down"><td>4</td><td>Host→Dev</td><td>1 000.0</td><td>MRd32</td><td>Addr=0xFE60_001C Tag=0x31</td><td>Next poll after 1 ms sleep</td></tr>
+<tr class="dir-up"><td>5</td><td>Dev→Host</td><td>1 035.4</td><td>CplD</td><td>Tag=0x31 Data=0x00000005</td><td>Same value, but 35 µs later</td></tr>
+<tr class="note"><td colspan="6">No Recovery, no Nak, no replay and no link-state change on the link between rows 4 and 5. The link was in L0 throughout.</td></tr>
+<tr class="dir-down"><td>6</td><td>Host→Dev</td><td>2 040.0</td><td>MRd32</td><td>Addr=0xFE60_001C Tag=0x32</td><td>Poll</td></tr>
+<tr class="dir-up"><td>7</td><td>Dev→Host</td><td>2 040.9</td><td>CplD</td><td>Tag=0x32 Data=0x00000009</td><td>SHST=10b: shutdown complete</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> The completion in row 5 is slow but correct. Because the link stayed in L0 with no retries, the delay is inside the completer: the controller was busy flushing its write cache and served the register read late, perhaps through firmware. That is legal; PCIe sets no completion deadline short of the requester's completion timeout. The cost is that the CPU core issuing the load stalled for 35 µs. A senior engineer would check two things: is the link really in L0 (if ASPM L1 were enabled, an exit latency of a few to tens of microseconds would look similar, and would appear on the analyzer as electrical idle followed by Recovery before the MRd is delivered), and does the delay correlate with internal work (shutdown, firmware activation, format)? If neither, the next suspect is a root-complex or switch queueing issue, visible as the MRd itself arriving late at the device-side analyzer probe.</p>
+</div>
+
+<h3>Failed: BAR moved, window did not</h3>
+<div class="trace" data-kind="synthetic" data-title="After a hot-plug rescan BAR0 is reassigned to 0xFE70_0000 but the root port window still ends at 0xFE6F_FFFF">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (µs)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0.0</td><td>CfgWr0</td><td>Reg=04h (10h) Data=0xFE700004</td><td>Rescan assigns BAR0 = 0xFE70_0000 (tooling bug: window not grown)</td></tr>
+<tr class="dir-down"><td>2</td><td>Host→Dev</td><td>2.0</td><td>CfgWr0</td><td>Reg=01h Data=0x0006</td><td>Mem+ BusMaster+</td></tr>
+<tr class="abnormal"><td>3</td><td>—</td><td>50.0</td><td>(nothing)</td><td>CPU load from 0xFE70_001C</td><td>First abnormal event: the driver's CSTS read produces no TLP on the SSD's link</td></tr>
+<tr class="note"><td colspan="6">The root complex does not route 0xFE70_001C to root port 00:01.1, whose window is 0xFE60_0000–0xFE6F_FFFF. Depending on the platform, the access is terminated inside the root complex (all ones returned) or sent elsewhere.</td></tr>
+<tr class="dir-down"><td>4</td><td>Host→Dev</td><td>60.0</td><td>(nothing)</td><td>CPU store to 0xFE70_0014 (CC.EN=1)</td><td>Silently lost: no MWr seen</td></tr>
+<tr class="note"><td colspan="6">Driver log (illustrative): controller reads CSTS = 0xffffffff, gives up. lspci -vv on 00:01.1 shows "Memory behind bridge: fe600000-fe6fffff"; on 01:00.0 "Region 0: Memory at fe700000".</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> The decisive evidence is an absence: the analyzer on the SSD's link sees no TLP at all for the driver's accesses. Contrast this with Chapter 19's trace where decode was disabled: there the MRd reached the device and came back UR. "No TLP on the link" moves the fault above the root port: routing (windows) or the CPU mapping. Comparing the BAR value with every window above it finds the mismatch in seconds. Fix: reassign windows and BARs consistently (a remove/rescan through the kernel, which recomputes windows), never by patching the BAR alone.</p>
+</div>
+
+<h3>Ambiguous: one TLP, two doorbells</h3>
+<div class="trace" data-kind="synthetic" data-title="A user-space driver maps BAR0 write-combining; SQ1 tail and CQ1 head stores merge">
+<table class="trace-table">
+<thead><tr><th>#</th><th>Dir</th><th>Time (ns)</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MWr64</td><td>Addr=0x1_2341_0040 Len=4 ReqID=0x0100</td><td>Controller posts CQE to CQ1 slot 4</td></tr>
+<tr class="dir-up"><td>2</td><td>Dev→Host</td><td>120</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x00000041</td><td>MSI-X interrupt (vector 1)</td></tr>
+<tr class="dir-down"><td>3</td><td>Host→Dev</td><td>3 900</td><td>MWr32</td><td>Addr=0xFE60_1008 Len=2 FirstBE=1111 LastBE=1111 Data=0x00000007, 0x00000005</td><td>One TLP writes SQ1TDBL = 7 and CQ1HDBL = 5</td></tr>
+<tr class="abnormal"><td>4</td><td>—</td><td>3 900–2 000 000</td><td>(nothing)</td><td>no MRd for SQ1 slot 6</td><td>The new command in slot 6 is never fetched</td></tr>
+<tr class="note"><td colspan="6">In the working run with the same software on another controller, row 3 is followed within 1 µs by an MRd for SQ1 slot 6.</td></tr>
+</tbody>
+</table>
+<p><strong>Analysis.</strong> Two explanations fit. (a) The host is wrong: doorbell registers should be written with separate, single-register accesses from an uncached mapping, and the user-space driver mapped BAR0 write-combining, so two stores were merged into one 8-byte MWr. (b) The controller is wrong: if the NVMe register access rules permit (or do not forbid) such a write, the controller should update both registers, and this one updated only the first or the second. The trace alone cannot decide, because it shows the TLP but not which register the controller acted on. Disambiguate by experiment: remap BAR0 uncached (or insert a store fence between the two stores) and confirm the fetch reappears; then, separately, inject the same 2-DW MWr with a test tool and observe whether the controller updates CQ1 head (by watching whether it stops posting when the CQ appears full). The likely conclusion is a host bug (a), with a controller robustness finding (b) worth reporting. Note that the first abnormal event is an absence (row 4), not the merged write itself, which is a legal TLP.</p>
+</div>
+</section>
+
+<section id="linux">
+<h2>Linux view</h2>
+<p>All commands below only read state. <span class="badge safe">Safe lab</span> unless marked otherwise. Example output in this section is illustrative (synthetic) and abbreviated; on your machine field order and wording depend on the pciutils and kernel versions.</p>
+<pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># 1. Region type, address, size, and whether decode is on</span>
+sudo lspci -vv -s 0000:01:00.0 | grep -E "Control:|Region|Capabilities: \[.*MSI-X" -A1
+
+<span class="cm"># 2. Every window above the device (walk from root port down)</span>
+sudo lspci -vv -s 0000:00:01.1 | grep -E "Memory behind bridge|Prefetchable memory behind bridge"
+
+<span class="cm"># 3. The kernel's resource tree: who owns which physical range</span>
+sudo cat /proc/iomem | grep -B3 -A3 "0000:01:00.0"
+
+<span class="cm"># 4. Per-BAR start, end, flags (resource file) and which resourceN files exist</span>
+cat /sys/bus/pci/devices/0000:01:00.0/resource
+ls /sys/bus/pci/devices/0000:01:00.0/ | grep resource
+
+<span class="cm"># 5. Power state and decode bits, raw</span>
+sudo setpci -s 0000:01:00.0 COMMAND
+cat /sys/bus/pci/devices/0000:01:00.0/power_state  2&gt;/dev/null
+
+<span class="cm"># 6. Memory type the kernel used for the mapping (x86, debugfs mounted)</span>
+sudo grep -i "fe600000" /sys/kernel/debug/x86/pat_memtype_list
+
+<span class="cm"># 7. Assignment history and errors</span>
+sudo dmesg | grep -E "01:00.0.*(BAR|no space|assigned|can't claim)|nvme.*CSTS"</code></pre>
+<p>Illustrative fragments (synthetic):</p>
+<pre class="code" data-kind="read-only" data-lang="text"><code>Control: I/O- Mem+ BusMaster+ SpecCycle- MemWINV- VGASnoop- ParErr- Stepping- SERR- FastB2B- DisINTx+
+Region 0: Memory at fe600000 (64-bit, non-prefetchable) [size=16K]
+Capabilities: [b0] MSI-X: Enable+ Count=33 Masked-
+        Vector table: BAR=0 offset=00002000
+        PBA: BAR=0 offset=00003000
+uncached-minus @ 0xfe600000-0xfe604000</code></pre>
+<table>
+<caption>What each output category proves and cannot prove</caption>
+<thead><tr><th>Output</th><th>Proves</th><th>Cannot prove</th></tr></thead>
+<tbody>
+<tr><td>"Region 0: Memory at … [size=16K]"</td><td>The BAR value and size as read from configuration space</td><td>That the bridges above forward that range; that the device actually responds</td></tr>
+<tr><td>"Control: Mem+"</td><td>MSE is set now</td><td>That it was set at the moment of a past failure</td></tr>
+<tr><td>"Memory behind bridge"</td><td>The window range of that bridge</td><td>Anything about other bridges in the path; check every one</td></tr>
+<tr><td><code>/proc/iomem</code> nesting</td><td>The kernel's belief about ownership and nesting</td><td>Hardware state if someone changed registers behind the kernel's back (for example with setpci)</td></tr>
+<tr><td>No <code>resource0_wc</code> file</td><td>The kernel will not offer a WC mapping of BAR0 to user space; such files exist only for prefetchable BARs</td><td>How a kernel driver mapped it</td></tr>
+<tr><td>PAT memtype "uncached-minus"</td><td>The kernel mapping's memory type for that range</td><td>User-space mappings made by other means</td></tr>
+<tr><td>"CSTS=0xffffffff" in a driver message</td><td>The driver's read returned all ones</td><td>Why: link down, decode off, not routed, D3hot, completion timeout all produce it</td></tr>
+<tr><td>"BAR 0: no space for [mem size …]"</td><td>Allocation failed in the kernel's view</td><td>Whether firmware could have placed it (firmware options, reserved ranges)</td></tr>
+</tbody>
+</table>
+<aside class="callout warn">
+<p>Do not "test" a BAR by writing to it with setpci, <code>devmem</code> or an mmap of <code>resource0</code> on a machine that matters. A single write to CC can disable the controller under a mounted filesystem. Reads of NVMe registers are side-effect-free by design, but reading a device you have not identified (another vendor's BAR) may not be.</p>
+</aside>
+</section>
+
+<section id="labs">
+<h2>Labs</h2>
+
+<h3>Beginner lab: draw the address map of your NVMe SSD</h3>
+<p><span class="badge safe">Safe lab</span> Read-only; no root needed for the script itself (some sysfs files need root on hardened systems).</p>
+<ul>
+<li><strong>Objective:</strong> produce, from sysfs, a table of every BAR of every NVMe controller, and compute the address of the admin and first I/O doorbells.</li>
+<li><strong>Prerequisites:</strong> <a href="ch19.html">Chapter 19</a>; a Linux machine with an NVMe SSD (or read the synthetic input below).</li>
+<li><strong>Setup:</strong> Python 3, standard library only.</li>
+</ul>
+<pre class="code" data-kind="executable" data-lang="python" data-title="bar_map.py"><code>#!/usr/bin/env python3
+"""List memory BARs of NVMe controllers (PCI class 0x010802) from sysfs, read-only.
+With --demo, uses a synthetic resource file matching the course lab system."""
+import glob, os, sys
+
+DEMO = ("0x00000000fe600000 0x00000000fe603fff 0x0000000000140204\n"
+        + "0x0000000000000000 0x0000000000000000 0x0000000000000000\n" * 5)
+
+def bars(resource_text):
+    out = []
+    for i, line in enumerate(resource_text.splitlines()[:6]):
+        start, end, flags = (int(x, 16) for x in line.split())
+        if end == 0:
+            continue
+        kind = "io" if flags &amp; 0x100 else "mem"
+        out.append({"bar": i, "start": start, "size": end - start + 1, "kind": kind,
+                    "64bit": bool(flags &amp; 0x100000), "prefetch": bool(flags &amp; 0x2000)})
+    return out
+
+def report(name, text, dstrd=0):
+    for b in bars(text):
+        print(f"{name} BAR{b['bar']}: {b['kind']} start=0x{b['start']:x} size={b['size'] // 1024} KiB "
+              f"64bit={b['64bit']} prefetchable={b['prefetch']}")
+        if b["bar"] == 0:
+            stride = 4 &lt;&lt; dstrd
+            for q in (0, 1):
+                sq = b["start"] + 0x1000 + (2 * q) * stride
+                cq = sq + stride
+                print(f"   SQ{q}TDBL=0x{sq:x}  CQ{q}HDBL=0x{cq:x}")
+
+if "--demo" in sys.argv:
+    report("demo 0000:01:00.0", DEMO)
+    sys.exit(0)
+found = False
+for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
+    try:
+        cls = open(os.path.join(dev, "class")).read().strip()
+        if cls != "0x010802":
+            continue
+        found = True
+        report(os.path.basename(dev), open(os.path.join(dev, "resource")).read())
+    except OSError as e:
+        print(f"{dev}: {e}")
+if not found:
+    print("no NVMe controllers found; try --demo")</code></pre>
+<ul>
+<li><strong>Procedure:</strong> run <code>python3 bar_map.py --demo</code>, then <code>python3 bar_map.py</code>. Compare BAR0 with <code>lspci -vv</code> and with the window of the parent bridge.</li>
+<li><strong>Observations:</strong> record BAR0's start and size, whether it is prefetchable, and whether any other BARs exist.</li>
+<li><strong>Questions:</strong> (1) Is BAR0 below 4 GiB? Why? (2) What does flag bit 0x100000 mean? (3) Why does the script assume DSTRD = 0, and how would you make it correct?</li>
+<li><strong>Expected reasoning:</strong> a non-prefetchable BAR behind a root port must be below 4 GiB; the flag bit is the kernel's 64-bit marker (IORESOURCE_MEM_64); the stride must come from CAP, which requires reading BAR0 (an MMIO read, hence the separate caution lab in Chapter 19).</li>
+</ul>
+<details class="solution"><summary>Solution</summary>
+<p>For the demo: BAR0 at 0xFE60_0000, 16 KiB, 64-bit, non-prefetchable; SQ0TDBL 0xFE60_1000, CQ0HDBL 0xFE60_1004, SQ1TDBL 0xFE60_1008, CQ1HDBL 0xFE60_100C. The 64-bit flag bit in the kernel resource flags marks a 64-bit memory BAR; 0x200 marks memory and 0x2000 prefetchable (kernel <code>IORESOURCE_*</code> values; check <code>include/linux/ioport.h</code> for your kernel). To handle DSTRD, read CAP via <code>nvme show-regs</code> (read-only) and pass DSTRD in; never guess it.</p>
+</details>
+<p><strong>Extension:</strong> add the MSI-X Table BIR and offset by parsing <code>lspci -vv</code> output, and print where each structure lands inside the BARs.</p>
+
+<h3>Intermediate lab: route an address through a simulated hierarchy</h3>
+<p><span class="badge safe">Safe lab</span> Pure simulation.</p>
+<ul>
+<li><strong>Objective:</strong> implement the decisions a root complex and bridges make for an MMIO address, and find which of several misconfigurations makes an access disappear, return UR, or land correctly.</li>
+<li><strong>Prerequisites:</strong> bridge windows (<a href="ch19.html">Chapter 19</a>), the architecture section above.</li>
+<li><strong>Setup:</strong> Python 3.</li>
+</ul>
+<pre class="code" data-kind="simulation" data-lang="python" data-title="mmio_route.py"><code>"""Route a CPU physical address through a simulated PCIe hierarchy (simulation).
+Each bridge has a non-prefetchable window (32-bit) and an optional prefetchable window.
+Each endpoint has BARs, a Memory Space Enable bit and a power state."""
+
+class Endpoint:
+    def __init__(self, name, bars, mse=True, dstate="D0"):
+        self.name, self.bars, self.mse, self.dstate = name, bars, mse, dstate
+
+    def claim(self, addr):
+        for i, (base, size, pf) in enumerate(self.bars):
+            if base &lt;= addr &lt; base + size:
+                if not self.mse or self.dstate != "D0":
+                    return f"{self.name}: address in BAR{i} but not decoding -&gt; UR completion"
+                return f"{self.name}: BAR{i} offset 0x{addr - base:x} -&gt; CplD / write accepted"
+        return None
+
+class Bridge:
+    def __init__(self, name, np_win, pf_win=None, children=()):
+        self.name, self.np_win, self.pf_win, self.children = name, np_win, pf_win, list(children)
+
+    def forwards(self, addr):
+        for win in (self.np_win, self.pf_win):
+            if win and win[0] &lt;= addr &lt;= win[1]:
+                if win is self.np_win and addr &gt; 0xFFFF_FFFF:
+                    return False                       # cannot happen: 32-bit window
+                return True
+        return False
+
+    def route(self, addr, path):
+        if not self.forwards(addr):
+            return None
+        path.append(self.name)
+        for c in self.children:
+            r = c.route(addr, path) if isinstance(c, Bridge) else c.claim(addr)
+            if r:
+                return r
+        return f"{self.name}: forwarded but no device claimed -&gt; UR from below the bridge"
+
+def rc_route(root_ports, addr):
+    path = []
+    for rp in root_ports:
+        r = rp.route(addr, path)
+        if r:
+            return " -&gt; ".join(path) + " : " + r
+    return "root complex: no root port claims the address -&gt; terminated in RC (CPU sees all ones)"
+
+ssd = Endpoint("01:00.0", [(0xFE60_0000, 0x4000, False)])
+rp = Bridge("00:01.1", (0xFE60_0000, 0xFE6F_FFFF), children=[ssd])
+for a in (0xFE60_001C, 0xFE60_1008, 0xFE60_4000, 0xFE70_001C):
+    print(f"0x{a:x}: {rc_route([rp], a)}")
+
+print("-- scenario B: MSE cleared")
+ssd.mse = False
+print(rc_route([rp], 0xFE60_001C))
+print("-- scenario C: device in D3hot")
+ssd.mse, ssd.dstate = True, "D3hot"
+print(rc_route([rp], 0xFE60_001C))</code></pre>
+<ul>
+<li><strong>Procedure:</strong> run it; then add a switch (a Bridge with its own window) between root port and SSD, and give the switch a window that does not cover BAR0. Run again.</li>
+<li><strong>Observations:</strong> note which scenarios produce "UR from the device", "UR from below a bridge", and "terminated in RC".</li>
+<li><strong>Questions:</strong> (1) Which scenarios would show a TLP on an analyzer placed on the SSD's link? (2) Which would generate an AER log at the SSD? (3) Why is 0xFE60_4000 different from 0xFE70_001C?</li>
+<li><strong>Expected reasoning:</strong> only accesses that the root port forwards reach the SSD's link; decode-off and D3hot accesses reach the device and are answered UR by it; an address inside the window but outside every BAR is forwarded by the root port and then not claimed, so the UR comes from below the bridge (in real hardware the root port's downstream side or the device, depending on topology); an address outside every window never leaves the root complex.</li>
+</ul>
+<details class="solution"><summary>Solution</summary>
+<p>0xFE60_001C and 0xFE60_1008 land in BAR0 (offsets 1Ch and 1008h). 0xFE60_4000 is inside the root port window but past the 16 KiB BAR: forwarded, unclaimed, UR — visible on the SSD's link because the root port forwards it to its only child. 0xFE70_001C is outside every window: nothing on the SSD's link. Scenarios B and C: TLP on the link, UR from the SSD, AER Unsupported Request logged at the SSD (reported or not depending on its AER masks and severity). With the misconfigured switch, accesses to BAR0 stop at the switch: the analyzer between switch and SSD sees nothing, the one between root port and switch sees the request and a UR returned by the switch.</p>
+</details>
+<p><strong>Extension:</strong> add a prefetchable 64-bit window and a 64-bit prefetchable BAR above 4 GiB; confirm it routes, then mark the same BAR non-prefetchable and explain why no bridge window can reach it.</p>
+
+<h3>Advanced lab: measure what an MMIO read costs</h3>
+<p><span class="badge caution">Caution lab</span> Needs root and maps BAR0 of a real SSD read-only. Run only on a test machine; do not modify the script to write. NVMe register reads have no side effects, but a bug that turns a read into a write could disable the controller.</p>
+<ul>
+<li><strong>Objective:</strong> measure the average and tail latency of a 32-bit MMIO read (VS register) and compare with a DRAM read, then relate it to the CPU time a driver loses per register read.</li>
+<li><strong>Prerequisites:</strong> <a href="ch12.html">Chapter 12</a> (non-posted cost), the Chapter 19 caution lab.</li>
+<li><strong>Setup:</strong> test machine with an idle NVMe SSD at a known BDF; Python 3.</li>
+</ul>
+<pre class="code" data-kind="hardware-dependent" data-lang="python" data-title="mmio_latency.py"><code>#!/usr/bin/env python3
+"""Time 32-bit MMIO reads of the NVMe VS register (BAR0 + 08h). READ-ONLY. Root, test machine only."""
+import mmap, os, sys, time, statistics
+
+bdf = sys.argv[1] if len(sys.argv) &gt; 1 else "0000:01:00.0"
+n = 20000
+fd = os.open(f"/sys/bus/pci/devices/{bdf}/resource0", os.O_RDONLY | os.O_SYNC)
+mm = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ)
+regs = memoryview(mm).cast("I")
+ram = memoryview(bytearray(4096)).cast("I")
+
+def timed(view, idx):
+    samples = []
+    for _ in range(n):
+        t0 = time.perf_counter_ns()
+        view[idx]
+        samples.append(time.perf_counter_ns() - t0)
+    samples.sort()
+    return statistics.mean(samples), samples[n // 2], samples[int(n * 0.99)], samples[-1]
+
+vs = regs[2]
+print(f"VS = 0x{vs:08x}")
+for label, view, idx in (("DRAM", ram, 2), ("MMIO VS", regs, 2)):
+    mean, p50, p99, mx = timed(view, idx)
+    print(f"{label:8s} mean={mean:8.0f} ns  p50={p50:6d}  p99={p99:6d}  max={mx}")
+regs.release(); ram.release(); mm.close(); os.close(fd)</code></pre>
+<ul>
+<li><strong>Procedure:</strong> run it three times: idle; while a read benchmark runs on the same SSD; with ASPM enabled versus disabled on that link if your platform allows (record the setting from <code>lspci -vv</code> LnkCtl, do not change it unless the machine is disposable).</li>
+<li><strong>Observations:</strong> DRAM numbers are dominated by Python overhead (hundreds of ns); the MMIO difference over DRAM is the read's real cost.</li>
+<li><strong>Questions:</strong> (1) Why is the measured difference roughly a microsecond and not tens of nanoseconds? (2) Why might the p99 jump under load? (3) What would ASPM L1 do to the first read after idle?</li>
+<li><strong>Expected reasoning:</strong> the load must travel to the device and back through the root complex, root port and device core (a non-posted round trip); under load, the MRd queues behind data TLPs and the device's register block may be busy; after idle with L1 enabled, the first read pays the L1 exit latency.</li>
+</ul>
+<details class="solution"><summary>Solution</summary>
+<p>Typical results on a direct-attached Gen4 link are in the range of several hundred nanoseconds to a couple of microseconds above DRAM, with tails rising under load; exact values are platform-dependent. Conclusion for driver design: register reads in the I/O path cost about a microsecond of a stalled core each, which is why NVMe's hot path uses only posted doorbell writes, and why the completion path discovers new entries by reading the Phase Tag in host memory rather than reading a device register.</p>
+</details>
+<p><strong>Extension:</strong> repeat inside a virtual machine with the SSD passed through (VFIO). The BAR is mapped directly into the guest, so reads should cost the same; then repeat for the MSI-X table page, which the hypervisor typically traps, and explain the difference.</p>
+
+<h3>Senior forensic lab: the drive that died after resume</h3>
+<p><span class="badge safe">Safe lab</span> Paper exercise with synthetic evidence.</p>
+<ul>
+<li><strong>Objective:</strong> localise a failure using only logs, configuration dumps and a short trace, and write a root-cause statement with confidence.</li>
+<li><strong>Prerequisites:</strong> this module's protocol and debugging sections; <a href="ch50.html">Chapter 50 (Power Management)</a> for device power states.</li>
+<li><strong>Setup (evidence, all synthetic):</strong></li>
+</ul>
+<pre class="code" data-kind="read-only" data-lang="text" data-title="evidence (synthetic, illustrative)"><code>[ 812.40] PM: suspend entry (s2idle)
+[ 812.55] nvme 0000:01:00.0: PME# disabled
+[ 905.10] PM: resume from suspend
+[ 905.31] nvme nvme0: controller is down; will reset: CSTS=0xffffffff, PCI_STATUS=0x10
+[ 905.31] nvme nvme0: Removing after probe failure status: -19
+
+lspci -vv -s 01:00.0 (after the failure)
+  Control: I/O- Mem+ BusMaster+
+  Region 0: Memory at fe600000 (64-bit, non-prefetchable) [size=16K]
+  Capabilities: [80] Power Management version 3
+        Status: D3 NoSoftRst- PME-Enable- DSel=0 DScale=0 PME-
+  LnkSta: Speed 16GT/s, Width x4
+
+Analyzer (device link), first 3 µs after the driver's resume handler starts
+  #1 Host-&gt;Dev  MRd32 Addr=0xFE60_001C Tag=0x05
+  #2 Dev-&gt;Host  Cpl   Tag=0x05 Status=UR</code></pre>
+<ul>
+<li><strong>Procedure:</strong> list every hypothesis that produces CSTS = all ones; eliminate each with a specific line of evidence; name the first abnormal event; propose a fix and a regression test.</li>
+<li><strong>Questions:</strong> (1) Why is "link down" eliminated? (2) Why is "address not routed" eliminated? (3) What does "D3 NoSoftRst-" tell you? (4) Which component failed to do its job?</li>
+<li><strong>Expected reasoning:</strong> the link is at 16 GT/s x4 and the MRd reached the device (it answered), so not link down and not routing. MSE is set (Mem+), so not decode-off. The device answered UR, consistent with being in D3hot where memory decode is unavailable. PCI_STATUS readable and PMCSR showing D3 confirms configuration space works. So the device was never returned to D0 before the driver touched BAR0, or it was returned and fell back.</li>
+</ul>
+<details class="solution"><summary>Solution</summary>
+<p><strong>First abnormal event:</strong> the MRd to CSTS at #1 issued while the function's power state was D3hot (#2 is the consequence). <strong>Root cause (confidence: medium-high):</strong> the resume path did not transition the function to D0 (or did not wait the required recovery time after writing PMCSR) before the NVMe driver read registers. "NoSoftRst-" means a D3hot→D0 transition may reset the function's internal state, including BARs, so the restore path must also restore configuration space after the transition. <strong>Disambiguating experiment:</strong> trace configuration writes during resume; a correct sequence shows CfgWr to PMCSR (PowerState = D0), a delay, configuration-space restore (BARs, Command), then MMIO. <strong>Fix:</strong> correct the platform or bus-driver resume ordering (in Linux this is normally handled by the PCI core before the driver's resume callback; a custom or out-of-tree path is the usual suspect). <strong>Regression test:</strong> 1,000 suspend/resume cycles with an analyzer trigger on any UR completion to the SSD, plus a check that the first MMIO after resume follows a PMCSR write to D0.</p>
+</details>
+<p><strong>Extension:</strong> rewrite the scenario with "NoSoftRst+" and explain why the BAR would then survive, but the NVMe controller might still need re-initialisation.</p>
+</section>
+
+<section id="debugging">
+<h2>Debugging</h2>
+<p>Six failure patterns, ordered from the most common in the field to the most subtle. Confidence is how sure you can be of the conclusion once the listed evidence is in hand.</p>
+
+<h3>Pattern 1: register reads return all ones</h3>
+<dl>
+<dt>Symptom</dt><dd>Driver logs CSTS = 0xffffffff; device unusable.</dd>
+<dt>Possible causes</dt><dd>Link down or in Recovery; MSE cleared; address not routed by a bridge; device in D3hot or in reset (FLR, conventional reset in progress); completion timeout from a hung device; surprise removal.</dd>
+<dt>Evidence</dt><dd>LnkSta (speed/width or "link down"), Control Mem+/-, PMCSR power state, AER status at root port and device, analyzer view of the MRd.</dd>
+<dt>First check</dt><dd>Can configuration space be read? If <code>lspci</code> returns all ones for the Vendor ID too, the link or device is gone; MMIO-specific causes are excluded.</dd>
+<dt>Second check</dt><dd>If configuration works: Mem+? Power state D0? BAR inside every window?</dd>
+<dt>Disambiguating experiment</dt><dd>Analyzer trigger on MRd to BAR0: no TLP → routing/CPU side; UR → decode/power; nothing back → completion timeout (device hung).</dd>
+<dt>Likely conclusion</dt><dd>With config space working and Mem+ in D0: device hung internally or link flapping (check AER Completion Timeout and link-state history).</dd>
+<dt>Confidence</dt><dd>High once the analyzer or AER classifies the response; low from the driver message alone.</dd>
+</dl>
+
+<h3>Pattern 2: "BAR 0: no space" after hot-plug or on dense servers</h3>
+<dl>
+<dt>Symptom</dt><dd>New SSD enumerates (config space works) but driver probe fails; dmesg shows a BAR assignment failure.</dd>
+<dt>Possible causes</dt><dd>Hot-plug port window too small (firmware reserved too little); MMIO hole below 4 GiB exhausted; 64-bit non-prefetchable BAR cannot go above 4 GiB; Resizable BAR or other devices grabbed the space.</dd>
+<dt>Evidence</dt><dd><code>/proc/iomem</code> layout; "Memory behind bridge" of the hot-plug port; firmware setup options for hot-plug resource padding.</dd>
+<dt>First check</dt><dd>Size of the downstream port's non-prefetchable window versus the BAR size (plus alignment).</dd>
+<dt>Second check</dt><dd>Free space in the MMIO hole: gaps in <code>/proc/iomem</code> under the host bridge window.</dd>
+<dt>Disambiguating experiment</dt><dd>Boot with the drive present (cold-plug): if it works, the failure is reservation for hot-plug, not total space. Kernel options that pad hot-plug windows or request reallocation (see the kernel parameters documentation for <code>pci=</code> options) can confirm.</dd>
+<dt>Likely conclusion</dt><dd>Insufficient hot-plug window reservation.</dd>
+<dt>Confidence</dt><dd>High.</dd>
+</dl>
+
+<h3>Pattern 3: commands occasionally use stale SQEs</h3>
+<dl>
+<dt>Symptom</dt><dd>Rare commands complete with Invalid Opcode or Invalid Field, or operate on wrong LBAs, under heavy load; never at low queue depth.</dd>
+<dt>Possible causes</dt><dd>Missing barrier between SQE stores and the doorbell store in a custom driver (user-space or firmware test harness); weakly ordered CPU; doorbell issued via a relaxed MMIO primitive; SQ in a CMB mapped WC without a fence before the doorbell.</dd>
+<dt>Evidence</dt><dd>Analyzer: the controller's SQE fetch (MRd) completes with data that differs from what the driver later shows it wrote; timing shows the MRd was issued very soon after the doorbell.</dd>
+<dt>First check</dt><dd>Which MMIO write primitive rings the doorbell, and is there a write barrier before it?</dd>
+<dt>Second check</dt><dd>Is the SQ in host memory or in the CMB, and what is its mapping type?</dd>
+<dt>Disambiguating experiment</dt><dd>Add a full barrier before the doorbell; if the failure rate drops to zero, the ordering hypothesis holds. Capture an SQE fetch whose data is wrong and compare to the driver's intended SQE.</dd>
+<dt>Likely conclusion</dt><dd>Host-side ordering bug, not a controller defect.</dd>
+<dt>Confidence</dt><dd>Medium until a wrong-data fetch is captured; high afterwards.</dd>
+</dl>
+
+<h3>Pattern 4: CPU soft lockups or machine checks on device failure</h3>
+<dl>
+<dt>Symptom</dt><dd>When an SSD fails, the host stalls for many milliseconds per access, logs soft lockup warnings, or takes a machine-check exception rather than a clean driver error.</dd>
+<dt>Possible causes</dt><dd>MMIO reads waiting for completion timeout (configured range long, often tens of milliseconds by default); platform escalates timeouts to machine checks; driver polls registers in a loop without bounding the number of reads.</dd>
+<dt>Evidence</dt><dd>Device Control 2 Completion Timeout Value at the root port; AER Completion Timeout logs; stack traces in the read accessor.</dd>
+<dt>First check</dt><dd>Root port Completion Timeout range and whether Completion Timeout is disabled.</dd>
+<dt>Second check</dt><dd>Whether Downstream Port Containment (DPC) is enabled at the root port, which can contain the failure faster and make subsequent reads fail quickly.</dd>
+<dt>Disambiguating experiment</dt><dd>On a test system, inject a device hang (or pull the device on a hot-plug test fixture) with different timeout ranges and measure stall time per read.</dd>
+<dt>Likely conclusion</dt><dd>Recovery policy and timeouts, not the NVMe driver logic.</dd>
+<dt>Confidence</dt><dd>Medium-high.</dd>
+</dl>
+
+<h3>Pattern 5: works on bare metal, fails in a virtual machine</h3>
+<dl>
+<dt>Symptom</dt><dd>Passed-through SSD probes in the guest, but interrupts never arrive or arrive on the wrong vector; or MMIO-heavy paths are very slow in an emulated controller.</dd>
+<dt>Possible causes</dt><dd>MSI-X table shares a page with doorbells or registers so the hypervisor's trap of the table page also traps those accesses (slow), or the guest writes the table directly in a way the hypervisor does not mirror; emulated controllers trap every doorbell write (VM exit per I/O).</dd>
+<dt>Evidence</dt><dd>MSI-X Table BIR/offset relative to doorbells; hypervisor exit statistics; whether the controller supports the doorbell-buffer (shadow doorbell) feature for emulated cases.</dd>
+<dt>First check</dt><dd>Is the MSI-X table in its own 4 KiB-aligned page, away from doorbells?</dd>
+<dt>Second check</dt><dd>VM-exit counters per I/O.</dd>
+<dt>Disambiguating experiment</dt><dd>Compare exit counts per I/O with a controller whose MSI-X table sits in a separate page or BAR.</dd>
+<dt>Likely conclusion</dt><dd>BAR layout choice in the device or emulation cost; design fix rather than bug.</dd>
+<dt>Confidence</dt><dd>Medium (hypervisor-specific).</dd>
+</dl>
+
+<h3>Pattern 6: firmware activation or reset changes BAR behaviour</h3>
+<dl>
+<dt>Symptom</dt><dd>After a firmware commit with activation, or after a Function Level Reset issued by a management tool, MMIO reads return UR or all ones until the driver rebinds.</dd>
+<dt>Possible causes</dt><dd>Configuration space reset by FLR (BARs and Command cleared) without the host restoring it; reset issued outside the OS's knowledge; device takes longer than allowed to become ready and answers configuration requests with Request Retry Status (RRS, formerly Configuration Request Retry Status).</dd>
+<dt>Evidence</dt><dd>BAR reads 0 or the reset value in <code>lspci</code>; Command shows Mem-; analyzer shows the FLR CfgWr (Device Control, Initiate FLR) from an unexpected requester or time.</dd>
+<dt>First check</dt><dd>Do BAR values in configuration space still match <code>/proc/iomem</code>?</dd>
+<dt>Second check</dt><dd>Who issued the reset (management software, the driver's own error recovery, a BMC path)?</dd>
+<dt>Disambiguating experiment</dt><dd>Repeat the action through the kernel's reset interface (which saves and restores configuration state) versus the external tool.</dd>
+<dt>Likely conclusion</dt><dd>Reset performed without save/restore of configuration space.</dd>
+<dt>Confidence</dt><dd>High once BAR values are seen to have changed.</dd>
+</dl>
+</section>
+
+<section id="interview">
+<h2>Interview</h2>
+<h3>Beginner</h3>
+<ol>
+<li><p>What does a BAR contain after enumeration?</p><details class="answer"><summary>Model answer</summary><p>The base address software assigned to the region in its upper bits, and read-only type bits in its low bits (memory/I/O, 32/64-bit, prefetchable). The size is not stored; it is implied by which low address bits are hard-wired to zero.</p></details></li>
+<li><p>Why is a register write cheaper for the CPU than a register read?</p><details class="answer"><summary>Model answer</summary><p>A write is posted: the CPU hands it off and continues. A read is non-posted: the core must wait for the completion to return across the link, about a microsecond.</p></details></li>
+<li><p>Which BAR holds the NVMe controller registers?</p><details class="answer"><summary>Model answer</summary><p>BAR0, combined with BAR1 as the upper half of a 64-bit address; registers start at offset 0, doorbells at 1000h.</p></details></li>
+<li><p>What does Memory Space Enable do?</p><details class="answer"><summary>Model answer</summary><p>Command register bit 1. When set, the function responds to memory requests that hit its BARs; when clear, it does not, and reads to its BARs complete with Unsupported Request.</p></details></li>
+<li><p>Where do you see the BAR address in Linux?</p><details class="answer"><summary>Model answer</summary><p><code>lspci -v</code> "Region 0", <code>/sys/bus/pci/devices/&lt;bdf&gt;/resource</code>, and <code>/proc/iomem</code>.</p></details></li>
+</ol>
+<h3>Intermediate</h3>
+<ol>
+<li><p>Why must an NVMe BAR0 be below 4 GiB on a typical system even though it is a 64-bit BAR?</p><details class="answer"><summary>Model answer</summary><p>It is non-prefetchable, and bridges forward non-prefetchable memory only through a window with 32-bit base and limit registers. Only the prefetchable window has upper-32-bit extensions.</p></details></li>
+<li><p>What TLP does a 32-bit store to BAR0 + 1008h produce, header size included?</p><details class="answer"><summary>Model answer</summary><p>A posted MWr with a 3-DW header (address below 4 GiB), Length 1, First DW BE 1111b, Last DW BE 0000b, Requester ID of the root complex, and one DWORD of data.</p></details></li>
+<li><p>Why does reading a register after writing one "flush" the write?</p><details class="answer"><summary>Model answer</summary><p>Ordering rules prevent a read request from passing a posted write on the same path, so the read reaches the device after the write; when its completion returns, the write has been delivered.</p></details></li>
+<li><p>What is the difference between a prefetchable BAR and a write-combining mapping?</p><details class="answer"><summary>Model answer</summary><p>Prefetchable is a device property declared in the BAR (no read side effects, merging allowed) that determines window placement and allows WC. WC is the CPU memory type the OS chooses for a mapping. A prefetchable BAR may still be mapped UC; a non-prefetchable one must not be mapped WC.</p></details></li>
+<li><p>Why is the IOMMU irrelevant to an MMIO doorbell write?</p><details class="answer"><summary>Model answer</summary><p>The IOMMU translates addresses in requests initiated by devices (DMA). A doorbell write is initiated by the CPU and addressed with a physical address that the root complex routes by its own decode; the IOMMU is not in that path.</p></details></li>
+</ol>
+<h3>Advanced</h3>
+<ol>
+<li><p>A driver reads the 64-bit CAP register as two 32-bit reads. What could go wrong and why is it acceptable for CAP?</p><details class="answer"><summary>Model answer</summary><p>Two reads are not atomic: if the register changed between them, the halves could be inconsistent. CAP is constant while the controller is operating, so tearing cannot occur. For a register whose value changes, the access rules and a re-read check would matter.</p></details></li>
+<li><p>What happens on the wire when a CPU touches a BAR of a function in D3hot?</p><details class="answer"><summary>Model answer</summary><p>The request reaches the device (the link and bridges are up) but the function does not decode memory in D3hot; a read completes with UR and the CPU receives all ones; a write is dropped. AER may log the UR at the device.</p></details></li>
+<li><p>Why should doorbells never be in a WC mapping?</p><details class="answer"><summary>Model answer</summary><p>WC stores can be delayed, merged with neighbouring stores into one multi-DWORD TLP, and reordered with respect to other stores. Doorbells must be delivered individually, promptly and in order after the SQE; merging two doorbells into one TLP relies on controller behaviour that may not be supported.</p></details></li>
+<li><p>How would you prove that a slow MMIO read is caused by the device rather than the link?</p><details class="answer"><summary>Model answer</summary><p>Put the analyzer at the device's link. If the MRd arrives promptly, the link is in L0 without Recovery or replay, and the completion leaves the device late, the latency is inside the completer. If the MRd arrives late, the delay is upstream; if the link was exiting L1, the delay is the exit latency.</p></details></li>
+<li><p>What is the consequence of No_Soft_Reset = 0 for a driver resuming from D3hot?</p><details class="answer"><summary>Model answer</summary><p>The transition to D0 may reset the function's internal state including configuration registers such as BARs and Command. Configuration space must be restored before MMIO, and the device re-initialised.</p></details></li>
+</ol>
+<h3>Senior</h3>
+<ol>
+<li><p>You are reviewing a new controller's BAR layout: registers and doorbells at BAR0 0h–1FFFh, MSI-X table at 1800h. What do you say?</p><details class="answer"><summary>Model answer</summary><p>The MSI-X table overlaps the doorbell area (doorbells start at 1000h; the table at 1800h collides with doorbells for higher queue numbers) and shares a 4 KiB page with hot-path registers. Hypervisors trap the MSI-X table page, so passthrough doorbell writes in that page would trap. Move the table and PBA to their own 4 KiB-aligned pages beyond the doorbell area sized for the maximum queue count and stride, or to a separate BAR.</p></details></li>
+<li><p>A customer's server fails to assign BARs for the 24th NVMe drive. Outline your investigation and the long-term fix.</p><details class="answer"><summary>Model answer</summary><p>Map the MMIO hole below 4 GiB and the windows of every switch port; compute per-port reservations (1 MiB granularity, alignment); confirm exhaustion. Short term: firmware setup for MMIO hole size and hot-plug padding. Long term: if the device can tolerate it, nothing in NVMe requires BAR0 to be non-prefetchable for a particular vendor's extra BARs (e.g. a CMB), and placing large apertures in prefetchable 64-bit BARs above 4 GiB relieves the hole; the register BAR stays small.</p></details></li>
+<li><p>How would you validate that a controller handles every legal access width to its registers?</p><details class="answer"><summary>Model answer</summary><p>Build a matrix: each register × access sizes (1, 2, 4, 8 bytes) × alignments × byte-enable patterns allowed by PCIe, cross-referenced with the NVMe register access rules. Use an exerciser or test driver to issue each, check read data and side effects against the spec-derived oracle, and record which combinations the spec leaves undefined so they are tested for robustness (no hang, no corruption) rather than for a specific result.</p></details></li>
+<li><p>Explain why "all ones" is a poor error signal and what a robust driver does.</p><details class="answer"><summary>Model answer</summary><p>It merges many root causes and is also a legal value for some registers. A robust driver checks it only on registers where all ones is impossible (CSTS has reserved bits), then confirms with configuration space reads (Vendor ID), AER/DPC state and the link status, before choosing between reset, removal and retry. It also bounds polling loops so a dead device costs milliseconds, not minutes.</p></details></li>
+<li><p>A team proposes putting submission queues in the CMB to cut latency. Which MMIO concerns do you raise?</p><details class="answer"><summary>Model answer</summary><p>SQE writes become CPU MMIO writes over the link instead of DRAM writes; they should be WC-mapped for efficiency, which needs a fence before the (UC) doorbell; host-side reads of the CMB are slow non-posted reads and must be avoided; the CMB BAR's prefetchable status and placement affect window budgets; and peer-to-peer users of the CMB need ACS/IOMMU configuration that allows routing. Measure: the latency win is the SQE fetch round trip saved, which must exceed the cost of posting 64 bytes over the link per command.</p></details></li>
+</ol>
+</section>
+
+<section id="quiz">
+<h2>Quiz</h2>
+<ol class="quiz">
+<li><p>A 64-bit non-prefetchable BAR on an endpoint behind a root port can be placed at:</p>
+<ul class="options" data-answer="2"><li>any 64-bit address</li><li>only below 4 GiB</li><li>only above 4 GiB</li><li>only in I/O space</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>The non-prefetchable bridge window is 32-bit only, so the BAR must be below 4 GiB to be reachable.</p></details></li>
+<li><p>An analyzer on the SSD's link sees no TLP when the driver reads CSTS. The most likely cause is:</p>
+<ul class="options" data-answer="3"><li>MSE cleared</li><li>Device in D3hot</li><li>The address is not inside a window that routes to this link</li><li>Completion timeout</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>MSE cleared and D3hot both let the TLP reach the device (which answers UR); a timeout still shows the MRd. Only routing (or a CPU-side mapping problem) prevents the TLP from appearing.</p></details></li>
+<li><p>Which memory type should a driver use for NVMe doorbells?</p>
+<ul class="options" data-answer="1"><li>Uncached</li><li>Write-combining</li><li>Write-back</li><li>Any; PCIe orders them</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>Uncached keeps each doorbell a separate, in-order, unmerged write.</p></details></li>
+<li><p>A 16-bit store to BAR0 + 1Ch produces:</p>
+<ul class="options" data-answer="3"><li>a 2-byte TLP</li><li>two 1-byte TLPs</li><li>a 1-DW MWr with two First DW BE bits set</li><li>a configuration write</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>TLP lengths are in DWORDs; byte enables mark the valid bytes.</p></details></li>
+<li><p>The IOMMU translates:</p>
+<ul class="options" data-answer="2"><li>CPU MMIO addresses to BAR offsets</li><li>addresses in device-initiated DMA requests</li><li>BAR sizes</li><li>configuration requests</li></ul>
+<details class="answer"><summary>Answer and reasoning</summary><p>It sits on the device→memory path.</p></details></li>
+<li><p>Why does the Linux NVMe hot path avoid MMIO reads?</p>
+<details class="answer"><summary>Model answer</summary><p>Each read stalls a CPU core for roughly a microsecond waiting for a completion; at millions of I/Os per second that cost is prohibitive. Doorbells are posted writes; completion detection uses the Phase Tag in host memory.</p></details></li>
+<li><p>Give three different root causes for a CSTS read returning 0xFFFFFFFF and one observation that separates each from the others.</p>
+<details class="answer"><summary>Model answer</summary><p>Link down: configuration reads also return all ones, LnkSta shows no link. Decode off or D3hot: configuration reads work; analyzer shows UR completion; Command Mem- or PMCSR D3. Not routed: configuration works, Mem+, D0, but no TLP on the device's link; BAR outside a bridge window.</p></details></li>
+<li><p>A trace shows MWr Len=2 at BAR0 + 1008h. What do you conclude about the host mapping, and what do you not yet know?</p>
+<details class="answer"><summary>Model answer</summary><p>Two 4-byte stores were merged (or an 8-byte store issued): the host likely used a WC mapping or a 64-bit store. You do not yet know whether the controller updated both doorbells; check the controller's subsequent behaviour (fetch from SQ1, and CQ1 head progress).</p></details></li>
+<li><p>True or false: clearing Memory Space Enable also clears the BAR's assigned address. Explain.</p>
+<details class="answer"><summary>Model answer</summary><p>False. MSE only gates decode; the BAR keeps its value. Resets (FLR, D3hot→D0 without No_Soft_Reset) are what clear BARs.</p></details></li>
+<li><p>Why should an MSI-X table not share a 4 KiB page with doorbells?</p>
+<details class="answer"><summary>Model answer</summary><p>Hypervisors intercept the MSI-X table at page granularity; doorbells in the same page would be trapped too, turning every I/O into a VM exit.</p></details></li>
+</ol>
+</section>
+
+<section id="teachback">
+<h2>Teach-back</h2>
+<ol>
+<li><p><strong>To a child:</strong> explain why flipping a switch on the hall wall is fast but reading a dial is slow, and what "all lights on" means.</p>
+<details class="answer"><summary>Model explanation</summary><p>"The switches on the wall are wired to machines far away in the basement. When you flip one, a message runs down the wire and you can walk away. When you want to read a dial, the dial isn't really on the wall: a helper runs down, looks at the real gauge, and runs back, and you have to wait. If the panel was taken off the wall, the helper comes back empty-handed and the wall just shows 'everything on' — that means 'nobody answered', not 'everything is fine'."</p></details></li>
+<li><p><strong>To a junior engineer:</strong> explain the path of a doorbell write from the driver's store instruction to the controller starting a fetch.</p>
+<details class="answer"><summary>Model explanation</summary><p>"BAR0 was assigned at 0xFE60_0000 during enumeration and the root port's window covers it. The driver mapped it uncached. After writing the SQE to host memory and issuing a write barrier, the driver stores the new tail to BAR0 + 1008h. The root complex sees the physical address belongs to root port 00:01.1, builds a posted MWr with a 3-DW header and one DWORD, and sends it. The SSD decodes it as SQ1's tail doorbell, notices new entries, and issues an MRd DMA to fetch the SQE. The only proof the write hit the right register is that fetch."</p></details></li>
+<li><p><strong>To a senior engineer:</strong> argue which evidence you need before blaming the device for an all-ones read.</p>
+<details class="answer"><summary>Model explanation</summary><p>"All-ones is synthesised by the root complex, so it is evidence of a failed read, not of a device fault. I need: configuration-space reachability (Vendor ID) to separate link loss; Command.MSE and PMCSR to separate decode and power state; the BAR versus every window to separate routing; and the analyzer or AER classification of the response — no TLP, UR, CA or timeout. Only a timeout or CA with link up, decode on, D0 and correct routing points at the device's internals, and even then I want the device's own logs or a reproduction before calling it a controller defect."</p></details></li>
+</ol>
+</section>
+
+<section id="mastery">
+<h2>Mastery gate</h2>
+<aside class="callout mastery">
+<p>Do not consider this module mastered until you can:</p>
+<ul class="checklist">
+<li>explain BARs and MMIO across CPU, root complex, fabric and device domains, including memory types and posted versus non-posted cost;</li>
+<li>draw the address path for a doorbell write and a CSTS read with every window and decision point;</li>
+<li>identify MMIO in a trace (requester, address range, length, byte enables) and spot merged writes, split reads, unanswered reads and UR completions;</li>
+<li>debug an all-ones read into one of its five causes with read-only checks and one analyzer experiment;</li>
+<li>distinguish MMIO from DMA (<a href="ch20.html">Chapter 20</a>), from configuration access through ECAM (<a href="ch18.html">Chapter 18</a>), from the NVMe register semantics behind the BAR (<a href="ch24.html">Chapter 24</a>), and from TLP ordering in general (<a href="dd10.html">Module 10</a>);</li>
+<li>cite the PCI Express Base Specification (configuration headers, Transaction Layer, power management), the NVMe over PCIe Transport Specification 1.4 (BAR usage) and the NVMe Base Specification 2.4 (Controller Registers) for each claim you make.</li>
+</ul>
+</aside>
+<p>Next: <a href="dd07.html">Module 07 — PCIe Physical Layer</a>.</p>
+</section>

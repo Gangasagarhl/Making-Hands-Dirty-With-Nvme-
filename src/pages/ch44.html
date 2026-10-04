@@ -1,0 +1,723 @@
+<p class="lead">An NVMe command can fail in many ways while the PCIe link underneath stays perfectly healthy. This chapter teaches the NVMe error model: the Status Field in every completion, its status code types and the codes you will meet most, the Do Not Retry and More bits, the Error Information log, Asynchronous Event Requests, aborts, and the controller's last word — Controller Fatal Status.</p>
+
+<section id="why">
+  <h2>Why this chapter exists</h2>
+  <p>So far, every command in this course has completed with status zero. Real systems are not so kind. A READ hits an unreadable block, a driver sends a field the controller does not support, firmware hits an assertion, the host asks for LBA 2 billion on a 1 TB namespace. Each of these is reported in an NVMe-defined way that is completely independent of PCIe. A PCIe analyzer will show those failures as perfectly successful TLPs: the controller DMA-wrote a completion entry; the link did its job. The failure is <em>inside</em> the 16 bytes.</p>
+  <p>Separating "NVMe said no" from "PCIe could not deliver" is the most important layering skill in this part of the course. This chapter covers the NVMe side; <a href="ch45.html">Chapter 45</a> covers PCIe; <a href="ch47.html">Chapter 47</a> correlates them.</p>
+  <h3>Learning objectives</h3>
+  <ul>
+    <li>Decode the Status Field of a Completion Queue Entry (CQE): Status Code (SC), Status Code Type (SCT), Command Retry Delay (CRD), More (M) and Do Not Retry (DNR).</li>
+    <li>Name the status code types (Generic, Command Specific, Media and Data Integrity, Path Related, Vendor Specific) and classify a failure into the right one.</li>
+    <li>Recognise the common generic codes: successful completion, invalid opcode, invalid field, command ID conflict, data transfer error, internal error, abort requested, invalid namespace or format, LBA out of range — and the media codes such as unrecovered read error.</li>
+    <li>Explain command aborts (the Abort command, SQ deletion, and what the aborted command's CQE looks like).</li>
+    <li>Use the Error Information log page and Asynchronous Event Requests to get context the CQE cannot carry.</li>
+    <li>Recognise controller fatal state (CSTS.CFS) and distinguish it from a device that has vanished from the bus (all-ones reads).</li>
+    <li>Read NVMe errors in Linux kernel logs and with nvme-cli, and reason about retry behaviour.</li>
+  </ul>
+  <h3>Prerequisites</h3>
+  <aside class="callout prereq"><p>You need the CQE format from <a href="ch25.html">Queue Architecture</a> and <a href="ch29.html">NVMe Command Structure</a>, the admin commands from <a href="ch30.html">Admin Commands</a> (Get Log Page 02h, Identify 06h), the I/O commands from <a href="ch31.html">NVM Command Set</a>, <a href="ch32.html">READ</a> and <a href="ch33.html">WRITE</a>, and the controller registers from <a href="ch24.html">NVMe Registers</a> (CSTS at 1Ch).</p></aside>
+</section>
+
+<section id="story">
+  <h2>The story</h2>
+  <aside class="callout kid">
+    <p>Back to the library. Every request slip comes back with an answer slip. Most say "Here's your book." But some say:</p>
+    <ul>
+      <li>"I don't understand what you wrote" — you asked for something the library does not do.</li>
+      <li>"You asked for shelf 900 but the library only has 500 shelves."</li>
+      <li>"The book is there, but the pages are smudged and I can't read them."</li>
+      <li>"You told me to stop looking, so I stopped."</li>
+      <li>"Don't bother asking again — it won't work next time either." (a little red stamp on the slip)</li>
+      <li>"There's more to this story in the big notebook at the front desk." (a blue stamp)</li>
+    </ul>
+    <p>And once in a while the librarian faints. She doesn't answer slips at all, but she has a sign on her desk that flips from "OK" to "I need help". Someone must wake her up and start again.</p>
+  </aside>
+  <aside class="callout analogy">
+    <p>Think of a postal parcel service. Each parcel comes back with a delivery receipt carrying a reason code from a small set of families: "address problem", "this kind of parcel has its own rules", "parcel damaged", "route problem", "carrier-specific". A "do not resend" box can be ticked. A "see incident report" box points you to the depot's incident log. And if the depot itself catches fire, receipts stop and a status light on the depot turns red.</p>
+  </aside>
+  <aside class="callout breaks">
+    <p><strong>Hides:</strong> the receipt is written into <em>your</em> memory by the depot over PCIe; it is not a separate channel, so a receipt can only report what the controller knows. If PCIe itself fails, no receipt arrives at all. <strong>Misleads:</strong> "do not resend" (DNR) is a hint about the same command on the same controller, not a statement that the data is lost forever: a different path in a multipath setup, or a retry after a reset, may still succeed. And the incident log has limited pages: old entries are overwritten, so you must read it promptly.</p>
+  </aside>
+</section>
+
+<section id="beginner">
+  <h2>Beginner explanation</h2>
+  <p>Every NVMe command gets exactly one completion entry (16 bytes) in a completion queue. Inside it, a 15-bit <span class="g" data-term="nvme-status-field">Status Field</span> says how the command ended. Zero means success. Anything else is an error, described by two numbers:</p>
+  <ul>
+    <li>The <span class="g" data-term="sct">Status Code Type (SCT)</span> — which family of error (3 bits).</li>
+    <li>The <strong>Status Code (SC)</strong> — which specific error in that family (8 bits).</li>
+  </ul>
+  <p>Two single-bit flags travel with them: <span class="g" data-term="dnr">Do Not Retry (DNR)</span> and <strong>More (M)</strong>. DNR=1 means "retrying the same command is expected to fail again". M=1 means "more information is in the Error Information log page".</p>
+  <table>
+    <caption>Status Code Types</caption>
+    <thead><tr><th>SCT</th><th>Name</th><th>Typical meaning</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>0h</td><td>Generic Command Status</td><td>Errors that can apply to many commands</td><td>Invalid opcode, invalid field, LBA out of range</td></tr>
+      <tr><td>1h</td><td>Command Specific Status</td><td>Meaning depends on which command failed</td><td>Create I/O CQ: Invalid Queue Size</td></tr>
+      <tr><td>2h</td><td>Media and Data Integrity Errors</td><td>Problems with stored data or its protection</td><td>Unrecovered Read Error, Write Fault</td></tr>
+      <tr><td>3h</td><td>Path Related Status</td><td>Problems with the path between host and namespace (multipath, ANA)</td><td>Asymmetric Access Inaccessible</td></tr>
+      <tr><td>4h–6h</td><td>Reserved</td><td>—</td><td>—</td></tr>
+      <tr><td>7h</td><td>Vendor Specific</td><td>Defined by the device maker</td><td>Anything; needs vendor documentation</td></tr>
+    </tbody>
+  </table>
+  <p>The error is NVMe's own report. It does not mean PCIe failed. In fact, you only see an NVMe status because PCIe successfully delivered the completion.</p>
+</section>
+
+<section id="engineering">
+  <h2>Engineering explanation</h2>
+
+  <h3>The Status Field in the CQE</h3>
+  <p>The CQE's Dword 3 holds the Command Identifier (CID), the Phase Tag (P) and the Status Field:</p>
+  <table class="packet">
+    <thead><tr><th class="row-label">CQE DW3</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody>
+      <tr><td class="row-label">bits</td><td colspan="1" class="hl">DNR</td><td colspan="1" class="hl">M</td><td colspan="2">CRD</td><td colspan="3" class="hl">SCT</td><td colspan="8" class="hl">SC</td><td colspan="1">P</td><td colspan="16">Command Identifier (CID)</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <caption>Status Field sub-fields (CQE Dword 3)</caption>
+    <thead><tr><th>Field</th><th>DW3 bits</th><th>Status Field bits</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>Status Code (SC)</td><td>24:17</td><td>7:0</td><td>Specific error within the type</td></tr>
+      <tr><td>Status Code Type (SCT)</td><td>27:25</td><td>10:8</td><td>Family of the error</td></tr>
+      <tr><td>Command Retry Delay (CRD)</td><td>29:28</td><td>12:11</td><td>Selects one of three retry delay times reported in Identify Controller (CRDT1–CRDT3); 0 = no delay</td></tr>
+      <tr><td>More (M)</td><td>30</td><td>13</td><td>More status information is available in the Error Information log page</td></tr>
+      <tr><td>Do Not Retry (DNR)</td><td>31</td><td>14</td><td>If the same command is resubmitted it is expected to fail</td></tr>
+    </tbody>
+  </table>
+  <p>The other CQE Dwords still matter in an error: <strong>DW2</strong> carries the SQ Identifier and SQ Head Pointer (so you know which queue the failed command came from and that the controller consumed it), and <strong>DW0</strong> (sometimes DW1) carries command-specific result information.</p>
+  <aside class="callout insight" data-title="Linux packs status differently"><p>The Linux NVMe driver stores status as a 16-bit value with the Phase Tag shifted out: <code>(SCT &lt;&lt; 8) | SC</code>, plus CRD in bits 12:11, More = 0x2000, DNR = 0x4000. So an Unrecovered Read Error (SCT 2h, SC 81h) appears as 0x281 in driver code, and with DNR as 0x4281. Do not confuse that packing with the raw CQE DW3 value, which is shifted left by 17 bits relative to the SC.</p></aside>
+
+  <h3>Generic Command Status (SCT 0h)</h3>
+  <p>Values 00h–7Fh are generic for all commands; 80h–BFh are reserved for I/O-command-set-specific meanings (the NVM Command Set defines several). The codes below are the ones you will meet most. Those marked <span class="badge uncertain">Uncertain</span> are given by name with a value you should confirm against the Generic Command Status table of your target revision.</p>
+  <table>
+    <caption>Common Generic Command Status values</caption>
+    <thead><tr><th>SC</th><th>Name</th><th>What it usually means in practice</th><th>Typical DNR</th></tr></thead>
+    <tbody>
+      <tr><td>00h</td><td>Successful Completion</td><td>The command did what was asked</td><td>0</td></tr>
+      <tr><td>01h</td><td>Invalid Command Opcode</td><td>Opcode not supported for this queue/command set (e.g. an I/O opcode on the admin queue, or an optional command not implemented)</td><td>1</td></tr>
+      <tr><td>02h</td><td>Invalid Field in Command</td><td>A field value is invalid or unsupported: reserved bits set, unsupported Feature ID, bad CNS in Identify, unsupported flag</td><td>1</td></tr>
+      <tr><td>03h</td><td>Command ID Conflict</td><td>The CID is already in use by an outstanding command in that SQ</td><td>usually 1</td></tr>
+      <tr><td>04h</td><td>Data Transfer Error</td><td>Transferring data or metadata between host and controller failed — often the NVMe-visible consequence of a PCIe-level problem (e.g. a completion with error for the controller's read of host memory)</td><td>varies</td></tr>
+      <tr><td>05h</td><td>Commands Aborted due to Power Loss Notification</td><td>Controller is shutting down because of a power-loss notification</td><td>varies</td></tr>
+      <tr><td>06h</td><td>Internal Error</td><td>Controller-internal failure while processing the command</td><td>varies</td></tr>
+      <tr><td>07h</td><td>Command Abort Requested</td><td>The command was aborted because of an Abort command</td><td>varies</td></tr>
+      <tr><td>08h</td><td>Command Aborted due to SQ Deletion</td><td>The submission queue holding the command was deleted</td><td>varies</td></tr>
+      <tr><td>09h / 0Ah</td><td>Aborted due to Failed / Missing Fused Command</td><td>Fused (Compare-and-Write) pair problems</td><td>varies</td></tr>
+      <tr><td>0Bh</td><td>Invalid Namespace or Format</td><td>NSID not valid/active for this command, or namespace format incompatible</td><td>1</td></tr>
+      <tr><td>0Ch</td><td>Command Sequence Error</td><td>Command not allowed in the current sequence (e.g. state-dependent)</td><td>varies</td></tr>
+      <tr><td>13h <span class="badge uncertain">Uncertain</span></td><td>PRP Offset Invalid</td><td>A PRP entry has an offset that violates PRP rules (see <a href="ch36.html">PRP</a>)</td><td>1</td></tr>
+      <tr><td>by name</td><td>Invalid SGL Segment Descriptor; Invalid Number of SGL Descriptors; Data SGL Length Invalid; SGL Descriptor Type Invalid</td><td>SGL construction problems (see <a href="ch37.html">SGL</a>) — confirm the values in the specification</td><td>1</td></tr>
+      <tr><td>by name</td><td>Namespace is Write Protected; Command Interrupted; Transient Transport Error</td><td>Write-protect state; retryable interruptions; transport hiccups (fabrics) — confirm values</td><td>varies</td></tr>
+    </tbody>
+  </table>
+  <p>Values in the I/O-command-set-specific part of the generic range (80h and up). <span class="badge uncertain">Uncertain</span> Which of these the Base specification lists itself and which the NVM Command Set specification lists has moved between revisions; confirm in Base 2.4 and NVM Command Set 1.3.</p>
+  <table>
+    <caption>Generic type (SCT 0h) values 80h and up used by the NVM Command Set</caption>
+    <thead><tr><th>SC</th><th>Name</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>80h</td><td>LBA Out of Range</td><td>SLBA + NLB exceeds the namespace size</td></tr>
+      <tr><td>81h</td><td>Capacity Exceeded</td><td>The command would exceed the namespace capacity (thin provisioning)</td></tr>
+      <tr><td>82h</td><td>Namespace Not Ready</td><td>Namespace temporarily not able to process (e.g. becoming ready); DNR tells you whether it is worth waiting</td></tr>
+      <tr><td>83h</td><td>Reservation Conflict</td><td>Access blocked by a namespace reservation held by another host</td></tr>
+      <tr><td>84h</td><td>Format In Progress</td><td>A Format NVM is running on the namespace</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Command Specific Status (SCT 1h)</h3>
+  <p>The same SC value means different things for different commands. A few that matter for queues and interrupts (confirm values in the Command Specific Status table and each command's description):</p>
+  <table>
+    <caption>Selected Command Specific Status values</caption>
+    <thead><tr><th>SC</th><th>Name</th><th>Returned by</th></tr></thead>
+    <tbody>
+      <tr><td>00h</td><td>Completion Queue Invalid</td><td>Create I/O SQ (CQID does not exist)</td></tr>
+      <tr><td>01h</td><td>Invalid Queue Identifier</td><td>Create/Delete queue commands</td></tr>
+      <tr><td>02h</td><td>Invalid Queue Size</td><td>Create queue commands (QSIZE beyond CAP.MQES or zero)</td></tr>
+      <tr><td>03h</td><td>Abort Command Limit Exceeded</td><td>Abort (more outstanding aborts than Identify Controller ACL allows)</td></tr>
+      <tr><td>05h</td><td>Asynchronous Event Request Limit Exceeded</td><td>Asynchronous Event Request (more than AERL outstanding)</td></tr>
+      <tr><td>08h <span class="badge uncertain">Uncertain</span></td><td>Invalid Interrupt Vector</td><td>Create I/O CQ (IV not valid) — see <a href="ch43.html">MSI-X</a></td></tr>
+      <tr><td>09h <span class="badge uncertain">Uncertain</span></td><td>Invalid Log Page</td><td>Get Log Page (unsupported LID)</td></tr>
+      <tr><td>by name</td><td>Invalid Firmware Slot; Invalid Firmware Image; Firmware Activation Requires Conventional Reset</td><td>Firmware Commit / Image Download</td></tr>
+      <tr><td>80h–BFh</td><td>I/O command set specific (NVM: Conflicting Attributes, Invalid Protection Information, Attempted Write to Read Only Range)</td><td>NVM I/O commands — confirm values</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Media and Data Integrity Errors (SCT 2h)</h3>
+  <table>
+    <caption>Media and Data Integrity Errors</caption>
+    <thead><tr><th>SC</th><th>Name</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>80h</td><td>Write Fault</td><td>The write could not be completed to media</td></tr>
+      <tr><td>81h</td><td>Unrecovered Read Error</td><td>Data could not be read even after the controller's error-correction and retry efforts</td></tr>
+      <tr><td>82h</td><td>End-to-end Guard Check Error</td><td>Protection Information guard (CRC) mismatch</td></tr>
+      <tr><td>83h</td><td>End-to-end Application Tag Check Error</td><td>PI application tag mismatch</td></tr>
+      <tr><td>84h</td><td>End-to-end Reference Tag Check Error</td><td>PI reference tag mismatch (often the wrong LBA was returned or written)</td></tr>
+      <tr><td>85h</td><td>Compare Failure</td><td>Compare command found different data (not a fault — a result)</td></tr>
+      <tr><td>86h</td><td>Access Denied</td><td>Access to the namespace/LBA denied (e.g. security state)</td></tr>
+      <tr><td>87h</td><td>Deallocated or Unwritten Logical Block</td><td>Read of a deallocated block when the namespace is configured to report it as an error</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout warn"><p>"Media error" does not prove the NAND is bad. An Unrecovered Read Error could be genuine media wear, a firmware mapping bug, a power-loss corruption, or a read of an LBA that was never correctly written. End-to-end Reference Tag errors in particular often indicate the controller returned the wrong block, not a damaged one.</p></aside>
+
+  <h3>Path Related Status (SCT 3h)</h3>
+  <p>Used with multipath and Asymmetric Namespace Access (ANA): Internal Path Error (00h), Asymmetric Access Persistent Loss (01h), Asymmetric Access Inaccessible (02h), Asymmetric Access Transition (03h), and controller- and host-pathing errors in higher values (confirm). The key property is that these say "try another path", which is why Linux native multipath treats them differently from other errors (failover rather than fail).</p>
+
+  <h3>DNR, More and CRD in practice</h3>
+  <ul>
+    <li><strong>DNR=0</strong>: the controller does not rule out success on retry. Linux retries such commands up to <code>nvme_core.max_retries</code> times (default 5), honouring CRD delays when the host has enabled Advanced Command Retry Enable through the Host Behavior Support feature.</li>
+    <li><strong>DNR=1</strong>: fail immediately; retrying wastes time. An invalid field will be invalid next time too.</li>
+    <li><strong>M=1</strong>: read the Error Information log page now — entries are a ring and can be overwritten.</li>
+    <li><strong>CRD≠0</strong>: wait the selected delay (CRDT1/2/3 from Identify Controller, in units of 100 ms) before retrying.</li>
+  </ul>
+  <aside class="callout version"><p>CRD and the Advanced Command Retry mechanism were added in NVMe 1.4. Older controllers always return CRD=0. Kernel retry policy (max retries, multipath failover rules, verbose error strings) is kernel-version-dependent.</p></aside>
+
+  <h3>Command ID conflicts</h3>
+  <p>The CID, together with the SQ Identifier, uniquely identifies an outstanding command. The host must not reuse a CID in the same SQ until the previous command with that CID has completed. If it does, the controller may return Command ID Conflict (03h). Controllers are not required to detect every conflict, and a conflict the controller misses can corrupt the host's bookkeeping (two completions with the same CID, or a completion matched to the wrong request). Linux mitigates this by encoding a generation counter in the upper CID bits so it can detect completions for stale requests and log them.</p>
+
+  <h3>Namespace errors</h3>
+  <p>Namespace errors come in two flavours: <em>addressing</em> (Invalid Namespace or Format 0Bh — the NSID is invalid, inactive or not attached; LBA Out of Range 80h — the address is beyond NSZE) and <em>state</em> (Namespace Not Ready 82h, Format In Progress 84h, Reservation Conflict 83h, Namespace is Write Protected). Addressing errors are almost always host bugs or stale host state (for example after a namespace was deleted and recreated with a smaller size). State errors are often transient and DNR tells you whether to wait.</p>
+
+  <h3>Aborts</h3>
+  <p>A command can end with an "aborted" status for several reasons:</p>
+  <ul>
+    <li><strong>Abort command</strong> (admin opcode 08h): the host names a command by SQ Identifier and CID. The controller makes a best effort; the Abort command's own completion (Dword 0, bit 0) says whether the target was aborted. If it was, the target completes with Command Abort Requested (07h). If not, the target eventually completes normally. Identify Controller's Abort Command Limit (ACL, 0's based) bounds concurrent aborts.</li>
+    <li><strong>SQ deletion</strong>: deleting a submission queue aborts commands still in it (08h).</li>
+    <li><strong>Reset</strong>: a Controller Level Reset (CC.EN 1→0) aborts every outstanding command <em>without</em> posting completions — the host must treat them as failed and resubmit. This is the important asymmetry: aborts post a CQE, resets do not.</li>
+    <li><strong>Power loss</strong>: 05h when a power-loss notification forces a shutdown.</li>
+  </ul>
+  <aside class="callout derived"><p>In Linux, the timeout handler historically sent an Abort first and escalated to a controller reset if the abort itself timed out. Current kernels often go straight to reset for I/O timeouts on PCIe, and some devices handle Abort poorly. Always look at which path your kernel took (see <a href="ch48.html">NVMe Reset</a>).</p></aside>
+
+  <h3>The Error Information log page</h3>
+  <p>The CQE has 15 bits of status. The <span class="g" data-term="error-information-log">Error Information log page</span> (Log Identifier 01h, read with Get Log Page) adds context. It is a ring of 64-byte entries; Identify Controller's Error Log Page Entries (ELPE, 0's based) says how many the controller keeps. Each entry contains, by name:</p>
+  <ul>
+    <li><strong>Error Count</strong> — a 64-bit, monotonically increasing identifier; 0 marks an empty entry. A gap in counts between reads means entries were lost (overwritten).</li>
+    <li><strong>Submission Queue ID</strong> and <strong>Command ID</strong> — which command (FFFFh when not tied to a command).</li>
+    <li><strong>Status Field</strong> — the status that was (or would have been) posted.</li>
+    <li><strong>Parameter Error Location</strong> — which byte and bit of the command caused the error, for invalid-field style errors. Extremely useful for driver developers.</li>
+    <li><strong>LBA</strong> and <strong>Namespace</strong> — first LBA that experienced the error and the NSID.</li>
+    <li><strong>Vendor Specific Information Available</strong> — points to a vendor log page with more detail.</li>
+    <li><strong>Transport Type</strong> and <strong>Transport Type Specific Information</strong>; <strong>Command Specific Information</strong>.</li>
+  </ul>
+  <aside class="callout notsaid"><p>The specification does not require a log entry for every failed command, and how many entries survive a controller reset or power cycle is implementation-dependent. Read the byte offsets of the entry fields from the Error Information log page table in the NVMe Base Specification rather than from memory.</p></aside>
+
+  <h3>Asynchronous Event Requests</h3>
+  <p>Some errors are not tied to any command: a doorbell write to a non-existent queue, a persistent internal error, a temperature threshold crossed. NVMe reports these through <span class="g" data-term="async-event-request">Asynchronous Event Requests</span> (admin opcode 0Ch). The host keeps one or more AER commands outstanding (up to Identify Controller's AERL + 1). They have no timeout. When an event occurs, the controller completes one with Dword 0 describing it:</p>
+  <table class="packet">
+    <thead><tr><th class="row-label">AER CQE DW0</th><th colspan="8">31…24</th><th colspan="8">23…16</th><th colspan="8">15…8</th><th colspan="8">7…0</th></tr></thead>
+    <tbody><tr><td class="row-label">fields</td><td colspan="8" class="rsvd">Reserved</td><td colspan="8" class="hl">Log Page Identifier</td><td colspan="8" class="hl">Asynchronous Event Information</td><td colspan="5" class="rsvd">Rsvd</td><td colspan="3" class="hl">Type</td></tr></tbody>
+  </table>
+  <table>
+    <caption>Asynchronous Event Types</caption>
+    <thead><tr><th>Type</th><th>Name</th><th>Examples of event information</th></tr></thead>
+    <tbody>
+      <tr><td>0h</td><td>Error status</td><td>Write to Invalid Doorbell Register, Invalid Doorbell Write Value, Diagnostic Failure, Persistent Internal Error, Transient Internal Error, Firmware Image Load Error (confirm values)</td></tr>
+      <tr><td>1h</td><td>SMART / Health status</td><td>Reliability degraded, temperature threshold, spare below threshold</td></tr>
+      <tr><td>2h</td><td>Notice</td><td>Namespace attribute changed, firmware activation starting, telemetry log changed, ANA change</td></tr>
+      <tr><td>6h</td><td>I/O Command Set specific status</td><td>Reservation log page available, sanitize operation completed</td></tr>
+      <tr><td>7h</td><td>Vendor specific</td><td>Vendor-defined</td></tr>
+    </tbody>
+  </table>
+  <p>After an event of a given type is reported, further events of that type are masked until the host reads the indicated log page (with the Retain Asynchronous Event bit cleared). Which notices are enabled is configured with the Asynchronous Event Configuration feature (Feature Identifier 0Bh).</p>
+  <aside class="callout warn" data-title="Two different 'AER's"><p>In NVMe, AER means <em>Asynchronous Event Request</em>. In PCIe, AER means <em>Advanced Error Reporting</em> (<a href="ch46.html">Chapter 46</a>). They are unrelated mechanisms at different layers. Always expand the acronym in bug reports.</p></aside>
+
+  <h3>Internal errors and controller fatal state</h3>
+  <p>An internal error can be scoped to one command (Internal Error 06h in that command's CQE), to the controller but recoverable (Transient Internal Error asynchronous event), or terminal. The terminal case is <span class="g" data-term="csts-cfs">Controller Fatal Status (CSTS.CFS)</span>: bit 1 of the Controller Status register at offset 1Ch. When the controller sets CFS it is telling the host "I can no longer process commands; reset me". Outstanding commands will not complete. The host must perform a reset (Controller Level Reset via CC.EN, or an NVM Subsystem Reset, or a PCIe-level reset) and reinitialise.</p>
+  <table>
+    <caption>Reading CSTS during an error</caption>
+    <thead><tr><th>CSTS value read</th><th>Interpretation</th><th>Layer</th></tr></thead>
+    <tbody>
+      <tr><td>0x0000_0001</td><td>RDY=1, CFS=0: controller claims to be healthy</td><td>NVMe OK; look elsewhere (interrupts, host)</td></tr>
+      <tr><td>0x0000_0003</td><td>RDY=1, CFS=1: controller fatal</td><td>NVMe controller (firmware/hardware)</td></tr>
+      <tr><td>0x0000_0000</td><td>RDY=0: controller disabled or not yet ready</td><td>NVMe state (reset in progress?)</td></tr>
+      <tr><td>0xFFFF_FFFF</td><td>All ones: not a valid CSTS. The read was likely answered by the root complex on behalf of a device that did not respond (link down, device removed, or Unsupported Request/Completion timeout)</td><td><strong>PCIe</strong>, not NVMe</td></tr>
+    </tbody>
+  </table>
+  <aside class="callout insight" data-title="The all-ones rule"><p>A register value of all ones from an MMIO read almost always means the read never reached a functioning device. Many platforms synthesise all-ones data when a non-posted read fails. Linux prints CSTS together with the PCI Status register in its "controller is down" message precisely so you can tell CFS (NVMe) from all-ones (PCIe).</p></aside>
+
+  <h3>The central concept on the ladder</h3>
+  <div class="ladder">
+    <div class="rung" data-rung="A"><p>Every request slip comes back with an answer slip; the answer can say "no", and why, and whether asking again could help.</p></div>
+    <div class="rung" data-rung="B"><p>Each command completes with a CQE whose Status Field gives a type (SCT), a code (SC), and DNR/More/CRD hints.</p></div>
+    <div class="rung" data-rung="C"><p>The controller's command processor or media back-end detects the error, the completion engine writes the CQE with non-zero status into the host CQ, optionally logs an Error Information entry in controller memory, and raises the interrupt as usual.</p></div>
+    <div class="rung" data-rung="D"><p>NVMe Base Specification: Completion Queue Entry, Status Field definition, Status Code Type values, Generic/Command Specific/Media/Path status tables; Error Information log page; Asynchronous Event Request; Controller Status register. NVM Command Set: NVM-specific status values.</p></div>
+    <div class="rung" data-rung="E"><p>On the link, an error completion is a perfectly normal Device→Host MWr of 16 bytes plus the usual MSI-X write. No PCIe error is involved.</p></div>
+    <div class="rung" data-rung="F"><p>The analyzer's NVMe decoder shows the CQE with Status ≠ 0; a raw TLP view shows only data bytes where DW3 bits 31:17 are non-zero. You must decode the payload to see the error.</p></div>
+    <div class="rung" data-rung="G"><p>Classify: SCT 0/1 with DNR → host sent something wrong (driver/application). SCT 2 → media/data path (controller/firmware/NAND). Generic 04h → look below at PCIe. No CQE at all → not an NVMe status problem: timeout, CFS, or PCIe.</p></div>
+  </div>
+
+  <h3>The 16 questions for the CQE Status Field</h3>
+  <table>
+    <caption>Sixteen questions about the Status Field</caption>
+    <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>What is it?</td><td>15 bits in CQE DW3 (31:17) reporting how a command ended.</td></tr>
+      <tr><td>Why was it created?</td><td>So every command has an unambiguous, structured result with retry guidance.</td></tr>
+      <tr><td>What problem does it solve?</td><td>Lets software distinguish host mistakes, transient conditions, media failures and path issues without vendor tools.</td></tr>
+      <tr><td>What existed before it?</td><td>SCSI sense data (sense key, ASC/ASCQ) and ATA error/status registers.</td></tr>
+      <tr><td>Why is the current design better?</td><td>Compact, in the completion itself, typed by family, explicit DNR, with richer detail deferred to logs.</td></tr>
+      <tr><td>Who creates it?</td><td>The controller.</td></tr>
+      <tr><td>Who consumes it?</td><td>The host driver, which maps it to a block-layer error and retry decision.</td></tr>
+      <tr><td>Where does it live?</td><td>In host memory, in the CQ entry; duplicated in the Error Information log if logged.</td></tr>
+      <tr><td>What memory/registers are involved?</td><td>CQ memory, Error Information log, Identify Controller (ELPE, ACL, AERL, CRDTn), CSTS.</td></tr>
+      <tr><td>What happens before it?</td><td>The controller fetches, validates and attempts to execute the command.</td></tr>
+      <tr><td>What happens after it?</td><td>Interrupt, host handler decodes status, retries or fails the request, may read the log.</td></tr>
+      <tr><td>What happens if it is wrong?</td><td>Wrong code → wrong recovery (retrying a hopeless command, failing a retryable one); success reported for a failed write → silent data corruption.</td></tr>
+      <tr><td>What does the protocol analyzer show?</td><td>A normal MWr of the CQE with non-zero status bits; NVMe-aware decoders name the status.</td></tr>
+      <tr><td>What does Linux show?</td><td>Kernel messages naming the command, LBA, SCT/SC and DNR/MORE; block-layer I/O error lines; nvme-cli error-log.</td></tr>
+      <tr><td>What would a validation engineer test?</td><td>That each invalid input produces the specified status, DNR correctness, Error Information log consistency, abort semantics, AER delivery, CFS handling.</td></tr>
+      <tr><td>What would a senior engineer suspect when it fails?</td><td>Whether the error is the cause or a symptom (Data Transfer Error hiding a PCIe fault); stale host state; firmware returning generic codes for specific problems.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="hardware">
+  <h2>Hardware view</h2>
+  <p>Errors are detected in different blocks of the controller, and where an error is detected determines what status it can produce:</p>
+  <figure>
+<pre class="diagram">
+ Host memory ◄──── PCIe ────► ┌──────────────────────── NVMe controller ────────────────────────┐
+  SQ / CQ / data              │ front end: doorbells, SQE fetch ──► command parser / validator   │
+                              │       │ invalid opcode/field/NSID/LBA range → SCT 0h / 1h        │
+                              │       ▼                                                          │
+                              │ DMA engine (PRP/SGL walk, data movement)                         │
+                              │       │ PCIe completion error / poisoned data → Data Transfer 04h │
+                              │       ▼                                                          │
+                              │ FTL / mapping ──► media back end (NAND, ECC, RAID-like parity)    │
+                              │       │ ECC failure → SCT 2h 81h; program fail → 80h; PI → 82–84h │
+                              │       ▼                                                          │
+                              │ completion engine: CQE status, Error Information log, AER events │
+                              │ health monitor / firmware watchdog ── fatal → CSTS.CFS = 1       │
+                              └──────────────────────────────────────────────────────────────────┘
+</pre>
+    <figcaption>Conceptual: which controller block typically produces which kind of NVMe status. Real partitioning is implementation-dependent.</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Validation errors</strong> are found before any data moves; the CQE comes back quickly (microseconds).</li>
+    <li><strong>Data transfer errors</strong> appear when the controller's own PCIe requests fail — for example, its Memory Read of a host data buffer returns a Completion with Unsupported Request status because the address is not mapped in the IOMMU. The controller cannot report a PCIe error to the host's NVMe driver directly, so it maps the failure to an NVMe status (often 04h). The PCIe side may also log an AER error at the device or root port.</li>
+    <li><strong>Media errors</strong> come back after the media latency (tens of microseconds to many milliseconds, since the controller retries reads internally with different thresholds before giving up).</li>
+    <li><strong>Fatal state</strong> is usually set by firmware when an internal consistency check or watchdog fails; the controller may stop responding to doorbells while still answering MMIO reads.</li>
+  </ul>
+  <aside class="callout impl"><p>Which conditions a controller detects, how long it retries a weak read before returning 81h, which internal errors it logs, and what vendor-specific detail it keeps are all implementation-dependent.</p></aside>
+</section>
+
+<section id="spec">
+  <h2>Specification view</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Completion Queue Entry; Status Field; Generic Command Status; Command Specific Status; Media and Data Integrity Errors; Path Related Status; Error Information log page; Asynchronous Event Request command; Abort command; Controller Status register</cite></li>
+    <li><cite class="spec">NVM Command Set Specification, Revision 1.3 — status values for NVM commands (LBA Out of Range, Capacity Exceeded, Namespace Not Ready, Reservation Conflict, protection-information errors)</cite></li>
+    <li><cite class="spec">NVMe over PCIe Transport Specification, Revision 1.4</cite> — how PCIe-level failures may surface to NVMe (transport-specific details).</li>
+  </ul>
+  <aside class="callout verified"><p>The Status Field occupies CQE Dword 3 bits 31:17 with SC (8 bits), SCT (3 bits), CRD (2 bits), More and DNR. SCT values: 0h Generic, 1h Command Specific, 2h Media and Data Integrity, 3h Path Related, 7h Vendor Specific. Generic codes 00h Successful Completion, 01h Invalid Command Opcode, 02h Invalid Field in Command, 03h Command ID Conflict, 04h Data Transfer Error, 06h Internal Error, 07h Command Abort Requested, 08h Aborted due to SQ Deletion, 0Bh Invalid Namespace or Format; NVM 80h LBA Out of Range; Media 80h Write Fault, 81h Unrecovered Read Error. Error Information is Log Identifier 01h. Asynchronous Event Request is admin opcode 0Ch; Abort is 08h. CSTS is at offset 1Ch with RDY in bit 0 and CFS in bit 1.</p></aside>
+  <aside class="callout derived"><p>Mapping a status to a "layer" (host, controller, media, PCIe) is interpretation. The specification defines what each code means, not whose bug it is.</p></aside>
+  <aside class="callout impl"><p>Which status a controller chooses when several apply; whether it detects CID conflicts; how many Error Information entries it keeps and whether they survive reset; DNR choice for internal errors; how long before media errors are returned.</p></aside>
+  <aside class="callout version"><p>The set of status codes grows with every revision (for example, codes for newer features and fabrics). CRD arrived with NVMe 1.4. NVMe 2.0 split command-set-specific statuses into separate command set specifications. Always use the tables of the revision your device reports in the VS register and Identify Controller.</p></aside>
+  <aside class="callout notsaid"><p>Check in the specification: exact values for the less common generic codes (SGL and PRP related, write protection, transient transport error); command-specific values per command; the complete list of Asynchronous Event Information values per type; Error Information log entry byte offsets. The specification does not say how a host must retry, how many times, or whether a media error should take a drive out of service.</p></aside>
+  <aside class="callout warn"><p>Never assume a non-zero status implies a PCIe problem, or that a PCIe problem will always produce an NVMe status. Never assume DNR=0 means the retry will succeed. Never treat vendor-specific (SCT 7h) codes as portable.</p></aside>
+</section>
+
+<section id="protocol">
+  <h2>Protocol view</h2>
+  <p>The NVMe error model is entirely in-band in NVMe data structures:</p>
+  <table>
+    <caption>Where NVMe error information travels</caption>
+    <thead><tr><th>Information</th><th>Carrier</th><th>Direction</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td>Command result</td><td>CQE Status Field</td><td>Controller → host memory (MWr)</td><td>Every command</td></tr>
+      <tr><td>Detail for one error</td><td>Error Information log entry</td><td>Controller → host memory, on Get Log Page</td><td>When host asks (prompted by M=1 or an AER)</td></tr>
+      <tr><td>Event not tied to a command</td><td>Asynchronous Event Request completion</td><td>Controller → host memory (CQE on admin CQ)</td><td>When event occurs, if an AER is outstanding</td></tr>
+      <tr><td>Fatal state</td><td>CSTS.CFS</td><td>Host reads controller register (MRd)</td><td>Whenever host polls CSTS (e.g. in timeout handling)</td></tr>
+      <tr><td>Health trend</td><td>SMART / Health log (02h)</td><td>On Get Log Page</td><td>Periodically, or after a SMART AER</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <ol class="seq" data-actors="Driver|Host memory|NVMe controller">
+      <li data-from="Driver" data-to="NVMe controller">SQ1 doorbell: READ CID 0x0072</li>
+      <li data-from="NVMe controller" data-to="Host memory">MRd SQE / CplD</li>
+      <li data-note="NVMe controller">media read fails after retries</li>
+      <li data-from="NVMe controller" data-to="Host memory" class="bad">MWr CQE: SCT 2h SC 81h, M=1</li>
+      <li data-from="NVMe controller" data-to="Driver">MSI-X vector 1</li>
+      <li data-from="Driver" data-to="NVMe controller">admin: Get Log Page LID 01h</li>
+      <li data-from="NVMe controller" data-to="Host memory">MWr: log entries (64 B each)</li>
+      <li data-from="NVMe controller" data-to="Host memory" class="dashed">MWr: admin CQE, success</li>
+      <li data-note="Driver">fail request; report LBA to filesystem</li>
+    </ol>
+    <figcaption>Synthetic sequence: a media error completion followed by reading the Error Information log.</figcaption>
+  </figure>
+  <figure>
+    <ol class="seq" data-actors="Driver|NVMe controller">
+      <li data-from="Driver" data-to="NVMe controller">AER (0Ch) ×4, kept outstanding</li>
+      <li data-note="NVMe controller">temperature crosses threshold</li>
+      <li data-from="NVMe controller" data-to="Driver" class="bad">AER CQE: type 1h SMART, LID 02h</li>
+      <li data-from="Driver" data-to="NVMe controller">Get Log Page 02h (RAE=0)</li>
+      <li data-from="NVMe controller" data-to="Driver" class="dashed">SMART log data</li>
+      <li data-from="Driver" data-to="NVMe controller">resubmit one AER</li>
+    </ol>
+    <figcaption>Conceptual Asynchronous Event Request cycle: the event type stays masked until the log page is read.</figcaption>
+  </figure>
+</section>
+
+<section id="trace">
+  <h2>Trace view</h2>
+  <p>Synthetic traces on the lab system. CQE Dword 3 is shown raw and decoded so you can practise the bit arithmetic. Namespace 1 has NSZE = 0x7470_6DB0 (last valid LBA 0x7470_6DAF).</p>
+  <div class="trace" data-kind="synthetic" data-title="Normal: successful READ completion">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0 ns</td><td>MWr64</td><td>Req=0x0100 Addr=0x1_2341_0120 Len=4 DW2=0x0001_0013 DW3=0x0001_0048</td><td>CQE: SQID 1, SQHD 0x13, P=1, status 0, CID 0x0048</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>110 ns</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x41</td><td>MSI-X vector 1</td></tr>
+      </tbody>
+    </table>
+    <p>DW3 = 0x0001_0048: bits 31:17 are zero → success; bit 16 = 1 → Phase Tag 1; CID = 0x0048.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: READ beyond end of namespace — LBA Out of Range, DNR">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 ns</td><td>MWr32</td><td>Addr=0xFE60_1008 Data=0x15</td><td>SQ1 tail doorbell</td></tr>
+        <tr class="dir-up"><td>2</td><td>Dev→Host</td><td>650 ns</td><td>MRd64</td><td>Tag=0x22 Addr=0x1_2340_0500 Len=16</td><td>Fetch SQE</td></tr>
+        <tr class="dir-down"><td>3</td><td>Host→Dev</td><td>1.4 µs</td><td>CplD</td><td>Tag=0x22 Status=SC</td><td>SQE: opc 02h, CID 0x0051, NSID 1, SLBA 0x7470_6DA8, NLB 15 (16 blocks)</td></tr>
+        <tr class="abnormal"><td>4</td><td>Dev→Host</td><td>3.1 µs</td><td>MWr64</td><td>Addr=0x1_2341_0140 Len=4 DW3=0x8101_0051</td><td><strong>First abnormal event:</strong> CQE status SCT 0h, SC 80h (LBA Out of Range), DNR=1</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>3.2 µs</td><td>MWr32</td><td>Addr=0xFEE0_1000 Data=0x41</td><td>Normal interrupt</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> No data was transferred (no MWr to a data buffer between rows 3 and 4), and the completion arrived 1.7 µs after the SQE — validation-time, not media-time. Decode DW3: 0x8101_0051 → DNR bit 31 = 1; M bit 30 = 0; SCT bits 27:25 = 0; SC bits 24:17 = 0x80; P = 1; CID = 0x0051. The SQE explains it: SLBA 0x7470_6DA8 + 16 blocks ends at 0x7470_6DB7, beyond the last valid LBA 0x7470_6DAF. This is a host-side bug (stale capacity, wrong offset arithmetic, or a partition table larger than the namespace). PCIe was fine throughout.</p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: Unrecovered Read Error with More bit, then Error Information log">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-up"><td>1</td><td>Dev→Host</td><td>0</td><td>MRd64 / CplD</td><td>Tag=0x2A</td><td>SQE fetched: READ CID 0x0072, SLBA 0x0010_2400, 8 blocks</td></tr>
+        <tr class="note"><td colspan="6">No data MWr for 38 ms: controller retrying the read internally</td></tr>
+        <tr class="abnormal"><td>2</td><td>Dev→Host</td><td>38.2 ms</td><td>MWr64</td><td>Addr=0x1_2341_0160 Len=4 DW3=0x4503_0072</td><td><strong>First abnormal event:</strong> SCT 2h, SC 81h (Unrecovered Read Error), M=1, DNR=0</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>38.2 ms</td><td>MWr32</td><td>Addr=0xFEE0_1000</td><td>Interrupt</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>38.3 ms</td><td>MWr32</td><td>Addr=0xFE60_1000</td><td>Admin doorbell: Get Log Page LID 01h, 4 entries</td></tr>
+        <tr class="dir-up"><td>5</td><td>Dev→Host</td><td>38.4 ms</td><td>MWr64 ×1</td><td>Len=64 (256 B)</td><td>Log data: newest entry Error Count 0x1A3, SQID 1, CID 0x0072, Status SCT 2h / SC 81h·, LBA 0x0010_2403, NSID 1</td></tr>
+        <tr class="note"><td colspan="6">Linux retries (DNR=0); the retry fails identically 37 ms later; after max retries the block layer reports an I/O error for sector 0x102403.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> DW3 0x4503_0072: bit 30 (M) = 1; bits 27:25 = 2 → Media; bits 24:17 = 0x81 → Unrecovered Read Error; P = 1. The long gap before the CQE is the controller's internal read-retry; it is consistent with a genuinely weak block. The Error Information log narrows the failure to LBA 0x0010_2403 (the fourth block of the eight). <em>· The log entry's 16-bit Status Field also carries a phase-tag bit in bit 0 on many revisions; confirm the layout in the specification before decoding it.</em></p>
+  </div>
+
+  <div class="trace" data-kind="synthetic" data-title="Abnormal: controller fatal — CSTS.CFS observed during timeout handling">
+    <table class="trace-table">
+      <thead><tr><th>#</th><th>Dir</th><th>Time</th><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr class="dir-down"><td>1</td><td>Host→Dev</td><td>0 s</td><td>MWr32</td><td>Addr=0xFE60_1010 Data=0x08</td><td>SQ2 doorbell</td></tr>
+        <tr class="abnormal"><td>—</td><td>—</td><td>0 → 30 s</td><td>(nothing)</td><td>No SQE fetch for SQ2</td><td><strong>First abnormal event:</strong> doorbell not followed by a fetch within microseconds</td></tr>
+        <tr class="dir-down"><td>2</td><td>Host→Dev</td><td>30 s</td><td>MRd32</td><td>Addr=0xFE60_001C Tag=0x07</td><td>Driver reads CSTS</td></tr>
+        <tr class="dir-up"><td>3</td><td>Dev→Host</td><td>30 s</td><td>CplD</td><td>Tag=0x07 Status=SC Data=0x0000_0003</td><td>RDY=1, CFS=1: controller fatal</td></tr>
+        <tr class="dir-down"><td>4</td><td>Host→Dev</td><td>30 s</td><td>MWr32</td><td>Addr=0xFE60_0014</td><td>CC write with EN=0: Controller Level Reset</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Reasoning.</strong> PCIe is alive (the CSTS read completed successfully with real data, not all ones). NVMe is not: the controller stopped fetching commands and reports CFS. The fault belongs to controller firmware or hardware; the first abnormal event (no fetch) dates the failure to before second 0. Collect the controller's telemetry log after recovery, and compare with any earlier asynchronous events.</p>
+  </div>
+</section>
+
+<section id="linux">
+  <h2>Linux view</h2>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code><span class="cm"># Kernel messages about NVMe errors (format varies by kernel version)</span>
+sudo dmesg -T | grep -E 'nvme|I/O error'
+
+<span class="cm"># Controller error log, SMART/health, and limits</span>
+sudo nvme error-log /dev/nvme0 -e 8
+sudo nvme smart-log /dev/nvme0
+sudo nvme id-ctrl /dev/nvme0 | grep -Ei '^(elpe|aerl|acl|crdt)'
+
+<span class="cm"># Controller registers, including CSTS (reads BAR0; root needed)</span>
+sudo nvme show-regs /dev/nvme0 -H | grep -A6 -i 'csts'
+
+<span class="cm"># Driver retry policy</span>
+cat /sys/module/nvme_core/parameters/max_retries
+cat /sys/module/nvme_core/parameters/io_timeout
+
+<span class="cm"># Per-command completion status via tracepoints (kernel tracing, no device writes)</span>
+sudo sh -c 'echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_complete_rq/enable'
+sudo cat /sys/kernel/tracing/trace_pipe | grep -v 'status=0x0'</code></pre>
+  <p>Illustrative kernel messages (synthetic; wording and fields differ between kernel versions and with <code>CONFIG_NVME_VERBOSE_ERRORS</code>):</p>
+  <pre class="code" data-kind="read-only" data-lang="text" data-title="illustrative, not captured"><code>nvme0n1: I/O Cmd(0x2) @ LBA 1953525160, 16 blocks, I/O Error (sct 0x0 / sc 0x80) DNR
+I/O error, dev nvme0n1, sector 1953525160 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 0
+nvme0n1: Read(0x2) @ LBA 1057792, 8 blocks, Unrecovered Read Error (sct 0x2 / sc 0x81) MORE
+critical medium error, dev nvme0n1, sector 1057795 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 0
+nvme nvme0: controller is down; will reset: CSTS=0x3, PCI_STATUS=0x10</code></pre>
+  <table>
+    <caption>Reading those lines</caption>
+    <thead><tr><th>Line</th><th>Tells you</th><th>Does not tell you</th></tr></thead>
+    <tbody>
+      <tr><td>"I/O Error (sct 0x0 / sc 0x80) DNR"</td><td>NVMe status exactly, and that the driver will not retry</td><td>Why the host computed that LBA</td></tr>
+      <tr><td>"I/O error, dev … sector …"</td><td>Block layer failed a request at that sector (512-byte units)</td><td>Which NVMe status caused it — find the preceding nvme line</td></tr>
+      <tr><td>"critical medium error"</td><td>Block layer mapped the status to a medium error</td><td>Whether the NAND is actually bad</td></tr>
+      <tr><td>"CSTS=0x3, PCI_STATUS=0x10"</td><td>CFS set; PCI Status sane → NVMe fatal, PCIe alive</td><td>Root cause inside the controller</td></tr>
+      <tr><td>"CSTS=0xffffffff, PCI_STATUS=0xffff"</td><td>Both reads returned all ones → device unreachable on PCIe</td><td>Whether it is link down, removal, or a hung function</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="code">
+  <h2>Code / pseudocode</h2>
+  <h3>CQE status decoder</h3>
+  <p>Standard-library Python. Decodes a raw CQE Dword 3 (or a Linux-style packed status) and names common codes. Codes not in its table are reported as "look up in the specification" rather than guessed.</p>
+  <pre class="code" data-kind="executable" data-lang="python" data-title="nvme_status.py"><code>#!/usr/bin/env python3
+"""Decode NVMe completion status. Synthetic teaching tool; names only the
+common codes taught in Chapter 44. Usage: nvme_status.py 0x81010051 [...]
+   or: nvme_status.py --linux 0x4281   (Linux packed status)"""
+import sys
+
+SCT = {0: "Generic", 1: "Command Specific", 2: "Media and Data Integrity",
+       3: "Path Related", 7: "Vendor Specific"}
+GENERIC = {0x00: "Successful Completion", 0x01: "Invalid Command Opcode",
+           0x02: "Invalid Field in Command", 0x03: "Command ID Conflict",
+           0x04: "Data Transfer Error",
+           0x05: "Commands Aborted due to Power Loss Notification",
+           0x06: "Internal Error", 0x07: "Command Abort Requested",
+           0x08: "Command Aborted due to SQ Deletion",
+           0x0B: "Invalid Namespace or Format", 0x0C: "Command Sequence Error",
+           0x80: "LBA Out of Range (NVM)", 0x81: "Capacity Exceeded (NVM)",
+           0x82: "Namespace Not Ready (NVM)", 0x83: "Reservation Conflict (NVM)",
+           0x84: "Format In Progress (NVM)"}
+MEDIA = {0x80: "Write Fault", 0x81: "Unrecovered Read Error",
+         0x82: "End-to-end Guard Check Error",
+         0x83: "End-to-end Application Tag Check Error",
+         0x84: "End-to-end Reference Tag Check Error", 0x85: "Compare Failure",
+         0x86: "Access Denied", 0x87: "Deallocated or Unwritten Logical Block"}
+LAYER = {0: "host request or controller state", 1: "host request (command-specific)",
+         2: "controller media / data path", 3: "multipath / ANA path",
+         7: "vendor-defined"}
+
+def name(sct, sc):
+    table = {0: GENERIC, 2: MEDIA}.get(sct, {})
+    return table.get(sc, "not in this decoder's table: look it up in the specification")
+
+def decode_fields(sc, sct, crd, more, dnr, cid=None, phase=None):
+    out = [f"SCT {sct:X}h ({SCT.get(sct, 'Reserved')}), SC {sc:02X}h: {name(sct, sc)}"]
+    out.append(f"CRD={crd} More={more} DNR={dnr}"
+               + ("" if cid is None else f" P={phase} CID=0x{cid:04X}"))
+    if sct == 0 and sc == 0:
+        out.append("success")
+    else:
+        out.append(f"suggested first suspicion: {LAYER.get(sct, 'unknown')}")
+        if sct == 0 and sc == 0x04:
+            out.append("note: Data Transfer Error often hides a PCIe-level failure; check AER")
+        out.append("retry: " + ("no (DNR)" if dnr else "permitted" + (f", after CRDT{crd}" if crd else "")))
+        if more:
+            out.append("read the Error Information log (LID 01h) now")
+    return out
+
+def from_dw3(dw3):
+    status = dw3 &gt;&gt; 17
+    return decode_fields(status &amp; 0xFF, (status &gt;&gt; 8) &amp; 7, (status &gt;&gt; 11) &amp; 3,
+                         (status &gt;&gt; 13) &amp; 1, (status &gt;&gt; 14) &amp; 1,
+                         cid=dw3 &amp; 0xFFFF, phase=(dw3 &gt;&gt; 16) &amp; 1)
+
+def from_linux(st):
+    return decode_fields(st &amp; 0xFF, (st &gt;&gt; 8) &amp; 7, (st &gt;&gt; 11) &amp; 3,
+                         (st &gt;&gt; 13) &amp; 1, (st &gt;&gt; 14) &amp; 1)
+
+if __name__ == "__main__":
+    args = sys.argv[1:] or ["0x00010048", "0x81010051", "0x45030072", "--linux", "0x4281"]
+    linux = False
+    for a in args:
+        if a == "--linux":
+            linux = True
+            continue
+        v = int(a, 0)
+        print(("Linux status " if linux else "CQE DW3 ") + f"0x{v:08X}")
+        for line in (from_linux(v) if linux else from_dw3(v)):
+            print("   " + line)
+        linux = False</code></pre>
+
+  <h3>Host retry decision (pseudocode, modelled on common driver behaviour)</h3>
+  <pre class="code" data-kind="pseudocode" data-lang="c"><code>disposition decide(req, status) {
+    if (status == SUCCESS)               return COMPLETE;
+    if (is_path_error(status) &amp;&amp; multipath) return FAILOVER;   /* SCT 3h */
+    if (status.dnr || req-&gt;retries &gt;= max_retries || req_is_failfast(req))
+                                         return FAIL;
+    delay = status.crd ? crdt[status.crd] * 100ms : 0;           /* if ACRE enabled */
+    return RETRY_AFTER(delay);
+}</code></pre>
+</section>
+
+<section id="worked">
+  <h2>Worked example</h2>
+  <p><strong>Scenario (synthetic).</strong> After installing a new kernel module that builds custom Dataset Management commands, the kernel log fills with lines like <code>nvme0n1: I/O Cmd(0x9) … I/O Error (sct 0x0 / sc 0x2) DNR</code>.</p>
+  <ol>
+    <li><strong>Classify.</strong> Opcode 09h (Dataset Management), SCT 0h, SC 02h: Invalid Field in Command, DNR. The controller rejected a field. This is a host-side request problem until proven otherwise.</li>
+    <li><strong>Get the location.</strong> <code>nvme error-log /dev/nvme0</code> shows the newest entry with the same CID and a Parameter Error Location pointing at byte 40 (Command Dword 10), bits 7:0 — the Number of Ranges field.</li>
+    <li><strong>Inspect the command.</strong> The module sets Number of Ranges to the count of ranges, but the field is 8 bits wide and 0's based. With 256 ranges the module writes 0x100 into Command Dword 10: the low 8 bits become 0 and bit 8 — a reserved bit — becomes 1. A non-zero reserved bit is an invalid field. (With fewer ranges the bug is quieter: the controller processes one range too many.)</li>
+    <li><strong>Fix and verify.</strong> Write <code>nr_ranges - 1</code>, cap at 256 ranges. Re-run: status 0.</li>
+    <li><strong>Lesson.</strong> Parameter Error Location turned a vague "invalid field" into an exact byte and bit. This is why the Error Information log exists.</li>
+  </ol>
+  <aside class="callout derived"><p>The Number of Ranges field description (8 bits, 0's based) is from the NVM Command Set Dataset Management command; confirm in <a href="ch35.html">Dataset Management</a>. The Parameter Error Location value here is synthetic.</p></aside>
+</section>
+
+<section id="mistakes">
+  <h2>Common mistakes</h2>
+  <ul>
+    <li>Reading SC without SCT. SC 80h is "LBA Out of Range" under SCT 0h and "Write Fault" under SCT 2h.</li>
+    <li>Decoding the Status Field from DW3 without shifting by 17 (the Phase Tag is bit 16).</li>
+    <li>Treating every error as PCIe: an NVMe status proves the PCIe path delivered a completion.</li>
+    <li>Treating every Data Transfer Error as NVMe: it is often the NVMe echo of a PCIe failure.</li>
+    <li>Ignoring the More bit and reading the Error Information log hours later after it has wrapped.</li>
+    <li>Retrying DNR=1 commands in user-space tools in a loop.</li>
+    <li>Confusing NVMe AER (Asynchronous Event Request) with PCIe AER (Advanced Error Reporting).</li>
+    <li>Reading CSTS=0xFFFF_FFFF as "CFS set". All ones means the read failed.</li>
+    <li>Assuming an aborted command will produce a CQE after a reset. Resets do not post completions.</li>
+  </ul>
+</section>
+
+<section id="debugging">
+  <h2>Debugging connection</h2>
+  <table>
+    <caption>NVMe error triage</caption>
+    <thead><tr><th>Observation</th><th>First check</th><th>Second check</th><th>Likely layer</th></tr></thead>
+    <tbody>
+      <tr><td>SCT 0h/1h with DNR</td><td>The SQE fields (trace or tracepoint)</td><td>Error log Parameter Error Location</td><td>Host software / driver</td></tr>
+      <tr><td>Generic 04h Data Transfer Error</td><td>AER logs at device and root port</td><td>IOMMU faults; PRP/SGL addresses</td><td>PCIe / IOMMU / host memory</td></tr>
+      <tr><td>Media 81h, long completion latency</td><td>SMART media errors, spare, percentage used</td><td>Is the LBA always the same? Was it ever written?</td><td>Media or firmware</td></tr>
+      <tr><td>Media 84h reference tag</td><td>Which LBA was requested vs reference tag</td><td>Recent firmware update, power loss</td><td>Firmware mapping (FTL)</td></tr>
+      <tr><td>No CQE, CSTS=0x3</td><td>Telemetry / vendor logs after reset</td><td>Previous AERs (transient internal errors)</td><td>Controller firmware/hardware</td></tr>
+      <tr><td>No CQE, CSTS=all ones</td><td>lspci, AER, link status</td><td>Surprise removal, power</td><td>PCIe link (<a href="ch45.html">Ch 45</a>)</td></tr>
+      <tr><td>Path status (SCT 3h)</td><td>ANA log, controller states in multipath</td><td>Fabric/port events</td><td>Path / multipath</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="senior">
+  <h2>Senior engineer insight</h2>
+  <ul>
+    <li><strong>Status codes describe symptoms at the controller's boundary.</strong> A Data Transfer Error describes what the controller saw, not what went wrong. Always ask "what could have made the controller see this?"</li>
+    <li><strong>The first error matters, not the loudest.</strong> A burst of I/O errors after a controller reset is usually fallout. Find the first failing command's status and the first abnormal event before it.</li>
+    <li><strong>Firmware sometimes lies by generalising.</strong> Internal Error (06h) is a catch-all. If a device returns it frequently, ask the vendor for the vendor-specific log that maps it to a cause.</li>
+    <li><strong>Read logs early.</strong> Error Information log entries and telemetry are volatile; a reset or a flood of new errors can destroy the evidence. Make collection automatic.</li>
+    <li><strong>Watch DNR in validation.</strong> Wrong DNR is a subtle compliance bug: DNR=1 on a transient condition causes unnecessary application failures; DNR=0 on a permanent one causes long retry stalls.</li>
+  </ul>
+</section>
+
+<section id="lab">
+  <h2>Lab</h2>
+  <h3>Lab 44 — Provoke, capture and decode harmless NVMe errors</h3>
+  <h4>Objective</h4><p>Generate three NVMe error completions with read-only commands, see each in the kernel log or nvme-cli output and in the Error Information log, and decode each by hand.</p>
+  <h4>Skills</h4><p>Status decoding, Error Information log reading, Linux NVMe error messages.</p>
+  <h4>Safety</h4>
+  <aside class="callout safety"><p><span class="badge caution">Caution lab</span> All commands are reads or Get commands and do not modify data, but they deliberately cause errors. Use a test device: error counters in SMART will increase, and on shared systems monitoring may alert. Never use vendor-specific opcodes for "invalid opcode" tests — they may do something.</p></aside>
+  <h4>Hardware required</h4><p>Linux host with a test NVMe SSD.</p>
+  <h4>Software required</h4><p>nvme-cli, Python 3, <code>nvme_status.py</code>.</p>
+  <h4>Input</h4><p>NSZE of namespace 1 (from <code>nvme id-ns /dev/nvme0n1</code>), LBA size.</p>
+  <h4>Expected output</h4><p>Three decoded statuses: Invalid Field in Command, LBA Out of Range, and (if the device logs them) matching Error Information entries.</p>
+  <h4>Background</h4><p>A Get Features with a reserved Feature Identifier is invalid; a READ whose range crosses NSZE is out of range.</p>
+  <h4>Step 1 — Baseline</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo nvme error-log /dev/nvme0 -e 4 &gt; before.txt
+sudo nvme id-ctrl /dev/nvme0 | grep -i elpe</code></pre>
+  <h4>Step 2 — Invalid field</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>sudo nvme get-feature /dev/nvme0 -f 0x00 ; echo "exit=$?"
+<span class="cm"># FID 00h is reserved; expect an error status reported by nvme-cli</span></code></pre>
+  <h4>Step 3 — LBA out of range</h4>
+  <pre class="code" data-kind="read-only" data-lang="sh"><code>NSZE=$(sudo nvme id-ns /dev/nvme0n1 | awk '/^nsze/ {print $3}')
+sudo nvme read /dev/nvme0n1 --start-block=$((NSZE - 4)) --block-count=7 \
+     --data-size=4096 --data=/dev/null ; echo "exit=$?"
+sudo dmesg | tail -5</code></pre>
+  <h4>Observation</h4><p>Compare <code>nvme error-log</code> after each step with before.txt. Decode each status with <code>nvme_status.py</code>.</p>
+  <h4>Questions</h4>
+  <ol><li>Did the device log an entry for each error? If not, why might it not?</li><li>Was DNR set in each case? Is that what you expected?</li><li>How long did each error take to complete, roughly, and what does that say about where it was detected?</li></ol>
+  <h4>Challenge</h4><p>Write a script that polls the Error Information log every minute and alerts when Error Count jumps by more than ELPE+1 (entries lost).</p>
+  <details class="hint"><summary>Hint</summary><p>Block count in nvme-cli is 0's based on some versions (the NLB field is 0's based). Check whether 7 means 7 or 8 blocks on your build.</p></details>
+  <details class="solution"><summary>Solution</summary>
+    <p>1. Logging is not mandatory for every error; many controllers log invalid-field errors with Parameter Error Location and LBA range errors with the LBA, but some only log media/internal errors.</p>
+    <p>2. Expected DNR=1 for both: neither will succeed on retry.</p>
+    <p>3. Both are detected at command validation, so completion takes microseconds — no media access. A media error would take far longer.</p>
+    <p>Challenge: store the last Error Count; if new_count − last_count &gt; ELPE + 1, the ring overflowed between polls and entries were lost.</p>
+  </details>
+  <h4>What a senior engineer notices</h4><p>Whether the device's Parameter Error Location is populated (quality signal); whether the SMART error-log-entries counter matches the number of errors you caused; whether dmesg printed anything for admin errors issued via passthrough (it often does not).</p>
+  <h4>Failure variants</h4><ul><li>nvme-cli refuses the out-of-range read before sending it (some versions validate) — use io-passthru to send the raw command.</li><li>Error log returns all-zero entries — device keeps few or none.</li></ul>
+  <h4>Extension</h4><p>Enable the <code>nvme_complete_rq</code> tracepoint and catch each status as it completes, with timestamps.</p>
+</section>
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <ol>
+    <li>Decode CQE DW3 = 0x0403_0011 and 0xC502_0099.</li>
+    <li>Build DW3 for: CID 0x0200, Phase 0, SCT 1h, SC 02h, DNR 1.</li>
+    <li>A Create I/O SQ fails with SCT 1h SC 00h. What did the host do wrong?</li>
+    <li>List three reasons a READ might end with Generic 04h.</li>
+    <li>Explain why a controller reset does not produce CQEs for outstanding commands and how the host learns their fate.</li>
+  </ol>
+  <details class="answer"><summary>Model answers</summary>
+    <p>1. 0x0403_0011 &gt;&gt; 17 = 0x201 → SC = 01h, SCT = (0x201 &gt;&gt; 8) &amp; 7 = 2h, M=0, DNR=0; P=1; CID 0x0011. SCT 2h SC 01h is not a defined media code in the table taught here — look it up; suspect a vendor or version issue. 0xC502_0099: &gt;&gt;17 = 0x6281 → SC 81h, SCT 2h, More=1, DNR=1; P=0; CID 0x0099 → Unrecovered Read Error, no retry, see log.</p>
+    <p>2. Status = DNR(1&lt;&lt;14) | SCT 1&lt;&lt;8 | 0x02 = 0x4102; DW3 = 0x4102 &lt;&lt; 17 | 0x0200 = 0x8204_0200.</p>
+    <p>3. Completion Queue Invalid: the CQID named in the Create I/O SQ does not exist (CQ not created, or created and deleted).</p>
+    <p>4. The controller's read of a PRP list or SGL failed (UR/CA completion, completion timeout); a poisoned completion from host memory; an internal DMA error.</p>
+    <p>5. A reset discards controller state including queues; there is nowhere valid to post. The host's timeout/reset path fails or requeues all outstanding requests itself.</p>
+  </details>
+</section>
+
+<section id="quiz">
+  <h2>Quiz</h2>
+  <ol class="quiz">
+    <li><p>Which bits of CQE Dword 3 hold the Status Field?</p><ul class="options" data-answer="2"><li>15:0</li><li>31:17</li><li>31:16</li><li>23:16</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>Bit 16 is the Phase Tag; 15:0 is the CID.</p></details></li>
+    <li><p>SCT 2h is</p><ul class="options" data-answer="3"><li>Generic</li><li>Command Specific</li><li>Media and Data Integrity Errors</li><li>Path Related</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>0 Generic, 1 Command Specific, 2 Media, 3 Path, 7 Vendor.</p></details></li>
+    <li><p>Generic status 0Bh means</p><ul class="options" data-answer="1"><li>Invalid Namespace or Format</li><li>LBA Out of Range</li><li>Internal Error</li><li>Command ID Conflict</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>LBA Out of Range is 80h; Internal Error 06h; CID Conflict 03h.</p></details></li>
+    <li><p>DNR=1 means</p><ul class="options" data-answer="2"><li>The data was not written</li><li>Resubmitting the same command is expected to fail</li><li>The controller is fatal</li><li>The host must reset</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>It is retry guidance for that command.</p></details></li>
+    <li><p>Which register bit indicates the controller has hit a fatal condition?</p><ul class="options" data-answer="4"><li>CC.EN</li><li>CSTS.RDY</li><li>CSTS.SHST</li><li>CSTS.CFS</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>Controller Fatal Status, CSTS bit 1.</p></details></li>
+    <li><p>The NVMe Error Information log page is Log Identifier</p><ul class="options" data-answer="1"><li>01h</li><li>02h</li><li>03h</li><li>0Ch</li></ul><details class="answer"><summary>Answer and reasoning</summary><p>02h is SMART/Health, 03h Firmware Slot; 0Ch is the AER opcode, not a log.</p></details></li>
+    <li><p>Why can an NVMe error completion never by itself prove the PCIe link is faulty?</p><details class="answer"><summary>Model answer</summary><p>Because the CQE reached host memory over PCIe; the link delivered it. A PCIe fault may be the <em>cause</em> (e.g. behind a Data Transfer Error), but you must find PCIe evidence (AER, analyzer) to say so.</p></details></li>
+    <li><p>What happens to an Asynchronous Event type after it is reported, and how does the host re-arm it?</p><details class="answer"><summary>Model answer</summary><p>Further events of that type are masked until the host reads the associated log page with Retain Asynchronous Event cleared; the host also resubmits an AER command.</p></details></li>
+    <li><p>Linux prints CSTS=0xffffffff. What layer do you investigate first?</p><details class="answer"><summary>Model answer</summary><p>PCIe: the MMIO read failed (device unreachable). Check link state, AER, removal, power — not NVMe firmware first.</p></details></li>
+    <li><p>How does an Abort command's result differ from the aborted command's result?</p><details class="answer"><summary>Model answer</summary><p>The Abort completes with its own status and Dword 0 indicating whether the target was aborted; the target, if aborted, completes separately with Command Abort Requested (07h).</p></details></li>
+  </ol>
+</section>
+
+<section id="interview">
+  <h2>Interview questions</h2>
+  <ol>
+    <li><p><strong>Beginner:</strong> Where does an NVMe command's error status appear?</p><details class="answer"><summary>Model answer</summary><p>In the Status Field of its Completion Queue Entry (DW3 bits 31:17).</p></details></li>
+    <li><p><strong>Beginner:</strong> Name the status code types.</p><details class="answer"><summary>Model answer</summary><p>Generic, Command Specific, Media and Data Integrity, Path Related, Vendor Specific.</p></details></li>
+    <li><p><strong>Intermediate:</strong> What are the More and DNR bits for?</p><details class="answer"><summary>Model answer</summary><p>More: additional information in the Error Information log. DNR: retrying the same command is expected to fail.</p></details></li>
+    <li><p><strong>Intermediate:</strong> How do NVMe asynchronous events work?</p><details class="answer"><summary>Model answer</summary><p>Host keeps AER commands outstanding; controller completes one when an event occurs with type, info and log page ID; that type is masked until the log is read; host resubmits.</p></details></li>
+    <li><p><strong>Advanced:</strong> A READ returns Data Transfer Error. Walk through your investigation.</p><details class="answer"><summary>Model answer</summary><p>Check AER at device and root port for UR/CA/completion timeout/poisoned TLP around the time; IOMMU fault logs for the device; validate PRPs/SGL in the SQE (trace or tracepoints); check whether the errors cluster on particular buffers or CPUs; reproduce with IOMMU in passthrough to separate translation issues.</p></details></li>
+    <li><p><strong>Advanced:</strong> Distinguish CSTS=0x3 from CSTS=0xFFFFFFFF.</p><details class="answer"><summary>Model answer</summary><p>0x3: RDY and CFS set — controller reachable but fatal (NVMe). All ones: read failed (PCIe/link/device gone).</p></details></li>
+    <li><p><strong>Senior:</strong> Design an error-handling validation plan for an NVMe controller.</p><details class="answer"><summary>Model answer</summary><p>Matrix of invalid inputs per command (opcodes, reserved fields, NSIDs, LBA ranges, PRP offsets, SGL types) → expected SCT/SC/DNR and log entries; media fault injection (ECC failure, program failure, PI mismatch); abort races (abort before fetch, during data, after completion); SQ deletion with outstanding commands; AER limits and masking; CFS injection and host recovery; CID reuse detection; Error log ring wrap and Error Count monotonicity.</p></details></li>
+  </ol>
+</section>
+
+<section id="teachback">
+  <h2>Teach-back challenge</h2>
+  <ul>
+    <li><strong>Child:</strong> the answer slips, the red "don't ask again" stamp and the fainting librarian.</li>
+    <li><strong>Junior engineer:</strong> decode a CQE DW3 by hand and say what to do next.</li>
+    <li><strong>Senior engineer:</strong> explain how NVMe errors and PCIe errors relate and how you would avoid misattributing one to the other.</li>
+  </ul>
+  <details class="answer"><summary>Model explanations</summary>
+    <p><strong>Child:</strong> "Every request gets an answer slip. Sometimes it says 'no, because…'. A red stamp means asking again won't help. If the librarian faints, her desk sign turns red and someone has to wake her."</p>
+    <p><strong>Junior:</strong> "Shift DW3 right by 17; low 8 bits are SC, next 3 SCT, then CRD, More, DNR. Name it from the SCT table. If More, read log 01h. If DNR, don't retry."</p>
+    <p><strong>Senior:</strong> "An NVMe status proves the completion path worked; a PCIe error may sit underneath (Data Transfer Error, timeouts). I always pair the NVMe view with AER and link state on the same timeline and start from the first abnormal event."</p>
+  </details>
+</section>
+
+<section id="summary">
+  <h2>Chapter summary</h2>
+  <p>NVMe reports command outcomes in the CQE Status Field: SC and SCT (Generic, Command Specific, Media and Data Integrity, Path Related, Vendor Specific), plus CRD, More and DNR. Common generic codes include 00h success, 01h invalid opcode, 02h invalid field, 03h CID conflict, 04h data transfer error, 06h internal error, 07h abort requested, 0Bh invalid namespace or format, and NVM 80h LBA out of range; key media codes are 80h write fault and 81h unrecovered read error. The Error Information log (01h) adds location and context; Asynchronous Event Requests (0Ch) report events not tied to a command; CSTS.CFS signals a fatal controller that needs reset, while all-ones reads point at PCIe. An NVMe error travels in a normal, successful PCIe write.</p>
+  <aside class="callout mastery">
+    <p>Do not move on until you can:</p>
+    <ul class="checklist">
+      <li>decode any CQE DW3 into CID, P, SC, SCT, CRD, M, DNR by hand</li>
+      <li>name the status code types and give an example of each</li>
+      <li>recite the common generic and media codes taught here and know where to look up the rest</li>
+      <li>explain aborts vs resets in terms of whether a CQE is posted</li>
+      <li>use the Error Information log and asynchronous events to get context</li>
+      <li>tell CSTS.CFS from an all-ones read and name the layer for each</li>
+      <li>find an error completion in a trace and decide its likely layer</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="next">
+  <h2>Further reading and next chapter</h2>
+  <ul>
+    <li><cite class="spec">NVM Express Base Specification, Revision 2.4 — Status Field and status tables; Error Information log; Asynchronous Event Request; Abort; Controller Status</cite></li>
+    <li><cite class="spec">NVM Command Set Specification, Revision 1.3 — NVM status values</cite></li>
+    <li>Linux: <code>drivers/nvme/host/core.c</code> (status handling, retries), <code>drivers/nvme/host/constants.c</code> (verbose status names), nvme-cli documentation for <code>error-log</code>.</li>
+    <li>Deeper: <a href="dd39.html">Deep-Dive Module: NVMe Errors</a>; <a href="ch57.html">SMART / Health</a>; <a href="ch48.html">NVMe Reset</a>.</li>
+  </ul>
+  <p><strong>Next:</strong> <a href="ch45.html">Chapter 45 — PCIe Errors</a> goes one layer down: what can go wrong with the packets and the link themselves.</p>
+</section>
