@@ -1,0 +1,771 @@
+<section class="part" id="part-x">
+<div class="part-num">PART X</div>
+<h1>NVMe Queues</h1>
+<p class="part-intro">Everything an NVMe (Non-Volatile Memory Express) controller does for a host starts with a 64-byte entry appearing in a ring buffer in host memory and ends with a 16-byte entry appearing in another ring buffer. This Part teaches those rings so precisely that you can compute, by hand, the head, tail, phase tag and doorbell value for any moment in a trace. Chapter 25 builds the general model (producer, consumer, full/empty, phase), Chapter 26 brings up the one queue pair the controller knows about at reset (the Admin queue), Chapter 27 uses it to create I/O queues, and Chapter 28 dissects the doorbell write all the way down to the PCIe (Peripheral Component Interconnect Express) Memory Write TLP (Transaction Layer Packet). If you can do the worked examples in this Part without looking, you can read 80% of an NVMe protocol trace.</p>
+</section>
+
+<section class="chapter" id="p4-ch25-queue-architecture" data-part="PART X — NVMe QUEUES">
+<h2><span class="num">25</span> Queue Architecture</h2>
+
+<div class="callout spec"><div class="callout-title">📘 Specification baseline</div>
+<p><b>DOCUMENT:</b> NVM Express Base Specification (queue model, SQE/CQE formats, status) and NVMe over PCIe Transport Specification (doorbell registers, memory-based queues, PRP rules on PCIe). <b>REVISION:</b> Base 2.4, PCIe Transport 1.4 (course baseline, set released 4 Aug 2026). <b>STATUS:</b> current baseline <span class="tag version">version</span>. <b>OLDER VERSIONS THAT MAY DIFFER:</b> NVMe 1.x placed everything (including doorbells) in one base document; from 2.0 the specification library was split into Base + Command Set + Transport documents, so the <i>same</i> mechanism may be described in a different document depending on which revision you open. <b>SOURCE:</b> nvmexpress.org/specifications. Exact section numbers are deliberately not quoted here — look them up in the revision you hold.</p></div>
+
+<h3>25.1 Why this chapter exists</h3>
+<p>An NVMe device is fast for one structural reason: the host and the controller almost never wait for each other. They share <b>circular queues in host memory</b>; the host <i>produces</i> commands into a Submission Queue (<a class="gl" href="#g-sq">SQ</a>) and the controller <i>produces</i> results into a Completion Queue (<a class="gl" href="#g-cq">CQ</a>). Each side only tells the other "how far I have got" — with a doorbell register write in one direction and with a CQ entry (<a class="gl" href="#g-cqe">CQE</a>) in the other. No locks are shared across the PCIe link. Every NVMe performance property (deep queues, per-CPU queues, interrupt steering, low latency) and almost every NVMe hang you will ever debug ("command timeout", "controller is down", "missing interrupt") is a consequence of this ring discipline. So we learn the rings first and the commands second.</p>
+
+<h3>25.2 Learning objectives</h3>
+<ul class="objectives">
+<li><b>Beginner:</b> name the SQ, CQ, Admin queue, I/O queue and say who produces and who consumes each.</li>
+<li><b>Intermediate:</b> compute the number of occupied slots, the empty condition and the full condition (<code>(tail + 1) mod size == head</code>) for any head/tail pair.</li>
+<li><b>Advanced:</b> step a CQ through a wrap and predict the phase tag value of every slot; explain why the phase tag removes the need for the host to read a controller register to find new completions.</li>
+<li><b>Senior:</b> given a partial trace, reconstruct each queue's head, tail and phase and identify the first event inconsistent with the ring rules.</li>
+<li><b>Trace-analysis:</b> map ring events to PCIe transactions (doorbell MWr, SQE MRd, CQE MWr, MSI-X MWr).</li>
+<li><b>Debugging:</b> distinguish "controller never fetched", "controller fetched but never completed" and "controller completed but host never noticed".</li>
+<li><b>Validation:</b> design tests for wrap-around, full-queue, phase inversion and SQHD feedback.</li>
+</ul>
+
+<h3>25.3 Prerequisites</h3>
+<p>You need: what <a class="gl" href="#g-mmio">MMIO</a> (memory-mapped I/O) and <a class="gl" href="#g-dma">DMA</a> (direct memory access) are; that the NVMe controller registers live in <a class="gl" href="#g-bar">BAR</a>0 (Base Address Register 0) space; and that an <a class="gl" href="#g-mwr">MWr</a> (Memory Write request) is posted while an <a class="gl" href="#g-mrd">MRd</a> (Memory Read request) needs a <a class="gl" href="#g-cpld">CplD</a> (Completion with Data). The controller registers <a class="gl" href="#g-cap">CAP</a>, <a class="gl" href="#g-cc">CC</a>, <a class="gl" href="#g-csts">CSTS</a>, <a class="gl" href="#g-aqa">AQA</a>, <a class="gl" href="#g-asq">ASQ</a> and <a class="gl" href="#g-acq">ACQ</a> are used here and explained more in <a href="#p4-ch26-admin-queue">Chapter 26</a>.</p>
+
+<h3>25.4 The story — the supermarket checkout</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div>
+<p>Imagine a supermarket with a <b>round conveyor belt</b> at the checkout. You (the host) put shopping baskets on the belt at the spot marked "next empty spot" — that spot is the <b>tail</b>. The cashier (the controller) picks baskets up from the spot marked "next basket to scan" — that is the <b>head</b>. The belt is round, so when you reach the end you start again at the beginning. You must never put a basket on a spot where the cashier has not yet taken the old basket away — so you always leave <i>one</i> spot empty, which is how you can tell "belt full" from "belt empty".</p>
+<p>When you put baskets down you ring a little <b>bell</b> (the doorbell) and shout the number of your latest spot. The cashier does not keep looking at the belt — they wait for the bell.</p>
+<p>When a basket is done, the cashier puts a <b>receipt</b> on a second round belt that comes back to you (the completion queue). Receipts printed on the first trip around are printed in <b>blue ink</b>; on the second trip around, <b>red ink</b>; then blue again. You know a receipt is new if its ink colour is the colour you expect for this trip. That ink colour is the <b>phase tag</b>.</p></div>
+
+<div class="callout analogy"><div class="callout-title">🌍 Analogy mapping</div>
+<div class="table-wrap"><table><thead><tr><th>Supermarket</th><th>NVMe</th><th>Lives where</th></tr></thead><tbody>
+<tr><td>Basket conveyor belt</td><td>Submission Queue (array of 64-byte SQEs)</td><td>Host memory (or optionally the Controller Memory Buffer)</td></tr>
+<tr><td>Receipt belt</td><td>Completion Queue (array of 16-byte CQEs)</td><td>Host memory</td></tr>
+<tr><td>"Next empty spot" (where you put baskets)</td><td>SQ tail — owned by host</td><td>Host variable; published via SQ Tail Doorbell</td></tr>
+<tr><td>"Next basket to scan"</td><td>SQ head — owned by controller</td><td>Controller internal; reported back in CQE.SQHD</td></tr>
+<tr><td>Bell + shouted spot number</td><td>Doorbell register write (MMIO)</td><td>BAR0 offset 1000h and above</td></tr>
+<tr><td>Ink colour of receipts</td><td>Phase Tag bit (CQE DW3 bit 16)</td><td>Each CQE</td></tr>
+<tr><td>Basket ticket number</td><td>Command Identifier (CID)</td><td>SQE CDW0[31:16], echoed in CQE DW3[15:0]</td></tr>
+<tr><td>Cashier shouting "done!"</td><td>Interrupt (MSI-X message)</td><td>A posted MWr to an address the host programmed</td></tr>
+</tbody></table></div></div>
+
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div>
+<ul>
+<li>A supermarket cashier scans baskets in order. An NVMe controller <b>fetches</b> SQEs in order from one SQ but may <b>complete them in any order</b>. That is why every receipt must carry the basket's ticket number (CID) and SQ identifier.</li>
+<li>Receipts are not tied to the basket's position on the belt. A CQ can serve <b>several</b> SQs; the controller writes the next free CQ slot, regardless of which SQ the command came from.</li>
+<li>There are many checkouts (up to 65,535 I/O queue pairs in the specification limit; a real controller reports far fewer) and an extra "manager's desk" queue (the Admin queue) for store management rather than shopping.</li>
+<li>The cashier does not physically remove the basket; "taking the basket" just means the controller has DMA-read the 64 bytes. The host learns that the slot is reusable only from the SQHD value in a later CQE.</li>
+</ul></div>
+
+<h3>25.5 Beginner view — the six words</h3>
+<p><b>Submission Queue (SQ)</b>: a fixed-size array of command slots. <b>Completion Queue (CQ)</b>: a fixed-size array of completion slots. <b>Producer</b>: the side that writes new entries and advances the <b>tail</b>. <b>Consumer</b>: the side that reads entries and advances the <b>head</b>. <b>Queue depth</b> (size): number of slots. <b>Phase tag</b>: one bit in every CQE that flips meaning on every lap around the CQ.</p>
+<div class="table-wrap"><table><thead><tr><th>Queue</th><th>Producer (writes entries, owns tail)</th><th>Consumer (reads entries, owns head)</th><th>How the producer announces new tail</th><th>How the consumer announces new head</th></tr></thead><tbody>
+<tr><td>SQ</td><td>Host driver</td><td>Controller</td><td>MMIO write of tail to SQyTDBL <span class="tag verified">verified</span></td><td>SQ Head Pointer (SQHD) field in every CQE it posts <span class="tag verified">verified</span></td></tr>
+<tr><td>CQ</td><td>Controller</td><td>Host driver</td><td>New entries carry the current phase tag value (no register) <span class="tag verified">verified</span></td><td>MMIO write of head to CQyHDBL <span class="tag verified">verified</span></td></tr>
+</tbody></table></div>
+<div class="callout remember"><div class="callout-title">📌 Remember</div><p>The <b>owner of an index is the side that advances it</b>. The host owns SQ tail and CQ head; the controller owns SQ head and CQ tail. Each side learns the other's index only through the one feedback channel: doorbell (host→controller) or CQE fields (controller→host).</p></div>
+
+<h3>25.6 Engineering view — ring arithmetic</h3>
+<p>Let the queue have <b>N</b> slots numbered 0…N−1. Indices always wrap modulo N.</p>
+<div class="formula">used = (tail − head) mod N &nbsp;&nbsp;&nbsp; free = N − 1 − used</div>
+<ul class="vars"><li><b>N</b> — queue size in entries (the Create command and AQA fields encode N−1, a 0-based value).</li><li><b>head</b> — index of the next entry the consumer will read.</li><li><b>tail</b> — index of the next free slot the producer will write.</li><li><b>used</b> — entries written but not yet consumed.</li><li><b>free</b> — slots the producer may still fill; one slot is always sacrificed.</li></ul>
+<div class="formula">EMPTY ⇔ head == tail &nbsp;&nbsp;&nbsp;&nbsp; FULL ⇔ (tail + 1) mod N == head</div>
+<ul class="vars"><li>The full rule means a queue of N slots holds at most <b>N − 1</b> outstanding entries <span class="tag verified">verified</span>. Without the sacrificed slot, head == tail would be ambiguous (empty or full?).</li></ul>
+<p>Worked numbers, N = 8:</p>
+<div class="table-wrap"><table><thead><tr><th>head</th><th>tail</th><th>used = (tail−head) mod 8</th><th>State</th><th>Can producer write?</th></tr></thead><tbody>
+<tr><td>0</td><td>0</td><td>0</td><td>empty</td><td>yes (7 free)</td></tr>
+<tr><td>2</td><td>5</td><td>3</td><td>partially full</td><td>yes (4 free)</td></tr>
+<tr><td>6</td><td>1</td><td>(1−6) mod 8 = 3</td><td>wrapped, 3 used (slots 6,7,0)</td><td>yes (4 free)</td></tr>
+<tr><td>3</td><td>2</td><td>7</td><td><b>full</b>: (2+1) mod 8 == 3</td><td>no</td></tr>
+<tr><td>0</td><td>7</td><td>7</td><td><b>full</b>: (7+1) mod 8 == 0</td><td>no</td></tr>
+</tbody></table></div>
+
+<h4>25.6.1 The phase tag, precisely</h4>
+<p>The host cannot cheaply ask "what is your CQ tail?" — there is no CQ tail register the host reads in normal operation. Instead every CQE carries a <b>Phase Tag (P)</b> bit, DW3 bit 16 <span class="tag verified">verified</span>. The rules:</p>
+<ol>
+<li>Host allocates CQ memory and <b>clears it to zero</b> before creating the queue, so every slot initially has P = 0. (The specification requires the host to initialise the phase tags to 0 in a newly created CQ. <span class="tag verified">verified</span>)</li>
+<li>On the controller's first lap it writes every CQE with P = 1.</li>
+<li>When the controller's CQ tail wraps from N−1 to 0, it inverts the value it writes: second lap P = 0, third lap P = 1, …</li>
+<li>The host keeps an <code>expected_phase</code>, starting at 1, and inverts it whenever <i>its</i> CQ head wraps from N−1 to 0.</li>
+<li>Host rule: <b>the CQE at CQ[head] is new iff CQE.P == expected_phase</b>. Stop at the first slot where it differs.</li>
+</ol>
+
+<figure class="diagram"><svg viewBox="0 0 800 440" role="img" aria-label="Circular completion queue of 8 slots with head at 2, tail at 5 and phase tags">
+<text class="lbl" x="230" y="22" text-anchor="middle">Completion Queue, N = 8, lap 1 (controller writes P=1)</text>
+<rect class="box" x="195" y="45" width="70" height="40"/><text class="lbl small" x="230" y="64" text-anchor="middle">0: P=1</text><text class="lbl small" x="230" y="78" text-anchor="middle">consumed</text>
+<rect class="box" x="301" y="89" width="70" height="40"/><text class="lbl small" x="336" y="108" text-anchor="middle">1: P=1</text><text class="lbl small" x="336" y="122" text-anchor="middle">consumed</text>
+<rect class="box accent" x="345" y="195" width="70" height="40"/><text class="lbl small" x="380" y="214" text-anchor="middle">2: P=1</text><text class="lbl small" x="380" y="228" text-anchor="middle">NEW</text>
+<rect class="box accent" x="301" y="301" width="70" height="40"/><text class="lbl small" x="336" y="320" text-anchor="middle">3: P=1</text><text class="lbl small" x="336" y="334" text-anchor="middle">NEW</text>
+<rect class="box accent" x="195" y="345" width="70" height="40"/><text class="lbl small" x="230" y="364" text-anchor="middle">4: P=1</text><text class="lbl small" x="230" y="378" text-anchor="middle">NEW</text>
+<rect class="box alt" x="89" y="301" width="70" height="40"/><text class="lbl small" x="124" y="320" text-anchor="middle">5: P=0</text><text class="lbl small" x="124" y="334" text-anchor="middle">stale/zero</text>
+<rect class="box alt" x="45" y="195" width="70" height="40"/><text class="lbl small" x="80" y="214" text-anchor="middle">6: P=0</text><text class="lbl small" x="80" y="228" text-anchor="middle">stale/zero</text>
+<rect class="box alt" x="89" y="89" width="70" height="40"/><text class="lbl small" x="124" y="108" text-anchor="middle">7: P=0</text><text class="lbl small" x="124" y="122" text-anchor="middle">stale/zero</text>
+<path class="ln" d="M 230 215 m 0 -30 a 30 30 0 1 1 -21 9" marker-end="url(#arrow)"/>
+<text class="lbl small" x="230" y="222" text-anchor="middle">wrap</text>
+<line class="ln" x1="470" y1="215" x2="420" y2="215" marker-end="url(#arrow)"/>
+<text class="lbl" x="475" y="212">CQ HEAD = 2 (host owns)</text>
+<text class="lbl small" x="475" y="228">host reads here next; expected_phase = 1</text>
+<line class="ln" x1="20" y1="400" x2="95" y2="345" marker-end="url(#arrow)"/>
+<text class="lbl" x="10" y="418">CQ TAIL = 5 (controller owns, never visible as a register)</text>
+<text class="lbl" x="475" y="290">Host scan: 2 P=1 ✓, 3 P=1 ✓, 4 P=1 ✓,</text>
+<text class="lbl" x="475" y="308">5 P=0 ≠ 1 → stop. 3 new CQEs.</text>
+<text class="lbl" x="475" y="340">Then host writes CQ1HDBL = 5.</text>
+<text class="lbl small" x="475" y="370">accent = new entries (current lap)</text>
+<text class="lbl small" x="475" y="388">alt = not yet written this lap</text>
+<text class="lbl small" x="475" y="406">plain = consumed, slot free for controller</text>
+</svg><figcaption>Figure 25.1 — An 8-slot CQ mid-lap. Head (host) at 2, controller tail at 5. The phase tag lets the host find the tail without any register read. <span class="tag conceptual">conceptual</span></figcaption></figure>
+
+<h4>25.6.2 Worked example — phase-tag flip across a wrap</h4>
+<p>CQ size N = 4. Host zeroed the memory. Trace the bit in every slot as completions arrive two at a time and the host consumes them.</p>
+<div class="table-wrap"><table><thead><tr><th>Step</th><th>Event</th><th>Slot P values [0,1,2,3]</th><th>ctrl tail / ctrl phase</th><th>host head / expected</th><th>Host decision</th></tr></thead><tbody>
+<tr><td>0</td><td>Queue created, memory zeroed</td><td>0,0,0,0</td><td>0 / 1</td><td>0 / 1</td><td>slot0 P=0≠1 → nothing</td></tr>
+<tr><td>1</td><td>Controller posts CID 0, 1</td><td>1,1,0,0</td><td>2 / 1</td><td>0 / 1</td><td>slots 0,1 new; slot 2 P=0 stop</td></tr>
+<tr><td>2</td><td>Host consumes, rings CQHDBL=2</td><td>1,1,0,0</td><td>2 / 1</td><td>2 / 1</td><td>—</td></tr>
+<tr><td>3</td><td>Controller posts CID 2, 3; tail wraps 3→0 so ctrl phase inverts</td><td>1,1,1,1</td><td>0 / <b>0</b></td><td>2 / 1</td><td>slots 2,3 new (P=1)</td></tr>
+<tr><td>4</td><td>Host consumes 2,3; head wraps 3→0 so expected inverts; rings CQHDBL=0</td><td>1,1,1,1</td><td>0 / 0</td><td>0 / <b>0</b></td><td>slot0 P=1 ≠ 0 → nothing new (correct! this is last lap's entry)</td></tr>
+<tr><td>5</td><td>Controller posts CID 4 with P=0</td><td><b>0</b>,1,1,1</td><td>1 / 0</td><td>0 / 0</td><td>slot0 P=0 == 0 → new; slot1 P=1 ≠ 0 stop</td></tr>
+</tbody></table></div>
+<p>Step 4 is the whole point: without the phase bit, the host would see a fully valid-looking CQE (CID 0) in slot 0 and would complete it <i>twice</i>. <span class="tag derived">derived</span></p>
+<div class="callout warn"><div class="callout-title">⚠️ Classic bug</div><p>A driver that forgets to zero CQ memory before Create I/O CQ, or reuses a CQ buffer after a controller reset without clearing it, will see "ghost completions" with P=1 on the first lap. The symptom is completions for CIDs the driver never issued, or double completion → use-after-free in the block layer. <span class="tag derived">derived</span></p></div>
+
+<h3>25.7 Hardware view</h3>
+<div class="callout hw"><div class="callout-title">🔧 What the silicon does</div>
+<ul>
+<li><b>Queue memory</b> is ordinary host DRAM allocated by the driver with a DMA-coherent allocator. The controller is given the base address (and for non-contiguous queues a PRP list) at creation time. With CAP.CQR = 1 the controller requires physically contiguous queues <span class="tag verified">verified</span>.</li>
+<li><b>Doorbell registers</b> are flip-flops/SRAM in the controller's BAR0 space. Writing them is cheap for the CPU (a posted write) and wakes the controller's fetch engine.</li>
+<li><b>Fetch engine</b>: when SQ tail (doorbell) ≠ internal SQ head, it issues MRd TLPs to read SQEs. Many controllers fetch several SQEs in one MRd (e.g. 64–512 bytes) <span class="tag impl">impl</span>.</li>
+<li><b>Completion engine</b>: writes 16-byte CQEs with MWr TLPs, then (optionally) the MSI-X message — itself just another MWr to the address the host programmed in the MSI-X table.</li>
+<li><b>Arbitration</b>: with many SQs, the controller chooses which SQ to fetch from by round robin (mandatory) or weighted round robin with urgent priority (optional, CAP.AMS) <span class="tag verified">verified</span>. Inside one SQ, fetch order is in order; execution and completion order are not guaranteed.</li>
+</ul></div>
+
+<h3>25.8 Specification view — the queue vocabulary</h3>
+<div class="table-wrap"><table><thead><tr><th>Term</th><th>Meaning</th><th>Where encoded</th><th>Label</th></tr></thead><tbody>
+<tr><td>Admin SQ/CQ (queue ID 0)</td><td>The single queue pair for management commands; exists from enable.</td><td>AQA (sizes), ASQ, ACQ (base addresses)</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>I/O SQ/CQ (IDs 1…)</td><td>Queues for command-set commands (Read, Write…); created by admin commands.</td><td>Create I/O CQ (05h), Create I/O SQ (01h)</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>Queue size</td><td>Entries; encoded 0-based. Minimum size is 2 entries. Max I/O size = CAP.MQES + 1; Admin max 4096.</td><td>CAP.MQES bits 15:0; AQA.ASQS bits 11:0, AQA.ACQS bits 27:16</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>Physically Contiguous (PC)</td><td>Queue lives in one contiguous region (PRP1 = base) or is described by a PRP list.</td><td>CDW11 bit 0 of create commands</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>Many-to-one mapping</td><td>Several SQs may point to the same CQ; one SQ maps to exactly one CQ.</td><td>Create I/O SQ CDW11.CQID</td><td><span class="tag verified">verified</span></td></tr>
+<tr><td>SQ entry size / CQ entry size</td><td>64 B / 16 B for NVM command set over PCIe. Encoded as power of two in CC.IOSQES/CC.IOCQES (6 and 4).</td><td>CC, Identify Controller SQES/CQES</td><td><span class="tag verified">verified</span></td></tr>
+</tbody></table></div>
+<div class="callout notsaid"><div class="callout-title">📭 What the spec does not say</div><p>It does not say how many SQEs a controller fetches per MRd, how quickly it reacts to a doorbell, which order it completes commands in, or how it splits internal resources across queues. All of that is <span class="tag impl">impl</span> and is exactly what makes two compliant SSDs behave very differently under the same workload.</p></div>
+
+<h3>25.9 Protocol view — what crosses the link for one command</h3>
+<pre class="diagram">
+ HOST (CPU + DRAM)                         PCIe link                     NVMe CONTROLLER
+ -----------------                                                       ---------------
+ 1 write 64B SQE into SQ[tail] (DRAM, no PCIe traffic)
+ 2 tail = (tail+1) mod N
+ 3 MMIO store tail ---------------- MWr 4B  BAR0+SQyTDBL ------------&gt;  doorbell latched
+                                                                         4 compare tail vs head
+ &lt;------------------------------ MRd 64B (or more) SQ[head] ----------- 5 fetch SQE(s)
+ root complex returns ----------- CplD 64B ---------------------------&gt; 6 decode, execute
+ &lt;------------------------------ MRd/MWr data via PRP/SGL ------------- 7 data DMA
+ &lt;------------------------------ MWr 16B CQE at CQ[ctrl tail] -------- 8 post completion
+ &lt;------------------------------ MWr 4B MSI-X message ---------------- 9 interrupt (if enabled)
+ 10 ISR: read CQEs while P == expected
+ 11 MMIO store head --------------- MWr 4B  BAR0+CQyHDBL ------------&gt;  CQ slots freed
+</pre>
+<p>Notice that only steps 3 and 11 are host-initiated PCIe transactions; everything else is controller-initiated DMA. That asymmetry is deliberate: posted writes from the CPU are cheap, reads across PCIe are expensive (hundreds of nanoseconds), so the host never reads device registers in the I/O fast path. <span class="tag derived">derived</span></p>
+
+<h3>25.10 Queue analysis safety (how to reason about a queue in any trace)</h3>
+<div class="callout debug"><div class="callout-title">🐞 Queue-analysis checklist</div>
+<p>For every queue you analyse, write down a row with all ten items below. If the trace does not expose one, write "MISSING EVIDENCE" — do not guess.</p>
+<div class="table-wrap"><table><thead><tr><th>Item</th><th>Where you find it</th><th>If missing</th></tr></thead><tbody>
+<tr><td>Queue identifier (QID)</td><td>Create command CDW10[15:0]; doorbell offset; CQE.SQID</td><td>Derive from doorbell offset and CAP.DSTRD</td></tr>
+<tr><td>Queue depth</td><td>Create CDW10[31:16]+1; AQA for admin</td><td>Lower bound = largest index seen + 1</td></tr>
+<tr><td>Head</td><td>SQ: CQE.SQHD; CQ: CQyHDBL writes</td><td>State "unknown"; never assume 0</td></tr>
+<tr><td>Tail</td><td>SQ: SQyTDBL writes; CQ: count of CQE writes</td><td>Same</td></tr>
+<tr><td>Command identifier</td><td>SQE CDW0[31:16]; CQE DW3[15:0]</td><td>Match by order only with low confidence</td></tr>
+<tr><td>Phase</td><td>CQE DW3 bit 16</td><td>Infer from lap count</td></tr>
+<tr><td>Memory location</td><td>ASQ/ACQ registers; Create PRP1</td><td>Match MRd/MWr addresses to ranges</td></tr>
+<tr><td>Ownership of each slot</td><td>Derived from head/tail</td><td>—</td></tr>
+<tr><td>Producer</td><td>Fixed by queue type</td><td>—</td></tr>
+<tr><td>Consumer</td><td>Fixed by queue type</td><td>—</td></tr>
+</tbody></table></div></div>
+
+<h3>25.11 Trace view — normal, slow, failed, ambiguous</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 25-A — normal: two reads on I/O queue pair 1, N = 16, DSTRD = 0</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Address / detail</th><th>Interpretation</th></tr></thead><tbody>
+<tr><td>0.000</td><td>H→D</td><td>MWr 4B</td><td>BAR0+1008h data=00000002h</td><td>SQ1 tail 0→2 (two SQEs written)</td></tr>
+<tr><td>0.410</td><td>D→H</td><td>MRd 128B</td><td>SQ1 base+000h</td><td>fetch slots 0 and 1 in one read <span class="tag impl">impl</span></td></tr>
+<tr><td>0.880</td><td>H→D</td><td>CplD 128B</td><td>—</td><td>two SQEs, CID 0010h and 0011h</td></tr>
+<tr><td>62.3</td><td>D→H</td><td>MWr 4096B…</td><td>data pages for CID 0011h</td><td>completes first: out of order is legal</td></tr>
+<tr><td>63.0</td><td>D→H</td><td>MWr 16B</td><td>CQ1 base+000h, CID 0011h, P=1, SQHD=2</td><td>CQE in slot 0</td></tr>
+<tr><td>63.1</td><td>D→H</td><td>MWr 4B</td><td>MSI-X vector 1 address</td><td>interrupt</td></tr>
+<tr><td>71.8</td><td>D→H</td><td>MWr 16B</td><td>CQ1 base+010h, CID 0010h, P=1, SQHD=2</td><td>CQE slot 1</td></tr>
+<tr><td>72.6</td><td>H→D</td><td>MWr 4B</td><td>BAR0+100Ch data=00000002h</td><td>CQ1 head → 2</td></tr>
+</tbody></table></div></div>
+
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 25-B — slow: completion late because the CQ was full</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Detail</th><th>Interpretation</th></tr></thead><tbody>
+<tr><td>0</td><td>D→H</td><td>MWr 16B</td><td>CQ2 slot 6 (N=8)</td><td>CQ now holds 7 un-acknowledged entries (head still 7 from last lap)</td></tr>
+<tr class="first-bad"><td>5–950</td><td>—</td><td>(no CQE writes)</td><td>data DMA for 3 more commands finishes</td><td>controller must not overwrite: (tail+1) mod 8 == head → full</td></tr>
+<tr class="bad"><td>951</td><td>H→D</td><td>MWr 4B</td><td>BAR0+CQ2HDBL = 6</td><td>host finally reaps (e.g. interrupt coalesced or CPU busy)</td></tr>
+<tr><td>952</td><td>D→H</td><td>MWr 16B ×3</td><td>slots 7, 0, 1 (slots 0,1 with inverted P)</td><td>backlog drains; latency = host reaping delay, not media</td></tr>
+</tbody></table></div></div>
+
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 25-C — failed: doorbell beyond queue size</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>TLP</th><th>Detail</th><th>Interpretation</th></tr></thead><tbody>
+<tr><td>0</td><td>H→D</td><td>MWr 4B</td><td>BAR0+1008h = 00000040h (SQ1 N=64)</td><td>tail = 64 is out of range 0…63</td></tr>
+<tr class="first-bad"><td>+1 µs</td><td>D→H</td><td>MWr 16B</td><td>Admin CQ: Asynchronous Event completion, type Error, info "Invalid Doorbell Write Value"</td><td>controller reports the bad write if an AER command is outstanding <span class="tag verified">verified</span> (exact reporting path is version-sensitive)</td></tr>
+<tr class="bad"><td>…</td><td>—</td><td>no MRd on SQ1</td><td>—</td><td>commands on SQ1 time out; driver resets controller</td></tr>
+</tbody></table></div></div>
+
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 25-D — ambiguous: CQE observed, host never consumed it</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>TLP</th><th>Detail</th><th>Interpretation</th></tr></thead><tbody>
+<tr><td>0</td><td>D→H</td><td>MWr 16B</td><td>CQ3 slot 0, CID 0007h, P=<b>0</b></td><td>controller thinks it is on lap 2 — or the CQE is correct and the host is on lap 2?</td></tr>
+<tr><td>+30 s</td><td>H</td><td>—</td><td>kernel log: I/O 7 QID 3 timeout</td><td>host never saw it</td></tr>
+</tbody></table></div>
+<p>Two hypotheses fit: (a) the controller's phase is stale (firmware bug after a queue re-creation), or (b) the host's expected phase is wrong (host bug: did not re-initialise after reset). Missing evidence: the lap count for this CQ since creation. Disambiguate by capturing from the Create I/O CQ command onward and counting CQE writes modulo N.</p></div>
+
+<h3>25.12 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code># How many I/O queues did the driver create? (read-only)
+ls /sys/block/nvme0n1/mq/            # one directory per blk-mq hardware context
+cat /sys/block/nvme0n1/mq/0/cpu_list # which CPUs map to hw queue 0
+cat /sys/block/nvme0n1/queue/nr_requests
+grep nvme /proc/interrupts           # one line per MSI-X vector; counts per CPU
+nvme get-feature /dev/nvme0 -f 0x07 -H   # Number of Queues feature (FID 07h)
+nvme show-regs /dev/nvme0 -H         # CAP.MQES, CAP.CQR, CAP.DSTRD, AQA...</code></pre>
+<div class="callout warn"><div class="callout-title">⚠️ Safety</div><p>All commands above only read. <code>nvme show-regs</code> maps BAR0 and reads registers; on some kernels it needs root and may be refused if the device is bound to another driver. Never use <code>setpci</code> or direct BAR writes to "poke" doorbells on a device that holds data.</p></div>
+<p>What these prove: the number of hardware contexts, the CPU→queue mapping, and the interrupt distribution. What they cannot prove: real-time head/tail values or whether a particular CQE was written — for that you need a driver tracepoint (<code>nvme:nvme_complete_rq</code>, <code>nvme:nvme_sq</code>) or a protocol analyzer.</p>
+
+<h3>25.13 Code — an executable SQ/CQ simulator with doorbells and phase tags</h3>
+<p>The program below models one SQ/CQ pair, a host and a controller that communicate <i>only</i> through the shared rings and two doorbell values — exactly like the real thing. It implements the full/empty rules, SQHD feedback and phase inversion, and lets you inject the six classic faults required by this course: wrong tail, wrong queue ID, duplicate CID, CQ overflow (full CQ), stale phase and missing completion.</p>
+<pre class="code" data-kind="simulation"><code>#!/usr/bin/env python3
+"""nvme_qsim.py - teaching simulator for one NVMe SQ/CQ pair.
+SIMULATION ONLY: models ring arithmetic, doorbells and phase tags.
+It does not model PCIe, real controller timing or any real device."""
+import random
+
+class Ring:
+    def __init__(self, size):
+        assert size &gt;= 2, "NVMe queues need at least 2 entries"
+        self.size = size
+        self.slots = [None] * size
+        self.head = 0          # consumer index
+        self.tail = 0          # producer index
+    def empty(self):
+        return self.head == self.tail
+    def full(self):
+        return (self.tail + 1) % self.size == self.head
+    def used(self):
+        return (self.tail - self.head) % self.size
+
+class Controller:
+    """Device side. Only sees memory + doorbell values the host gives it."""
+    def __init__(self, sq, cq, sqid, faults):
+        self.sq, self.cq, self.sqid = sq, cq, sqid
+        self.sq_tail_db = 0     # last value host rang into SQyTDBL
+        self.cq_head_db = 0     # last value host rang into CQyHDBL
+        self.phase = 1          # controller's current CQ phase (starts at 1)
+        self.cq_tail = 0
+        self.faults = faults
+        self.inflight_cids = set()
+        self.log = []
+
+    def ring_sq_doorbell(self, value, qid):
+        if qid != self.sqid:
+            self.log.append(f"  [ctrl] doorbell write for SQ{qid}: no such queue -&gt; ignored "
+                            "(real HW: undefined/async error 'Invalid Doorbell Write')")
+            return
+        if value &gt;= self.sq.size:
+            self.log.append(f"  [ctrl] SQ tail {value} &gt;= size {self.sq.size}: invalid doorbell value")
+            return
+        self.sq_tail_db = value
+        self.log.append(f"  [ctrl] SQ{qid}TDBL &lt;- {value}")
+
+    def ring_cq_doorbell(self, value):
+        self.cq_head_db = value
+        self.log.append(f"  [ctrl] CQ{self.sqid}HDBL &lt;- {value}")
+
+    def cq_full(self):
+        return (self.cq_tail + 1) % self.cq.size == self.cq_head_db
+
+    def run(self, budget=99):
+        """Fetch commands between our SQ head and the doorbell tail, complete them."""
+        done = 0
+        while self.sq.head != self.sq_tail_db and done &lt; budget:
+            if self.cq_full():
+                self.log.append("  [ctrl] CQ full (tail+1 == head) -&gt; must stall, cannot post")
+                return
+            cmd = self.sq.slots[self.sq.head]
+            self.log.append(f"  [ctrl] fetch SQ[{self.sq.head}] opcode={cmd['opc']:02X}h cid={cmd['cid']}")
+            self.sq.head = (self.sq.head + 1) % self.sq.size
+            status = 0x0000
+            if cmd['nsid'] == 0:
+                status = 0x000B          # zeroed slot = opcode 00h NSID 0 -&gt; Invalid Namespace or Format
+            elif cmd['cid'] in self.inflight_cids:
+                status = 0x0003          # Generic SCT 0, SC 03h Command ID Conflict (detection is impl-dependent)
+            if status == 0:
+                self.inflight_cids.add(cmd['cid'])
+            if status == 0 and cmd['cid'] in self.faults.get('drop_cid', ()):
+                self.log.append(f"  [ctrl] (fault) cid={cmd['cid']} never completes (held/lost) - no CQE")
+                done += 1
+                continue
+            phase = self.phase if not self.faults.get('stale_phase') else self.phase ^ 1
+            cqe = {'dw0': 0, 'sqhd': self.sq.head, 'sqid': self.sqid,
+                   'cid': cmd['cid'], 'p': phase, 'status': status}
+            self.cq.slots[self.cq_tail] = cqe
+            self.log.append(f"  [ctrl] post CQ[{self.cq_tail}] cid={cqe['cid']} P={phase} "
+                            f"SQHD={cqe['sqhd']} status={status:04X}h -&gt; MSI-X")
+            self.cq_tail = (self.cq_tail + 1) % self.cq.size
+            if self.cq_tail == 0:
+                self.phase ^= 1          # wrap =&gt; invert phase for next pass
+            self.inflight_cids.discard(cmd['cid']) if status == 0 else None
+            done += 1
+
+class Host:
+    def __init__(self, depth, faults=None, cq_depth=None):
+        self.faults = faults or {}
+        self.sq, self.cq = Ring(depth), Ring(cq_depth or depth)
+        self.sq.slots = [{'opc': 0x00, 'cid': 0, 'nsid': 0}] * depth   # zeroed SQ memory
+        self.cq.slots = [{'p': 0}] * self.cq.size          # host zeroes CQ memory =&gt; P=0
+        self.expected_phase = 1
+        self.ctrl = Controller(self.sq, self.cq, 1, self.faults)
+        self.next_cid = 0
+        self.sq_head_seen = 0                        # learned from CQE.SQHD
+
+    def submit(self, opc=0x02):
+        if (self.sq.tail + 1) % self.sq.size == self.sq_head_seen:
+            print("  [host] SQ full - cannot submit (tail+1 == head)")
+            return False
+        cid = self.next_cid
+        if self.faults.get('dup_cid') and cid == 2:
+            cid = 1                                   # fault: reuse an in-flight CID
+        self.next_cid += 1
+        self.sq.slots[self.sq.tail] = {'opc': opc, 'cid': cid, 'nsid': 1}
+        self.sq.tail = (self.sq.tail + 1) % self.sq.size
+        print(f"  [host] write SQE cid={cid} into SQ[{(self.sq.tail-1) % self.sq.size}], tail -&gt; {self.sq.tail}")
+        return True
+
+    def doorbell(self):
+        val = self.sq.tail
+        if self.faults.get('wrong_tail'):
+            val = (val + 1) % self.sq.size            # fault: one too far
+        qid = self.faults.get('wrong_qid', 1)
+        self.ctrl.ring_sq_doorbell(val, qid)
+
+    def reap(self):
+        n = 0
+        while True:
+            e = self.cq.slots[self.cq.head]
+            if e['p'] != self.expected_phase:
+                break                                  # not new yet
+            print(f"  [host] reap CQ[{self.cq.head}] cid={e['cid']} status={e['status']:04X}h "
+                  f"SQHD={e['sqhd']}")
+            self.sq_head_seen = e['sqhd']
+            self.cq.head = (self.cq.head + 1) % self.cq.size
+            if self.cq.head == 0:
+                self.expected_phase ^= 1
+            n += 1
+        if n:
+            self.ctrl.ring_cq_doorbell(self.cq.head)
+        else:
+            print(f"  [host] no new CQE at CQ[{self.cq.head}] (expect P={self.expected_phase})")
+        return n
+
+def flush(ctrl):
+    for line in ctrl.log:
+        print(line)
+    ctrl.log.clear()
+
+def scenario(name, depth, rounds, per_round, faults=None, reap=True, cq_depth=None):
+    print(f"=== {name} (SQ depth={depth}, CQ depth={cq_depth or depth}) ===")
+    h = Host(depth, faults, cq_depth)
+    for r in range(rounds):
+        for _ in range(per_round):
+            h.submit()
+        h.doorbell(); flush(h.ctrl)
+        h.ctrl.run(); flush(h.ctrl)
+        if reap:
+            h.reap(); flush(h.ctrl)
+    print(f"  final: SQ head/tail={h.sq.head}/{h.sq.tail} CQ ctrl-tail={h.ctrl.cq_tail} "
+          f"host-head={h.cq.head} host-phase={h.expected_phase} ctrl-phase={h.ctrl.phase}\n")
+
+if __name__ == "__main__":
+    scenario("normal: wrap twice, watch phase flip", 4, 4, 2)
+    scenario("fault: wrong tail (one past real tail)", 4, 1, 1, {'wrong_tail': True})
+    scenario("fault: doorbell rung for wrong queue id", 4, 1, 1, {'wrong_qid': 2})
+    scenario("fault: duplicate CID while first copy still in flight", 8, 1, 3,
+             {'dup_cid': True, 'drop_cid': (1,)})
+    scenario("fault: host never reaps -&gt; CQ full, controller stalls", 8, 1, 5, reap=False, cq_depth=4)
+    scenario("fault: stale phase written by device", 4, 1, 1, {'stale_phase': True})
+    scenario("fault: missing completion", 4, 1, 2, {'drop_cid': (0,)})</code></pre>
+<p>Output of <code>python3 nvme_qsim.py</code> (produced by actually running the program above; it is simulation output, not a device log):</p>
+<pre class="code" data-kind="simulation"><code>=== normal: wrap twice, watch phase flip (SQ depth=4, CQ depth=4) ===
+  [host] write SQE cid=0 into SQ[0], tail -&gt; 1
+  [host] write SQE cid=1 into SQ[1], tail -&gt; 2
+  [ctrl] SQ1TDBL &lt;- 2
+  [ctrl] fetch SQ[0] opcode=02h cid=0
+  [ctrl] post CQ[0] cid=0 P=1 SQHD=1 status=0000h -&gt; MSI-X
+  [ctrl] fetch SQ[1] opcode=02h cid=1
+  [ctrl] post CQ[1] cid=1 P=1 SQHD=2 status=0000h -&gt; MSI-X
+  [host] reap CQ[0] cid=0 status=0000h SQHD=1
+  [host] reap CQ[1] cid=1 status=0000h SQHD=2
+  [ctrl] CQ1HDBL &lt;- 2
+  [host] write SQE cid=2 into SQ[2], tail -&gt; 3
+  [host] write SQE cid=3 into SQ[3], tail -&gt; 0
+  [ctrl] SQ1TDBL &lt;- 0
+  [ctrl] fetch SQ[2] opcode=02h cid=2
+  [ctrl] post CQ[2] cid=2 P=1 SQHD=3 status=0000h -&gt; MSI-X
+  [ctrl] fetch SQ[3] opcode=02h cid=3
+  [ctrl] post CQ[3] cid=3 P=1 SQHD=0 status=0000h -&gt; MSI-X
+  [host] reap CQ[2] cid=2 status=0000h SQHD=3
+  [host] reap CQ[3] cid=3 status=0000h SQHD=0
+  [ctrl] CQ1HDBL &lt;- 0
+  [host] write SQE cid=4 into SQ[0], tail -&gt; 1
+  [host] write SQE cid=5 into SQ[1], tail -&gt; 2
+  [ctrl] SQ1TDBL &lt;- 2
+  [ctrl] fetch SQ[0] opcode=02h cid=4
+  [ctrl] post CQ[0] cid=4 P=0 SQHD=1 status=0000h -&gt; MSI-X
+  [ctrl] fetch SQ[1] opcode=02h cid=5
+  [ctrl] post CQ[1] cid=5 P=0 SQHD=2 status=0000h -&gt; MSI-X
+  [host] reap CQ[0] cid=4 status=0000h SQHD=1
+  [host] reap CQ[1] cid=5 status=0000h SQHD=2
+  [ctrl] CQ1HDBL &lt;- 2
+  [host] write SQE cid=6 into SQ[2], tail -&gt; 3
+  [host] write SQE cid=7 into SQ[3], tail -&gt; 0
+  [ctrl] SQ1TDBL &lt;- 0
+  [ctrl] fetch SQ[2] opcode=02h cid=6
+  [ctrl] post CQ[2] cid=6 P=0 SQHD=3 status=0000h -&gt; MSI-X
+  [ctrl] fetch SQ[3] opcode=02h cid=7
+  [ctrl] post CQ[3] cid=7 P=0 SQHD=0 status=0000h -&gt; MSI-X
+  [host] reap CQ[2] cid=6 status=0000h SQHD=3
+  [host] reap CQ[3] cid=7 status=0000h SQHD=0
+  [ctrl] CQ1HDBL &lt;- 0
+  final: SQ head/tail=0/0 CQ ctrl-tail=0 host-head=0 host-phase=1 ctrl-phase=1
+
+=== fault: wrong tail (one past real tail) (SQ depth=4, CQ depth=4) ===
+  [host] write SQE cid=0 into SQ[0], tail -&gt; 1
+  [ctrl] SQ1TDBL &lt;- 2
+  [ctrl] fetch SQ[0] opcode=02h cid=0
+  [ctrl] post CQ[0] cid=0 P=1 SQHD=1 status=0000h -&gt; MSI-X
+  [ctrl] fetch SQ[1] opcode=00h cid=0
+  [ctrl] post CQ[1] cid=0 P=1 SQHD=2 status=000Bh -&gt; MSI-X
+  [host] reap CQ[0] cid=0 status=0000h SQHD=1
+  [host] reap CQ[1] cid=0 status=000Bh SQHD=2
+  [ctrl] CQ1HDBL &lt;- 2
+  final: SQ head/tail=2/1 CQ ctrl-tail=2 host-head=2 host-phase=1 ctrl-phase=1
+
+=== fault: doorbell rung for wrong queue id (SQ depth=4, CQ depth=4) ===
+  [host] write SQE cid=0 into SQ[0], tail -&gt; 1
+  [ctrl] doorbell write for SQ2: no such queue -&gt; ignored (real HW: undefined/async error 'Invalid Doorbell Write')
+  [host] no new CQE at CQ[0] (expect P=1)
+  final: SQ head/tail=0/1 CQ ctrl-tail=0 host-head=0 host-phase=1 ctrl-phase=1
+
+=== fault: duplicate CID while first copy still in flight (SQ depth=8, CQ depth=8) ===
+  [host] write SQE cid=0 into SQ[0], tail -&gt; 1
+  [host] write SQE cid=1 into SQ[1], tail -&gt; 2
+  [host] write SQE cid=1 into SQ[2], tail -&gt; 3
+  [ctrl] SQ1TDBL &lt;- 3
+  [ctrl] fetch SQ[0] opcode=02h cid=0
+  [ctrl] post CQ[0] cid=0 P=1 SQHD=1 status=0000h -&gt; MSI-X
+  [ctrl] fetch SQ[1] opcode=02h cid=1
+  [ctrl] (fault) cid=1 never completes (held/lost) - no CQE
+  [ctrl] fetch SQ[2] opcode=02h cid=1
+  [ctrl] post CQ[1] cid=1 P=1 SQHD=3 status=0003h -&gt; MSI-X
+  [host] reap CQ[0] cid=0 status=0000h SQHD=1
+  [host] reap CQ[1] cid=1 status=0003h SQHD=3
+  [ctrl] CQ1HDBL &lt;- 2
+  final: SQ head/tail=3/3 CQ ctrl-tail=2 host-head=2 host-phase=1 ctrl-phase=1
+
+=== fault: host never reaps -&gt; CQ full, controller stalls (SQ depth=8, CQ depth=4) ===
+  [host] write SQE cid=0 into SQ[0], tail -&gt; 1
+  [host] write SQE cid=1 into SQ[1], tail -&gt; 2
+  [host] write SQE cid=2 into SQ[2], tail -&gt; 3
+  [host] write SQE cid=3 into SQ[3], tail -&gt; 4
+  [host] write SQE cid=4 into SQ[4], tail -&gt; 5
+  [ctrl] SQ1TDBL &lt;- 5
+  [ctrl] fetch SQ[0] opcode=02h cid=0
+  [ctrl] post CQ[0] cid=0 P=1 SQHD=1 status=0000h -&gt; MSI-X
+  [ctrl] fetch SQ[1] opcode=02h cid=1
+  [ctrl] post CQ[1] cid=1 P=1 SQHD=2 status=0000h -&gt; MSI-X
+  [ctrl] fetch SQ[2] opcode=02h cid=2
+  [ctrl] post CQ[2] cid=2 P=1 SQHD=3 status=0000h -&gt; MSI-X
+  [ctrl] CQ full (tail+1 == head) -&gt; must stall, cannot post
+  final: SQ head/tail=3/5 CQ ctrl-tail=3 host-head=0 host-phase=1 ctrl-phase=1
+
+=== fault: stale phase written by device (SQ depth=4, CQ depth=4) ===
+  [host] write SQE cid=0 into SQ[0], tail -&gt; 1
+  [ctrl] SQ1TDBL &lt;- 1
+  [ctrl] fetch SQ[0] opcode=02h cid=0
+  [ctrl] post CQ[0] cid=0 P=0 SQHD=1 status=0000h -&gt; MSI-X
+  [host] no new CQE at CQ[0] (expect P=1)
+  final: SQ head/tail=1/1 CQ ctrl-tail=1 host-head=0 host-phase=1 ctrl-phase=1
+
+=== fault: missing completion (SQ depth=4, CQ depth=4) ===
+  [host] write SQE cid=0 into SQ[0], tail -&gt; 1
+  [host] write SQE cid=1 into SQ[1], tail -&gt; 2
+  [ctrl] SQ1TDBL &lt;- 2
+  [ctrl] fetch SQ[0] opcode=02h cid=0
+  [ctrl] (fault) cid=0 never completes (held/lost) - no CQE
+  [ctrl] fetch SQ[1] opcode=02h cid=1
+  [ctrl] post CQ[0] cid=1 P=1 SQHD=2 status=0000h -&gt; MSI-X
+  [host] reap CQ[0] cid=1 status=0000h SQHD=2
+  [ctrl] CQ1HDBL &lt;- 1
+  final: SQ head/tail=2/2 CQ ctrl-tail=1 host-head=1 host-phase=1 ctrl-phase=1</code></pre>
+<h4>Reading the fault output</h4>
+<div class="table-wrap"><table><thead><tr><th>Injected fault</th><th>How it manifests in the model</th><th>How it manifests on real hardware</th></tr></thead><tbody>
+<tr><td>Wrong tail (one past)</td><td>Controller fetches a zeroed slot: opcode 00h (Flush) with NSID 0 → status 000Bh Invalid Namespace or Format, CID 0 completes twice</td><td>Garbage or stale SQE executed — could be a <i>valid old Write</i> replayed: silent corruption. Most dangerous fault. <span class="tag derived">derived</span></td></tr>
+<tr><td>Wrong queue ID</td><td>Doorbell ignored, command never fetched</td><td>Doorbell to a non-existent queue: asynchronous error event possible; command times out</td></tr>
+<tr><td>Duplicate CID</td><td>Second copy completes with 0003h Command ID Conflict</td><td>Behaviour <span class="tag impl">impl</span>: controller may detect it or may not; host may complete the wrong request</td></tr>
+<tr><td>CQ full</td><td>Controller stalls after 3 posts with a 4-entry CQ</td><td>Completions delayed; throughput collapse; looks like a slow drive</td></tr>
+<tr><td>Stale phase</td><td>CQE written but host sees "nothing new"</td><td>Timeout although analyzer shows the CQE MWr</td></tr>
+<tr><td>Missing completion</td><td>CID 0 never completes; later CIDs do</td><td>Single-command timeout; Abort then reset escalation</td></tr>
+</tbody></table></div>
+
+<h3>25.14 Command lifecycle (teaching model)</h3>
+<p>The following state chain is a <b>teaching model</b> <span class="tag conceptual">conceptual</span>. It is <i>not</i> a normative controller state machine; the specification defines the queue and completion rules, not a named internal state for each step.</p>
+<pre class="diagram">
+CREATED ─► QUEUED ─► SUBMITTED ─► FETCHED ─► EXECUTING ─► DATA TRANSFER ─► MEDIA OPERATION
+ (driver   (SQE in   (doorbell    (MRd of    (decoded)    (MRd/MWr via    (NAND read/
+  builds    SQ slot)  rung)        SQE done)               PRP/SGL)         program; may
+  request)                                                                  overlap DMA)
+   ─► COMPLETED ─► CQE POSTED ─► INTERRUPT / POLL ─► DRIVER RETIREMENT
+      (status      (MWr 16B     (MSI-X MWr or       (CID matched, request
+       decided)     with P)      host polling)        ended, CQ head rung)
+</pre>
+<div class="table-wrap"><table><thead><tr><th>Transition</th><th>Observable on PCIe?</th><th>Observable in Linux?</th></tr></thead><tbody>
+<tr><td>QUEUED→SUBMITTED</td><td>Yes: doorbell MWr</td><td><code>nvme:nvme_setup_cmd</code> tracepoint (just before)</td></tr>
+<tr><td>SUBMITTED→FETCHED</td><td>Yes: MRd + CplD of SQ address</td><td>No</td></tr>
+<tr><td>EXECUTING / MEDIA</td><td>No (internal)</td><td>No</td></tr>
+<tr><td>DATA TRANSFER</td><td>Yes: MWr (read cmd) / MRd (write cmd) to data pages</td><td>No (unless IOMMU fault)</td></tr>
+<tr><td>CQE POSTED</td><td>Yes: MWr 16B to CQ</td><td>No</td></tr>
+<tr><td>INTERRUPT</td><td>Yes: MWr to MSI-X address</td><td><code>/proc/interrupts</code> counter</td></tr>
+<tr><td>RETIREMENT</td><td>Yes: CQ head doorbell (maybe batched)</td><td><code>nvme:nvme_complete_rq</code></td></tr>
+</tbody></table></div>
+
+<h3>25.15 Common mistakes</h3>
+<ul>
+<li>Believing a queue of N entries holds N commands. It holds N−1.</li>
+<li>Encoding the size as N instead of N−1 in AQA or Create commands (0-based fields).</li>
+<li>Thinking the host learns SQ progress from a register. It learns it only from CQE.SQHD.</li>
+<li>Assuming completion order = submission order.</li>
+<li>Expecting the phase tag to be 1 for "valid". It is valid when it <i>matches the expected lap value</i>.</li>
+<li>Re-using CQ memory after a reset without zeroing it.</li>
+</ul>
+
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>When someone says "the drive hung", ask for <b>four numbers per queue</b>: last SQ tail doorbell value, last SQHD the host saw, last CQ head doorbell value, and the CQ slot/phase of the last CQE written. Ninety percent of "hangs" fall out of those four numbers: if tail ≠ SQHD and no MRd was seen, the controller never fetched; if a CQE was written but the CQ head never moved, the host lost the interrupt or misjudged the phase; if the CQ is full, the host is the bottleneck.</p></div>
+
+<div class="lab"><div class="lab-head">🧪 Lab 25.1 — Ring arithmetic by hand and in the simulator <span class="safety safe">SAFE LAB</span></div>
+<p><b>Objective:</b> predict head/tail/phase for any sequence, then confirm with the simulator. <b>Prerequisites:</b> Python 3.8+. <b>Setup:</b> save the simulator as <code>nvme_qsim.py</code>.</p>
+<ol><li>Without running anything, compute for SQ/CQ depth 4: after submitting and reaping 2 commands four times, what are the final SQ head/tail, CQ head, host expected phase and controller phase?</li>
+<li>Run the normal scenario and compare.</li>
+<li>Change depth to 5 and rounds to 3 with 3 commands per round. Predict where the phase flips.</li>
+<li>Add a scenario where the host reaps only every second round. Observe when the controller stalls.</li></ol>
+<p><b>Observations:</b> list the CQ slot and P value of every posted CQE. <b>Questions:</b> why does P on slot 0 differ between lap 1 and lap 2? Why can the host only have 3 commands outstanding on a depth-4 SQ?</p>
+<details class="answer"><summary>Solution</summary><p>Depth 4, 8 commands total, two laps: SQ head/tail 0/0, CQ head 0, host expected phase 1 (flipped twice), controller phase 1 (flipped twice). With depth 5 and 3 per round the controller's tail goes 0→3→1 (wrap after 5 posts, phase becomes 0)→4; the first CQE with P=0 is the 6th completion, in slot 0. A depth-4 SQ: (tail+1) mod 4 == head when 3 are outstanding.</p></details>
+<p><b>Extension:</b> give the controller a random completion order (shuffle the fetched batch before posting) and confirm that the host still matches every CID.</p></div>
+
+<div class="lab"><div class="lab-head">🧪 Lab 25.2 — Read the queue layout of your own system <span class="safety safe">SAFE LAB</span></div>
+<p><b>Objective:</b> relate blk-mq hardware contexts to NVMe I/O queues and MSI-X vectors. <b>Setup:</b> any Linux machine with an NVMe drive; read-only commands from §25.12.</p>
+<ol><li>Count directories under <code>/sys/block/nvme0n1/mq/</code>.</li><li>Count nvme lines in <code>/proc/interrupts</code>.</li><li>Run <code>nvme get-feature /dev/nvme0 -f 7 -H</code> and note NSQA/NCQA (0-based).</li></ol>
+<p><b>Questions:</b> why is the number of vectors typically (I/O queues + 1)? Why may the number of hctx be smaller than NSQA+1?</p>
+<details class="answer"><summary>Solution</summary><p>Vector 0 is usually shared by the admin queue (and sometimes I/O queue 1); each I/O CQ has its own vector so completions interrupt the CPU that submitted. The driver creates at most min(controller-allocated queues, CPUs, module parameters) I/O queues; the controller may also allocate fewer than requested. Exact sharing policy is <span class="tag impl">impl</span> (Linux version dependent).</p></details>
+<p><b>Extension:</b> check <code>/sys/module/nvme/parameters/poll_queues</code> and <code>write_queues</code> — polled queues have no interrupt vector.</p></div>
+
+<div class="callout exercise"><div class="callout-title">🎯 Exercise</div><p>A CQ of 32 entries. The host has head = 30, expected phase = 0. The controller writes 5 CQEs. List the slots, the P bit in each, and the host's head and expected phase afterwards. <i>Answer:</i> slots 30, 31 with P=0; wrap; slots 0, 1, 2 with P=1. Host head = 3, expected phase = 1.</p></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>An SQ has N = 64, head = 10, tail = 9. How many commands are outstanding?</p><details class="answer"><summary>Answer</summary><p>(9 − 10) mod 64 = 63 = N − 1 → the queue is full.</p></details></li>
+<li><p>Who owns the CQ tail and how does the host learn it?</p><details class="answer"><summary>Answer</summary><p>The controller. The host never reads it; it infers it by scanning CQEs whose phase tag matches its expected phase.</p></details></li>
+<li><p>Why does the host need CQE.SQHD?</p><details class="answer"><summary>Answer</summary><p>It is the only way the host learns which SQ slots the controller has consumed and may be reused; without it the host cannot evaluate the SQ full condition.</p></details></li>
+<li><p>Can two SQs share one CQ? Can one SQ use two CQs?</p><details class="answer"><summary>Answer</summary><p>Yes; no. Mapping is many SQs to one CQ.</p></details></li>
+<li><p>A CQE has P = 1 and the host expects 0. New or old?</p><details class="answer"><summary>Answer</summary><p>Old (left over from the previous lap). The host stops scanning.</p></details></li>
+</ol></div>
+
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> What is a queue pair in NVMe? <details class="answer"><summary>Model answer</summary>An SQ and the CQ it is associated with; the host submits to the SQ and the controller reports results in the CQ. The admin pair is QID 0; I/O pairs are created by admin commands.</details></li>
+<li><span class="lvl">Beginner</span> Why is one slot always left empty? <details class="answer"><summary>Model answer</summary>So that head == tail means only "empty"; full is tail + 1 == head.</details></li>
+<li><span class="lvl">Intermediate</span> Explain the phase tag and why it avoids an MMIO read. <details class="answer"><summary>Model answer</summary>Each CQE's P bit equals the controller's lap parity; the host compares with its own expected lap parity, so it can find all new entries in its own memory (cache-friendly), with no PCIe read of a tail register, which would cost ~1 µs.</details></li>
+<li><span class="lvl">Intermediate</span> Why do NVMe drivers create one queue per CPU? <details class="answer"><summary>Model answer</summary>Each CPU then owns its SQ tail and CQ head with no cross-CPU locking or cache-line bouncing, and the CQ's MSI-X vector can target the same CPU.</details></li>
+<li><span class="lvl">Advanced</span> The controller completes out of order. What breaks if the driver assumed in-order? <details class="answer"><summary>Model answer</summary>It would retire the wrong request (wrong buffer returned to the application) — data corruption visible above the block layer; CID matching is mandatory.</details></li>
+<li><span class="lvl">Senior</span> A customer shows an analyzer capture where the CQE was written but Linux timed out the I/O. What do you check? <details class="answer"><summary>Model answer</summary>CQE phase vs the CQ's lap count since creation; CQ address vs the address the driver programmed (written to wrong memory/IOMMU fault?); MSI-X MWr presence and its address/data vs the MSI-X table; whether vector was masked; interrupt affinity/CPU offline; and whether CID/SQID in the CQE matches an outstanding request.</details></li>
+</ol></div>
+
+<div class="callout exercise"><div class="callout-title">🎯 Teach-back</div><p>Explain the phase tag (1) to a child using the ink-colour story, (2) to a junior engineer with the N=4 table from §25.6.2, and (3) to a senior engineer as "lap parity that converts a shared-memory ring into a lock-free single-producer/single-consumer channel without tail publication".</p></div>
+
+<div class="callout notsaid"><div class="callout-title">📭 Zero-hallucination ledger</div>
+<div class="table-wrap"><table><tbody>
+<tr><th>What is verified?</th><td>SQE 64 B / CQE 16 B; SQ produced by host, CQ by controller; full when (tail+1) mod N == head; phase tag in CQE DW3 bit 16 inverted per lap; host zeroes CQ before creation; SQHD feedback in CQE DW2. <span class="tag verified">verified</span></td></tr>
+<tr><th>What is derived?</th><td>N−1 usable slots; ghost completions if CQ not zeroed; host needs no MMIO read to find new CQEs. <span class="tag derived">derived</span></td></tr>
+<tr><th>What is implementation-dependent?</th><td>SQE fetch batching, completion order, reaction time to doorbells, internal arbitration beyond RR/WRR. <span class="tag impl">impl</span></td></tr>
+<tr><th>What is version-dependent?</th><td>Location of queue/doorbell text (single 1.x document vs Base + PCIe Transport since 2.0). <span class="tag version">version</span></td></tr>
+<tr><th>What must be checked in the specification?</th><td>Exact normative wording on CQ initialisation and on invalid doorbell writes in the revision you test.</td></tr>
+<tr><th>What should never be assumed?</th><td>In-order completion; that a CQE with P=1 is new; that the host can read a CQ tail register.</td></tr>
+</tbody></table></div></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can compute used/free/full/empty for any head, tail, N.</li>
+<li>I can draw a CQ through two laps with correct P values.</li>
+<li>I can state who owns each of the four indices and how each is published.</li>
+<li>I can predict the PCIe transactions for a single command.</li>
+<li>I ran the simulator and can explain the output of each fault scenario.</li>
+<li>I can cite which specification document (Base vs PCIe Transport) describes queues vs doorbells in the revision I use.</li>
+</ul></div>
+
+<h3>25.16 Summary</h3>
+<p>NVMe is two kinds of rings in host memory plus two kinds of index publication: doorbell writes for the host's indices and CQE fields (SQHD, phase) for the controller's. Full is tail+1 == head, empty is head == tail, and the phase bit is lap parity. Everything else in this Part builds on that.</p>
+<p><b>Further reading:</b> NVM Express Base Specification 2.4 (queue model, completion entry); NVMe over PCIe Transport Specification 1.4 (memory-based queues, doorbells); Linux <code>drivers/nvme/host/pci.c</code> (functions handling submission and <code>nvme_cqe_pending</code>-style phase checks; names vary by kernel version <span class="tag version">version</span>). <b>Next:</b> <a href="#p4-ch26-admin-queue">Chapter 26 — the Admin queue</a>.</p>
+</section>
+
+<section class="chapter" id="p4-ch26-admin-queue" data-part="PART X — NVMe QUEUES">
+<h2><span class="num">26</span> The Admin Queue</h2>
+
+<h3>26.1 Why this chapter exists</h3>
+<p>At reset the controller knows about exactly one queue pair: the Admin Submission Queue and Admin Completion Queue (queue ID 0). Every other capability — learning what the controller is (Identify), reading its health (Get Log Page), configuring it (Set Features), and creating every I/O queue — is done by commands on this pair. If admin bring-up fails, nothing else exists. Understanding the exact register handshake that creates the admin queue is also the single best way to debug "controller never becomes ready" failures.</p>
+
+<h3>26.2 Learning objectives</h3>
+<ul class="objectives">
+<li>Program AQA, ASQ and ACQ correctly, including the 0-based size encoding and alignment.</li>
+<li>Sequence controller enable: CC.EN=0 → wait CSTS.RDY=0 → configure → CC.EN=1 → wait CSTS.RDY=1.</li>
+<li>Explain why admin commands use PRPs (not SGLs) over PCIe and why admin commands are low-rate.</li>
+<li>Issue Identify, Get Log Page, Get/Set Features conceptually and know which fields to fill.</li>
+<li>Explain the queue-creation order (CQ before SQ) and deletion order (SQ before CQ).</li>
+</ul>
+<p><b>Prerequisites:</b> <a href="#p4-ch25-queue-architecture">Chapter 25</a> (ring rules). Register definitions (CAP 00h, CC 14h, CSTS 1Ch, AQA 24h, ASQ 28h, ACQ 30h).</p>
+
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy — the manager's desk</div><p>The supermarket has normal checkouts for shopping (I/O queues), but before the store opens, only the <b>manager's desk</b> exists. You go there to ask "what is this store?" (Identify), "show me the incident book" (Get Log Page), "open checkout number 3 and use belt number 3 for receipts" (Create I/O CQ/SQ), or "change the store temperature" (Set Features). The manager's desk is slow and you rarely use it, but nothing opens without it.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>The manager's desk is not physically different hardware — the admin queue uses the same ring mechanics, doorbells (SQ0TDBL at 1000h, CQ0HDBL at 1000h + (4 &lt;&lt; DSTRD)) and CQE format. What differs is its <i>creation</i> (registers, not commands), its command set (admin opcodes), and that it cannot be deleted.</p></div>
+
+<h3>26.3 Engineering — the registers that define the admin pair</h3>
+<div class="table-wrap"><table class="bitfield"><thead><tr><th>Register (offset)</th><th>Bits</th><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>AQA (24h)</td><td>11:0</td><td>ASQS</td><td>Admin SQ size, 0-based (value 31 → 32 entries). Minimum 1 (2 entries) <span class="tag verified">verified</span></td></tr>
+<tr><td>AQA (24h)</td><td>27:16</td><td>ACQS</td><td>Admin CQ size, 0-based. 12-bit field → maximum 4096 entries <span class="tag verified">verified</span></td></tr>
+<tr><td>ASQ (28h, 64-bit)</td><td>63:12</td><td>ASQB</td><td>Admin SQ base; bits 11:0 must be zero (4 KiB aligned, more precisely aligned to the memory page size) <span class="tag verified">verified</span></td></tr>
+<tr><td>ACQ (30h, 64-bit)</td><td>63:12</td><td>ACQB</td><td>Admin CQ base; page aligned <span class="tag verified">verified</span></td></tr>
+<tr><td>CC (14h)</td><td>0</td><td>EN</td><td>Enable</td></tr>
+<tr><td>CC (14h)</td><td>6:4</td><td>CSS</td><td>I/O command set selected (000b NVM; 110b all supported I/O command sets when CAP.CSS allows) <span class="tag version">version</span></td></tr>
+<tr><td>CC (14h)</td><td>10:7</td><td>MPS</td><td>Memory page size = 2^(12+MPS) bytes; must lie within CAP.MPSMIN…MPSMAX</td></tr>
+<tr><td>CC (14h)</td><td>13:11</td><td>AMS</td><td>Arbitration: 000b round robin, 001b weighted round robin with urgent</td></tr>
+<tr><td>CC (14h)</td><td>15:14</td><td>SHN</td><td>Shutdown notification</td></tr>
+<tr><td>CC (14h)</td><td>19:16 / 23:20</td><td>IOSQES / IOCQES</td><td>I/O SQ/CQ entry sizes as log2: 6 (64 B) and 4 (16 B)</td></tr>
+<tr><td>CSTS (1Ch)</td><td>0 / 1</td><td>RDY / CFS</td><td>Ready / Controller Fatal Status</td></tr>
+<tr><td>CAP (00h)</td><td>15:0, 16, 31:24, 35:32</td><td>MQES, CQR, TO, DSTRD</td><td>Max queue entries (0-based), contiguous queues required, timeout (500 ms units), doorbell stride</td></tr>
+</tbody></table></div>
+
+<h3>26.4 Mechanism — bringing up the admin queue step by step</h3>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Who acts</th><th>What changes</th><th>Where</th><th>Evidence on the wire / in Linux</th></tr></thead><tbody>
+<tr><td>1</td><td>Host</td><td>Reads CAP (MQES, DSTRD, TO, MPSMIN/MAX, CSS)</td><td>BAR0+00h</td><td>MRd 8B (or 2×4B) + CplD</td></tr>
+<tr><td>2</td><td>Host</td><td>If CC.EN=1, writes CC.EN=0 and polls CSTS.RDY until 0 (bounded by CAP.TO × 500 ms)</td><td>BAR0+14h, 1Ch</td><td>MWr to 14h, repeated MRd of 1Ch</td></tr>
+<tr><td>3</td><td>Host</td><td>Allocates zeroed, page-aligned memory for admin SQ and CQ</td><td>DRAM</td><td>none</td></tr>
+<tr><td>4</td><td>Host</td><td>Writes AQA = (ACQS−1)&lt;&lt;16 | (ASQS−1); ASQ, ACQ = bus addresses</td><td>BAR0+24h, 28h, 30h</td><td>3–5 MWr TLPs</td></tr>
+<tr><td>5</td><td>Host</td><td>Writes CC: MPS, CSS, AMS, IOSQES=6, IOCQES=4, EN=1</td><td>BAR0+14h</td><td>MWr</td></tr>
+<tr><td>6</td><td>Controller</td><td>Initialises; sets CSTS.RDY=1 (or CFS=1 on failure)</td><td>internal</td><td>host's MRd of 1Ch eventually returns RDY=1</td></tr>
+<tr><td>7</td><td>Host</td><td>Submits Identify Controller (CNS 01h) on SQ0 and rings SQ0TDBL</td><td>BAR0+1000h</td><td>MWr; then controller MRd of ASQ; MWr 4096 B to PRP1; MWr CQE to ACQ; MSI/MSI-X or INTx (admin interrupt)</td></tr>
+</tbody></table></div>
+<p>Linux equivalent: the driver's controller-enable path waits on CSTS.RDY; failure shows as a kernel message about the controller not becoming ready within the CAP.TO-derived timeout <span class="tag version">version</span> (exact text varies across kernel releases).</p>
+<pre class="code" data-kind="pseudocode"><code>/* Admin queue bring-up (pseudocode; real drivers add barriers, timeouts, error paths) */
+cap   = mmio_read64(bar0 + 0x00);
+mqes  = (cap &amp; 0xFFFF) + 1;            /* entries, from 0-based field              */
+dstrd = (cap &gt;&gt; 32) &amp; 0xF;
+to_ms = ((cap &gt;&gt; 24) &amp; 0xFF) * 500;
+
+mmio_write32(bar0 + 0x14, cc &amp; ~1);   /* CC.EN = 0                                */
+wait_until((mmio_read32(bar0 + 0x1C) &amp; 1) == 0, to_ms);
+
+asq = dma_alloc_zeroed(64 * 32, PAGE_ALIGN);   /* 32-entry admin SQ                 */
+acq = dma_alloc_zeroed(16 * 32, PAGE_ALIGN);   /* 32-entry admin CQ, P bits = 0     */
+mmio_write32(bar0 + 0x24, (31 &lt;&lt; 16) | 31);    /* AQA: ACQS=31, ASQS=31 (0-based)   */
+mmio_write64(bar0 + 0x28, asq.bus_addr);
+mmio_write64(bar0 + 0x30, acq.bus_addr);
+
+cc = (4 &lt;&lt; 20) | (6 &lt;&lt; 16) | (0 &lt;&lt; 11) | (0 &lt;&lt; 7) | (0 &lt;&lt; 4) | 1;
+     /* IOCQES=4, IOSQES=6, AMS=RR, MPS=0 (4 KiB), CSS=NVM, EN=1 */
+mmio_write32(bar0 + 0x14, cc);
+wait_until(mmio_read32(bar0 + 0x1C) &amp; 1, to_ms);   /* also check CFS (bit 1)     */</code></pre>
+
+<h3>26.5 Specification — what makes the admin queue special</h3>
+<ul>
+<li>Queue ID 0 for both admin SQ and CQ; created by register writes at enable, not by commands; cannot be deleted <span class="tag verified">verified</span>.</li>
+<li>Admin commands over PCIe use PRPs; SGLs are not supported for admin commands on the PCIe transport (PSDT shall be 00b) <span class="tag verified">verified</span>. (Fabrics transports differ <span class="tag version">version</span>.)</li>
+<li>Admin queue memory must be physically contiguous — there is no PRP list for ASQ/ACQ.</li>
+<li>The Admin CQ receives completions of admin commands only, including Asynchronous Event Request completions, which arrive "late" (whenever an event happens).</li>
+<li>Admin command set opcodes are separate from I/O command set opcodes: opcode 02h is Get Log Page on the admin queue and Read on an NVM I/O queue. The <b>queue</b> decides the opcode table.</li>
+</ul>
+
+<h3>26.6 The admin commands you use in the first second of life</h3>
+<div class="table-wrap"><table><thead><tr><th>Order</th><th>Command (opcode)</th><th>Key fields</th><th>Why</th></tr></thead><tbody>
+<tr><td>1</td><td>Identify (06h), CNS 01h</td><td>PRP1 → 4 KiB buffer</td><td>Learn MDTS, SQES/CQES, VWC, SGLS, OACS, NN, version</td></tr>
+<tr><td>2</td><td>Set Features (09h), FID 07h Number of Queues</td><td>CDW11: NCQR[31:16], NSQR[15:0] 0-based</td><td>Request I/O queue count; CQE DW0 returns allocated NCQA/NSQA (0-based) <span class="tag verified">verified</span></td></tr>
+<tr><td>3</td><td>Create I/O CQ (05h) × n</td><td>QID, QSIZE, PRP1, IV, IEN, PC</td><td>Completion rings with interrupt vectors</td></tr>
+<tr><td>4</td><td>Create I/O SQ (01h) × n</td><td>QID, QSIZE, PRP1, CQID, QPRIO, PC</td><td>Submission rings bound to a CQ</td></tr>
+<tr><td>5</td><td>Identify CNS 02h, then CNS 00h per NSID</td><td>NSID</td><td>Discover namespaces and their LBA formats</td></tr>
+<tr><td>6</td><td>Asynchronous Event Request (0Ch) × k</td><td>none</td><td>Park requests for future events (temperature, errors, namespace change)</td></tr>
+<tr><td>7</td><td>Get Log Page (02h) / Get Features (0Ah)</td><td>LID / FID</td><td>Health, error and configuration readback</td></tr>
+</tbody></table></div>
+<p>Each command's full format is in <a href="#p4-ch30-admin-commands">Chapter 30</a>.</p>
+
+<h3>26.7 Trace view</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 26-A — normal admin bring-up (abbreviated)</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Dir</th><th>TLP</th><th>Address</th><th>Data / meaning</th></tr></thead><tbody>
+<tr><td>1</td><td>H→D</td><td>MRd 8B</td><td>BAR0+00h</td><td>CAP: MQES=1023 (0-based), DSTRD=0, TO=40 (20 s)</td></tr>
+<tr><td>2</td><td>H→D</td><td>MWr</td><td>BAR0+24h</td><td>AQA = 001F001Fh (32/32)</td></tr>
+<tr><td>3</td><td>H→D</td><td>MWr</td><td>BAR0+28h / 30h</td><td>ASQ / ACQ bus addresses</td></tr>
+<tr><td>4</td><td>H→D</td><td>MWr</td><td>BAR0+14h</td><td>CC = 00460001h (IOCQES 4, IOSQES 6, EN 1)</td></tr>
+<tr><td>5</td><td>H→D</td><td>MRd ×k</td><td>BAR0+1Ch</td><td>CSTS.RDY 0 … 0 … 1 (~ms)</td></tr>
+<tr><td>6</td><td>H→D</td><td>MWr</td><td>BAR0+1000h</td><td>SQ0 tail = 1 (Identify Controller)</td></tr>
+<tr><td>7</td><td>D→H</td><td>MRd 64B</td><td>ASQ+0</td><td>fetch</td></tr>
+<tr><td>8</td><td>D→H</td><td>MWr 4096B (split by MPS)</td><td>PRP1 buffer</td><td>Identify data (several TLPs, each ≤ Max_Payload_Size)</td></tr>
+<tr><td>9</td><td>D→H</td><td>MWr 16B</td><td>ACQ+0</td><td>CQE CID=0, SQHD=1, SQID=0, P=1, status 0</td></tr>
+<tr><td>10</td><td>H→D</td><td>MWr</td><td>BAR0+1004h</td><td>CQ0 head = 1</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 26-B — slow: RDY takes most of CAP.TO</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead><tbody>
+<tr><td>0</td><td>CC.EN=1 written</td><td>—</td></tr>
+<tr class="first-bad"><td>0–14.8 s</td><td>CSTS reads return RDY=0</td><td>controller recovering metadata after unsafe shutdown <span class="tag impl">impl</span>; still within CAP.TO=20 s</td></tr>
+<tr><td>14.8 s</td><td>RDY=1</td><td>legal but slow boot; check SMART unsafe-shutdown count</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 26-C — failed: CSTS.CFS set</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead><tbody>
+<tr><td>0</td><td>CC.EN=1</td><td>—</td></tr>
+<tr class="first-bad"><td>2 ms</td><td>CSTS = 00000002h (CFS=1, RDY=0)</td><td>Controller Fatal Status: firmware detected fatal error; host should reset (CC.EN 1→0 or NSSR/PCIe reset)</td></tr>
+<tr class="bad"><td>20 s</td><td>driver gives up</td><td>"device not ready" class of message; disable device</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 26-D — ambiguous: CSTS reads return FFFFFFFFh</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead><tbody>
+<tr><td>0</td><td>MRd BAR0+1Ch → CplD data FFFFFFFFh</td><td>could be a real value? No: all-ones typically means the read was answered by the Root Complex on behalf of a device that is gone (UR/CA/link down) — or the device is in D3hot with memory decode off</td></tr>
+</tbody></table></div><p>Missing evidence: completion status of the MRd (SC vs UR/CA), link state (LTSSM), Command register Memory Space Enable. Check <code>lspci -vvv</code> for "Control: Mem+" and the link status.</p></div>
+
+<h3>26.8 Failure patterns</h3>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Likely conclusion / confidence</th></tr></thead><tbody>
+<tr><td>1</td><td>RDY never rises</td><td>AQA zero; ASQ unaligned; MPS out of range; CSS unsupported</td><td>Readback of AQA/ASQ/ACQ/CC</td><td>CAP.MPSMIN/MAX, CAP.CSS</td><td>Retry with minimal config (MPS=0, CSS=000b)</td><td>Host config error — high</td></tr>
+<tr><td>2</td><td>CFS=1 after enable</td><td>Firmware fault, power issue</td><td>Persistent event / error log after reset</td><td>Power rails, temperature</td><td>Cold power-cycle</td><td>Device fault — medium</td></tr>
+<tr><td>3</td><td>First Identify times out</td><td>Wrong ACQ address; IOMMU blocks DMA; interrupt not routed</td><td>IOMMU fault log in dmesg</td><td>Analyzer: was CQE MWr sent and to where?</td><td>Poll ACQ memory instead of waiting for interrupt</td><td>IOMMU/interrupt — high if fault logged</td></tr>
+<tr><td>4</td><td>Identify data all zeros</td><td>PRP1 points to wrong buffer; cache not invalidated on non-coherent platform</td><td>PRP1 vs buffer bus address</td><td>Platform coherency</td><td>Fill buffer with pattern before command</td><td>Host mapping — medium</td></tr>
+<tr><td>5</td><td>Admin commands slow (seconds)</td><td>Firmware doing background work; Format/Sanitize in progress</td><td>Sanitize Status log</td><td>Outstanding admin commands</td><td>Repeat Identify after idle</td><td>Device state — impl-dependent</td></tr>
+</tbody></table></div>
+
+<div class="lab"><div class="lab-head">🧪 Lab 26.1 — Decode your controller's CAP and admin config <span class="safety safe">SAFE LAB</span></div>
+<p><b>Objective:</b> read and interpret CAP, CC, AQA without changing anything. <b>Setup:</b> root shell, nvme-cli.</p>
+<pre class="code" data-kind="read-only inspection"><code>sudo nvme show-regs /dev/nvme0 -H | less     # read-only register decode
+sudo nvme id-ctrl /dev/nvme0 | egrep -i 'mdts|sqes|cqes|sgls|oacs|ver'</code></pre>
+<ol><li>Record MQES+1, DSTRD, TO×500 ms, MPSMIN.</li><li>Record AQA and compute admin queue depths (add 1 to each field).</li><li>Compute SQ0TDBL and CQ0HDBL offsets.</li></ol>
+<p><b>Questions:</b> Why does Linux choose a fixed admin depth rather than the maximum? What would happen if MPS were set larger than the OS page size?</p>
+<details class="answer"><summary>Solution</summary><p>Admin traffic is low-rate; a small depth wastes no memory (Linux uses a fixed admin depth constant, <span class="tag version">version</span>). MPS larger than the OS page size would make PRP construction impossible for buffers made of OS pages that are not MPS-aligned and contiguous — Linux sets MPS to match its page size (or the closest supported).</p></details>
+<p><b>Extension:</b> correlate the "nvme nvme0: … I/O queues" kernel message at boot (<code>journalctl -k | grep nvme</code>) with Set Features Number of Queues.</p></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>AQA = 003F001Fh. Sizes?</p><details class="answer"><summary>Answer</summary><p>ACQS = 3Fh → 64-entry admin CQ; ASQS = 1Fh → 32-entry admin SQ.</p></details></li>
+<li><p>Can an admin command use an SGL on PCIe?</p><details class="answer"><summary>Answer</summary><p>No. PSDT must be 00b (PRP) for admin commands over PCIe.</p></details></li>
+<li><p>Why create the I/O CQ before the I/O SQ?</p><details class="answer"><summary>Answer</summary><p>Create I/O SQ names an existing CQID; if the CQ does not exist, the command fails with Completion Queue Invalid (command-specific status 00h).</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> What are AQA, ASQ, ACQ? <details class="answer"><summary>Model answer</summary>Admin Queue Attributes (sizes), Admin SQ Base Address, Admin CQ Base Address — the registers that define queue pair 0 before CC.EN is set.</details></li>
+<li><span class="lvl">Intermediate</span> Walk through controller enable. <details class="answer"><summary>Model answer</summary>Disable, wait RDY=0, program AQA/ASQ/ACQ, program CC with MPS/CSS/AMS/entry sizes and EN=1, wait RDY=1 within CAP.TO, check CFS, then Identify.</details></li>
+<li><span class="lvl">Advanced</span> Why does an outstanding AER matter for debugging? <details class="answer"><summary>Model answer</summary>Errors like invalid doorbell writes, SMART thresholds or namespace changes are reported only when an AER command is outstanding; a driver that never posts AERs is blind to these asynchronous events.</details></li>
+<li><span class="lvl">Senior</span> Device hangs during admin init only on one server model. Hypotheses? <details class="answer"><summary>Model answer</summary>IOMMU/ACS differences blocking DMA to ACQ, interrupt remapping, MPS/page size mismatch, BIOS leaving device in a state (CC.EN=1) the driver doesn't reset correctly, power/link (ASPM) issues. Evidence: IOMMU faults, analyzer capture of ACQ writes, CSTS values.</details></li>
+</ol></div>
+<div class="callout notsaid"><div class="callout-title">📭 Zero-hallucination ledger</div>
+<div class="table-wrap"><table><tbody>
+<tr><th>What is verified?</th><td>AQA ASQS[11:0]/ACQS[27:16] 0-based; ASQ 28h, ACQ 30h page-aligned; CC.EN/CSTS.RDY handshake; CAP.TO in 500 ms units; admin commands use PRPs on PCIe. <span class="tag verified">verified</span></td></tr>
+<tr><th>What is derived?</th><td>Bring-up order and the evidence each step leaves on PCIe. <span class="tag derived">derived</span></td></tr>
+<tr><th>What is implementation-dependent?</th><td>Time to RDY, admin command latency, behaviour while background tasks run. <span class="tag impl">impl</span></td></tr>
+<tr><th>What is version-dependent?</th><td>CC.CSS encodings for multiple command sets (2.0+); fields added to Identify over revisions. <span class="tag version">version</span></td></tr>
+<tr><th>What must be checked in the specification?</th><td>Required CC fields for your command-set selection; CFS recovery requirements.</td></tr>
+<tr><th>What should never be assumed?</th><td>That RDY rises immediately; that FFFFFFFFh is a register value.</td></tr>
+</tbody></table></div></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can write the AQA/CC values for a given configuration in hex.</li>
+<li>I can list the bring-up sequence with the evidence each step leaves.</li>
+<li>I can explain why opcode 02h means different things on SQ0 and SQ1.</li>
+<li>I can diagnose RDY timeout vs CFS vs all-ones reads.</li>
+</ul></div>
+<h3>26.9 Summary</h3>
+<p>The admin queue pair is created by registers, uses PRPs, carries the commands that discover and configure the controller and that create I/O queues. <b>Next:</b> <a href="#p4-ch27-io-queues">Chapter 27 — I/O queues</a>.</p>
+</section>

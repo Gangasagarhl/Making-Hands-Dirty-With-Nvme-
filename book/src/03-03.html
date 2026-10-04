@@ -1,0 +1,384 @@
+<section class="chapter" id="p3-ch19-bars-mmio" data-part="PART VII — PCIe CONFIGURATION">
+<h2><span class="num">19</span> BARs and MMIO</h2>
+
+<div class="callout spec"><div class="callout-title">📘 Specification baseline</div>
+<p><b>DOCUMENTS:</b> PCI Express Base Specification (BAR format, bridge windows, memory request routing); NVMe over PCIe Transport Specification Revision 1.4 and NVMe Base Specification Revision 2.4 (register map placed in memory space; doorbells; Controller Memory Buffer) <span class="tag version">version</span>. <b>STATUS:</b> current baseline (confirm on nvmexpress.org and pcisig.com). <b>OLDER VERSIONS THAT MAY DIFFER:</b> in NVMe 1.x the register map and PCI requirements were in one document; registers added in 2.0 (e.g. CRTO, NSSD) do not exist on 1.x controllers. <b>SOURCE:</b> PCI-SIG; NVM Express; Linux <code>drivers/pci/setup-res.c</code>, <code>drivers/pci/probe.c</code> (<code>__pci_read_base</code>) and <code>drivers/nvme/host/pci.c</code>.</p></div>
+
+<h3 id="p3-19-why">19.1 Why this chapter exists</h3>
+<p>The NVMe driver controls the SSD by reading and writing registers: CAP to learn limits, CC to enable, CSTS to see readiness, AQA/ASQ/ACQ to locate the admin queues, and doorbells to announce work. All of those registers live inside a <b>Base Address Register (<a class="gl" href="#g-bar">BAR</a>) window</b> — a range of physical addresses that, once assigned, the device decodes as its own. This chapter explains how that window is sized, placed, enabled and used, and how a single CPU store becomes a PCIe Memory Write TLP that rings an NVMe doorbell. It is the bridge between PCIe configuration (<a href="#p3-ch18-config-space">Chapter 18</a>) and NVMe registers (<a href="#p3-ch24-registers">Chapter 24</a>).</p>
+
+<h3 id="p3-19-objectives">19.2 Learning objectives</h3>
+<ul class="objectives">
+<li><b>Beginner:</b> explain a BAR as "a numbered doorway into the device" and distinguish memory BARs from I/O BARs.</li>
+<li><b>Intermediate:</b> perform the BAR sizing algorithm for 32-bit and 64-bit BARs and compute size and alignment.</li>
+<li><b>Advanced:</b> explain prefetchable vs non-prefetchable, bridge windows, and why NVMe BAR0 is non-prefetchable.</li>
+<li><b>Senior:</b> reason about MMIO ordering (posted writes, read-to-flush), access width and atomicity, write-combining, and their effect on doorbell correctness and performance.</li>
+<li><b>Trace analysis:</b> identify MMIO MRd/MWr TLPs to BAR0 and decode the register offset from the address.</li>
+<li><b>Debugging:</b> diagnose all-ones register reads, BAR assignment failures and doorbell writes that "vanish".</li>
+<li><b>Validation:</b> test BAR sizing behaviour, reserved-region behaviour and access-width handling of a controller.</li>
+</ul>
+
+<h3 id="p3-19-prereq">19.3 Prerequisites</h3>
+<p><a href="#p3-ch17-enumeration">Chapter 17</a> (where sizing fits in enumeration) and <a href="#p3-ch18-config-space">Chapter 18</a> (BAR fields at 10h–24h, Command register MSE). Memory Read (<a class="gl" href="#g-mrd">MRd</a>) and Memory Write (<a class="gl" href="#g-mwr">MWr</a>) TLPs; posted vs non-posted requests.</p>
+
+<h3 id="p3-19-story">19.4 Story: a numbered doorway</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div>
+<p>A <b>BAR is a numbered doorway into the device</b>. The device was built with a doorway of a fixed width — say 16 rooms wide — but no street number. The town planner (firmware) asks: "How wide is your doorway?" The device can't say the number directly, so they play a game: the planner writes "all the rooms!" (all ones) on the doorway sign; the device rubs out the parts of the number it can't use; what's left tells the planner how wide the doorway is. Then the planner paints a real street number on the doorway. From then on, anyone walking to that street number — the CPU — is actually walking into the device's rooms: room 0 is "what can you do" (CAP), room 14h is "start working" (CC), room 1000h is the bell (doorbell).</p></div>
+<div class="callout analogy"><div class="callout-title">🌍 Real-world analogy</div>
+<p>A company rents a block of extension numbers on a switchboard. It says "we need 100 consecutive extensions, aligned to a hundred" but not which ones; the telephone exchange assigns 4300–4399. Calls to those numbers ring inside the company; extension 4314 is always the same desk regardless of which block the company got.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div>
+<p>Walking into a room has no side effect, but reading some device registers can (e.g. a read can clear a status in some devices — not typical for NVMe registers, but legal for devices in general — which is exactly why "non-prefetchable" exists). Also, a doorway only works once the device is told "open for visitors" (Command.MSE = 1), and the street (bridge windows above the device) must route visitors there.</p></div>
+
+<h3 id="p3-19-beginner">19.5 Beginner view: the BAR register format</h3>
+<div class="table-wrap"><table class="bitfield">
+<thead><tr><th>Bits</th><th>Memory BAR</th><th>I/O BAR</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>0 = memory space indicator (RO)</td><td>1 = I/O space indicator (RO)</td></tr>
+<tr><td>2:1</td><td>Type (RO): 00b = 32-bit decoder anywhere in 32-bit space; 10b = 64-bit decoder (uses this BAR and the next one); 01b reserved (was "below 1 MiB" in old PCI); 11b reserved</td><td>bit 1 reserved, bits 31:2 address</td></tr>
+<tr><td>3</td><td>Prefetchable (RO)</td><td>—</td></tr>
+<tr><td>31:4</td><td>Base address (RW above the size boundary, hard-wired 0 below it)</td><td>—</td></tr>
+</tbody></table></div>
+<p>The trick that makes sizing work: <b>the device hard-wires to zero every address bit that lies inside its window</b>. A 16 KiB window spans address bits 13:0, so bits 13:4 of the BAR always read 0 regardless of what is written; only bits 31:14 (and the upper BAR for 64-bit) are writable. All BAR sizes are powers of two and every BAR is naturally aligned to its size. <span class="tag verified">verified</span></p>
+
+<h3 id="p3-19-sizing">19.6 The BAR sizing algorithm</h3>
+<ol>
+<li>Clear Command.MSE (and I/O Space Enable for I/O BARs) so that the transient all-ones address is not decoded. Otherwise, for a moment, the device claims an address range at the top of memory that might overlap real resources. <span class="tag verified">verified</span></li>
+<li>Read and save the BAR's original value (and the upper BAR if 64-bit).</li>
+<li>Write FFFF_FFFFh to the BAR (and to the upper BAR if 64-bit).</li>
+<li>Read back. Mask off the low type bits (memory: lower 4 bits; I/O: lower 2 bits).</li>
+<li>Invert and add one: size = (~masked) + 1, computed across 64 bits for a 64-bit BAR.</li>
+<li>Restore the original value(s); restore Command.</li>
+</ol>
+<div class="formula">size = (NOT (readback AND ~0xF)) + 1 &nbsp;&nbsp;(computed in the BAR's width: 32 or 64 bits)</div>
+<ul class="vars"><li><b>readback</b> — value read after writing all ones (for 64-bit: upper DWORD &lt;&lt; 32 | lower DWORD).</li>
+<li><b>0xF</b> — the four read-only type bits of a memory BAR (use 0x3 for an I/O BAR).</li>
+<li><b>size</b> — window size in bytes; also its required alignment.</li></ul>
+
+<h4 id="p3-19-worked-size">19.6.1 Worked example: an NVMe BAR0 of 16 KiB</h4>
+<div class="table-wrap"><table>
+<thead><tr><th>Step</th><th>Action</th><th>BAR0 (10h)</th><th>BAR1 (14h)</th><th>Reasoning</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Read original</td><td>FEA0_0004h</td><td>0000_0000h</td><td>Memory, type 10b (64-bit), non-prefetchable; address FEA0_0000h</td></tr>
+<tr><td>2</td><td>Write all ones</td><td>← FFFF_FFFFh</td><td>← FFFF_FFFFh</td><td>Command.MSE = 0 during this</td></tr>
+<tr><td>3</td><td>Read back</td><td>FFFF_C004h</td><td>FFFF_FFFFh</td><td>Bits 13:4 stuck at 0; type bits unchanged</td></tr>
+<tr><td>4</td><td>Mask low 4 bits</td><td>FFFF_C000h</td><td>FFFF_FFFFh</td><td>64-bit mask = FFFF_FFFF_FFFF_C000h</td></tr>
+<tr><td>5</td><td>Invert</td><td colspan="2">0000_0000_0000_3FFFh</td><td></td></tr>
+<tr><td>6</td><td>Add one</td><td colspan="2">0000_0000_0000_4000h = 16 384 bytes = 16 KiB</td><td>Alignment 16 KiB</td></tr>
+<tr><td>7</td><td>Restore</td><td>← FEA0_0000h</td><td>← 0000_0000h</td><td>Type bits are RO; writing 0 there is harmless</td></tr>
+</tbody></table></div>
+<p>The executable simulation below models a BAR register in software (hard-wiring the low bits exactly as hardware does) and runs the same algorithm for three BARs.</p>
+<pre class="code" data-kind="simulation"><code>#!/usr/bin/env python3
+"""BAR sizing SIMULATION. A fake BAR register models how hardware hard-wires the low
+address bits to zero; the sizing code is the same algorithm firmware/OS use."""
+
+class FakeBar:
+    def __init__(self, size, is64, prefetch):
+        assert size &amp; (size - 1) == 0 and size &gt;= 16       # power of two, &gt;= 16 bytes
+        self.size, self.is64, self.pf = size, is64, prefetch
+        self.addr = 0                                     # full 64-bit address latch
+    def _flags(self):
+        return (0b10 &lt;&lt; 1 if self.is64 else 0) | (self.pf &lt;&lt; 3)   # bit0=0 -&gt; memory
+    def read(self, upper=False):
+        if upper:
+            return (self.addr &gt;&gt; 32) &amp; 0xFFFF_FFFF
+        return (self.addr &amp; 0xFFFF_FFFF &amp; ~(self.size - 1)) | self._flags()
+    def write(self, value, upper=False):
+        mask = ~(self.size - 1) &amp; 0xFFFF_FFFF_FFFF_FFFF  # writable address bits only
+        if not self.is64:
+            mask &amp;= 0xFFFF_FFFF
+        if upper:
+            new = (self.addr &amp; 0xFFFF_FFFF) | (value &lt;&lt; 32)
+        else:
+            new = (self.addr &amp; ~0xFFFF_FFFF) | value
+        self.addr = new &amp; mask
+
+def size_bar(bar):
+    lo_orig = bar.read()
+    if lo_orig &amp; 1:
+        raise ValueError("I/O BAR: mask with ~0x3 instead")
+    is64 = ((lo_orig &gt;&gt; 1) &amp; 0b11) == 0b10
+    hi_orig = bar.read(upper=True) if is64 else 0
+    # (Command.Memory Space Enable must be 0 while sizing -- see text.)
+    bar.write(0xFFFF_FFFF)
+    lo = bar.read()
+    hi = 0xFFFF_FFFF
+    if is64:
+        bar.write(0xFFFF_FFFF, upper=True)
+        hi = bar.read(upper=True)
+    print(f"  read back lo={lo:#010x}" + (f" hi={hi:#010x}" if is64 else ""))
+    mask = (hi &lt;&lt; 32 | (lo &amp; ~0xF)) &amp; 0xFFFF_FFFF_FFFF_FFFF
+    if not is64:
+        mask |= 0xFFFF_FFFF_0000_0000      # treat a 32-bit BAR as having all-ones upper bits
+    size = ((~mask) &amp; 0xFFFF_FFFF_FFFF_FFFF) + 1
+    bar.write(lo_orig &amp; ~0xF)               # restore original address
+    if is64:
+        bar.write(hi_orig, upper=True)
+    return size, is64, (lo_orig &gt;&gt; 3) &amp; 1
+
+for desc, bar in [("NVMe BAR0 (16 KiB, 64-bit, non-prefetchable)", FakeBar(16 * 1024, True, 0)),
+                  ("32-bit 1 MiB non-prefetchable", FakeBar(1 &lt;&lt; 20, False, 0)),
+                  ("64-bit 8 GiB prefetchable (e.g. a GPU)", FakeBar(8 &lt;&lt; 30, True, 1))]:
+    print(desc)
+    size, is64, pf = size_bar(bar)
+    print(f"  size = {size:#x} ({size // 1024} KiB) 64-bit={int(is64)} prefetchable={pf}")</code></pre>
+<p>Output:</p>
+<pre class="code" data-kind="simulation"><code>NVMe BAR0 (16 KiB, 64-bit, non-prefetchable)
+  read back lo=0xffffc004 hi=0xffffffff
+  size = 0x4000 (16 KiB) 64-bit=1 prefetchable=0
+32-bit 1 MiB non-prefetchable
+  read back lo=0xfff00000
+  size = 0x100000 (1024 KiB) 64-bit=0 prefetchable=0
+64-bit 8 GiB prefetchable (e.g. a GPU)
+  read back lo=0x0000000c hi=0xfffffffe
+  size = 0x200000000 (8388608 KiB) 64-bit=1 prefetchable=1</code></pre>
+<p>Note the 8 GiB case: the lower DWORD reads back 0000_000Ch — all its address bits are inside the window — and the upper DWORD FFFF_FFFEh carries the size information. A 32-bit-only sizing routine would conclude "size = 16 bytes"! This is why a 64-bit BAR must be sized as a pair. <span class="tag derived">derived</span></p>
+
+<h3 id="p3-19-types">19.7 32-bit vs 64-bit, prefetchable vs non-prefetchable</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Property</th><th>Meaning</th><th>Consequence</th><th>NVMe BAR0</th></tr></thead>
+<tbody>
+<tr><td>32-bit (type 00b)</td><td>Decoder only handles addresses below 4 GiB</td><td>Must be placed below 4 GiB; competes for scarce 32-bit MMIO space</td><td>Not the usual choice</td></tr>
+<tr><td>64-bit (type 10b)</td><td>Decoder handles 64-bit addresses; occupies two BAR slots</td><td>May be placed anywhere — if the bridge windows above allow it</td><td>Required to be a 64-bit memory BAR by the NVMe PCIe transport register requirements (MLBAR/MUBAR naming) <span class="tag verified">verified</span> — confirm exact wording in your revision</td></tr>
+<tr><td>Prefetchable (bit 3 = 1)</td><td>Reads have no side effects; bytes may be merged/prefetched; writes may be merged</td><td>Can live in the bridge's prefetchable (64-bit capable) window; CPU may map it write-combining</td><td>No</td></tr>
+<tr><td>Non-prefetchable (bit 3 = 0)</td><td>Reads may have side effects; accesses must be performed exactly as issued</td><td>Must live in the non-prefetchable window (32-bit only in the classic Type 1 header)</td><td>Yes — register semantics</td></tr>
+</tbody></table></div>
+<p>In NVMe terms, the registers at BAR0 are named MLBAR (Memory Register Base Lower Address, at 10h) and MUBAR (Memory Register Base Upper Address, at 14h) in the transport specification. The NVMe specification also defines an optional Index/Data Pair register mechanism at BAR2 for legacy I/O-space access to the registers <span class="tag version">version</span>; modern hosts use the memory BAR. Other BARs may hold MSI-X tables, the Controller Memory Buffer (CMB) or Persistent Memory Region (PMR) — located through MSI-X BIR fields and CMBLOC.BIR / PMRCAP.BIR <span class="tag impl">impl</span>.</p>
+
+<h3 id="p3-19-assign">19.8 Placing the window: resource assignment</h3>
+<p>After sizing all BARs, firmware (or the OS) solves a packing problem: assign every BAR an address naturally aligned to its size, inside its parent bridge's window, and size each bridge window (1 MiB granularity for memory windows) to cover all children. Bridges are then programmed bottom-up so that memory requests are routed:</p>
+<ul>
+<li>A Downstream-going MWr/MRd is forwarded by a bridge if its address lies within the bridge's Memory or Prefetchable window.</li>
+<li>An Upstream-going request (DMA from the SSD) is forwarded by a bridge if its address lies <em>outside</em> its windows (i.e. not destined for a sibling below it) — peer-to-peer within a switch is possible when the address falls inside a sibling's window and the switch permits it (ACS may redirect it upstream) <span class="tag verified">verified</span>.</li>
+</ul>
+<figure class="diagram"><svg viewBox="0 0 820 360" role="img" aria-label="Address map showing DRAM, MMIO window, bridge window and NVMe BAR0 layout">
+<rect class="box" x="30" y="20" width="200" height="60" rx="4"/>
+<text class="lbl" x="130" y="46" text-anchor="middle">DRAM</text>
+<text class="lbl small" x="130" y="66" text-anchor="middle">0 – below MMIO hole</text>
+<rect class="box accent" x="30" y="90" width="200" height="120" rx="4"/>
+<text class="lbl" x="130" y="116" text-anchor="middle">32-bit MMIO hole</text>
+<text class="lbl small" x="130" y="136" text-anchor="middle">host bridge window (_CRS)</text>
+<rect class="box alt" x="50" y="150" width="160" height="50" rx="4"/>
+<text class="lbl small" x="130" y="170" text-anchor="middle">Root Port window</text>
+<text class="lbl small" x="130" y="188" text-anchor="middle">FEA0_0000–FEBF_FFFF</text>
+<rect class="box" x="30" y="220" width="200" height="40" rx="4"/>
+<text class="lbl small" x="130" y="245" text-anchor="middle">ECAM, APIC, firmware…</text>
+<rect class="box" x="30" y="270" width="200" height="60" rx="4"/>
+<text class="lbl" x="130" y="296" text-anchor="middle">DRAM above 4 GiB</text>
+<text class="lbl small" x="130" y="316" text-anchor="middle">+ 64-bit MMIO above it</text>
+<line class="ln" x1="210" y1="175" x2="388" y2="70" marker-end="url(#arrow)"/>
+<rect class="box accent" x="390" y="20" width="400" height="40" rx="4"/>
+<text class="lbl" x="590" y="45" text-anchor="middle">NVMe BAR0 = FEA0_0000h, 16 KiB</text>
+<rect class="box" x="390" y="70" width="400" height="56" rx="4"/>
+<text class="lbl" x="590" y="92" text-anchor="middle">+0000h–0FFFh controller registers</text>
+<text class="lbl small" x="590" y="112" text-anchor="middle">CAP 00h · VS 08h · INTMS 0Ch · INTMC 10h · CC 14h · CSTS 1Ch · NSSR 20h · AQA 24h · ASQ 28h · ACQ 30h …</text>
+<rect class="box" x="390" y="134" width="400" height="56" rx="4"/>
+<text class="lbl" x="590" y="156" text-anchor="middle">+1000h… doorbells</text>
+<text class="lbl small" x="590" y="176" text-anchor="middle">SQ0TDBL 1000h · CQ0HDBL 1000h+(4&lt;&lt;DSTRD) · SQ1TDBL …</text>
+<rect class="box alt" x="390" y="198" width="400" height="44" rx="4"/>
+<text class="lbl" x="590" y="225" text-anchor="middle">+2000h MSI-X table (this synthetic device)</text>
+<rect class="box alt" x="390" y="250" width="400" height="44" rx="4"/>
+<text class="lbl" x="590" y="277" text-anchor="middle">+3000h MSI-X PBA (this synthetic device)</text>
+<text class="lbl small" x="390" y="320">MSI-X table/PBA placement is implementation-dependent;</text>
+<text class="lbl small" x="390" y="338">registers and doorbell offsets are defined by the NVMe specification.</text>
+</svg><figcaption>Figure 19.1 — From the platform address map down to the NVMe BAR0 layout of the synthetic device from Chapter 18.</figcaption></figure>
+
+<h3 id="p3-19-mmio">19.9 MMIO vs configuration access</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Aspect</th><th>Configuration access</th><th>MMIO (memory-mapped I/O) access</th></tr></thead>
+<tbody>
+<tr><td>Address space</td><td>Configuration space (BDF + register)</td><td>Memory space (physical address in a BAR window)</td></tr>
+<tr><td>CPU mechanism</td><td>Load/store to ECAM window (or CF8h/CFCh)</td><td>Load/store to the BAR address mapped uncached in the kernel</td></tr>
+<tr><td>TLP types</td><td>CfgRd0/1, CfgWr0/1</td><td>MRd, MWr (32- or 64-bit address format)</td></tr>
+<tr><td>Writes posted?</td><td>No — always completed</td><td>Yes — MWr is posted (no completion)</td></tr>
+<tr><td>Routing</td><td>By bus number (ID routing)</td><td>By address (bridge windows)</td></tr>
+<tr><td>Enabled by</td><td>Always available once the link is up</td><td>Command.MSE = 1 and a valid BAR assignment</td></tr>
+<tr><td>Typical size</td><td>1 DW per request</td><td>1–2 DW for registers; larger for CMB/WC regions</td></tr>
+<tr><td>NVMe use</td><td>Identity, enable bits, MSI-X capability, PCIe error state</td><td>CAP, CC, CSTS, AQA, ASQ, ACQ, doorbells, MSI-X table, CMB</td></tr>
+<tr><td>Performance</td><td>Slow path; not used in the I/O path</td><td>Doorbell writes are in the hot I/O path</td></tr>
+</tbody></table></div>
+
+<h4 id="p3-19-cpu-path">19.9.1 What happens when the driver writes a doorbell</h4>
+<ol>
+<li>The driver executes <code>writel(tail, dbs + offset)</code>. <code>dbs</code> is a kernel virtual address produced by <code>ioremap()</code> of BAR0.</li>
+<li>The CPU's MMU translates the virtual address to the physical BAR address. The page is mapped uncacheable (UC) — no cache line is allocated, the store goes out as-is <span class="tag impl">impl</span> (architecture-specific memory types).</li>
+<li>The store reaches the Root Complex, which decodes the physical address as MMIO belonging to the Root Port's window and generates a <b>MWr</b> TLP: 1 DW payload, address = BAR0 + offset, Requester ID = the Root Complex.</li>
+<li>Bridges forward it downstream by address range. The SSD's BAR0 decoder claims it.</li>
+<li>Because MWr is <b>posted</b>, the CPU does not wait for any acknowledgement at the transaction level (the Data Link Layer still ACKs the TLP for reliability). The CPU continues immediately.</li>
+<li>The controller latches the new tail value and begins fetching submission queue entries by DMA (<a href="#p3-ch20-dma">Chapter 20</a>).</li>
+</ol>
+<div class="callout proto"><div class="callout-title">📡 Protocol: posted write ordering and the "read to flush" idiom</div>
+<p>PCIe ordering rules let a later read not pass an earlier posted write in the same direction (with default attributes) <span class="tag verified">verified</span>. So if software must be sure a register write has <em>arrived</em> (for example before timing a delay), it reads any register of the same device: the read's completion cannot return before the earlier write was delivered. Linux drivers use this idiom (a read-back after write) in some reset and shutdown paths. Doorbell writes in the hot path deliberately avoid it — waiting a round-trip per I/O would cost microseconds.</p></div>
+<div class="callout warn"><div class="callout-title">⚠️ Access width</div>
+<p>NVMe 64-bit registers (CAP, ASQ, ACQ, CMBMSC, …) may be accessed by hosts as two 32-bit accesses on platforms that lack atomic 64-bit MMIO; Linux uses <code>lo_hi_readq</code>/<code>lo_hi_writeq</code> helpers on such platforms. The NVMe specification defines the access rules for each register (for example which widths are required to be supported) — check the "register access" rules in your revision before relying on a particular behaviour <span class="tag version">version</span>. Never use byte or word writes to doorbells; they are 32-bit registers.</p></div>
+
+<h3 id="p3-19-addresses">19.10 Addressing safety: six addresses that are not the same</h3>
+<p>Engineers routinely lose days because two people say "the address" and mean different things. Never casually equate these:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Address kind</th><th>Who uses it</th><th>Example in our story</th><th>Translated by</th></tr></thead>
+<tbody>
+<tr><td>Virtual address (VA)</td><td>CPU instructions in a process or the kernel</td><td>Kernel <code>dbs</code> pointer from <code>ioremap()</code>; user buffer pointer in fio</td><td>CPU MMU page tables</td></tr>
+<tr><td>Physical address (PA)</td><td>CPU memory system after MMU translation</td><td>FEA0_1008h (doorbell) or a DRAM page holding a submission queue</td><td>—</td></tr>
+<tr><td>DMA address / IOVA</td><td>What the driver puts into PRPs, ASQ/ACQ, Create Queue commands</td><td>An I/O virtual address returned by <code>dma_map_*()</code></td><td>IOMMU (if enabled) into PA; identity when no IOMMU</td></tr>
+<tr><td>PCIe bus address</td><td>The address field of a TLP on the link</td><td>The address in the controller's MRd/MWr = the DMA address it was given</td><td>Root Complex/IOMMU on the upstream side; usually identical to PA for MMIO downstream on common platforms <span class="tag impl">impl</span></td></tr>
+<tr><td>BAR address</td><td>The bus address range the device decodes</td><td>BAR0 = FEA0_0000h</td><td>Assigned by firmware/OS; may differ from CPU PA on some non-x86 platforms with address offsets <span class="tag impl">impl</span></td></tr>
+<tr><td>Controller-local address</td><td>Inside the SSD controller (SRAM, DRAM buffers, NAND addressing)</td><td>Firmware's internal buffer for a 4 KiB block</td><td>Controller firmware — invisible to the host</td></tr>
+</tbody></table></div>
+<p>An IOMMU may change the address a device must use: the same DRAM page has one PA but the device must present the IOVA. That is why NVMe PRP entries contain DMA addresses, not physical addresses, from the device's point of view <span class="tag verified">verified</span>.</p>
+
+<h3 id="p3-19-hw">19.11 Hardware view inside the SSD controller</h3>
+<p>Inside the controller, the PCIe endpoint core's BAR decoder compares the address of each incoming MRd/MWr against the BAR0 window and passes hits, with the offset, to a register block. The register block implements fixed registers (often in hardware), doorbell registers (often a small write-only RAM per queue whose writes trigger the queue manager), and possibly the MSI-X table. What happens after a doorbell write — how quickly the fetch engine reacts, whether doorbell writes are coalesced — is <span class="tag impl">implementation-dependent</span> and generally unobservable except through timing on a protocol analyzer.</p>
+<div class="callout notsaid"><div class="callout-title">📭 What the spec does not say</div>
+<p>The NVMe specification defines what each register means and how the host shall use it; it does not specify how the controller implements decode, how long a register read takes, or how doorbell writes are internally queued. Latency numbers you see in a trace for MMIO reads are properties of a particular platform and controller.</p></div>
+
+<h3 id="p3-19-linux">19.12 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code>sudo lspci -s 01:00.0 -vv | grep -i region       # BAR address, type, size
+cat /sys/bus/pci/devices/0000:01:00.0/resource    # lines: start end flags (BAR0..BAR5, ROM, ...)
+sudo grep -A3 -i 'nvme' /proc/iomem               # which driver claimed the region
+ls -l /sys/bus/pci/devices/0000:01:00.0/resource0 # the BAR0 file (mmap-able by root)
+sudo dmesg | grep -E '01:00.0.*(BAR|reg 0x10)'     # sizing/assignment messages</code></pre>
+<p>Reading NVMe registers directly through <code>resource0</code> is possible for root. The following is <b>hardware-dependent</b> and should be run only on a test machine:</p>
+<pre class="code" data-kind="hardware-dependent"><code>#!/usr/bin/env python3
+# CAUTION LAB: maps BAR0 of an NVMe device read-only and reads CAP, VS, CC, CSTS.
+# Reading these registers has no side effects per the NVMe register definitions,
+# but mapping device memory as root is a privileged operation. NEVER write here
+# while the kernel nvme driver owns the device.
+import mmap, os, struct, sys
+bdf = sys.argv[1]                                   # e.g. 0000:01:00.0
+fd = os.open(f"/sys/bus/pci/devices/{bdf}/resource0", os.O_RDONLY | os.O_SYNC)
+m = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ)
+rd32 = lambda off: struct.unpack_from("&lt;I", m, off)[0]   # 32-bit accesses only
+cap = rd32(0x00) | (rd32(0x04) &lt;&lt; 32)
+print(f"CAP={cap:#018x} VS={rd32(0x08):#010x} CC={rd32(0x14):#010x} CSTS={rd32(0x1C):#010x}")</code></pre>
+<div class="callout warn"><div class="callout-title">⚠️ Safety note</div>
+<p>Python's <code>struct.unpack_from</code> on an mmap is not guaranteed to perform a single 32-bit bus access on every platform/Python build <span class="tag impl">impl</span>. For reliable register work use a tool or a small C program with volatile 32-bit loads. Some kernels restrict <code>resource</code> mapping when lockdown is active. Writing any register (especially CC, NSSR or doorbells) behind the driver's back can corrupt queues and data.</p></div>
+
+<h3 id="p3-19-trace">19.13 Trace view</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 19.A — normal: driver reads CAP, VS and CSTS, then rings an admin doorbell</div><div class="table-wrap"><table>
+<thead><tr><th>t (ns)</th><th>Dir</th><th>TLP</th><th>Address</th><th>Len</th><th>Data</th><th>Decoded</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↓</td><td>MRd (32-bit addr)</td><td>FEA0_0000h</td><td>1 DW</td><td>—</td><td>CAP low</td></tr>
+<tr><td>780</td><td>↑</td><td>CplD</td><td>—</td><td>1 DW</td><td>2803_03FFh</td><td>MQES=3FFh, CQR=1, AMS WRR=1, TO=28h</td></tr>
+<tr><td>900</td><td>↓</td><td>MRd</td><td>FEA0_0004h</td><td>1 DW</td><td>—</td><td>CAP high</td></tr>
+<tr><td>1650</td><td>↑</td><td>CplD</td><td>—</td><td>1 DW</td><td>1A40_0830h</td><td>NSSRS, CSS, MPSMAX, CMBS … (decoded in Ch 24)</td></tr>
+<tr><td>1800</td><td>↓</td><td>MRd</td><td>FEA0_0008h</td><td>1 DW</td><td>—</td><td>VS</td></tr>
+<tr><td>2550</td><td>↑</td><td>CplD</td><td>—</td><td>1 DW</td><td>0002_0400h</td><td>NVMe 2.4</td></tr>
+<tr><td>…</td><td></td><td></td><td></td><td></td><td></td><td>(controller enable sequence; see Ch 24)</td></tr>
+<tr><td>9100</td><td>↓</td><td>MWr</td><td>FEA0_1000h</td><td>1 DW</td><td>0000_0001h</td><td>SQ0TDBL ← 1: one admin command submitted</td></tr>
+<tr><td>9400</td><td>↑</td><td>MRd</td><td>(host SQ address)</td><td>16 DW</td><td>—</td><td>Controller fetches the 64-byte SQ entry (DMA)</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 19.B — slow: MMIO read latency spike</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Address</th><th>Data</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0.0</td><td>↓</td><td>MRd</td><td>FEA0_001Ch</td><td>—</td><td>Poll CSTS</td></tr>
+<tr class="first-bad"><td>37.5</td><td>↑</td><td>CplD</td><td>—</td><td>0000_0000h</td><td>Completion 37 µs later (normal on this platform ≈1 µs) — controller busy, or link in L1 exiting</td></tr>
+<tr><td>—</td><td></td><td></td><td></td><td></td><td>Check: did the link enter L1/L1.x before the read (ASPM)? Is the controller in a firmware critical section? Ambiguous without link-state view.</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 19.C — failed: driver uses BAR address after the OS reassigned BAR0</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Event</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>BAR0 = FEA0_0000h at boot</td><td>Userspace tool caches the address</td></tr>
+<tr><td>2</td><td>Remove + rescan; PCI core assigns BAR0 = FE80_0000h</td><td>Command.MSE re-enabled at new address</td></tr>
+<tr class="first-bad"><td>3</td><td>Tool reads FEA0_001Ch (stale)</td><td>Address no longer decoded by any device in that window</td></tr>
+<tr class="bad"><td>4</td><td>Root Port / RC returns UR → all-ones to CPU</td><td>Tool prints CSTS = FFFF_FFFFh: "controller fatal?" — wrong conclusion</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace 19.D — ambiguous: all-ones on CSTS during surprise removal</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr class="first-bad"><td>1</td><td>CSTS read returns FFFF_FFFFh</td><td>RDY=1, CFS=1, SHST=11b… nonsense combination</td></tr>
+<tr><td>2</td><td>Root Port Link Status: DLLLA = 0; Slot Status: Presence Detect changed</td><td>Device gone — the value is a synthesized all-ones, not a register value</td></tr>
+<tr><td>3</td><td>Linux nvme driver logic treats all-ones CSTS as "device removed / dead"</td><td>Driver checks this pattern explicitly in its timeout/reset paths <span class="tag impl">impl</span></td></tr>
+</tbody></table></div></div>
+
+<h3 id="p3-19-code">19.14 Code: modelling BAR0 register decode</h3>
+<pre class="code" data-kind="pseudocode"><code># Inside a (simplified) controller model: decode an incoming memory request
+on_memory_request(tlp):
+    if not cfg.command.MSE:                 return  # not decoded → upstream sees UR
+    if not (BAR0 &lt;= tlp.addr &lt; BAR0 + 16 KiB): return  # not ours
+    off = tlp.addr - BAR0
+    if tlp.is_write:
+        if off &gt;= 0x1000:
+            q, is_cq = divmod((off - 0x1000) // (4 &lt;&lt; CAP.DSTRD), 2)
+            ring_doorbell(q, is_cq, tlp.data)      # tail for SQ, head for CQ
+        else:
+            write_register(off, tlp.data, tlp.byte_enables)
+    else:
+        send CplD(read_register(off, tlp.length))</code></pre>
+
+<h3 id="p3-19-mistakes">19.15 Common mistakes</h3>
+<ul>
+<li>Sizing a 64-bit BAR with only its lower DWORD.</li>
+<li>Leaving Command.MSE = 1 while writing all ones to a BAR.</li>
+<li>Assuming BAR addresses are stable across boots or rescans.</li>
+<li>Mapping register BARs write-combining or cacheable — reads might be served stale, writes merged or reordered.</li>
+<li>Expecting a completion for an MMIO write.</li>
+<li>Putting a CPU physical address into a PRP when an IOMMU is active (should be a DMA address).</li>
+<li>Assuming MSI-X table placement — always read BIR/offset.</li>
+</ul>
+
+<h3 id="p3-19-failures">19.16 Five failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Conclusion (confidence)</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>dmesg: "BAR 0: no space for [mem size 0x00004000 64bit]"</td><td>Bridge window too small; no 32-bit space left</td><td><code>/proc/iomem</code> windows</td><td>Firmware MMIO settings</td><td>Remove other devices / enable realloc on a test system</td><td>Resource exhaustion (high)</td></tr>
+<tr><td>2</td><td>All register reads return all-ones but Vendor ID is fine</td><td>MSE = 0; BAR unassigned; device in D3hot</td><td>Command; Region line "[disabled]" or "[virtual]"</td><td>PMCSR</td><td>Enable via the driver path (not setpci) and retest</td><td>Decode disabled (high)</td></tr>
+<tr><td>3</td><td>Doorbell writes have no effect</td><td>Wrong DSTRD in offset math; wrong BAR mapping; controller not enabled (CSTS.RDY=0)</td><td>CAP.DSTRD, computed offset</td><td>Analyzer: is the MWr on the link, at which address?</td><td>Compare TLP address to BAR0 + expected offset</td><td>Offset bug vs controller state (medium-high)</td></tr>
+<tr><td>4</td><td>Intermittent stale register values</td><td>Mapping with wrong memory type</td><td>Driver's ioremap variant</td><td>PAT/MTRR configuration <span class="tag impl">impl</span></td><td>Map UC explicitly; compare</td><td>Mapping attribute bug (medium)</td></tr>
+<tr><td>5</td><td>Peer-to-peer DMA fails between two SSDs under one switch</td><td>ACS redirects P2P upstream; IOMMU blocks; not supported by the RC</td><td>ACS capability control on DSPs</td><td>IOMMU fault logs</td><td>Test P2P with ACS settings known; consult platform docs</td><td>Platform policy (medium)</td></tr>
+</tbody></table></div>
+
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div>
+<p>All-ones is the universal "something is not there" signature for both configuration reads and MMIO reads. Make it a reflex: when a register reads all-ones, first prove the device is still reachable (Vendor ID, link state), then prove decode is on (MSE, BAR), and only then believe the value. NVMe registers do have fields that can legitimately be all-ones in part, but a whole 32-bit FFFF_FFFFh in CSTS or CAP is never a healthy value.</p></div>
+
+<h3 id="p3-19-zero">19.17 Zero-hallucination ledger</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Category</th><th>Items</th></tr></thead>
+<tbody>
+<tr><td><span class="tag verified">verified</span></td><td>BAR bit layout; power-of-two sizes and natural alignment; sizing algorithm; 64-bit BARs occupy two slots; MWr posted; MMIO routing by bridge windows; NVMe registers in memory space at BAR0 with doorbells from 1000h.</td></tr>
+<tr><td><span class="tag derived">derived</span></td><td>Size computations; the 8 GiB 32-bit-sizing pitfall; read-to-flush reasoning.</td></tr>
+<tr><td><span class="tag impl">impl</span></td><td>MSI-X/CMB placement; CPU memory types; MMIO latency; doorbell processing inside the controller; platform address offsets.</td></tr>
+<tr><td><span class="tag version">version</span></td><td>Registers introduced in NVMe 2.x; exact access-width rules; Index/Data Pair mechanism status.</td></tr>
+<tr><td>Check in the spec</td><td>Required BAR configuration for an NVMe controller in the PCIe Transport spec; access-width requirements for 64-bit registers.</td></tr>
+<tr><td>Never assume</td><td>BAR address stability; that an MMIO write has arrived without a read-back; that all-ones is register data.</td></tr>
+</tbody></table></div>
+
+<h3 id="p3-19-labs">19.18 Labs</h3>
+<div class="lab"><div class="lab-head">🧪 Lab 19.1 — Size BARs on paper and in simulation <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> compute size from read-back values. <b>Procedure:</b> for each read-back pair, compute size and type: (a) FFFF_F000h (32-bit); (b) FFFE_000Ch / FFFF_FFFFh; (c) FFFF_FF01h (I/O). Then add each case to <code>bar_size.py</code> by constructing an appropriate <code>FakeBar</code> (or an I/O variant) and confirm.</p>
+<details class="answer"><summary>Solution</summary><p>(a) memory, 32-bit, non-prefetchable, size 4 KiB. (b) memory, 64-bit, prefetchable, mask FFFF_FFFF_FFFE_0000h → size 128 KiB. (c) I/O BAR, mask with ~3h → FFFF_FF00h → size 256 bytes.</p></details>
+<p><b>Extension:</b> write a function that packs a list of BARs into a window with natural alignment and reports the minimum bridge window size (1 MiB granular).</p></div>
+<div class="lab"><div class="lab-head">🧪 Lab 19.2 — Map BAR0 of an emulated NVMe device <span class="safety caution">CAUTION</span></div>
+<p><b>Setup:</b> QEMU VM with an extra <code>-device nvme</code> that is not the boot disk. <b>Procedure:</b> run the hardware-dependent reader in 19.12 against its BDF; decode CAP with the decoder in <a href="#p3-ch24-registers">Chapter 24</a>. Compare VS with <code>nvme id-ctrl /dev/nvme0 | grep -i ver</code>.</p>
+<details class="answer"><summary>Expected reasoning</summary><p>VS read from BAR0 and the "ver" field of Identify Controller should agree in what they report (both encode the supported specification version, MJR.MNR.TER). CC.EN=1 and CSTS.RDY=1 because the kernel driver has enabled the controller.</p></details></div>
+<div class="lab"><div class="lab-head">🧪 Lab 19.3 — Senior forensic: the vanishing doorbell <span class="safety safe">SAFE</span></div>
+<p><b>Scenario (synthetic):</b> a custom user-space driver rings SQ1 tail at BAR0+1008h, but the controller never fetches. CAP high DWORD = 0000_0002h. <b>Task:</b> find the bug.</p>
+<details class="answer"><summary>Model answer</summary><p>CAP.DSTRD = bits 35:32 = 2 → stride 4&lt;&lt;2 = 16 bytes. SQ1TDBL = 1000h + (2×1)×16 = 1020h, not 1008h. 1008h falls in the gap between SQ0TDBL (1000h) and CQ0HDBL (1010h) — a write to an undefined location. Fix: compute offsets from DSTRD. Confidence high; verify with an analyzer showing MWr at 1008h with no subsequent MRd of SQ1 memory.</p></details></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Read-back after all-ones: FFFF_8004h, upper FFFF_FFFFh. Size?</p><details class="answer"><summary>Answer</summary><p>Mask FFFF_FFFF_FFFF_8000h → size 8000h = 32 KiB; 64-bit, non-prefetchable.</p></details></li>
+<li><p>Why are register BARs non-prefetchable?</p><details class="answer"><summary>Answer</summary><p>Because reads may have side effects or must reflect current state; the system must not speculatively read or merge accesses.</p></details></li>
+<li><p>Is an MMIO write to a doorbell acknowledged by a completion TLP?</p><details class="answer"><summary>Answer</summary><p>No. MWr is posted. Only link-level ACK DLLPs acknowledge delivery across each link.</p></details></li>
+<li><p>Where are NVMe doorbells located?</p><details class="answer"><summary>Answer</summary><p>In BAR0 starting at offset 1000h; SQyTDBL at 1000h + (2y)×(4&lt;&lt;DSTRD) and CQyHDBL at 1000h + (2y+1)×(4&lt;&lt;DSTRD).</p></details></li>
+<li><p>Name two address kinds that may differ for the same DRAM page.</p><details class="answer"><summary>Answer</summary><p>Physical address and DMA address/IOVA (when an IOMMU is used); also the kernel virtual address.</p></details></li>
+</ol></div>
+
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> What is a BAR? <details class="answer"><summary>Model answer</summary><p>A configuration register that declares the type and size of an address window the device decodes, and holds the base address software assigns to it.</p></details></li>
+<li><span class="lvl">Intermediate</span> Walk me through BAR sizing for a 64-bit BAR. <details class="answer"><summary>Model answer</summary><p>Disable decode, save both DWORDs, write all ones to both, read both, combine, mask the 4 type bits, invert, add one, restore both, re-enable decode.</p></details></li>
+<li><span class="lvl">Intermediate</span> MMIO vs config access? <details class="answer"><summary>Model answer</summary><p>Config: ID-routed, non-posted CfgRd/CfgWr to configuration space; MMIO: address-routed MRd/MWr to BAR windows, writes posted. NVMe registers are MMIO.</p></details></li>
+<li><span class="lvl">Advanced</span> Why might a driver read back a register after writing it? <details class="answer"><summary>Model answer</summary><p>To force earlier posted writes to complete before proceeding (ordering: the read completion cannot pass the earlier write), e.g. before a timed delay or before assuming a reset bit took effect.</p></details></li>
+<li><span class="lvl">Senior</span> Dozens of NVMe drives fail to get BARs in a dense server. What is your analysis? <details class="answer"><summary>Model answer</summary><p>Non-prefetchable windows are 32-bit in Type 1 bridges; each drive's BAR0 (+ MSI-X, maybe CMB) needs space aligned within 1 MiB-granular bridge windows; with hot-plug reservation per port, 32-bit MMIO is exhausted. Options: firmware with larger MMIO hole, reducing per-port reservation, relying on 64-bit placement where the platform permits, or BIOS settings; verify with /proc/iomem and dmesg.</p></details></li>
+</ol></div>
+
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can size any BAR from read-back values, including 64-bit and I/O BARs.</li>
+<li>I can explain prefetchable vs non-prefetchable and which window each lands in.</li>
+<li>I can trace a doorbell write from <code>writel()</code> to an MWr TLP and to the controller.</li>
+<li>I can name the six address kinds and who translates between them.</li>
+<li>I can diagnose all-ones reads by layer.</li>
+<li>I can compute NVMe doorbell offsets for any DSTRD.</li>
+</ul></div>
+
+<h3 id="p3-19-summary">19.19 Summary, further reading and next</h3>
+<p>A BAR is a numbered doorway: the device fixes its size and type, software chooses its address. Sizing exploits hard-wired zero bits; 64-bit BARs are sized as pairs. NVMe registers are MMIO in BAR0 (non-prefetchable, 64-bit), with doorbells at 1000h. MMIO writes are posted; reads are non-posted and can be used to flush. Address kinds differ: VA, PA, IOVA, bus address, BAR address, controller-local.</p>
+<p><b>Further reading:</b> PCIe Base Specification sections on BARs and Type 1 windows; NVMe over PCIe Transport Specification (register mapping, MLBAR/MUBAR); Linux <code>Documentation/driver-api/device-io.rst</code> (MMIO accessors and ordering). <b>Next:</b> <a href="#p3-ch20-dma">Chapter 20 — DMA</a>, where the device starts reading and writing <em>host</em> memory.</p>
+</section>

@@ -1,0 +1,317 @@
+<section class="chapter" id="p5-ch50-power" data-part="PART XVI — POWER AND RESET">
+<h2><span class="num">50</span> Power Management (Deep-Dive Module: Power Management)</h2>
+
+<h3>50.1 Why this chapter exists</h3>
+<p>A laptop NVMe SSD may spend 99% of its life idle; a data-centre SSD may never be idle at all. Power management lets one design serve both — but it stacks <em>three independent</em> power-control systems on top of each other: <b>NVMe power states</b> (PS0…PSn, chosen by the host or autonomously via APST), <b>PCIe link power states</b> (ASPM L0s/L1 and L1 substates) and <b>PCIe device power states</b> (D0, D3hot, D3cold). Each saves power by adding wake-up latency, and each has failure modes: drives that never wake, links that throw errors on L1 exit, firmware that loses state in deep sleep. A large fraction of consumer NVMe bug reports on Linux are power-management quirks. This chapter makes the stack and its trade-offs explicit.</p>
+
+<h3>50.2 Learning objectives</h3>
+<ul class="objectives">
+<li><b>Beginner:</b> name the three power systems and their states.</li>
+<li><b>Intermediate:</b> read Power State Descriptors (MP, ENLAT, EXLAT, NOPS); configure/inspect Feature 02h and APST (0Ch); explain Linux <code>nvme_core.default_ps_max_latency_us</code>.</li>
+<li><b>Advanced:</b> explain ASPM L0s/L1, L1.1/L1.2, LTR, CLKREQ#, D3hot vs D3cold, PME and their latency budgets.</li>
+<li><b>Senior:</b> diagnose wake failures by separating power, link, controller and driver causes; tune for latency vs power.</li>
+<li><b>Trace-analysis:</b> recognise power transitions on the link (PM DLLPs, electrical idle, LTSSM L1 entry/exit, PME messages).</li>
+<li><b>Debugging/validation:</b> five failure patterns, power-state lab.</li>
+</ul>
+
+<h3>50.3 Kid story and analogy boundary</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>The warehouse has three ways to save electricity. Inside, the manager can <b>dim the lights</b> in steps — bright, dim, very dim, off (NVMe power states); in the "off" steps nobody works, and it takes a while to switch lights back on. The <b>road</b> to your house can close one lane, or put up a barrier that takes a moment to lift (link L0s, L1). And the whole warehouse can go into <b>night mode</b> — doors locked except for the night bell (D3hot) — or be <b>switched off at the mains</b> (D3cold), which means a full morning start-up before anyone can help you.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Analogy boundary</div><p><b>Represents:</b> three independent mechanisms, latency to wake. <b>Hides:</b> that the host and device must <em>agree</em> on some of these (ASPM must be enabled at both link ends, L1 substates need CLKREQ# and LTR), and that autonomous transitions (APST, ASPM) happen without host commands — there's no request on the wire you can point to. <b>Misleading when:</b> you assume a "dimmed" warehouse is also a closed road: NVMe PS and PCIe link states are independent; a drive in PS4 may have its link in L0 if ASPM is disabled, and a drive in PS0 may have its link in L1 between I/Os.</p></div>
+
+<h3>50.4 Vocabulary</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Term</th><th>Plain</th><th>Engineering</th><th>Common confusion</th></tr></thead>
+<tbody>
+<tr><td>PS0…PSn</td><td>Light levels</td><td>NVMe power states; up to 32 (Identify Controller NPSS, zero-based); each described by a 32-byte Power State Descriptor</td><td>Higher number ≠ always lower power — check MP</td></tr>
+<tr><td>Operational / Non-operational</td><td>Working / not working</td><td>NOPS bit in descriptor; I/O not processed in non-operational states (controller returns to an operational state to process I/O)</td><td>Admin commands may be processed without leaving the state (check spec)</td></tr>
+<tr><td>ENLAT / EXLAT</td><td>Time to dim / brighten</td><td>Entry / Exit Latency in µs</td><td>Sum is the worst-case added latency of a round trip</td></tr>
+<tr><td>APST</td><td>Automatic dimmer</td><td>Autonomous Power State Transition, Feature 0Ch, table of idle timeouts → target state</td><td>Host sets the policy, device executes</td></tr>
+<tr><td>ASPM</td><td>Lane closing</td><td>Active State Power Management of link (L0s, L1) without software intervention</td><td>Independent of D-state transitions</td></tr>
+<tr><td>L1.1 / L1.2</td><td>Barrier with/without guard</td><td>L1 PM Substates: further power reduction with CLKREQ#; L1.2 turns off common-mode voltage keepers</td><td>Exit latency much larger in L1.2</td></tr>
+<tr><td>LTR</td><td>"I can wait this long"</td><td>Latency Tolerance Reporting message from device to platform</td><td>Used to decide L1.2 entry (threshold)</td></tr>
+<tr><td>D0 / D3hot / D3cold</td><td>Day / night / mains off</td><td>PCI device power states (PMCSR PowerState); D3cold = main power removed</td><td>D3hot keeps config space accessible; memory space not</td></tr>
+<tr><td>PME</td><td>Wake-up bell</td><td>Power Management Event message / WAKE#</td><td>Not an interrupt by itself</td></tr>
+<tr><td>L2/L3 Ready</td><td>Ready for mains off</td><td>Link state after PME_Turn_Off / PME_TO_Ack handshake before power removal</td><td>—</td></tr>
+</tbody></table></div>
+
+<h3>50.5 Architecture: the three-level stack</h3>
+<figure class="diagram"><svg viewBox="0 0 820 400" role="img" aria-label="Three stacked power management layers: NVMe power states, PCIe link states and PCIe device power states, with who controls each">
+<rect class="box accent" x="20" y="20" width="780" height="100" rx="8"/>
+<text class="lbl" x="40" y="46">NVMe power states (controller)</text>
+<text class="lbl small" x="40" y="72">PS0 (max perf) → PS1 → PS2 (operational, lower max power) → PS3 → PS4 (non-operational, idle)</text>
+<text class="lbl small" x="40" y="96">Control: Set Features 02h (host) or APST Feature 0Ch (autonomous after idle time). Cost: ENLAT + EXLAT.</text>
+<rect class="box alt" x="20" y="140" width="780" height="100" rx="8"/>
+<text class="lbl" x="40" y="166">PCIe link states (both link ends)</text>
+<text class="lbl small" x="40" y="192">L0 → L0s (per-direction, fast exit) → L1 → L1.1 / L1.2 (CLKREQ#, LTR threshold) ; L2/L3 for power removal</text>
+<text class="lbl small" x="40" y="216">Control: ASPM enable bits in Link Control (host policy), entry decided by hardware on idle. Cost: exit latency.</text>
+<rect class="box" x="20" y="260" width="780" height="100" rx="8"/>
+<text class="lbl" x="40" y="286">PCIe device states (function)</text>
+<text class="lbl small" x="40" y="312">D0 (active) → D3hot (config only; memory requests UR; link to L1) → D3cold (power removed; L2 with Vaux or L3)</text>
+<text class="lbl small" x="40" y="336">Control: PMCSR writes / platform (ACPI) for D3cold. Cost: ≥10 ms D3hot→D0; full init from D3cold.</text>
+<text class="lbl small" x="40" y="388">Independent but interacting: e.g. D3hot forces link to L1; APST non-operational states often coincide with link L1.x when ASPM enabled.</text>
+</svg><figcaption>Figure 50.1 — Three power-management layers. Each is controlled differently and each adds its own wake-up latency.</figcaption></figure>
+
+<h3>50.6 NVMe power states</h3>
+<h4>50.6.1 Power State Descriptor (Identify Controller, 32 bytes each)</h4>
+<div class="table-wrap"><table>
+<thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>MP (Maximum Power) + MXPS (scale)</td><td>Max power in this state (0.01 W units, or 0.0001 W when MXPS=1)</td></tr>
+<tr><td>NOPS</td><td>Non-Operational Power State: 1 = I/O not processed in this state</td></tr>
+<tr><td>ENLAT</td><td>Entry Latency (µs)</td></tr>
+<tr><td>EXLAT</td><td>Exit Latency (µs)</td></tr>
+<tr><td>RRT, RRL, RWT, RWL</td><td>Relative Read/Write Throughput/Latency rankings</td></tr>
+<tr><td>IDLP/IPS, ACTP/APW/APS</td><td>Idle power and active power with scales/workload</td></tr>
+</tbody></table></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Illustrative descriptor table for a client SSD (synthetic values)</div><div class="table-wrap"><table>
+<thead><tr><th>PS</th><th>MP</th><th>NOPS</th><th>ENLAT (µs)</th><th>EXLAT (µs)</th><th>Comment</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>8.0 W</td><td>0</td><td>0</td><td>0</td><td>Full performance</td></tr>
+<tr><td>1</td><td>5.5 W</td><td>0</td><td>0</td><td>0</td><td>Capped performance</td></tr>
+<tr><td>2</td><td>3.5 W</td><td>0</td><td>0</td><td>0</td><td>Further capped</td></tr>
+<tr><td>3</td><td>0.05 W</td><td>1</td><td>2000</td><td>2000</td><td>Light sleep</td></tr>
+<tr><td>4</td><td>0.005 W</td><td>1</td><td>6000</td><td>14000</td><td>Deep sleep (often relies on L1.2)</td></tr>
+</tbody></table></div></div>
+<h4>50.6.2 Host-controlled transitions — Feature 02h</h4>
+<p>Set Features 02h (Power Management) CDW11 bits 4:0 = PS, bits 7:5 = Workload Hint. Get Features 02h returns the current state. If the host submits I/O while the controller is in a non-operational state, the controller transitions to an operational state to process it (<span class="tag verified">verified</span> in substance — consult the Base spec "Power Management" section for exact rules).</p>
+<h4>50.6.3 APST — Feature 0Ch</h4>
+<p>Identify Controller APSTA bit indicates support. Set Features 0Ch: CDW11 bit 0 APSTE (enable) and a 256-byte data buffer of 32 entries (one per power state, 8 bytes each):</p>
+<div class="table-wrap"><table class="bitfield">
+<thead><tr><th>Entry bits</th><th>Field</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>7:3</td><td>ITPS — Idle Transition Power State</td><td>State to move to after the idle time, when in the state this entry describes</td></tr>
+<tr><td>31:8</td><td>ITPT — Idle Time Prior to Transition</td><td>Milliseconds of idle before transition (0 = disabled for this entry)</td></tr>
+</tbody></table></div>
+<p>APST transitions go only to non-operational states. The device returns to the last operational state when work arrives, paying EXLAT.</p>
+<h4>50.6.4 Linux: nvme_core.default_ps_max_latency_us</h4>
+<p>Linux builds the APST table automatically: it considers non-operational states whose ENLAT + EXLAT ≤ the latency tolerance (<code>nvme_core.default_ps_max_latency_us</code>, commonly 100000 µs by default — <span class="tag version">version</span>/kernel-dependent) and picks idle timeouts proportional to the state's latency (<span class="tag impl">impl</span> — the heuristic has changed across kernel versions). Setting the parameter to 0 disables APST. A per-device override exists via <code>/sys/class/nvme/nvme0/power/pm_qos_latency_tolerance_us</code>. Quirk tables (e.g. NVME_QUIRK_NO_DEEPEST_PS, NVME_QUIRK_NO_APST) disable states known to be broken on specific models.</p>
+<pre class="code" data-kind="read-only inspection"><code>sudo nvme id-ctrl /dev/nvme0 -H | sed -n '/^ps /,$p'      # power state descriptors
+sudo nvme id-ctrl /dev/nvme0 | grep -E "npss|apsta"
+sudo nvme get-feature /dev/nvme0 -f 0x02 -H              # current power state
+sudo nvme get-feature /dev/nvme0 -f 0x0c -H              # APST table (read-only)
+cat /sys/module/nvme_core/parameters/default_ps_max_latency_us
+cat /sys/class/nvme/nvme0/power/pm_qos_latency_tolerance_us</code></pre>
+
+<h3>50.7 PCIe link power: ASPM and L1 substates</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>State</th><th>Entry</th><th>Exit latency (order of magnitude)</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>L0</td><td>—</td><td>—</td><td>Active</td></tr>
+<tr><td>L0s</td><td>Per direction, transmitter idle short time</td><td>&lt; 1 µs to a few µs</td><td>Gen3+ links often don't use it; optional in newer spec revisions (<span class="tag version">version</span>); not supported in FLIT mode</td></tr>
+<tr><td>L1 (ASPM)</td><td>Both sides agree via PM DLLPs (PM_Active_State_Request_L1 / PM_Request_Ack)</td><td>Few µs to tens of µs</td><td>Reported in LnkCap L1 Exit Latency</td></tr>
+<tr><td>L1.1</td><td>CLKREQ# deasserted; common-mode maintained</td><td>Tens of µs</td><td>L1 PM Substates capability (ext cap ID 001Eh)</td></tr>
+<tr><td>L1.2</td><td>Also common-mode off; uses LTR threshold</td><td>Tens to hundreds of µs (T_POWER_ON, Common_Mode_Restore_Time)</td><td>Biggest savings, biggest risk</td></tr>
+<tr><td>L2 / L3</td><td>After PME_Turn_Off / PME_TO_Ack, L2/L3 Ready, power removed</td><td>Full re-train</td><td>Used with D3cold</td></tr>
+</tbody></table></div>
+<p>ASPM is enabled per link end in Link Control bits 1:0 (01 L0s, 10 L1, 11 both). Endpoint Device Capabilities report acceptable L0s/L1 latencies; software should enable ASPM only where exit latencies along the path fit. Linux: <code>/sys/module/pcie_aspm/parameters/policy</code> (default, performance, powersave, powersupersave), boot option <code>pcie_aspm=off</code>, and per-link controls under <code>/sys/bus/pci/devices/…/link/</code> on recent kernels (<span class="tag version">version</span>).</p>
+<div class="callout hw"><div class="callout-title">🔧 Hardware</div><p>L1.2 requires the CLKREQ# sideband signal to be wired correctly on the board and supported at both ends, and correct T_POWER_ON / Common_Mode_Restore_Time programming. A board that advertises L1.2 but wires CLKREQ# incorrectly produces devices that "fall off the bus" after idle — the link cannot exit L1.2 cleanly and the root port logs Surprise Down or the device stops responding.</p></div>
+
+<h3>50.8 PCIe device power: D-states</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>D-state</th><th>Accessible</th><th>Link</th><th>Context</th><th>Return to D0</th></tr></thead>
+<tbody>
+<tr><td>D0</td><td>Everything</td><td>L0 / ASPM states</td><td>Full</td><td>—</td></tr>
+<tr><td>D1/D2</td><td>Optional, rarely used by NVMe</td><td>L1</td><td>Device-specific</td><td>Short</td></tr>
+<tr><td>D3hot</td><td>Config space only; memory/IO requests → UR</td><td>L1 (entered via PM_Enter_L1 DLLP)</td><td>Preserved if No_Soft_Reset=1; otherwise device resets on D3hot→D0 (internal reset, config must be restored)</td><td>Write PMCSR to D0, wait 10 ms</td></tr>
+<tr><td>D3cold</td><td>Nothing (power off)</td><td>L2 (with Vaux) or L3</td><td>Lost (except Vaux-powered sticky/PME)</td><td>Power on, full reset, enumeration restore, NVMe init</td></tr>
+</tbody></table></div>
+<div class="callout spec"><div class="callout-title">📘 Spec</div><p><span class="tag verified">verified</span> PMCSR (Power Management Control/Status, in the PM capability, ID 01h) bits 1:0 PowerState (00 D0, 01 D1, 10 D2, 11 D3hot); bit 3 No_Soft_Reset; bit 8 PME_En; bit 15 PME_Status. 10 ms recovery time after D3hot → D0 before accessing the function. NVMe RTD3R / RTD3E in Identify Controller report the expected resume and entry latency for "runtime D3" (power removal) in µs — these are the NVMe-side numbers for D3cold-style power-off.</p></div>
+<div class="callout impl"><div class="callout-title">🏭 Implementation-dependent</div><p>How Linux handles system suspend for NVMe depends on platform: on many client platforms with s2idle, the driver keeps the controller in D0 and relies on an NVMe non-operational power state plus ASPM L1.2, instead of a full shutdown (because shutdown + power-off costs RTD3R on resume). Platform firmware (ACPI _DSD "StorageD3Enable" and similar) may request D3. The exact policy changes by kernel version and platform.</p></div>
+
+<h3>50.9 Latency trade-offs</h3>
+<div class="formula">added_latency_first_IO ≈ EXLAT(NVMe PS) + L1.x exit latency (+ D3hot→D0 10 ms + controller re-init, if applicable)</div>
+<ul class="vars"><li><b>EXLAT</b> — exit latency of the current NVMe non-operational state</li><li><b>L1.x exit</b> — link exit latency (L1, L1.1 or L1.2)</li><li><b>D-state term</b> — only if runtime PM put the function into D3</li></ul>
+<p>Example (synthetic): PS4 EXLAT 14 ms + L1.2 exit 70 µs → the first read after idle takes ~14 ms instead of ~80 µs. For a desktop, fine; for a database with a 5 ms SLO, unacceptable — disable deep APST states with <code>default_ps_max_latency_us</code> (e.g. 5000) on that system.</p>
+
+<h3>50.10 Mechanism: APST idle → sleep → wake</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Who acts</th><th>What changes</th><th>Where</th><th>Evidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Driver</td><td>Sets APST table (Feature 0Ch)</td><td>Controller</td><td>Admin command; get-feature</td></tr>
+<tr><td>2</td><td>Controller</td><td>Detects idle (no outstanding commands) for ITPT ms in PS0</td><td>Controller</td><td>None on link (just no traffic)</td></tr>
+<tr><td>3</td><td>Controller</td><td>Enters ITPS (e.g. PS3)</td><td>Controller</td><td>Get Features 02h (host can query — wakes? admin processing allowed)</td></tr>
+<tr><td>4</td><td>Link (both ends)</td><td>ASPM L1 entry (PM DLLP handshake), then L1.2 if LTR/threshold allow</td><td>Link</td><td>Analyzer: PM DLLPs, electrical idle; LTR message earlier</td></tr>
+<tr><td>5</td><td>Controller</td><td>After further ITPT, PS4</td><td>Controller</td><td>None</td></tr>
+<tr><td>6</td><td>Host</td><td>Submits I/O: doorbell MWr</td><td>Root port</td><td>Root port must first exit L1.2 → L1 → Recovery → L0</td></tr>
+<tr><td>7</td><td>Link</td><td>CLKREQ# asserted, refclk on, exit to L0 via Recovery</td><td>Link</td><td>LTSSM Recovery on analyzer</td></tr>
+<tr><td>8</td><td>Controller</td><td>Receives doorbell; exits PS4 (EXLAT) to last operational state</td><td>Controller</td><td>Gap between doorbell and SQE fetch ≈ EXLAT</td></tr>
+<tr><td>9</td><td>Controller</td><td>Normal command processing</td><td>—</td><td>Normal trace shape thereafter</td></tr>
+</tbody></table></div>
+
+<h3>50.11 Synthetic traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: wake from PS4 + L1.2</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>−5 s</td><td>last CQ head doorbell; link enters L1 then L1.2</td><td>Idle</td></tr>
+<tr><td>0</td><td>root port: CLKREQ# asserted; Recovery → L0 (≈ 60 µs)</td><td>Link exit</td></tr>
+<tr><td>60 µs</td><td>↓ MWr SQ1 tail doorbell</td><td>Delivered after link up</td></tr>
+<tr><td>14.1 ms</td><td>↑ MRd SQE fetch</td><td>Doorbell→fetch gap ≈ EXLAT(PS4)=14 ms</td></tr>
+<tr><td>14.2 ms</td><td>… data, CQE, MSI-X</td><td>Normal</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: latency spikes under bursty load</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>periodic</td><td>I/O bursts every 120 ms; APST ITPT(PS0→PS3) = 100 ms</td><td>Device enters PS3 between bursts</td></tr>
+<tr class="first-bad"><td>each burst start</td><td>first I/O +2 ms (EXLAT PS3)</td><td>p99 latency spikes at 2 ms; root cause: APST timeout shorter than the workload's idle period</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: device lost after deepest state</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>idle; PS4; link L1.2</td><td>—</td></tr>
+<tr><td>600 s</td><td>↓ doorbell after link exit attempt</td><td>—</td></tr>
+<tr class="first-bad"><td>600 s</td><td>link exits to Recovery, fails, → Detect; root port logs Surprise Down (if supported/unmasked)</td><td>Link could not exit L1.2 (CLKREQ#/refclk/T_POWER_ON problem) — link-level</td></tr>
+<tr class="bad"><td>630 s</td><td>nvme: I/O timeout; CSTS=0xFFFFFFFF; controller reset fails; device removed</td><td>Symptoms</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: timeout after idle, link fine</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>link exits L1 cleanly; doorbell delivered</td><td>Link healthy</td></tr>
+<tr class="first-bad"><td>0 → 30 s</td><td>no SQE fetch MRd visible in captured interval</td><td>Controller didn't wake from PS4? Firmware bug in PS4 exit — or doorbell to wrong queue? CSTS read: RDY=1, CFS=0</td></tr>
+</tbody></table></div></div>
+<p><b>Reasoning:</b> with the link proven healthy and the doorbell visible, the candidates are controller (firmware stuck in a non-operational state) or driver (doorbell to wrong offset). Disambiguate: disable APST (latency 0) and retest — if the problem vanishes, it's power-state firmware (common reason for Linux quirk entries).</p>
+
+<h3>50.12 Five failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Causes</th><th>First check</th><th>Second check</th><th>Experiment</th><th>Conclusion / confidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Drive disappears after idle; CSTS all-ones</td><td>L1.2 exit failure; deepest PS bug</td><td>AER root port (Surprise Down), link state</td><td>Idle time correlation</td><td>default_ps_max_latency_us=0, then pcie_aspm=off (separately)</td><td>Whichever removes it; medium-high</td></tr>
+<tr><td>2</td><td>Periodic latency spikes</td><td>APST too aggressive</td><td>APST table</td><td>Idle gaps in workload</td><td>Raise ITPT / limit latency</td><td>Configuration; high</td></tr>
+<tr><td>3</td><td>Correctable errors only around idle</td><td>L1 exit signal integrity</td><td>AER RxErr timing</td><td>ASPM policy</td><td>Disable ASPM</td><td>Link PM; medium</td></tr>
+<tr><td>4</td><td>Resume from suspend fails</td><td>D3cold power sequencing; driver ordering; RTD3R long</td><td>dmesg resume path</td><td>Platform D3 policy</td><td>Toggle platform suspend mode (s2idle vs deep)</td><td>Platform/driver; medium</td></tr>
+<tr><td>5</td><td>UR at device after runtime resume</td><td>Host MMIO before D0+10 ms or before config restore</td><td>AER header log (MRd to BAR0)</td><td>Runtime PM timeline</td><td>Disable runtime PM (power/control=on)</td><td>Driver ordering; medium</td></tr>
+</tbody></table></div>
+
+<h3>50.13 Labs</h3>
+<div class="lab"><div class="lab-head">🧪 Lab 50.1 (beginner) — Inventory the power stack <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> record all three layers' configuration for your drive. <b>Procedure:</b> run the read-only commands in §50.6.4; <code>sudo lspci -vvv -s &lt;nvme&gt; | grep -E "LnkCap|LnkCtl|L1SubCap|L1SubCtl1|PME|Status: D"</code>; <code>cat /sys/module/pcie_aspm/parameters/policy</code>; <code>cat /sys/bus/pci/devices/&lt;bdf&gt;/power/control</code>. <b>Observations:</b> NPSS, PS table, APST enabled, ASPM enabled states, L1 substates enabled, D-state, runtime PM. <b>Questions:</b> what's the worst-case wake latency on your system?</p>
+<details class="answer"><summary>Solution</summary><p>Sum the EXLAT of the deepest APST-enabled state and the L1.x exit latency; add D3 resume if runtime PM puts the device in D3. Many laptops: ~10–20 ms; servers often have APST/ASPM disabled → microseconds.</p></details></div>
+<div class="lab"><div class="lab-head">🧪 Lab 50.2 (intermediate) — Measure first-I/O-after-idle latency <span class="safety caution">CAUTION</span></div>
+<p><b>Objective:</b> observe APST exit latency in software. <b>Setup:</b> test system; read-only I/O. <b>Procedure:</b> run a 4 KiB O_DIRECT read, sleep N seconds (N = 0.05, 0.5, 2, 10), read again, record latency; repeat with <code>nvme_core.default_ps_max_latency_us=0</code> (boot parameter; reboot required).</p>
+<pre class="code" data-kind="executable"><code>for s in 0.05 0.5 2 10; do
+  sleep "$s"
+  sudo fio --name=w --filename=/dev/nvme0n1 --rw=randread --bs=4k --direct=1 \
+       --ioengine=psync --number_ios=1 --readonly --output-format=terse \
+       | awk -F';' -v s="$s" '{print "idle", s, "s: clat_us", $16}'
+done</code></pre>
+<div class="callout warn"><div class="callout-title">⚠️ Safety</div><p>The fio job is read-only (<code>--readonly</code>). Changing kernel parameters affects power/battery and must be done on a test machine. The terse-output field index for completion latency varies by fio version — verify against <code>fio --terse-version</code> documentation before trusting the number.</p></div>
+<details class="answer"><summary>Solution</summary><p>Expect latency to jump once idle exceeds the APST ITPT for a non-operational state (e.g. ~100 ms → +EXLAT). With APST disabled, latency stays flat (but idle power rises).</p></details></div>
+<div class="lab"><div class="lab-head">🧪 Lab 50.3 (advanced/senior) — Power-state lab: active → idle → low power → wake → failure <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> distinguish power, link, controller and driver issues in a synthetic incident. <b>Given (synthetic timeline):</b></p>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic composite timeline</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Source</th><th>Event</th></tr></thead>
+<tbody>
+<tr><td>10:00:00.000</td><td>workload</td><td>Active: 20k IOPS</td></tr>
+<tr><td>10:00:05.000</td><td>workload</td><td>Idle begins</td></tr>
+<tr><td>10:00:05.100</td><td>device (inferred)</td><td>APST: PS0 → PS3 (ITPT 100 ms)</td></tr>
+<tr><td>10:00:05.1xx</td><td>analyzer</td><td>Link: L1 entry, then L1.2</td></tr>
+<tr><td>10:00:07.100</td><td>device (inferred)</td><td>APST: PS3 → PS4 (ITPT 2000 ms)</td></tr>
+<tr><td>10:05:00.000</td><td>analyzer</td><td>Root port: CLKREQ# asserted; Recovery; L0 reached in 75 µs</td></tr>
+<tr><td>10:05:00.000075</td><td>analyzer</td><td>↓ MWr SQ4 tail doorbell</td></tr>
+<tr class="first-bad"><td>10:05:00.000075 → 10:05:30</td><td>analyzer</td><td>No upstream TLP from device in captured interval; link stays L0; DLLP Acks for the doorbell seen; UpdateFC DLLPs continue</td></tr>
+<tr class="bad"><td>10:05:30</td><td>dmesg (illustrative)</td><td>nvme nvme0: I/O tag 12 (…) QID 4 timeout, aborting</td></tr>
+<tr class="bad"><td>10:05:30</td><td>analyzer</td><td>↓ MWr admin SQ0 doorbell (Abort); no fetch</td></tr>
+<tr class="bad"><td>10:06:00</td><td>dmesg (illustrative)</td><td>controller reset; ↓ MRd CSTS → CplD 0x0000_0001 (RDY=1, CFS=0)</td></tr>
+<tr><td>10:06:00+</td><td>analyzer</td><td>CC.EN=0 → RDY=0 → EN=1 → RDY=1; I/O resumes</td></tr>
+</tbody></table></div></div>
+<p><b>Questions:</b> (1) Power issue, link issue, controller issue or driver issue? (2) What's the first abnormal event? (3) What evidence rules out the link? (4) What rules out the driver? (5) What experiment confirms? (6) Mitigation?</p>
+<details class="answer"><summary>Solution</summary><p>(1) Controller (firmware) issue in leaving a non-operational power state — a power-management-triggered controller bug. (2) The absence of any device response after the doorbell at 10:05:00.000075 — phrased as "no upstream TLP visible in the captured interval" (capture covered both directions, link in L0, so coverage is good). (3) Link exited L1.2 to L0 promptly, DLLP Acks for the doorbell prove the device's data link layer received it; flow control continues — the link layer is alive. (4) The doorbell targeted SQ4's tail offset with a plausible value (verify), the admin Abort doorbell was also ignored (two different queues), and a controller reset fixed it without driver changes; CSTS shows no CFS — the controller wasn't "fatal", it was unresponsive. (5) Disable APST deep states (default_ps_max_latency_us below PS4's ENLAT+EXLAT) and run the same idle/wake pattern — failure should disappear; then re-enable only PS4 to confirm it's PS4-specific; check for firmware updates/errata. (6) Firmware update; until then, limit APST (kernel parameter or quirk). Confidence: medium-high.</p></details>
+<p><b>Extension:</b> rewrite the timeline so that the link fails to exit L1.2 instead, and list what evidence changes (Surprise Down, LTSSM Detect, CSTS all-ones).</p></div>
+
+<h3>50.14 Interview questions</h3>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> Name the three power-management layers of an NVMe SSD. <details class="answer"><summary>Model answer</summary><p>NVMe power states, PCIe link states (ASPM), PCIe device states (D-states).</p></details></li>
+<li><span class="lvl">Beginner</span> What is APST? <details class="answer"><summary>Model answer</summary><p>Autonomous Power State Transition: the controller moves to non-operational states after configured idle times.</p></details></li>
+<li><span class="lvl">Beginner</span> What does NOPS mean? <details class="answer"><summary>Model answer</summary><p>Non-operational: I/O not processed in that state.</p></details></li>
+<li><span class="lvl">Beginner</span> D3hot vs D3cold? <details class="answer"><summary>Model answer</summary><p>D3hot: powered, config accessible; D3cold: main power removed.</p></details></li>
+<li><span class="lvl">Beginner</span> What is ASPM? <details class="answer"><summary>Model answer</summary><p>Hardware-autonomous link power saving (L0s, L1) during idle.</p></details></li>
+<li><span class="lvl">Intermediate</span> How does Linux choose APST states? <details class="answer"><summary>Model answer</summary><p>Non-operational states with ENLAT+EXLAT ≤ default_ps_max_latency_us; timeouts by heuristic.</p></details></li>
+<li><span class="lvl">Intermediate</span> What's in a power state descriptor? <details class="answer"><summary>Model answer</summary><p>MP, NOPS, ENLAT, EXLAT, relative throughput/latency, idle/active power.</p></details></li>
+<li><span class="lvl">Intermediate</span> What does L1.2 need on the board? <details class="answer"><summary>Model answer</summary><p>CLKREQ# routing, LTR support, correct T_POWER_ON/common mode restore timing.</p></details></li>
+<li><span class="lvl">Intermediate</span> Why does a memory read to a D3hot device fail? <details class="answer"><summary>Model answer</summary><p>In D3hot only configuration requests are supported; memory requests get UR.</p></details></li>
+<li><span class="lvl">Intermediate</span> What's RTD3R? <details class="answer"><summary>Model answer</summary><p>RTD3 Resume Latency (Identify Controller): expected time to resume from power-off runtime D3.</p></details></li>
+<li><span class="lvl">Advanced</span> How do PM DLLPs negotiate L1? <details class="answer"><summary>Model answer</summary><p>Downstream component requests (PM_Active_State_Request_L1), upstream acknowledges (PM_Request_Ack) after blocking new TLPs; both go to electrical idle.</p></details></li>
+<li><span class="lvl">Advanced</span> What's LTR used for? <details class="answer"><summary>Model answer</summary><p>Device reports tolerable latency so platform can choose deeper states (e.g. L1.2 threshold, package C-states).</p></details></li>
+<li><span class="lvl">Advanced</span> Why might s2idle keep NVMe in D0? <details class="answer"><summary>Model answer</summary><p>Faster resume and lower complexity using NVMe PS + L1.2 instead of full shutdown and RTD3R.</p></details></li>
+<li><span class="lvl">Advanced</span> How does the trace show an APST exit? <details class="answer"><summary>Model answer</summary><p>Doorbell→fetch gap ≈ EXLAT; often preceded by link L1.x exit.</p></details></li>
+<li><span class="lvl">Advanced</span> Effect of No_Soft_Reset=0 on D3hot→D0? <details class="answer"><summary>Model answer</summary><p>Function undergoes internal reset; config must be restored; NVMe sees a controller-level reset.</p></details></li>
+<li><span class="lvl">Senior</span> Tuning for a latency-SLO database server? <details class="answer"><summary>Model answer</summary><p>Limit APST (latency budget), disable L1.2 or ASPM if exits exceed SLO, runtime PM off, measure p99.</p></details></li>
+<li><span class="lvl">Senior</span> How do you separate power vs link vs controller vs driver for a wake failure? <details class="answer"><summary>Model answer</summary><p>Link state/AER/LTSSM for link; DLLP Acks + no device response for controller; config restore/timing for driver; ablation (APST off, ASPM off, runtime PM off) one at a time.</p></details></li>
+<li><span class="lvl">Senior</span> Why do Linux quirk tables exist for NVMe PS? <details class="answer"><summary>Model answer</summary><p>Some firmware/boards fail in deep states; quirks disable them per model.</p></details></li>
+<li><span class="lvl">Senior</span> How does thermal throttling interact with power states? <details class="answer"><summary>Model answer</summary><p>Device may lower performance autonomously (thermal management temperatures, HCTM) independent of host-selected PS; shows as throughput drop with SMART temperature evidence.</p></details></li>
+<li><span class="lvl">Senior</span> What evidence proves a device was in a deep state when it failed? <details class="answer"><summary>Model answer</summary><p>Idle duration vs APST table, link L1.2 in trace, get-feature 02h before failure (if captured), doorbell→fetch gap patterns; otherwise only inferred — state confidence.</p></details></li>
+</ol></div>
+<div class="callout remember"><div class="callout-title">📌 Teach-back</div><p><b>Child:</b> dimming lights, closing road lanes, night mode and mains off. <b>Junior:</b> PS descriptors, APST table, ASPM states, D-states and the commands to inspect them. <b>Senior:</b> latency budget formula, platform/firmware/driver interactions, ablation-based diagnosis.</p></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>Explain the three layers and their controls.</li>
+<li>Diagram Figure 50.1 and the APST wake sequence.</li>
+<li>Identify in a trace: L1 entry/exit, doorbell→fetch gap from EXLAT.</li>
+<li>Debug the five failure patterns and the power-state lab.</li>
+<li>Distinguish NVMe PS from link states from D-states.</li>
+<li>Cite: NVMe Base (Power Management, APST features), PCIe Base (PM capability, ASPM, L1 PM Substates, LTR).</li>
+</ul></div>
+</section>
+
+<section class="chapter" id="p5-ch50b-capstone" data-part="PART XVI — POWER AND RESET">
+<h2><span class="num">50A</span> Capstone: One Incident, Every Layer</h2>
+
+<h3>50A.1 Why this capstone exists</h3>
+<p>Parts XIII–XVI gave you the normal end-to-end sequence, interrupts, three floors of errors, resets and power states. Real incidents use all of them at once. This capstone presents a single synthetic incident and walks through a full investigation using the complete event model, timeline reconstruction, the first-abnormal-event rule and the negative-evidence rule.</p>
+
+<h3>50A.2 The incident (synthetic)</h3>
+<p>A storage server reports a burst of I/O errors on one NVMe drive at 02:14, followed by the drive disappearing and reappearing 40 seconds later. The application team wants to RMA the drive.</p>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic evidence pack (abbreviated; dmesg lines illustrative)</div><div class="table-wrap"><table>
+<thead><tr><th>Time</th><th>Source</th><th>Observation</th></tr></thead>
+<tbody>
+<tr><td>01:00–02:13</td><td>sysfs counters</td><td>Root port 00:03.0 aer_rootport_total_err_cor rising ~5/min; device RxErr</td></tr>
+<tr><td>02:13:50</td><td>BMC</td><td>Chassis fan profile change; inlet temp +6 °C</td></tr>
+<tr class="first-bad"><td>02:14:02.110</td><td>dmesg</td><td>AER: Corrected error: BadTLP, Timeout (Replay) from 02:00.0 — burst of ~400 in 1 s</td></tr>
+<tr class="bad"><td>02:14:02.900</td><td>dmesg</td><td>AER: Uncorrected (Non-Fatal) from 02:00.0: CmpltTO</td></tr>
+<tr class="bad"><td>02:14:03.0</td><td>NVMe (later from error log)</td><td>Error log entries: SQID 5, CID 0x00A1, status SCT0/04h Data Transfer Error</td></tr>
+<tr class="bad"><td>02:14:03.4</td><td>dmesg</td><td>Link down on 00:03.0 (DPC triggered on uncorrectable error)</td></tr>
+<tr class="bad"><td>02:14:03.4</td><td>dmesg</td><td>nvme0: controller is down; will reset: CSTS=0xffffffff (illustrative)</td></tr>
+<tr><td>02:14:04–02:14:43</td><td>dmesg</td><td>DPC recovery; link retrains at Gen4 x4 → later Gen3 x4; controller re-init; I/O resumes</td></tr>
+<tr><td>02:14:44</td><td>SMART</td><td>media_errors 0; critical_warning 0; temperature 61 °C; unsafe shutdowns +0</td></tr>
+</tbody></table></div></div>
+
+<h3>50A.3 Investigation</h3>
+<h4>Step 1 — Build the expected timeline</h4>
+<p>Normal: I/O with clean link, rare correctable errors, no uncorrectable errors, link at Gen4 x4.</p>
+<h4>Step 2 — Observed timeline and first deviation</h4>
+<p>The background RxErr since 01:00 is a pre-existing deviation (low rate). The first <em>sharp</em> deviation is the burst of BadTLP/Replay Timeouts at 02:14:02.110. Working backwards: what preceded it? The BMC fan/temperature change at 02:13:50. Hypothesis: a marginal link (already showing RxErr) crossed a threshold with temperature change.</p>
+<h4>Step 3 — Layer assignment</h4>
+<div class="table-wrap"><table>
+<thead><tr><th>Event</th><th>Layer</th><th>Cause or symptom?</th></tr></thead>
+<tbody>
+<tr><td>RxErr background</td><td>Link (PHY)</td><td>Early cause indicator</td></tr>
+<tr><td>BadTLP/Replay burst</td><td>Link (DLL)</td><td>Cause (proximate)</td></tr>
+<tr><td>CmpltTO on device</td><td>PCIe TL</td><td>Symptom (completions delayed/lost during link trouble/Recovery)</td></tr>
+<tr><td>NVMe 04h Data Transfer Error</td><td>NVMe</td><td>Symptom (device converted transport failure into NVMe status)</td></tr>
+<tr><td>DPC link down</td><td>PCIe port</td><td>Containment action (by design)</td></tr>
+<tr><td>CSTS all-ones</td><td>Driver view</td><td>Symptom of containment</td></tr>
+<tr><td>Link retrain at Gen3</td><td>Link</td><td>Corroborates signal-integrity problem at Gen4</td></tr>
+<tr><td>SMART clean</td><td>Media/FW</td><td>Negative evidence against media failure (good coverage: SMART counts media errors reliably)</td></tr>
+</tbody></table></div>
+<h4>Step 4 — Negative evidence check</h4>
+<p>"No media errors" is supported (SMART media_errors and error log show only transport status). "The drive's PHY is at fault" vs "the slot/riser/retimer is at fault" cannot be separated with this evidence — both ends of the link are candidates. Phrase it: "The evidence localises the fault to the physical link between root port 00:03.0 and device 02:00.0; it does not identify which side."</p>
+<h4>Step 5 — Disambiguating experiments</h4>
+<ul>
+<li>Swap the drive into a known-good slot and put a known-good drive in this slot (A/B swap): follow the errors.</li>
+<li>Run at forced Gen3 to confirm margin-dependent behaviour (test window).</li>
+<li>Check retimer/riser seating and firmware; check thermal profile.</li>
+<li>If available, use lane margining (PCIe 4.0+ Lane Margining at the Receiver — <span class="tag version">version</span>) to quantify eye margin per lane.</li>
+</ul>
+<h4>Step 6 — Conclusion</h4>
+<p>Do not RMA the drive on this evidence. The incident is a link-layer (signal integrity) fault, likely aggravated by temperature, that propagated up as PCIe completion timeouts, NVMe Data Transfer Errors, DPC containment and a controller reset. Confidence: medium-high for "link layer"; low for "which side". Next step: A/B swap.</p>
+
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>Notice how every layer told the truth from its own point of view: the NVMe controller correctly reported a Data Transfer Error, the driver correctly saw an unreachable controller, the AER driver correctly logged a completion timeout, and DPC correctly contained the link. The root cause lives where none of the error messages point directly — in the trend of corrected errors that nobody alerted on. Build monitoring on correctable-error <em>rates</em>.</p></div>
+
+<div class="mastery"><div class="callout-title">✅ Mastery gate — Parts XIII–XVI</div><ul class="checklist">
+<li>I can narrate the end-to-end read and write and count their TLPs.</li>
+<li>I can correlate any NVMe event with its TLP type, direction, address region and tag.</li>
+<li>I can explain MSI-X structure, masking, pending bits and coalescing.</li>
+<li>I can decode NVMe status, AER status and AER header logs.</li>
+<li>I can run the decision trees and assign layers with confidence levels.</li>
+<li>I can list what each reset and power state destroys and what must be rebuilt.</li>
+<li>I always identify the first abnormal event and phrase absence claims with coverage.</li>
+</ul></div>
+</section>

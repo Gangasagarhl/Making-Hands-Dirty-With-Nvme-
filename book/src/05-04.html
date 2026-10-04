@@ -1,0 +1,389 @@
+<section class="part" id="p5-part-xv"><div class="part-num">PART XV</div><h1>Error Handling</h1><p class="part-intro">Errors on an NVMe SSD live on at least three floors of the building. On the top floor, the NVMe controller reports command outcomes in the 15-bit status field of every CQE, keeps an Error Information log, raises asynchronous events, and — in the worst case — declares itself fatally broken through CSTS.CFS. On the middle floor, the PCIe transaction and data link layers detect malformed, poisoned, unexpected and missing packets and classify them as correctable, uncorrectable non-fatal or uncorrectable fatal. Underneath, the physical layer suffers receiver errors that the data link layer quietly repairs with replays. AER (Advanced Error Reporting) is the instrument panel for the PCIe floors. This part teaches each floor, then — the real skill — how to correlate them so you can tell a software bug from a driver bug, an NVMe protocol error, a PCIe transaction error, a link problem, a firmware bug or a failing NAND die.</p></section>
+
+<section class="chapter" id="p5-ch44-nvme-errors" data-part="PART XV — ERROR HANDLING">
+<h2><span class="num">44</span> NVMe Errors (Deep-Dive Module: NVMe Errors)</h2>
+
+<h3>44.1 Why this chapter exists</h3>
+<p>Every NVMe command ends with a status. Most of the time it is zero. When it isn't, the exact Status Code Type (SCT) and Status Code (SC), plus the DNR (Do Not Retry) and More bits, tell the host whether the command was malformed, rejected for a state reason, failed by the media, aborted, or failed because of a path problem — and whether retrying could help. Misreading status (e.g. treating "Invalid Field" as a media failure, or retrying a DNR error forever) causes wrong RMAs, data loss and endless retry storms. Beyond per-command status, NVMe has controller-level mechanisms — asynchronous events, the Error Information log, SMART/Health critical warnings, and the Controller Fatal Status bit — that you must read alongside.</p>
+
+<h3>44.2 Learning objectives</h3>
+<ul class="objectives">
+<li><b>Beginner:</b> locate the status field in a CQE and decode SCT/SC for success, invalid opcode, invalid field, LBA out of range.</li>
+<li><b>Intermediate:</b> classify status codes into generic, command specific, media and data integrity, path related; interpret DNR, More, CRD.</li>
+<li><b>Advanced:</b> use the Error Information log, Asynchronous Event Requests and SMART critical warnings to build a controller-level error picture; understand abort and CFS handling.</li>
+<li><b>Senior:</b> design retry/escalation policy; separate host-induced from device-induced statuses.</li>
+<li><b>Trace-analysis:</b> decode status from a captured CQE MWr payload.</li>
+<li><b>Debugging:</b> apply the five failure patterns.</li>
+<li><b>Validation:</b> design negative tests that elicit specific statuses safely.</li>
+</ul>
+
+<h3>44.3 Kid story and analogy boundary</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>Every receipt the warehouse gives you has a <b>stamp</b>. Green "OK". Blue stamps mean "<b>you filled the card wrong</b>" (no such book type, a box ticked that makes no sense, a card number you already used). Orange stamps are "<b>that particular kind of request didn't work</b>" (the shelf you asked to build is the wrong size). Red stamps mean "<b>the book itself is damaged</b>" (we couldn't read page 7). Purple means "<b>the road to that warehouse is blocked</b>". And there's a small "don't bother asking again" box that is ticked when retrying won't help. If the whole warehouse catches fire, it doesn't stamp anything — it hangs a big sign on the door (CSTS.CFS).</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Analogy boundary</div><p><b>Represents:</b> SCT categories, DNR. <b>Hides:</b> that status can only be delivered if the controller is healthy enough to write a CQE; that some failures produce no CQE (timeouts); that statuses are command-set specific (the same SC value means different things under different SCTs and command sets). <b>Misleading when:</b> you assume a "red stamp" always means the SSD's NAND is failing — some media/data-integrity codes (e.g. end-to-end guard check errors) may reflect host-supplied protection information mismatches.</p></div>
+
+<h3>44.4 The status field</h3>
+<p>CQE Dword 3: bits 15:0 CID, bit 16 Phase Tag, bits 31:17 Status Field (SF). Inside the 15-bit SF:</p>
+<div class="table-wrap"><table class="bitfield">
+<thead><tr><th>SF bit</th><th>CQE DW3 bit</th><th>Field</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>7:0</td><td>24:17</td><td>SC — Status Code</td><td>Specific code within the type</td></tr>
+<tr><td>10:8</td><td>27:25</td><td>SCT — Status Code Type</td><td>0 Generic, 1 Command Specific, 2 Media and Data Integrity, 3 Path Related, 4–6 reserved, 7 Vendor Specific</td></tr>
+<tr><td>12:11</td><td>29:28</td><td>CRD — Command Retry Delay</td><td>Selects one of CRDT1–3 from Identify Controller (in 100 ms units) if host supports it</td></tr>
+<tr><td>13</td><td>30</td><td>M — More</td><td>More status information available in the Error Information log</td></tr>
+<tr><td>14</td><td>31</td><td>DNR — Do Not Retry</td><td>Retrying the identical command is expected to fail</td></tr>
+</tbody></table></div>
+<div class="callout trace"><div class="callout-title">🔍 Linux status notation</div><p>Linux prints NVMe status as the 15-bit SF value shifted down (i.e. <code>(DW3 &gt;&gt; 17)</code>), so <code>0x281</code> = SCT 2, SC 81h (Unrecovered Read Error), and <code>0x4002</code> = DNR set, SCT 0, SC 02h (Invalid Field in Command). On a trace, the raw DW3 of a CQE MWr is <code>(SF &lt;&lt; 17) | (P &lt;&lt; 16) | CID</code>: Unrecovered Read Error with P=1, CID 0x0042 → <code>0x0503_0042</code>.</p></div>
+
+<h3>44.5 Status code examples</h3>
+<h4>Generic Command Status (SCT 0h)</h4>
+<div class="table-wrap"><table>
+<thead><tr><th>SC</th><th>Name</th><th>Typical cause</th><th>Who is usually at fault</th></tr></thead>
+<tbody>
+<tr><td>00h</td><td>Successful Completion</td><td>—</td><td>—</td></tr>
+<tr><td>01h</td><td>Invalid Command Opcode</td><td>Opcode not supported (e.g. optional command, wrong queue type)</td><td>Host / capability mismatch</td></tr>
+<tr><td>02h</td><td>Invalid Field in Command</td><td>Reserved bits set, unsupported option, bad CDW value</td><td>Host</td></tr>
+<tr><td>03h</td><td>Command ID Conflict</td><td>CID already in use in that SQ</td><td>Host driver bug</td></tr>
+<tr><td>04h</td><td>Data Transfer Error</td><td>Data could not be moved (e.g. PCIe error during DMA)</td><td>Transport — investigate PCIe</td></tr>
+<tr><td>05h</td><td>Commands Aborted due to Power Loss Notification</td><td>Power loss signalled</td><td>Platform</td></tr>
+<tr><td>06h</td><td>Internal Error</td><td>Controller internal failure</td><td>Device</td></tr>
+<tr><td>07h</td><td>Command Abort Requested</td><td>Host issued Abort (08h) for this command</td><td>Host action</td></tr>
+<tr><td>08h</td><td>Command Aborted due to SQ Deletion</td><td>Host deleted the SQ with commands outstanding</td><td>Host action (normal during teardown)</td></tr>
+<tr><td>0Bh</td><td>Invalid Namespace or Format</td><td>NSID not active/valid</td><td>Host or namespace management state</td></tr>
+<tr><td>0Ch</td><td>Command Sequence Error</td><td>Illegal command order (e.g. fused/firmware sequences)</td><td>Host</td></tr>
+<tr><td>13h</td><td>PRP Offset Invalid</td><td>PRP entry with illegal offset</td><td>Host driver</td></tr>
+<tr><td>80h (NVM)</td><td>LBA Out of Range</td><td>SLBA+NLB beyond namespace size</td><td>Host</td></tr>
+<tr><td>81h (NVM)</td><td>Capacity Exceeded</td><td>Thin-provisioned capacity exhausted</td><td>Configuration</td></tr>
+<tr><td>82h (NVM)</td><td>Namespace Not Ready</td><td>Namespace temporarily unavailable (e.g. during format/sanitize)</td><td>State — retry later</td></tr>
+<tr><td>83h (NVM)</td><td>Reservation Conflict</td><td>Reservation held by another host</td><td>Multi-host config</td></tr>
+<tr><td>84h (NVM)</td><td>Format In Progress</td><td>Format NVM running</td><td>State</td></tr>
+</tbody></table></div>
+<p>Other generic codes cover SGL descriptor errors, Keep Alive timeouts (fabrics), Sanitize in progress/failed, Namespace is Write Protected, Command Interrupted, Transient Transport Error and more; consult the Base specification's generic status table (and the command-set specification for 80h–BFh values). <span class="tag verified">verified</span> for the codes listed above.</p>
+
+<h4>Command Specific Status (SCT 1h) — examples</h4>
+<div class="table-wrap"><table>
+<thead><tr><th>SC</th><th>Name</th><th>Command</th></tr></thead>
+<tbody>
+<tr><td>00h</td><td>Completion Queue Invalid</td><td>Create I/O SQ referencing non-existent CQ</td></tr>
+<tr><td>01h</td><td>Invalid Queue Identifier</td><td>Create/Delete queue with bad QID</td></tr>
+<tr><td>02h</td><td>Invalid Queue Size</td><td>QSIZE beyond CAP.MQES or zero</td></tr>
+<tr><td>03h</td><td>Abort Command Limit Exceeded</td><td>Too many outstanding Aborts (ACL)</td></tr>
+<tr><td>05h</td><td>Asynchronous Event Request Limit Exceeded</td><td>More AERs than AERL+1</td></tr>
+<tr><td>06h / 07h</td><td>Invalid Firmware Slot / Invalid Firmware Image</td><td>Firmware Commit</td></tr>
+<tr><td>08h</td><td>Invalid Interrupt Vector</td><td>Create I/O CQ with IV beyond available vectors</td></tr>
+<tr><td>09h</td><td>Invalid Log Page</td><td>Get Log Page unsupported LID</td></tr>
+<tr><td>0Ah</td><td>Invalid Format</td><td>Format NVM with unsupported LBA format</td></tr>
+<tr><td>0Bh</td><td>Firmware Activation Requires Conventional Reset</td><td>Firmware Commit</td></tr>
+<tr><td>0Ch</td><td>Invalid Queue Deletion</td><td>Delete CQ while SQs still attached</td></tr>
+<tr><td>80h (NVM)</td><td>Conflicting Attributes</td><td>e.g. Dataset Management</td></tr>
+<tr><td>81h (NVM)</td><td>Invalid Protection Information</td><td>PRINFO inconsistent with format</td></tr>
+<tr><td>82h (NVM)</td><td>Attempted Write to Read Only Range</td><td>Write</td></tr>
+</tbody></table></div>
+
+<h4>Media and Data Integrity Errors (SCT 2h)</h4>
+<div class="table-wrap"><table>
+<thead><tr><th>SC</th><th>Name</th><th>Meaning / first interpretation</th></tr></thead>
+<tbody>
+<tr><td>80h</td><td>Write Fault</td><td>Media write failed; often device-side</td></tr>
+<tr><td>81h</td><td>Unrecovered Read Error</td><td>ECC and read-retry could not recover data — the canonical media error</td></tr>
+<tr><td>82h</td><td>End-to-end Guard Check Error</td><td>PI guard (CRC) mismatch — can be host data/PI generation or device corruption</td></tr>
+<tr><td>83h</td><td>End-to-end Application Tag Check Error</td><td>App tag mismatch</td></tr>
+<tr><td>84h</td><td>End-to-end Reference Tag Check Error</td><td>Ref tag (usually LBA-derived) mismatch — misdirected write/read suspicion</td></tr>
+<tr><td>85h</td><td>Compare Failure</td><td>Compare command found mismatch (not a fault)</td></tr>
+<tr><td>86h</td><td>Access Denied</td><td>Security / access control</td></tr>
+<tr><td>87h</td><td>Deallocated or Unwritten Logical Block</td><td>Read of deallocated block when the controller is configured to report it as an error</td></tr>
+</tbody></table></div>
+<p><b>Path Related (SCT 3h)</b> codes (e.g. Internal Path Error, Asymmetric Access Inaccessible/Transition, Host Pathing Error) matter mostly for multipath/fabrics and ANA; for a single-ported PCIe drive they are rare. <b>Vendor Specific (SCT 7h)</b> codes need vendor documentation.</p>
+
+<h3>44.6 Error categories the course must cover</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Category</th><th>How it manifests</th><th>Host action</th></tr></thead>
+<tbody>
+<tr><td>Command status</td><td>SF in CQE</td><td>Decode SCT/SC, DNR; log</td></tr>
+<tr><td>Invalid opcode</td><td>SCT0/01h, usually DNR</td><td>Check Identify (OACS, ONCS), queue type (admin vs I/O)</td></tr>
+<tr><td>Invalid field</td><td>SCT0/02h, DNR; Error log gives Parameter Error Location</td><td>Fix CDW values</td></tr>
+<tr><td>Command ID conflict</td><td>SCT0/03h</td><td>Driver bug — CID reused while outstanding</td></tr>
+<tr><td>Namespace errors</td><td>0Bh Invalid Namespace or Format; 82h Not Ready; 20h Write Protected</td><td>Check namespace attachment/state (nvme list-ns, id-ns)</td></tr>
+<tr><td>Media errors</td><td>SCT2/81h, 80h; SMART media_errors increments</td><td>Retry may help once if DNR clear; otherwise rewrite/remap at higher layer; monitor SMART</td></tr>
+<tr><td>Internal errors</td><td>SCT0/06h; async event persistent/transient internal error</td><td>Collect logs, telemetry; may need reset</td></tr>
+<tr><td>Aborts</td><td>07h (host abort), 08h (SQ deletion), 05h (power loss)</td><td>Expected during recovery; resubmit if appropriate</td></tr>
+<tr><td>Controller fatal state</td><td>CSTS.CFS = 1; commands stop completing; MMIO may read normal or all-ones</td><td>Controller reset (CC.EN 1→0→1); escalate to PCIe reset if needed</td></tr>
+</tbody></table></div>
+
+<h3>44.7 Error Information log (Log Identifier 01h)</h3>
+<p>Each entry is 64 bytes; the controller keeps up to ELPE+1 entries (Identify Controller Error Log Page Entries, zero-based). Entries record (<span class="tag verified">verified</span> field set; exact byte offsets — consult the Base spec):</p>
+<ul>
+<li><b>Error Count</b> — 64-bit unique, incrementing identifier (0 = invalid entry).</li>
+<li><b>Submission Queue ID</b> and <b>Command ID</b> — which command (FFFFh if not command-related).</li>
+<li><b>Status Field</b> — the status that was (or would have been) returned, including Phase Tag position conventions.</li>
+<li><b>Parameter Error Location</b> — byte and bit within the SQE that caused an Invalid Field — invaluable for host bugs.</li>
+<li><b>LBA</b> and <b>Namespace</b> — first LBA affected.</li>
+<li><b>Vendor Specific Information Available</b>, <b>Transport Type</b>, <b>Command Specific Information</b>, <b>Transport Type Specific Information</b>.</li>
+</ul>
+<pre class="code" data-kind="read-only inspection"><code>sudo nvme error-log /dev/nvme0 -e 16        # last 16 entries (read-only)
+sudo nvme smart-log /dev/nvme0              # media_errors, num_err_log_entries, critical_warning
+sudo nvme get-log /dev/nvme0 --log-id=0x01 --log-len=1024   # raw bytes</code></pre>
+<div class="callout impl"><div class="callout-title">🏭 Implementation-dependent</div><p>Which errors a controller records in the Error log is partly implementation-defined: some log every non-zero status, some only selected ones. Many consumer drives log host-caused Invalid Field errors from probing commands (e.g. the OS querying an unsupported log page), producing large <code>num_err_log_entries</code> counts that are <em>not</em> health problems. Always read the entries before concluding.</p></div>
+
+<h3>44.8 Asynchronous events</h3>
+<p>The host keeps one or more Asynchronous Event Request commands (admin opcode 0Ch) outstanding; they have no timeout. When something happens, the controller completes one with DW0 describing the event:</p>
+<div class="table-wrap"><table class="bitfield">
+<thead><tr><th>DW0 bits</th><th>Field</th><th>Values</th></tr></thead>
+<tbody>
+<tr><td>2:0</td><td>Asynchronous Event Type</td><td>0 Error status, 1 SMART/Health status, 2 Notice, 6 I/O Command specific status, 7 Vendor specific</td></tr>
+<tr><td>15:8</td><td>Asynchronous Event Information</td><td>Type-specific (e.g. for Error: 00h write to invalid doorbell register, 01h invalid doorbell write value, 02h diagnostic failure, 03h persistent internal error, 04h transient internal error, 05h firmware image load error; for Notice: namespace attribute changed, firmware activation starting, …)</td></tr>
+<tr><td>23:16</td><td>Log Page Identifier</td><td>Log page to read to clear the event (e.g. 01h Error, 02h SMART, 04h Changed Namespace List)</td></tr>
+</tbody></table></div>
+<p>Events of a type are masked until the host reads the indicated log page (with RAE clear). Async events are the only way a controller tells the host about errors that are <em>not</em> tied to a command — notably a bad doorbell write, which otherwise would just silently be ignored.</p>
+<div class="callout debug"><div class="callout-title">🐞 Debugging</div><p>When a doorbell write seems to "do nothing", look for an async event with type 0 / info 00h or 01h on the admin CQ. If your driver doesn't keep AERs outstanding (custom/bring-up drivers often don't), you've thrown away the controller's only way to tell you.</p></div>
+
+<h3>44.9 Abort and Controller Fatal Status</h3>
+<p><b>Abort (08h):</b> CDW10 = SQID (15:0) and CID (31:16) of the target. Abort is best effort: completion DW0 bit 0 = 1 means the command was <em>not</em> aborted. The aborted command, if aborted, completes with SCT0/07h. Linux sends Abort on I/O timeout, then escalates to controller reset if the Abort itself times out.</p>
+<p><b>CSTS.CFS (bit 1):</b> the controller sets Controller Fatal Status when it cannot communicate through its normal mechanisms — no further CQEs are expected. Host response is a controller reset; if CSTS reads as <code>0xFFFFFFFF</code> the issue is not CFS but that the device isn't answering MMIO at all (link down, surprise removal, reset in progress) — a PCIe-floor problem.</p>
+
+<h3>44.10 Mechanism: from detection to host action</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Who acts</th><th>What changes</th><th>Where</th><th>Evidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Controller parser</td><td>Detects invalid field at CDW12 bit 31 (example)</td><td>Controller</td><td>—</td></tr>
+<tr><td>2</td><td>Controller</td><td>Creates Error log entry (Error Count N, SQID, CID, SF, PEL byte 48 bit 7)</td><td>Error log</td><td>nvme error-log</td></tr>
+<tr><td>3</td><td>Controller</td><td>Posts CQE with SF = DNR|SCT0|02h, M=1</td><td>CQ (MWr)</td><td>Trace DW3; nvme_complete_rq status</td></tr>
+<tr><td>4</td><td>Controller</td><td>MSI-X</td><td>Link</td><td>Trace</td></tr>
+<tr><td>5</td><td>Driver</td><td>Maps status to block error (BLK_STS_*); DNR → no retry</td><td>Kernel</td><td>dmesg if logged (verbose errors config)</td></tr>
+<tr><td>6</td><td>Filesystem/app</td><td>Receives EIO (or other errno)</td><td>User</td><td>App log</td></tr>
+</tbody></table></div>
+
+<h3>44.11 Synthetic traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: success CQE</div><div class="table-wrap"><table>
+<thead><tr><th>Dir</th><th>TLP</th><th>Payload DW3</th><th>Decode</th></tr></thead>
+<tbody><tr><td>↑</td><td>MWr CQ1</td><td>0x0001_0007</td><td>CID 7, P=1, SF=0 → success</td></tr></tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: retried media read</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Decode</th></tr></thead>
+<tbody>
+<tr class="first-bad"><td>0–9 ms</td><td>SQE fetched, no data for 9 ms</td><td>Device internal read-retry ladder (impl)</td></tr>
+<tr><td>9 ms</td><td>Data MWr ×16, CQE DW3 0x0001_0008</td><td>Success — but SMART may count a corrected error only in vendor logs</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: unrecovered read error</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>TLP</th><th>Payload</th><th>Decode</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↓↑↓</td><td>doorbell, MRd, CplD</td><td>Read SLBA 0x7A120</td><td>normal</td></tr>
+<tr class="first-bad"><td>12 ms</td><td>↑</td><td>MWr CQE (no data MWr before it)</td><td>DW3 = 0x4503_0009</td><td>DW3 &gt;&gt; 17 = SF 0x2281 → DNR=0, M=1 (SF bit 13), SCT=2, SC=81h → Unrecovered Read Error, more information in the Error log; P=1, CID 0x0009</td></tr>
+<tr><td>12 ms</td><td>↑</td><td>MWr MSI-X</td><td>—</td><td>—</td></tr>
+</tbody></table></div></div>
+<p>Note: no data was written to the buffer — the buffer's previous contents remain; a driver that ignores status would hand stale data to the application.</p>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: Data Transfer Error</div><div class="table-wrap"><table>
+<thead><tr><th>Dir</th><th>TLP</th><th>Detail</th><th>Decode</th></tr></thead>
+<tbody>
+<tr><td>↑</td><td>MRd data</td><td>tag 0x21</td><td>write data fetch</td></tr>
+<tr><td>↓</td><td>CplD tag 0x21</td><td>normal-looking</td><td>—</td></tr>
+<tr class="first-bad"><td>↑</td><td>MWr CQE</td><td>SCT0 SC04h</td><td>Data Transfer Error despite clean-looking completions</td></tr>
+</tbody></table></div></div>
+<p><b>Reasoning:</b> candidates: a CplD with ECRC error not visible to the analyzer decode (check ECRC field), an internal controller DMA parity error, PI check of transferred data, or a completion arriving after the device's internal timeout. Device-side AER (Correctable Internal / Uncorrectable Internal error bits) and the Error log entry are the next evidence.</p>
+
+<h3>44.12 Five failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Conclusion / confidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>EIO on reads of one region; status 0x281</td><td>NAND degradation; read disturb; retention loss</td><td>nvme error-log LBA</td><td>SMART media_errors trend</td><td>Re-read same LBA after rewrite (on test data)</td><td>Media; high if reproducible at fixed LBA</td></tr>
+<tr><td>2</td><td>Invalid Field on new feature use</td><td>Host sets unsupported option</td><td>Error log PEL</td><td>Identify fields (ONCS, OACS, etc.)</td><td>Issue with option cleared</td><td>Host; high</td></tr>
+<tr><td>3</td><td>Command ID Conflict</td><td>Driver reuses CID; duplicated submission after reset</td><td>Trace CIDs in fetched SQEs</td><td>Driver version</td><td>Reproduce with CID tracing</td><td>Driver; high</td></tr>
+<tr><td>4</td><td>Sudden total failure, CSTS=0x3</td><td>Controller fatal (RDY=1, CFS=1)</td><td>CSTS value</td><td>Telemetry log after reset</td><td>Controller reset recovers?</td><td>Firmware; medium</td></tr>
+<tr><td>5</td><td>Data Transfer Errors bursts with AER events</td><td>PCIe errors during DMA</td><td>AER logs on root port + device</td><td>Link speed/width</td><td>Force lower link speed</td><td>Link/transport; medium</td></tr>
+</tbody></table></div>
+
+<h3>44.13 Labs</h3>
+<div class="lab"><div class="lab-head">🧪 Lab 44.1 (beginner) — Decode CQE DW3 values <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> decode raw CQE status. <b>Setup:</b> values (synthetic): <code>0x0001_0010</code>, <code>0x8005_0011</code>, <code>0x0101_0012</code>, <code>0x0503_0013</code>, <code>0x8004_0014</code>. <b>Procedure:</b> SF = DW3 &gt;&gt; 17; P = bit 16; CID = low 16 bits.</p>
+<details class="answer"><summary>Solution</summary><p>(1) CID 0x10, P=1, success. (2) DW3&gt;&gt;17 = 0x4002 → DNR=1, SCT0, SC 02h Invalid Field; P=1; CID 0x11. (3) 0x0101_0012 &gt;&gt; 17 = 0x80 → SCT0 SC80h → LBA Out of Range (NVM); P=1; CID 0x12. (4) 0x0503_0013 &gt;&gt; 17 = 0x281 → SCT2 SC81h Unrecovered Read Error; P=1. (5) 0x8004_0014 &gt;&gt; 17 = 0x4002 → DNR, Invalid Field; P=0 — phase 0 is legal after a wrap.</p></details>
+<p><b>Extension:</b> write a decoder that prints names for the codes in §44.5.</p></div>
+<div class="lab"><div class="lab-head">🧪 Lab 44.2 (intermediate) — Read error logs safely <span class="safety safe">SAFE</span></div>
+<p><b>Procedure:</b> run the read-only commands in §44.7; correlate error entries' SQID/CID with any dmesg messages; classify each entry host vs device.</p>
+<details class="answer"><summary>Solution</summary><p>Entries with SQID 0 and status Invalid Field/Invalid Log Page are typically host probes (e.g. tools querying unsupported log pages). Entries on I/O queues with SCT 2 are media-related. Entries with SQID FFFFh are not command-related.</p></details></div>
+<div class="lab"><div class="lab-head">🧪 Lab 44.3 (advanced) — Elicit an Invalid Field error safely <span class="safety caution">CAUTION</span></div>
+<p><b>Objective:</b> generate a known host error without risking data. <b>Setup:</b> test system. <b>Procedure:</b> issue a Get Log Page for an unsupported vendor log ID via <code>nvme get-log /dev/nvme0 --log-id=0xC7 --log-len=512</code> (read-only admin command); observe the returned status and new Error log entry.</p>
+<details class="answer"><summary>Solution</summary><p>Expected: SCT1/09h Invalid Log Page or SCT0/02h Invalid Field (implementation may vary); Error count increments if the controller logs it. Demonstrates host-induced errors in the log.</p></details>
+<p><b>Extension:</b> compare behaviour across two drive models.</p></div>
+<div class="lab"><div class="lab-head">🧪 Lab 44.4 (senior forensic) — Is it the drive? <span class="safety safe">SAFE</span></div>
+<p><b>Given (synthetic):</b> app reports checksum mismatch; NVMe statuses all success; namespace formatted with PI type 1; no E2E errors; error log empty; dmesg shows IOMMU faults from 02:00.0 at nearby times.</p>
+<details class="answer"><summary>Solution</summary><p>PI would have caught media/device corruption of the data with E2E check errors (82h/84h). Success with corruption plus IOMMU faults points to host-side DMA mapping problems (buffer reuse/unmapped) or app bugs. Confidence medium; next evidence: IOMMU strict mode reproduction, data capture of MWr payloads.</p></details></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Which SCT is "Media and Data Integrity Errors"?</p><details class="answer"><summary>Answer</summary><p>2h.</p></details></li>
+<li><p>What does DNR mean?</p><details class="answer"><summary>Answer</summary><p>Do Not Retry — the same command is expected to fail again.</p></details></li>
+<li><p>Linux prints status 0x2281. Decode.</p><details class="answer"><summary>Answer</summary><p>More=1, SCT 2, SC 81h — Unrecovered Read Error, details in Error log.</p></details></li>
+<li><p>How does the controller report a write to an invalid doorbell?</p><details class="answer"><summary>Answer</summary><p>Asynchronous event, type Error (0), info 00h, if an AER command is outstanding.</p></details></li>
+<li><p>CSTS reads 0xFFFFFFFF. Is CFS set?</p><details class="answer"><summary>Answer</summary><p>Can't tell — the read failed (device unreachable); all-ones is a PCIe-level symptom.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> Where is the status in a CQE? <details class="answer"><summary>Model answer</summary><p>DW3 bits 31:17.</p></details></li>
+<li><span class="lvl">Beginner</span> Difference between Invalid Opcode and Invalid Field? <details class="answer"><summary>Model answer</summary><p>Opcode unsupported vs supported command with bad parameter.</p></details></li>
+<li><span class="lvl">Beginner</span> What is the Error Information log? <details class="answer"><summary>Model answer</summary><p>Log 01h, 64-byte entries with count, SQID, CID, status, parameter location, LBA, NSID.</p></details></li>
+<li><span class="lvl">Beginner</span> What is an AER command in NVMe? <details class="answer"><summary>Model answer</summary><p>Asynchronous Event Request (0Ch) — not PCIe AER; a parked command completed when an event occurs.</p></details></li>
+<li><span class="lvl">Beginner</span> What's CFS? <details class="answer"><summary>Model answer</summary><p>CSTS bit 1 Controller Fatal Status.</p></details></li>
+<li><span class="lvl">Intermediate</span> How should retry logic treat DNR and CRD? <details class="answer"><summary>Model answer</summary><p>DNR=1: don't retry; else retry, honouring CRD delays (CRDT) if ACRE enabled.</p></details></li>
+<li><span class="lvl">Intermediate</span> Why might num_err_log_entries be huge on a healthy drive? <details class="answer"><summary>Model answer</summary><p>Host probing produces logged invalid-field/log errors.</p></details></li>
+<li><span class="lvl">Intermediate</span> What causes Command Aborted due to SQ Deletion? <details class="answer"><summary>Model answer</summary><p>Deleting an SQ with outstanding commands — normal during reset/teardown.</p></details></li>
+<li><span class="lvl">Intermediate</span> How do E2E PI errors help localise corruption? <details class="answer"><summary>Model answer</summary><p>Guard/ref tags verify data integrity and LBA association across the path.</p></details></li>
+<li><span class="lvl">Intermediate</span> What's the Parameter Error Location? <details class="answer"><summary>Model answer</summary><p>Byte/bit in the SQE responsible for an invalid-field error.</p></details></li>
+<li><span class="lvl">Advanced</span> What's the Linux recovery ladder on timeout? <details class="answer"><summary>Model answer</summary><p>Abort → controller reset → remove device if reset fails (impl-dependent details).</p></details></li>
+<li><span class="lvl">Advanced</span> When is an Abort considered successful? <details class="answer"><summary>Model answer</summary><p>Completion DW0 bit 0 = 0 and the target completes with 07h; otherwise not aborted.</p></details></li>
+<li><span class="lvl">Advanced</span> Data Transfer Error: where to look? <details class="answer"><summary>Model answer</summary><p>PCIe AER on device/root port, IOMMU faults, poisoned TLPs.</p></details></li>
+<li><span class="lvl">Advanced</span> How are async events re-armed? <details class="answer"><summary>Model answer</summary><p>Read the indicated log page (RAE=0) and submit a new AER command.</p></details></li>
+<li><span class="lvl">Advanced</span> What's DLFEAT and its relation to 87h? <details class="answer"><summary>Model answer</summary><p>Deallocate features describe read behaviour for deallocated blocks; error 87h reported when configured (DULBE).</p></details></li>
+<li><span class="lvl">Senior</span> Design an error-handling policy for a storage array. <details class="answer"><summary>Model answer</summary><p>Classify by SCT; retry transient (non-DNR) with backoff; rebuild from redundancy on 81h; quarantine on repeated; reset on CFS; correlate with AER and SMART.</p></details></li>
+<li><span class="lvl">Senior</span> How do you prove an RMA is justified? <details class="answer"><summary>Model answer</summary><p>Reproducible media errors at device LBAs, SMART trends, telemetry, clean PCIe/host evidence.</p></details></li>
+<li><span class="lvl">Senior</span> Why can't status alone tell you who's at fault? <details class="answer"><summary>Model answer</summary><p>Same status may stem from host data/PI, transport, or device; need cross-layer evidence.</p></details></li>
+<li><span class="lvl">Senior</span> How do you handle a controller that silently stops completing? <details class="answer"><summary>Model answer</summary><p>Timeouts → check CSTS (CFS vs all-ones), AER, link; reset ladder; capture telemetry.</p></details></li>
+<li><span class="lvl">Senior</span> What's risky about retrying writes blindly? <details class="answer"><summary>Model answer</summary><p>Semantics (e.g. ordering, atomicity, reservations) and wasting time on DNR errors; masking a deeper fault.</p></details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can decode any CQE DW3 into CID, P, SC, SCT, CRD, M, DNR.</li>
+<li>I can name 10+ generic, 5 command-specific and 5 media status codes.</li>
+<li>I can read and classify Error log entries.</li>
+<li>I can explain async events and CFS.</li>
+<li>I can distinguish host-caused, transport-caused and device-caused statuses.</li>
+</ul></div>
+<p><b>Next:</b> <a href="#p5-ch45-pcie-errors">Chapter 45 — PCIe errors</a>.</p>
+</section>
+
+<section class="chapter" id="p5-ch45-pcie-errors" data-part="PART XV — ERROR HANDLING">
+<h2><span class="num">45</span> PCIe Errors (Deep-Dive Module: PCIe Errors)</h2>
+
+<h3>45.1 Why this chapter exists</h3>
+<p>PCIe was designed so that most physical-layer imperfections never reach software: LCRC (Link CRC) and the Ack/Nak replay protocol repair corrupted TLPs transparently. When errors <em>do</em> reach software, PCIe classifies them by who detected them and how bad they are. Understanding the classes — correctable, uncorrectable non-fatal, uncorrectable fatal — and the individual errors (Bad TLP, Bad DLLP, Replay Timer Timeout, Receiver Error, Completion Timeout, Unsupported Request, Completer Abort, Malformed TLP, Poisoned TLP, ECRC, Surprise Down…) lets you tell a marginal link from a broken driver from a dead device.</p>
+
+<h3>45.2 Learning objectives</h3>
+<ul class="objectives">
+<li>Classify every major PCIe error into correctable / non-fatal / fatal and name the layer that detects it.</li>
+<li>Explain which errors are "symptoms" (replays, completion timeouts) vs "causes".</li>
+<li>Explain how errors are signalled (ERR_COR, ERR_NONFATAL, ERR_FATAL messages), and how baseline (Device Status) and advanced (AER) reporting differ.</li>
+<li>Interpret error patterns in synthetic traces.</li>
+<li>Apply five failure patterns.</li>
+</ul>
+
+<h3>45.3 Story and analogy</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>Letters between two towns travel on a road with a postman. If rain smudges a letter, the receiving post office says "send that again please" and nobody else ever hears about it — that's a <b>correctable</b> error; the post office just keeps a tally. If a letter arrives addressed to a house that doesn't exist, the post office says "unsupported!" — the letter is lost but the road is fine: <b>uncorrectable non-fatal</b>. If the bridge collapses, no letters get through at all: <b>uncorrectable fatal</b>.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>Severity of most uncorrectable errors is <em>programmable</em> (via the AER Severity register), not inherent; "non-fatal" refers to the link's reliability, not the impact on your application — a non-fatal Completion Timeout can still hang your NVMe command and crash a filesystem. And some correctable errors (Replay Timer Timeout, REPLAY_NUM Rollover) are the early warning of a bridge about to collapse.</p></div>
+
+<h3>45.4 Error classes</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Class</th><th>Definition</th><th>Hardware handled?</th><th>Message</th><th>Typical software response</th></tr></thead>
+<tbody>
+<tr><td>Correctable</td><td>Detected and corrected by hardware, no information lost</td><td>Yes (e.g. replay)</td><td>ERR_COR</td><td>Count, rate-monitor; act on trends</td></tr>
+<tr><td>Uncorrectable non-fatal</td><td>Transaction affected, link still reliable</td><td>No — a transaction failed</td><td>ERR_NONFATAL</td><td>Device driver error handler; recovery possibly without link reset</td></tr>
+<tr><td>Uncorrectable fatal</td><td>Link or device integrity compromised</td><td>No</td><td>ERR_FATAL</td><td>Link/slot reset (Secondary Bus Reset), driver re-init; DPC may contain</td></tr>
+</tbody></table></div>
+
+<h3>45.5 The master error table</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Error</th><th>Layer</th><th>Detected by</th><th>Class (default severity)</th><th>What it means</th><th>Typical root causes</th></tr></thead>
+<tbody>
+<tr><td>Receiver Error</td><td>Physical</td><td>Receiver</td><td>Correctable</td><td>8b/10b or framing/symbol errors, block/sync errors (Gen3+), FEC-uncorrectable issues in FLIT mode (<span class="tag version">version</span>)</td><td>Signal integrity, equalization, reference clock, retimer, connector</td></tr>
+<tr><td>Bad TLP</td><td>Data link</td><td>Receiver</td><td>Correctable</td><td>TLP with LCRC error or bad sequence number; receiver NAKs</td><td>Bit errors on the link</td></tr>
+<tr><td>Bad DLLP</td><td>Data link</td><td>Receiver</td><td>Correctable</td><td>DLLP with CRC error (discarded)</td><td>Bit errors</td></tr>
+<tr><td>REPLAY_NUM Rollover</td><td>Data link</td><td>Transmitter</td><td>Correctable</td><td>Same TLP replayed 4 times without success → link retrain initiated</td><td>Persistent bit errors</td></tr>
+<tr><td>Replay Timer Timeout</td><td>Data link</td><td>Transmitter</td><td>Correctable</td><td>No Ack/Nak received in time → replay</td><td>Lost Acks, bit errors, far-end congestion</td></tr>
+<tr><td>Advisory Non-Fatal</td><td>Transaction</td><td>Varies</td><td>Correctable (signalled as ERR_COR)</td><td>Uncorrectable error handled as advisory (e.g. some UR/Poisoned/CTO cases at certain roles)</td><td>Depends on underlying error</td></tr>
+<tr><td>Corrected Internal Error</td><td>Internal</td><td>Component</td><td>Correctable</td><td>Internal ECC corrected</td><td>Device internals</td></tr>
+<tr><td>Header Log Overflow</td><td>AER</td><td>Component</td><td>Correctable</td><td>No room to log further headers</td><td>Error storm</td></tr>
+<tr><td>Data Link Protocol Error</td><td>Data link</td><td>Receiver</td><td>Uncorrectable, fatal</td><td>e.g. Ack/Nak sequence number not matching outstanding TLP</td><td>Protocol bug, severe corruption</td></tr>
+<tr><td>Surprise Down</td><td>Data link</td><td>Downstream port</td><td>Uncorrectable, fatal</td><td>Link went down unexpectedly (DL_Active lost) — optional reporting capability</td><td>Hot removal, power loss of device, device reset, cable</td></tr>
+<tr><td>Flow Control Protocol Error</td><td>Transaction / DL</td><td>Receiver</td><td>Uncorrectable, fatal</td><td>Illegal credit advertisement</td><td>Design bug</td></tr>
+<tr><td>Receiver Overflow</td><td>Transaction</td><td>Receiver</td><td>Uncorrectable, fatal</td><td>TLP received beyond advertised credits</td><td>Credit accounting bug</td></tr>
+<tr><td>Malformed TLP</td><td>Transaction</td><td>Receiver</td><td>Uncorrectable, fatal</td><td>Format violations: payload &gt; MPS, length mismatch, crossing 4 KiB, illegal type/fields</td><td>MPS misconfiguration (classic!), design bug</td></tr>
+<tr><td>ECRC Error</td><td>Transaction</td><td>Receiver (if checking enabled)</td><td>Uncorrectable, non-fatal</td><td>End-to-end CRC mismatch — corrupted inside a switch/bridge</td><td>Internal corruption in an intermediate component</td></tr>
+<tr><td>Poisoned TLP Received</td><td>Transaction</td><td>Receiver</td><td>Uncorrectable, non-fatal</td><td>TLP with EP=1: data known bad at origin</td><td>Memory ECC error at source, internal error upstream</td></tr>
+<tr><td>Completion Timeout</td><td>Transaction</td><td>Requester</td><td>Uncorrectable, non-fatal</td><td>Non-posted request got no (complete) completion in time</td><td>Lost completion, unreachable completer, IOMMU drop, device hung, link retraining</td></tr>
+<tr><td>Completer Abort</td><td>Transaction</td><td>Completer</td><td>Uncorrectable, non-fatal</td><td>Completer couldn't complete a request it otherwise supports (internal violation)</td><td>Access-rule violation, device internal error</td></tr>
+<tr><td>Unexpected Completion</td><td>Transaction</td><td>Receiver of the Cpl</td><td>Uncorrectable, non-fatal</td><td>Completion with no matching outstanding request</td><td>Misrouting, late completion after timeout</td></tr>
+<tr><td>Unsupported Request</td><td>Transaction</td><td>Completer</td><td>Uncorrectable, non-fatal</td><td>Request type/address not supported (e.g. MRd to unclaimed address, request while Memory Space disabled)</td><td>Bad address, device in reset/D3hot, IOMMU block (RC-dependent)</td></tr>
+<tr><td>ACS Violation</td><td>Transaction</td><td>Switch/RC port</td><td>Uncorrectable, non-fatal</td><td>Access Control Services blocked a request</td><td>Peer-to-peer policy, virtualisation config</td></tr>
+<tr><td>Uncorrectable Internal Error</td><td>Internal</td><td>Component</td><td>Uncorrectable, fatal</td><td>Internal non-correctable fault</td><td>Device hardware</td></tr>
+</tbody></table></div>
+<div class="callout spec"><div class="callout-title">📘 Spec</div><p><span class="tag verified">verified</span> The error list and default severities above reflect the PCIe Base Specification's AER Uncorrectable Error Severity register defaults (Data Link Protocol, Surprise Down, Flow Control Protocol, Receiver Overflow, Malformed TLP and Uncorrectable Internal Error default to fatal; others non-fatal). Severity is programmable. Newer revisions add errors (e.g. related to TLP prefixes, IDE, FLIT mode) — <span class="tag version">version</span>; consult the current Base spec for the full list.</p></div>
+
+<h3>45.6 Requester vs completer errors</h3>
+<p>For a non-posted request, errors split by role: the <b>completer</b> detects UR and CA and returns a completion with that status (and logs the error, possibly as advisory); the <b>requester</b> detects Completion Timeout and receives the UR/CA completion status, and logs Unexpected Completion if a completion matches nothing. For NVMe this matters because the <b>device is the requester</b> for all data-path reads (SQE fetch, write data, PRP lists). So a host-side problem servicing the device's reads appears in the <em>device's</em> AER registers as Completion Timeout — the SSD is reporting the host's failure.</p>
+<div class="callout remember"><div class="callout-title">📌 Remember</div><p>"The SSD logged a Completion Timeout" usually means "the SSD asked the host for something and the host never answered". Treat it as host/topology-side evidence first.</p></div>
+
+<h3>45.7 Signalling paths</h3>
+<pre class="diagram">Endpoint detects error
+  ├─ updates Device Status (CED/NFED/FED/URD)         [baseline, always]
+  ├─ updates AER status bits (if AER implemented)      [advanced]
+  ├─ if not masked and reporting enabled (Device Control bits 0-3, SERR# for fatal/non-fatal on bridges):
+  │     sends Msg ERR_COR / ERR_NONFATAL / ERR_FATAL upstream (Requester ID = itself)
+  └─ root port receives message
+        ├─ Root Error Status records (first/multiple, source ID)
+        ├─ if Root Error Command enables → interrupt to OS (AER service driver)
+        └─ (optional) DPC trigger on fatal/non-fatal → contain link</pre>
+<p><b>DPC (Downstream Port Containment):</b> an optional capability on downstream ports that, on an uncorrectable error, disables the link to stop traffic (protecting data integrity), lets software recover the port, and makes subsequent requests to the device complete with UR/all-ones. Linux supports DPC and Error Disconnect Recover (EDR) — <span class="tag impl">impl</span>/platform-dependent.</p>
+
+<h3>45.8 Synthetic traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: single replay (correctable)</div><div class="table-wrap"><table>
+<thead><tr><th>t (ns)</th><th>Dir</th><th>Packet</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↑</td><td>TLP seq 0x2A1 MWr data</td><td>—</td></tr>
+<tr><td>40</td><td>↑</td><td>TLP seq 0x2A2 MWr data</td><td>LCRC bad on arrival</td></tr>
+<tr><td>120</td><td>↓</td><td>DLLP Nak seq 0x2A1</td><td>Receiver: Bad TLP (correctable, logged at RC side)</td></tr>
+<tr><td>160</td><td>↑</td><td>TLP seq 0x2A2 (replay)</td><td>—</td></tr>
+<tr><td>260</td><td>↓</td><td>DLLP Ack seq 0x2A2</td><td>Recovered; software only sees a counter increment</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: link degrading into Recovery</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr class="first-bad"><td>0–2 s</td><td>Nak rate rising from 0 to ~1e3/s; Receiver Errors on device side</td><td>Marginal signal integrity (first deviation)</td></tr>
+<tr class="bad"><td>2.1 s</td><td>REPLAY_NUM Rollover → LTSSM Recovery; traffic paused ~µs</td><td>Correctable, but latency spikes</td></tr>
+<tr class="bad"><td>2.1 s</td><td>Link retrains at lower speed (Gen4 → Gen3)</td><td>Bandwidth halved; LnkSta shows downgraded speed</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: Malformed TLP from MPS mismatch</div><div class="table-wrap"><table>
+<thead><tr><th>Dir</th><th>Packet</th><th>Detail</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>—</td><td>config</td><td>Root port MPS=128; endpoint MPS programmed 256 (misconfiguration)</td><td>Pre-existing cause</td></tr>
+<tr class="first-bad"><td>↑</td><td>MWr</td><td>payload 64 DW (256 B) read data</td><td>Exceeds receiver's MPS</td></tr>
+<tr class="bad"><td>RC</td><td>AER</td><td>Malformed TLP (fatal) logged at root port with header</td><td>Header log shows Length=0x040</td></tr>
+<tr class="bad"><td>OS</td><td>recovery</td><td>Link reset; NVMe I/O errors</td><td>Symptom</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: Surprise Down vs intentional reset</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>Host writes CC.EN=0 then NSSR</td><td>Host-initiated subsystem reset — the link may go down as part of it (impl)</td></tr>
+<tr class="first-bad"><td>+1 ms</td><td>Root port logs Surprise Down (fatal)</td><td>Expected consequence of NSSR or a real failure?</td></tr>
+</tbody></table></div></div>
+<p><b>Reasoning:</b> an NVM Subsystem Reset can take the link down (<span class="tag impl">impl</span>); unless software masks Surprise Down around it, the root port reports it. Distinguish by correlating timestamps with intentional actions — the first-abnormal-event rule applied to <em>expected</em> abnormalities.</p>
+
+<h3>45.9 Five failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Conclusion / confidence</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Storm of corrected errors (RxErr, BadTLP) in dmesg</td><td>Signal integrity, ASPM L1 exit issues, retimer</td><td>LnkSta speed/width</td><td>Error rate vs load / ASPM</td><td>Disable ASPM (pcie_aspm=off) or force lower speed on test system</td><td>Physical link; medium-high</td></tr>
+<tr><td>2</td><td>Device CTO + NVMe timeouts</td><td>Host not answering reads: IOMMU, RC, switch</td><td>IOMMU fault log</td><td>Root port AER</td><td>Boot with iommu=pt (test system)</td><td>Host/platform; medium</td></tr>
+<tr><td>3</td><td>Malformed TLP fatal</td><td>MPS mismatch; buggy device</td><td>lspci MaxPayload on both ends</td><td>Header log length</td><td>pci=pcie_bus_safe</td><td>Configuration; high</td></tr>
+<tr><td>4</td><td>UR on host MMIO to SSD, all-ones reads</td><td>Device in reset/D3, Memory Space disabled, removed</td><td>lspci Control/Status</td><td>Power state</td><td>Read config space (if 0xFFFF device absent)</td><td>Device state; high</td></tr>
+<tr><td>5</td><td>Poisoned TLP received by SSD</td><td>Host memory UE</td><td>Machine-check/EDAC logs</td><td>Physical address</td><td>Memory test</td><td>Host memory; high</td></tr>
+</tbody></table></div>
+
+<h3>45.10 Lab</h3>
+<div class="lab"><div class="lab-head">🧪 Lab 45.1 — Classify errors from descriptions <span class="safety safe">SAFE</span></div>
+<p><b>Procedure:</b> for each scenario, give error name, class, detecting component: (a) SSD sends 512 B MWr to a root port with MPS 256; (b) host's DRAM reports UE while serving an SSD read; (c) SSD replays a TLP 4 times; (d) host reads BAR0 while SSD is in D3hot; (e) switch internal SRAM bit flip on a forwarded TLP with ECRC.</p>
+<details class="answer"><summary>Solution</summary><p>(a) Malformed TLP, fatal (default), root port. (b) Poisoned TLP Received (CplD EP=1), non-fatal, SSD. (c) REPLAY_NUM Rollover, correctable, SSD transmitter (then Recovery). (d) Unsupported Request (memory requests in D3hot are not supported), non-fatal, SSD as completer; host sees UR completion → all-ones. (e) ECRC Error, non-fatal, final receiver (if ECRC check enabled).</p></details></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Which errors are corrected by the data link layer replay?</p><details class="answer"><summary>Answer</summary><p>Bad TLP (LCRC/sequence), with Replay Timer Timeout / REPLAY_NUM Rollover as related correctable events.</p></details></li>
+<li><p>Who detects a Completion Timeout?</p><details class="answer"><summary>Answer</summary><p>The requester.</p></details></li>
+<li><p>What's the default severity of Malformed TLP?</p><details class="answer"><summary>Answer</summary><p>Fatal.</p></details></li>
+<li><p>What does EP=1 mean?</p><details class="answer"><summary>Answer</summary><p>Poisoned — the data payload is known to be corrupt.</p></details></li>
+<li><p>Why is ECRC useful if LCRC exists?</p><details class="answer"><summary>Answer</summary><p>LCRC is per link and regenerated at every hop; ECRC covers end-to-end, detecting corruption inside switches.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> Three PCIe error classes? <details class="answer"><summary>Model answer</summary><p>Correctable, uncorrectable non-fatal, uncorrectable fatal.</p></details></li>
+<li><span class="lvl">Intermediate</span> UR vs CA? <details class="answer"><summary>Model answer</summary><p>UR: request not supported by completer; CA: supported but completer failed to complete it due to a violation/internal error.</p></details></li>
+<li><span class="lvl">Advanced</span> Why might a correctable error storm hurt performance? <details class="answer"><summary>Model answer</summary><p>Replays consume bandwidth and add latency; interrupts per error cost CPU; may lead to retraining/downgrades.</p></details></li>
+<li><span class="lvl">Senior</span> Device reports CTO, root port reports nothing. Next steps? <details class="answer"><summary>Model answer</summary><p>Check IOMMU, switch ports' AER, whether the request reached the RC (analyzer upstream of switch), completion routing (BDF changes), ACS.</p></details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can fill the master error table from memory with class and detector.</li>
+<li>I can explain why the SSD logs host-caused completion timeouts.</li>
+<li>I can describe ERR_* message flow and DPC.</li>
+<li>I can classify MPS-mismatch, poisoned, UR and ECRC scenarios.</li>
+</ul></div>
+<p><b>Next:</b> <a href="#p5-ch46-aer">Chapter 46 — AER registers in detail</a>.</p>
+</section>

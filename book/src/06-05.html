@@ -1,0 +1,309 @@
+<section class="part" id="p6-part-xix"><div class="part-num">PART XIX</div><h1>NVMe over Fabrics</h1><p class="part-intro">NVMe was designed around shared memory: queues live in host RAM, the controller reads them by DMA, and a doorbell write across PCIe says “look now”. NVMe over Fabrics (NVMe-oF) keeps the command set, the queue-pair model, the namespaces and the status codes, and replaces the shared-memory transport with <em>messages</em> — capsules — carried by RDMA or TCP. This part teaches what stays the same, what changes, and how to debug the new layers. Baseline: NVMe Base 2.4 (which contains the fabrics architecture), NVMe over TCP Transport 1.3, NVMe over RDMA Transport 1.3, NVMe over PCIe Transport 1.4 (revision numbers per the August 2026 set — confirm on nvmexpress.org).</p></section>
+
+<section class="chapter" id="p6-ch65-nvmeof-model" data-part="PART XIX — NVMe OVER FABRICS">
+<h2><span class="num">65</span> The NVMe-oF Mental Model</h2>
+<div class="callout spec"><div class="callout-title">📘 Specification baseline</div>
+<p><b>DOCUMENTS:</b> NVMe Base Specification 2.4 (NVMe over Fabrics architecture, capsules, Fabrics commands, discovery, NQNs); transport binding specifications for PCIe (1.4), RDMA (1.3) and TCP (1.3). <b>VERSION NOTES:</b> NVMe-oF was a separate specification (1.0 in 2016, 1.1 in 2019) until the NVMe 2.0 refactoring (2021) moved the architecture into the Base specification and the bindings into transport specifications <span class="tag version">version</span>.</p></div>
+<h3>65.1 Why this chapter exists</h3>
+<p>Engineers who know NVMe over PCIe often bring the wrong instincts to fabrics: they look for doorbells, PRPs and MSI-X, and find none. Engineers who know networking look for “a storage protocol inside TCP” and miss that it is still NVMe queue semantics. This chapter builds the bridge so the next three chapters make sense.</p>
+<ul class="objectives">
+<li>State precisely what is common to all NVMe transports and what each transport binds differently.</li>
+<li>Explain capsules (command capsule = SQE + optional data/SGLs; response capsule = CQE).</li>
+<li>Compare command delivery, data transfer, completion and notification across PCIe, RDMA and TCP.</li>
+<li>Explain why fabrics need explicit Connect, NQNs and keep-alive.</li>
+</ul>
+<p><b>Prerequisites:</b> NVMe queues and SQE/CQE format (<a class="gl" href="#g-sq">SQ</a>, <a class="gl" href="#g-cqe">CQE</a>), <a class="gl" href="#g-prp">PRP</a> and <a class="gl" href="#g-sgl">SGL</a>; <a href="#p6-ch58-namespaces">namespaces</a>.</p>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy — same order form, different delivery</div><p>The library uses the same order form everywhere. In the school building (PCIe) you drop the form in a box on the librarian’s desk and ring a bell. For a library in another town you mail the form in an envelope (capsule) by express courier (RDMA) or by the regular postal service (TCP). The librarian fills orders the same way; only the delivery changes.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>With PCIe, the librarian reaches into the school’s memory directly (DMA). With TCP, nobody reaches into anyone’s memory; every byte travels as a message. RDMA is in between: the remote librarian can read and write registered parts of the school’s memory, with permission keys.</p></div>
+<h3>65.2 What remains the same</h3>
+<ul>
+<li>Command set semantics: Read, Write, Flush, Identify, Get Log Page, and their status codes. <span class="tag verified">verified</span></li>
+<li>The SQE (64 bytes) and CQE (16 bytes) structures, with fabrics-specific use of some fields (e.g. SGLs are mandatory for data descriptions; PRPs are not used). <span class="tag verified">verified</span></li>
+<li>The subsystem → controller → namespace hierarchy, NSIDs, Asynchronous Events, reservations, ANA (Asymmetric Namespace Access) for multipath.</li>
+<li>Queue-pair model: admin queue (QID 0) plus I/O queues.</li>
+</ul>
+<h3>65.3 What changes</h3>
+<div class="table-wrap"><table><thead><tr><th>Aspect</th><th>NVMe over PCIe</th><th>NVMe over RDMA</th><th>NVMe over TCP</th></tr></thead><tbody>
+<tr><td>Queue location</td><td>host memory (or CMB); controller DMAs</td><td>each side’s memory; SQE delivered in a capsule</td><td>each side’s memory; capsule in a TCP stream</td></tr>
+<tr><td>Command notification</td><td>doorbell MWr</td><td>RDMA SEND of command capsule</td><td>CapsuleCmd PDU</td></tr>
+<tr><td>Data description</td><td>PRP or SGL</td><td>SGL (Keyed SGL Data Block: address + length + key) or in-capsule</td><td>SGL (transport data block) or in-capsule</td></tr>
+<tr><td>Data movement</td><td>controller DMA (MRd/MWr TLPs)</td><td>target-initiated RDMA READ / RDMA WRITE</td><td>H2CData / C2HData PDUs; R2T to solicit write data</td></tr>
+<tr><td>Completion</td><td>CQE MWr to host CQ + phase tag</td><td>RDMA SEND of response capsule</td><td>CapsuleResp PDU (or SUCCESS flag on last C2HData where enabled)</td></tr>
+<tr><td>Notification to host</td><td>MSI-X interrupt</td><td>RDMA completion queue event at the host NIC</td><td>socket receive; no NVMe-level interrupt</td></tr>
+<tr><td>Controller registers</td><td>MMIO in BAR0</td><td>Property Get / Property Set fabrics commands</td><td>same</td></tr>
+<tr><td>Association setup</td><td>enumeration + CC.EN</td><td>RDMA CM connect + Fabrics Connect command per queue</td><td>TCP connect + ICReq/ICResp + Fabrics Connect per queue</td></tr>
+<tr><td>Liveness</td><td>link state, CSTS</td><td>Keep Alive command + transport</td><td>Keep Alive + TCP</td></tr>
+<tr><td>Identity</td><td>PCIe BDF</td><td>NQN (NVMe Qualified Name) of host and subsystem</td><td>same</td></tr>
+</tbody></table></div>
+<p><span class="tag verified">verified</span> structure of the comparison; field-level details belong to the transport specifications.</p>
+<h3>65.4 Capsules</h3>
+<figure class="diagram"><svg viewBox="0 0 800 220" role="img" aria-label="Command capsule and response capsule structure">
+<rect class="box accent" x="30" y="40" width="220" height="60" rx="6"/><text class="lbl" x="140" y="68" text-anchor="middle">SQE (64 B)</text><text class="lbl small" x="140" y="88" text-anchor="middle">SGL in DPTR</text>
+<rect class="box alt" x="250" y="40" width="300" height="60" rx="6"/><text class="lbl" x="400" y="68" text-anchor="middle">optional additional SGLs / in-capsule data</text>
+<text class="lbl small" x="290" y="125" text-anchor="middle">Command capsule (host → controller)</text>
+<rect class="box accent" x="30" y="150" width="120" height="50" rx="6"/><text class="lbl" x="90" y="180" text-anchor="middle">CQE (16 B)</text>
+<rect class="box alt" x="150" y="150" width="200" height="50" rx="6"/><text class="lbl small" x="250" y="180" text-anchor="middle">(optional data, transport-defined)</text>
+<text class="lbl small" x="600" y="180" text-anchor="middle">Response capsule (controller → host)</text>
+</svg><figcaption>Figure 65.1 — Capsule structure. Maximum in-capsule data size is negotiated/advertised per transport and controller (e.g. IOCCSZ, IORCSZ in Identify Controller). <span class="tag verified">verified</span> concept.</figcaption></figure>
+<h3>65.5 Fabrics commands</h3>
+<div class="table-wrap"><table><thead><tr><th>Fabrics command (opcode 7Fh, FCTYPE)</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>Connect (01h)</td><td>create the admin or an I/O queue association; carries host NQN, subsystem NQN, Host Identifier, requested CNTLID (FFFFh for the dynamic controller model)</td></tr>
+<tr><td>Property Get (04h) / Property Set (00h)</td><td>read/write controller properties (CAP, VS, CC, CSTS…) instead of MMIO</td></tr>
+<tr><td>Authentication Send (05h) / Receive (06h)</td><td>in-band authentication (DH-HMAC-CHAP)</td></tr>
+<tr><td>Disconnect (08h)</td><td>tear down an I/O queue (newer revisions) <span class="tag version">version</span></td></tr>
+</tbody></table></div>
+<p><span class="tag verified">verified</span> for Connect, Property Get/Set and Authentication FCTYPE values; confirm in Base 2.4.</p>
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>On PCIe, the transport is “invisible” and reliable: if a TLP is lost the link retries it. On fabrics, the transport has its own failure modes (packet loss, congestion, path failover, TLS errors) that surface to NVMe as timeouts and reconnects. Every NVMe-oF debug session starts by deciding: <em>is this an NVMe problem or a transport problem?</em></p></div>
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Why are PRPs not used on fabrics?</p><details class="answer"><summary>Answer</summary><p>PRPs are host physical page pointers meaningful only to a DMA engine with direct memory access; fabrics need descriptors meaningful to the transport (RDMA keys, TCP offsets), hence SGLs.</p></details></li>
+<li><p>How does a fabrics host read CSTS?</p><details class="answer"><summary>Answer</summary><p>Property Get fabrics command on the admin queue.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Intermediate</span> What stays the same between NVMe/PCIe and NVMe/TCP? <details class="answer"><summary>Model answer</summary>Command sets, SQE/CQE structures, queue-pair model, subsystem/controller/namespace model, status codes, log pages.</details></li>
+<li><span class="lvl">Senior</span> Where does latency come from in NVMe/TCP vs PCIe? <details class="answer"><summary>Model answer</summary>Network stack processing, copies, NIC interrupts, switch hops, R2T round trips for writes, and TCP congestion control — none of which exist in a PCIe doorbell/DMA path.</details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist"><li>I can fill the “what changes” table from memory.</li><li>I can define command and response capsules.</li><li>I can explain Connect, Property Get/Set and keep-alive.</li></ul></div>
+<p><b>Next:</b> <a href="#p6-ch66-nvme-tcp">Chapter 66 — NVMe/TCP</a>.</p>
+</section>
+
+<section class="chapter" id="p6-ch66-nvme-tcp" data-part="PART XIX — NVMe OVER FABRICS">
+<h2><span class="num">66</span> NVMe/TCP</h2>
+<div class="callout spec"><div class="callout-title">📘 Specification baseline</div>
+<p><b>DOCUMENT:</b> NVMe over TCP Transport Specification, revision 1.3 per the August 2026 set (course brief — confirm). <b>STATUS:</b> transport binding. <b>VERSION NOTES:</b> NVMe/TCP was ratified in 2018 (TP 8000) and first published within NVMe-oF 1.1; TLS support and secure channel concatenation were added in later TPs <span class="tag version">version</span>. <b>PORTS:</b> 4420 is the IANA-assigned port commonly used for NVMe-oF I/O; 8009 for the NVMe/TCP discovery service <span class="tag verified">verified</span>.</p></div>
+<h3>66.1 Why this chapter exists</h3>
+<p>NVMe/TCP runs on any Ethernet with an ordinary NIC and Linux kernel, which makes it the most widely deployed fabrics transport. Debugging it means reading a packet capture where NVMe commands are hidden inside a TCP byte stream as PDUs. This chapter teaches the PDU types, the command/data/completion paths, and the performance and failure patterns.</p>
+<ul class="objectives">
+<li>List the PDU types and their directions.</li>
+<li>Decode the 8-byte common header (PDU-Type, FLAGS, HLEN, PDO, PLEN).</li>
+<li>Trace read and write commands, including R2T and in-capsule data.</li>
+<li>Explain header and data digests and when to enable them.</li>
+<li>Diagnose connection, digest, R2T and timeout problems.</li>
+</ul>
+<p><b>Prerequisites:</b> <a href="#p6-ch65-nvmeof-model">Chapter 65</a>; TCP fundamentals (stream, segments, retransmission).</p>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy — a phone call with forms</div><p>Two offices keep a phone line open (TCP connection). First they say hello and agree on rules (ICReq/ICResp). Then one reads out order forms (CapsuleCmd). For a delivery order, the other says “send me pages 1–4 now” (R2T) and the first reads them out (H2CData). For a fetch order, the other reads the pages back (C2HData) and then says “done, status OK” (CapsuleResp).</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>TCP is a byte stream: PDUs are not aligned to TCP segments, one segment can carry many PDUs, one PDU can span many segments. A capture tool must reassemble the stream to find PDU boundaries using PLEN.</p></div>
+<h3>66.2 PDU types</h3>
+<div class="table-wrap"><table><thead><tr><th>Type value</th><th>PDU</th><th>Direction</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>00h</td><td>ICReq</td><td>host → controller</td><td>Initialize Connection Request: PDU format version, host PDU data alignment, digest enable requests, maximum outstanding R2Ts</td></tr>
+<tr><td>01h</td><td>ICResp</td><td>controller → host</td><td>Initialize Connection Response: controller PDU data alignment, digest settings, MAXH2CDATA (max data per H2CData PDU)</td></tr>
+<tr><td>02h</td><td>H2CTermReq</td><td>host → controller</td><td>host terminates connection due to fatal transport error</td></tr>
+<tr><td>03h</td><td>C2HTermReq</td><td>controller → host</td><td>controller terminates connection due to fatal transport error</td></tr>
+<tr><td>04h</td><td>CapsuleCmd</td><td>host → controller</td><td>command capsule: 64-byte SQE + optional in-capsule data</td></tr>
+<tr><td>05h</td><td>CapsuleResp</td><td>controller → host</td><td>response capsule: 16-byte CQE</td></tr>
+<tr><td>06h</td><td>H2CData</td><td>host → controller</td><td>write data, sent in response to an R2T</td></tr>
+<tr><td>07h</td><td>C2HData</td><td>controller → host</td><td>read data; LAST_PDU flag; optional SUCCESS flag to omit CapsuleResp</td></tr>
+<tr><td>09h</td><td>R2T</td><td>controller → host</td><td>Ready to Transfer: solicits a range of write data (offset + length, transfer tag)</td></tr>
+</tbody></table></div>
+<p><span class="tag verified">verified</span> PDU names and type values (08h is not used for these PDUs). Field layouts beyond the common header: read the TCP transport specification.</p>
+<div class="table-wrap"><table class="bitfield"><thead><tr><th>Byte 0</th><th>Byte 1</th><th>Byte 2</th><th>Byte 3</th><th>Bytes 4–7</th></tr></thead><tbody>
+<tr><td>PDU-Type</td><td>FLAGS (e.g. HDGSTF, DDGSTF, LAST_PDU, SUCCESS — meaning depends on type)</td><td>HLEN (header length)</td><td>PDO (PDU data offset)</td><td>PLEN (total PDU length incl. header, digests, padding)</td></tr>
+</tbody></table></div>
+<p>The common header is 8 bytes; it is followed by the PDU-specific header (e.g. the 64-byte SQE for CapsuleCmd), an optional header digest (CRC32C, 4 bytes), optional padding up to PDO, data, and an optional data digest (CRC32C). <span class="tag verified">verified</span></p>
+<h3>66.3 Paths</h3>
+<pre class="diagram">  READ (8 KiB)                               WRITE (64 KiB, not in-capsule)
+  Host                    Controller          Host                    Controller
+   | CapsuleCmd (Read)  ----&gt; |                | CapsuleCmd (Write) ----&gt; |
+   |                           | media read     |                          | buffer alloc
+   | &lt;---- C2HData (0..8K, LAST)|                | &lt;---- R2T (off 0, 32K)  |
+   | &lt;---- CapsuleResp (CQE)   |                | H2CData (0..32K)  ----&gt; |
+   |                           |                | &lt;---- R2T (off 32K,32K) |
+                                                | H2CData (32K..64K)----&gt; |
+                                                |                          | media write
+                                                | &lt;---- CapsuleResp (CQE) |</pre>
+<p>Small writes can carry data in the CapsuleCmd itself (in-capsule data), avoiding the R2T round trip, if the controller’s in-capsule data size allows. <span class="tag verified">verified</span> The number of R2Ts and their sizes are controller choices bounded by MAXR2T and MAXH2CDATA <span class="tag impl">impl</span>.</p>
+<h3>66.4 Performance</h3>
+<div class="formula">T_write ≈ RTT (CapsuleCmd→R2T) + Σ(H2CData serialization) + t_media + RTT/2 (CapsuleResp)</div>
+<ul class="vars"><li><b>RTT</b> — network round-trip time</li><li><b>H2CData serialization</b> — bytes / link rate per data PDU</li><li><b>t_media</b> — controller processing and media time</li></ul>
+<p>Writes pay at least one extra half round trip for the R2T compared with reads unless in-capsule data is used. CPU cost per I/O (copies, checksums, interrupts) often limits IOPS before the network does; digests add CRC32C computation (offloaded by some NICs) <span class="tag impl">impl</span>.</p>
+<h3>66.5 Traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: connection setup and one 4 KiB read (PDU view after stream reassembly)</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>t (µs)</th><th>Dir</th><th>PDU</th><th>Key fields</th></tr></thead><tbody>
+<tr><td>1</td><td>0</td><td>H→C</td><td>TCP SYN/SYN-ACK/ACK to port 4420</td><td></td></tr>
+<tr><td>2</td><td>90</td><td>H→C</td><td>ICReq</td><td>PFV 0, HPDA 0, HDGST/DDGST requested off</td></tr>
+<tr><td>3</td><td>140</td><td>C→H</td><td>ICResp</td><td>CPDA 0, MAXH2CDATA 128 KiB</td></tr>
+<tr><td>4</td><td>200</td><td>H→C</td><td>CapsuleCmd (Fabrics Connect, QID 0)</td><td>hostnqn, subnqn, CNTLID FFFFh; 1 KiB in-capsule data</td></tr>
+<tr><td>5</td><td>420</td><td>C→H</td><td>CapsuleResp</td><td>Success; CNTLID 5 in DW0</td></tr>
+<tr><td>6</td><td>…</td><td>both</td><td>Property Get CAP, Property Set CC.EN=1, Property Get CSTS, Identify…</td><td>admin queue bring-up</td></tr>
+<tr><td>7</td><td>9 000</td><td>H→C</td><td>CapsuleCmd (Read, CID 0x0012, NSID 1, SLBA 0x1000, NLB 0 → 1 block of 4 KiB)</td><td>on I/O queue connection</td></tr>
+<tr><td>8</td><td>9 095</td><td>C→H</td><td>C2HData</td><td>CCCID 0x0012, DATAO 0, DATAL 4096, LAST_PDU</td></tr>
+<tr><td>9</td><td>9 097</td><td>C→H</td><td>CapsuleResp</td><td>CID 0x0012, status 0</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: data digest error</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Dir</th><th>PDU</th><th>Note</th></tr></thead><tbody>
+<tr><td>1</td><td>H→C</td><td>ICReq (DDGST enabled)</td><td></td></tr>
+<tr class="first-bad"><td>2</td><td>C→H</td><td>C2HData with DDGST mismatch</td><td>host computes CRC32C ≠ received digest</td></tr>
+<tr class="bad"><td>3</td><td>H→C</td><td>H2CTermReq (fatal status: data digest error)</td><td>host tears down connection</td></tr>
+<tr class="bad"><td>4</td><td>—</td><td>TCP FIN/RST; host reconnect attempts</td><td>outstanding I/O retried/failed per host policy</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: write latency dominated by R2T round trips</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>PDU</th><th>Note</th></tr></thead><tbody>
+<tr><td>0</td><td>CapsuleCmd Write 1 MiB</td><td></td></tr>
+<tr class="bad"><td>210</td><td>R2T #1 (128 KiB)</td><td>controller allocates buffers in chunks; MAXR2T = 1</td></tr>
+<tr class="bad"><td>…</td><td>8 × (R2T → H2CData)</td><td>each costs an RTT ≈ 200 µs</td></tr>
+<tr><td>1 900</td><td>CapsuleResp</td><td></td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: keep-alive timeout during congestion</div><div class="table-wrap"><table>
+<thead><tr><th>t (s)</th><th>Event</th></tr></thead><tbody>
+<tr><td>0</td><td>KATO = 5 s; host sends Keep Alive every ~2.5 s (host policy)</td></tr>
+<tr class="bad"><td>3–9</td><td>TCP retransmissions, window collapse (network congestion)</td></tr>
+<tr class="bad"><td>9</td><td>Controller: keep-alive timer expired → controller tears down association</td></tr>
+</tbody></table></div></div>
+<p>Was the target too strict or the network broken? The PDUs show the Keep Alive was <em>sent</em>; TCP analysis shows it was delayed in retransmission. The NVMe layer behaved correctly given the transport failure. <span class="tag derived">derived</span></p>
+<h3>66.6 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code>sudo nvme discover -t tcp -a 192.0.2.10 -s 8009          # read discovery log (no connection to I/O ctrl)
+sudo nvme list-subsys                                      # show connected subsystems and paths
+cat /etc/nvme/hostnqn                                      # this host's NQN
+sudo tcpdump -i eth1 -w nvme.pcap 'tcp port 4420'          # capture; Wireshark has an NVMe/TCP dissector
+journalctl -k | grep -E 'nvme.*(tcp|reconnect|keep-alive|digest)'</code></pre>
+<pre class="code" data-kind="hardware-dependent"><code># LAB: connect to a test target (creates block devices on this host)
+sudo nvme connect -t tcp -a 192.0.2.10 -s 4420 -n nqn.2026-01.org.example:lab-subsys1
+sudo nvme disconnect -n nqn.2026-01.org.example:lab-subsys1</code></pre>
+<div class="callout warn"><div class="callout-title">⚠️ Safety</div><p>Connecting to a production target from a lab host can expose shared namespaces to a second writer. Use a dedicated test subsystem with host-NQN access control. Packet captures contain data; treat them as sensitive.</p></div>
+<h3>66.7 Failure patterns</h3>
+<div class="table-wrap"><table><thead><tr><th>Symptom</th><th>Causes</th><th>First check</th><th>Second check</th><th>Experiment</th><th>Confidence</th></tr></thead><tbody>
+<tr><td>Connect fails immediately</td><td>Host NQN not allowed; wrong subsystem NQN; port</td><td>Connect CapsuleResp status</td><td>Target ACL</td><td>Discover first, copy NQN exactly</td><td>High</td></tr>
+<tr><td>Periodic reconnects</td><td>Keep-alive expiry; network flaps; target restarts</td><td>Kernel log timestamps</td><td>TCP retransmissions</td><td>Increase KATO in lab</td><td>Medium</td></tr>
+<tr><td>Digest errors</td><td>NIC offload bug; memory corruption; middlebox</td><td>Which direction</td><td>Disable offloads</td><td>Swap NIC</td><td>Medium</td></tr>
+<tr><td>Writes much slower than reads</td><td>R2T round trips; small MAXH2CDATA; no in-capsule</td><td>PDU timeline</td><td>ICResp values</td><td>Tune target</td><td>High</td></tr>
+<tr><td>High CPU, low IOPS</td><td>Interrupt/softirq bound; single queue; copies</td><td><code>perf top</code></td><td>Number of I/O queues/connections</td><td>More queues, IRQ affinity</td><td>Medium</td></tr>
+</tbody></table></div>
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>Map every NVMe/TCP I/O queue to its TCP connection (one connection per queue) and analyse them separately. An apparently random latency spike usually belongs to one connection that hit retransmission — averaged across queues it looks like a storage problem.</p></div>
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Which PDU solicits write data?</p><details class="answer"><summary>Answer</summary><p>R2T (09h), sent by the controller.</p></details></li>
+<li><p>What do HLEN, PDO and PLEN tell you?</p><details class="answer"><summary>Answer</summary><p>Header length, offset of data within the PDU, and total PDU length — enough to find the next PDU in the stream.</p></details></li>
+<li><p>Can a read finish without a CapsuleResp?</p><details class="answer"><summary>Answer</summary><p>Yes, if the SUCCESS flag mechanism is enabled/used on the last C2HData PDU; otherwise a CapsuleResp follows.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> List the NVMe/TCP PDU types. <details class="answer"><summary>Model answer</summary>ICReq, ICResp, H2CTermReq, C2HTermReq, CapsuleCmd, CapsuleResp, H2CData, C2HData, R2T.</details></li>
+<li><span class="lvl">Intermediate</span> Why use digests if TCP has checksums? <details class="answer"><summary>Model answer</summary>TCP’s 16-bit checksum is weak and does not cover corruption inside NICs, offload engines or middleboxes after checksum verification; CRC32C end-to-end digests catch those.</details></li>
+<li><span class="lvl">Advanced</span> How do you find PDU boundaries in a capture? <details class="answer"><summary>Model answer</summary>Reassemble the TCP stream and walk PDUs using PLEN from each common header, starting from ICReq.</details></li>
+<li><span class="lvl">Senior</span> A customer sees 2× write latency over TCP vs RDMA. Explain and propose fixes. <details class="answer"><summary>Model answer</summary>R2T round trip(s), stack copies, interrupt handling; fixes: in-capsule data for small writes, larger R2T/MAXH2CDATA, more queues, busy-poll, NIC offloads, CPU affinity.</details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can list PDU types with values and directions.</li>
+<li>I can decode a common header and walk a stream.</li>
+<li>I can draw read and write PDU sequences including R2T.</li>
+<li>I can separate NVMe failures from TCP failures with evidence.</li>
+</ul></div>
+<p><b>Next:</b> <a href="#p6-ch67-nvme-rdma">Chapter 67 — NVMe/RDMA</a>.</p>
+</section>
+
+<section class="chapter" id="p6-ch67-nvme-rdma" data-part="PART XIX — NVMe OVER FABRICS">
+<h2><span class="num">67</span> NVMe/RDMA</h2>
+<div class="callout spec"><div class="callout-title">📘 Specification baseline</div>
+<p><b>DOCUMENT:</b> NVMe over RDMA Transport Specification, revision 1.3 per the August 2026 set (course brief — confirm). <b>RELATED:</b> InfiniBand Architecture Specification and RoCE annexes (IBTA), iWARP RFCs (IETF). <b>STATUS:</b> transport binding. <span class="tag version">version</span></p></div>
+<h3>67.1 Why this chapter exists</h3>
+<p>RDMA (Remote Direct Memory Access) lets a NIC read and write registered memory on another machine without involving that machine’s CPU in the data path. NVMe/RDMA uses this to keep the “controller moves the data” spirit of PCIe NVMe across a network, giving the lowest-latency fabrics transport — at the cost of specialised networks and configuration.</p>
+<ul class="objectives"><li>Explain RDMA verbs at a conceptual level: SEND/RECEIVE, RDMA READ, RDMA WRITE.</li><li>Explain queue pairs and the mapping of NVMe queues to RDMA QPs.</li><li>Explain memory registration and keyed SGLs.</li><li>Trace NVMe reads and writes over RDMA.</li><li>Recognise RDMA transport failures (lossless network, PFC, retries).</li></ul>
+<p><b>Prerequisites:</b> <a href="#p6-ch65-nvmeof-model">Chapter 65</a>.</p>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy — the robot arm with a permission card</div><p>Before the library in the other town may take books from your shelf, you give it a permission card for one shelf (memory registration and key). Then its robot arm can reach over the network and take exactly those books (RDMA READ) or put books on that shelf (RDMA WRITE), without you lifting a finger. Messages like “please do this order” and “done!” are still mailed as letters (SEND).</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>The permission card is a 32-bit key plus address range checked by the NIC hardware; it can be invalidated, and stale keys are a security and correctness hazard. Also, RoCE networks usually need lossless Ethernet configuration (PFC/ECN) to perform well — the robot arm hates dropped packets.</p></div>
+<h3>67.2 Mechanism</h3>
+<div class="table-wrap"><table><thead><tr><th>NVMe step</th><th>RDMA operation</th><th>Who initiates</th></tr></thead><tbody>
+<tr><td>Submit command</td><td>SEND of command capsule (consumes a pre-posted RECEIVE at the target)</td><td>Host</td></tr>
+<tr><td>Read data (controller → host)</td><td>RDMA WRITE into host buffer described by Keyed SGL (address, length, key)</td><td>Target</td></tr>
+<tr><td>Write data (host → controller)</td><td>RDMA READ from host buffer described by Keyed SGL, or in-capsule data</td><td>Target</td></tr>
+<tr><td>Complete</td><td>SEND of response capsule (optionally with invalidate of the host key)</td><td>Target</td></tr>
+</tbody></table></div>
+<p>Each NVMe queue pair (admin or I/O) maps to one RDMA queue pair (QP); connections are established with the RDMA connection manager, then the Fabrics Connect command is sent over that QP. <span class="tag verified">verified</span> concept; field and descriptor formats in the RDMA transport specification.</p>
+<h3>67.3 Traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: 16 KiB read over RoCEv2</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>t (µs)</th><th>Dir</th><th>RDMA op</th><th>Content</th></tr></thead><tbody>
+<tr><td>1</td><td>0.0</td><td>H→T</td><td>SEND</td><td>command capsule: Read, SGL = keyed {addr 0x7f..000, len 16384, key 0x1a2b3c4d}</td></tr>
+<tr><td>2</td><td>14.0</td><td>T→H</td><td>RDMA WRITE</td><td>16 KiB to addr with key 0x1a2b3c4d</td></tr>
+<tr><td>3</td><td>14.6</td><td>T→H</td><td>SEND (with invalidate)</td><td>response capsule: CQE status 0</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: remote access error</div><div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Dir</th><th>Op</th><th>Note</th></tr></thead><tbody>
+<tr><td>1</td><td>H→T</td><td>SEND (Write cmd, keyed SGL)</td><td>host deregistered buffer too early (bug)</td></tr>
+<tr class="first-bad"><td>2</td><td>T→H</td><td>RDMA READ</td><td>NAK: remote access error (invalid key)</td></tr>
+<tr class="bad"><td>3</td><td>—</td><td>QP transitions to error state</td><td>all I/O on this queue fails; host reconnects</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: PFC pause storms</div><div class="table-wrap"><table>
+<thead><tr><th>t (ms)</th><th>Event</th></tr></thead><tbody>
+<tr class="bad"><td>0–40</td><td>switch sends PFC pause frames on priority 3; RDMA WRITEs stall; latency p99 ×20</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: retry exceeded</div><div class="table-wrap"><table>
+<thead><tr><th>Event</th><th>Note</th></tr></thead><tbody>
+<tr class="bad"><td>Work completion: transport retry counter exceeded</td><td>target down? path down? congestion drops on lossy RoCE?</td></tr>
+</tbody></table></div></div>
+<p>Disambiguate with switch counters (drops, pauses), port state on both ends, and whether other QPs on the same path survived. <span class="tag derived">derived</span></p>
+<h3>67.4 Failure patterns</h3>
+<div class="table-wrap"><table><thead><tr><th>Symptom</th><th>Causes</th><th>First check</th><th>Second check</th></tr></thead><tbody>
+<tr><td>Connect fails</td><td>RDMA CM address resolution; GID/VLAN/priority mismatch</td><td><code>rdma link</code>, <code>ibv_devinfo</code></td><td>Target logs</td></tr>
+<tr><td>QP error mid-I/O</td><td>Invalid key / access rights</td><td>Work completion status</td><td>Host memory registration lifecycle</td></tr>
+<tr><td>Tail latency spikes</td><td>PFC pauses / ECN marking</td><td>Switch counters</td><td>QoS configuration</td></tr>
+<tr><td>Throughput low at small I/O</td><td>Single QP; CPU completion handling</td><td>Queue count</td><td>Interrupt moderation</td></tr>
+<tr><td>Works on IB, fails on RoCE</td><td>Lossless config missing</td><td>Drop counters</td><td>DCB settings</td></tr>
+</tbody></table></div>
+<pre class="code" data-kind="read-only inspection"><code>rdma link show
+ibv_devinfo | head -30
+sudo nvme discover -t rdma -a 192.0.2.20 -s 4420
+journalctl -k | grep -E 'nvme_rdma|nvme.*rdma'</code></pre>
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>In NVMe/RDMA the data path is driven by the <em>target</em>: it pulls write data and pushes read data. That mirrors PCIe NVMe (the controller does DMA) and is why RDMA latency approaches local NVMe. It also means a host-side memory lifecycle bug shows up as a <em>remote</em> error on the target’s operation — look at both sides.</p></div>
+<div class="quiz"><h4>Quiz</h4><ol><li><p>Which RDMA operation moves data for an NVMe Write command (non-in-capsule)?</p><details class="answer"><summary>Answer</summary><p>RDMA READ, issued by the target against the host’s registered buffer.</p></details></li><li><p>What three things does a keyed SGL descriptor carry?</p><details class="answer"><summary>Answer</summary><p>Address, length and key (remote access key).</p></details></li></ol></div>
+<div class="interview"><h4>Interview questions</h4><ol><li><span class="lvl">Intermediate</span> What is memory registration and why is it needed? <details class="answer"><summary>Model answer</summary>Pinning and mapping a buffer in the NIC with access rights and a key so remote peers can access it via RDMA without CPU involvement and without accessing unauthorised memory.</details></li><li><span class="lvl">Senior</span> RoCEv2 vs TCP for NVMe-oF in a large cloud? <details class="answer"><summary>Model answer</summary>RoCE: lower latency and CPU, needs lossless/congestion-managed fabric and RDMA NICs; TCP: universal, simpler operations, higher CPU and latency; choice depends on scale, operational maturity and hardware.</details></li></ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist"><li>I can map NVMe steps to RDMA operations.</li><li>I can explain QPs, registration and keyed SGLs.</li><li>I can diagnose remote access and retry-exceeded errors.</li></ul></div>
+<p><b>Next:</b> <a href="#p6-ch68-fabric-arch">Chapter 68 — Fabric Architecture and Discovery</a>.</p>
+</section>
+
+<section class="chapter" id="p6-ch68-fabric-arch" data-part="PART XIX — NVMe OVER FABRICS">
+<h2><span class="num">68</span> Fabric Architecture and Discovery</h2>
+<div class="callout spec"><div class="callout-title">📘 Specification baseline</div>
+<p><b>DOCUMENT:</b> NVMe Base Specification 2.4 — NVM subsystem model, NQN format, discovery controller, Discovery Log Page (Log Identifier 70h), Asymmetric Namespace Access (ANA). Discovery enhancements (centralized discovery controllers, discovery information management, automated discovery over IP) were added via technical proposals ratified around 2021–2022 <span class="tag version">version</span>.</p></div>
+<h3>68.1 The hierarchy</h3>
+<figure class="diagram"><svg viewBox="0 0 800 260" role="img" aria-label="Host to fabric to target to subsystem to controller to namespace">
+<rect class="box" x="10" y="90" width="110" height="70" rx="8"/><text class="lbl" x="65" y="122" text-anchor="middle">Host</text><text class="lbl small" x="65" y="142" text-anchor="middle">host NQN</text>
+<rect class="box alt" x="150" y="90" width="110" height="70" rx="8"/><text class="lbl" x="205" y="122" text-anchor="middle">Fabric</text><text class="lbl small" x="205" y="142" text-anchor="middle">TCP / RDMA / FC</text>
+<rect class="box" x="290" y="90" width="110" height="70" rx="8"/><text class="lbl" x="345" y="122" text-anchor="middle">Target port</text><text class="lbl small" x="345" y="142" text-anchor="middle">addr + svcid</text>
+<rect class="box accent" x="430" y="90" width="120" height="70" rx="8"/><text class="lbl" x="490" y="122" text-anchor="middle">Subsystem</text><text class="lbl small" x="490" y="142" text-anchor="middle">subsystem NQN</text>
+<rect class="box" x="580" y="90" width="100" height="70" rx="8"/><text class="lbl" x="630" y="122" text-anchor="middle">Controller</text><text class="lbl small" x="630" y="142" text-anchor="middle">CNTLID</text>
+<rect class="box" x="700" y="90" width="90" height="70" rx="8"/><text class="lbl" x="745" y="122" text-anchor="middle">Namespace</text><text class="lbl small" x="745" y="142" text-anchor="middle">NSID</text>
+<path class="ln" d="M120 125 L150 125" marker-end="url(#arrow)"/><path class="ln" d="M260 125 L290 125" marker-end="url(#arrow)"/><path class="ln" d="M400 125 L430 125" marker-end="url(#arrow)"/><path class="ln" d="M550 125 L580 125" marker-end="url(#arrow)"/><path class="ln" d="M680 125 L700 125" marker-end="url(#arrow)"/>
+<text class="lbl small" x="400" y="210" text-anchor="middle">Dynamic controller model: each Connect (CNTLID FFFFh) creates a controller for that host association</text>
+</svg><figcaption>Figure 68.1 — NVMe-oF hierarchy. Fibre Channel (FC-NVMe) is defined by INCITS T11 with an NVMe binding; it is outside this course’s baseline list. <span class="tag verified">verified</span></figcaption></figure>
+<h3>68.2 Discovery</h3>
+<p>A <b>discovery controller</b> is a special controller (in a discovery subsystem with the well-known NQN <code>nqn.2014-08.org.nvmexpress.discovery</code>, or a unique NQN for newer discovery models) that supports only what is needed to return the <b>Discovery Log Page</b>. Each log entry describes how to reach one subsystem port: transport type (TRTYPE), address family (ADRFAM), subsystem type, port ID, controller ID, transport address (TRADDR), transport service ID (TRSVCID, e.g. 4420), subsystem NQN and transport-specific attributes. <span class="tag verified">verified</span></p>
+<pre class="code" data-kind="pseudocode"><code>host:
+  connect to discovery controller (e.g. TCP 192.0.2.10:8009, NQN = well-known discovery NQN)
+  Get Log Page LID 70h  -&gt; entries[]
+  for e in entries matching policy:
+      connect admin queue to e.TRADDR:e.TRSVCID, subnqn = e.SUBNQN
+      Identify controller / namespaces; create I/O queues (one connection per queue)
+  optionally keep discovery association (persistent) for change notifications</code></pre>
+<p>Centralized Discovery Controllers (CDC) aggregate many subsystems in large IP fabrics; hosts and subsystems register with them (Discovery Information Management) and mDNS-based automated discovery can locate discovery controllers <span class="tag version">version</span> — confirm the current model and names in Base 2.4.</p>
+<h3>68.3 Multipath and ANA</h3>
+<p>A namespace can be reachable through several controllers/ports. Asymmetric Namespace Access (ANA) reports per-group states (optimized, non-optimized, inaccessible, persistent loss, change) via an ANA log page so hosts choose paths. Linux native NVMe multipath presents one block device per namespace across paths. <span class="tag verified">verified</span></p>
+<pre class="code" data-kind="read-only inspection"><code>cat /sys/module/nvme_core/parameters/multipath
+sudo nvme list-subsys -v
+sudo nvme ana-log /dev/nvme1</code></pre>
+<h3>68.4 Interoperability (Extended topic 97)</h3>
+<p>A standard interface does not eliminate implementation bugs. Every NVMe deployment is a chain, and an interoperability failure can sit in any link or between two links:</p>
+<div class="table-wrap"><table><thead><tr><th>Link in the chain</th><th>Typical interop issue</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Host application ↔ OS</td><td>assumes write ordering or atomicity NVMe doesn’t give</td><td>application logs, fsync patterns</td></tr>
+<tr><td>OS ↔ driver</td><td>quirk tables, timeout defaults, queue counts</td><td>kernel version, module parameters</td></tr>
+<tr><td>Driver ↔ PCIe platform</td><td>MSI-X, IOMMU, ASPM, RO quirks</td><td><code>lspci -vvv</code>, IOMMU faults</td></tr>
+<tr><td>Platform ↔ controller</td><td>link training, equalization, power states</td><td>LnkSta, AER counters</td></tr>
+<tr><td>Controller ↔ firmware</td><td>optional feature support differs across firmware revisions</td><td>Identify Controller (FR), feature support bits</td></tr>
+<tr><td>Firmware ↔ media</td><td>wear, read disturb, retention</td><td>SMART, vendor logs</td></tr>
+<tr><td>Host ↔ fabric ↔ target</td><td>NQN format, digests, MAXH2CDATA, KATO, TLS versions</td><td>PDU captures, connect status</td></tr>
+</tbody></table></div>
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>Interoperability bugs live in “optional” and “may”. When two compliant implementations fail together, list every optional feature and every “may” behaviour each one exercises, and test them pairwise. Then check which revision each side claims (VS register / Identify), because they may be reading different specifications.</p></div>
+<div class="lab"><div class="lab-head">🧪 Lab 68.1 (Extended Lab 49) — PCIe path vs TCP path side by side <span class="safety caution">CAUTION</span></div>
+<p><b>Objective:</b> compare one 4 KiB read over local NVMe/PCIe and over NVMe/TCP. <b>Prerequisites:</b> two Linux machines (or one with loopback), a disposable SSD, the Linux <code>nvmet</code> target (configfs). <b>Setup:</b> export a test namespace with nvmet-tcp on port 4420 with host NQN restriction; on the host, connect with <code>nvme connect</code>. <b>Procedure:</b> (1) run <code>fio --rw=randread --bs=4k --iodepth=1 --readonly</code> against the local device and against the remote one; (2) capture <code>tcpdump</code> on the TCP path; (3) fill the table below. <b>Observations / table:</b></p>
+<div class="table-wrap"><table><thead><tr><th>Dimension</th><th>PCIe path</th><th>TCP path</th></tr></thead><tbody>
+<tr><td>Command transport</td><td>SQE in host memory, doorbell MWr, controller MRd</td><td>CapsuleCmd PDU in TCP stream</td></tr>
+<tr><td>Data transport</td><td>controller MWr TLPs into PRP/SGL buffers</td><td>C2HData PDU(s), copied by stack (or zero-copy where supported)</td></tr>
+<tr><td>Completion</td><td>CQE MWr + phase tag + MSI-X</td><td>CapsuleResp PDU (or SUCCESS flag)</td></tr>
+<tr><td>Network layers</td><td>PCIe transaction/data link/physical</td><td>NVMe/TCP PDU → TCP → IP → Ethernet (+ target’s own PCIe to its SSD)</td></tr>
+<tr><td>Failure modes</td><td>AER, completion timeout, link down, CFS</td><td>connection loss, digest error, KATO expiry, retransmission, target-side PCIe errors</td></tr>
+<tr><td>Measured QD1 latency</td><td>(your value)</td><td>(your value)</td></tr>
+</tbody></table></div>
+<p><b>Questions:</b> how many PCIe transactions occur on the <em>target</em> machine for one remote read? Where are the two extra copies (if any)? Which layer adds most latency?</p>
+<details class="answer"><summary>Solution</summary><p>The target performs the same local PCIe NVMe sequence (doorbell, SQE fetch, data MWr, CQE, interrupt) against its SSD, then sends PDUs. The remote read therefore contains a complete local read plus network round trip and stack processing; typical added latency is tens of microseconds on a LAN (implementation- and environment-dependent). Expected reasoning: decompose latency into host stack, wire, target stack, target local NVMe.</p></details>
+<p><b>Extension:</b> enable data digest and measure CPU cost; introduce 1% packet loss with <code>tc netem</code> (lab only) and observe reconnects.</p></div>
+<div class="quiz"><h4>Quiz</h4><ol><li><p>What is in a Discovery Log Page entry?</p><details class="answer"><summary>Answer</summary><p>Transport type, address family, subsystem type, port ID, controller ID, transport address, service ID, subsystem NQN, transport-specific attributes.</p></details></li><li><p>What is the well-known discovery NQN?</p><details class="answer"><summary>Answer</summary><p>nqn.2014-08.org.nvmexpress.discovery</p></details></li></ol></div>
+<div class="interview"><h4>Interview questions</h4><ol><li><span class="lvl">Intermediate</span> Walk the hierarchy host → namespace. <details class="answer"><summary>Model answer</summary>Host (host NQN) reaches a target port over a fabric, connects to a subsystem (subsystem NQN), which creates a controller (CNTLID) for the association; the controller exposes attached namespaces (NSIDs).</details></li><li><span class="lvl">Senior</span> Design discovery for 10 000 hosts. <details class="answer"><summary>Model answer</summary>Centralized discovery controllers with registration, zoning/access policy, persistent discovery connections for change notification, mDNS or DHCP-based bootstrap, redundancy for the CDC itself.</details></li></ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist"><li>I can draw host → fabric → target → subsystem → controller → namespace.</li><li>I can explain discovery and decode discovery entries.</li><li>I can explain ANA multipath.</li><li>I can compare the PCIe and TCP paths across five dimensions.</li><li>I can list interop risk points along the chain.</li></ul></div>
+<p><b>Next:</b> <a href="#p6-part-xx">Part XX — 2026 NVMe 2.4 Updates</a>.</p>
+</section>

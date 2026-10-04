@@ -1,0 +1,419 @@
+<section class="part" id="part-vi">
+<div class="part-num">PART VI</div>
+<h1>PCIe Data Link Layer</h1>
+<p class="part-intro">The Transaction Layer assumes something nearly magical: every TLP it hands down arrives at the other end of the link exactly once, in order, uncorrupted, and only when the receiver has room for it. The Data Link Layer is the machinery that makes this true, one link at a time — sequence numbers, LCRC, acknowledgements, a replay buffer, and credit-based flow control carried in small Data Link Layer Packets (DLLPs). For NVMe engineers this layer explains why a marginal link is "slow but not broken", why throughput can stall with an idle SSD and an idle CPU, and how a link heals itself — until it cannot.</p>
+<div class="callout spec"><div class="callout-title">📘 Specification baseline</div><p><b>DOCUMENT:</b> PCI Express Base Specification, Data Link Layer chapter and Flow Control sections of the Transaction Layer chapter. <b>REVISION:</b> non-FLIT DLL behavior is stable from 1.x through 5.x and 6.x non-FLIT mode. PCIe 6.0 FLIT mode replaces per-TLP sequence numbers/LCRC with per-FLIT CRC, FEC and FLIT sequence numbers, carries DLLP information in FLIT DLP bytes, and adds scaled and shared flow control options <span class="tag version">version</span>. Data Link Feature exchange (DLLP) was added in 4.0 <span class="tag version">version</span>.</p></div>
+</section>
+
+<section class="chapter" id="p2-ch15-dllp" data-part="PART VI — PCIe DATA LINK LAYER">
+<h2><span class="num">15</span> DLLPs, ACK/NAK and Replay</h2>
+<h3>15.1 Why this chapter exists</h3>
+<p>"Bad TLP: 1,237 correctable errors" in an AER log is a Data Link Layer story: 1,237 TLPs arrived damaged and were silently retransmitted. Understanding sequence numbers, Ack/Nak and replay lets you translate those counters into bandwidth loss, latency spikes and risk, and tells you when the link will give up and retrain.</p>
+<ul class="objectives">
+<li><b>Beginner:</b> explain what a DLLP is and the difference between Ack/Nak and a completion.</li>
+<li><b>Intermediate:</b> describe sequence numbers, LCRC, the replay buffer and the transmitter/receiver counters.</li>
+<li><b>Advanced:</b> walk through Nak-triggered replay, timer-triggered replay and REPLAY_NUM rollover.</li>
+<li><b>Senior:</b> estimate replay cost and decide when correctable errors are a production risk.</li>
+<li><b>Trace:</b> recognize replays (duplicate sequence numbers) and Nak storms in a synthetic capture.</li>
+<li><b>Debug/validation:</b> map AER correctable bits to DLL events; design a stress test that exposes a marginal link.</li>
+</ul>
+<p><b>Prerequisites:</b> <a href="#p2-ch07-layers">layer model</a>, <a href="#p2-ch10-tlps">TLPs</a>.</p>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>A <b>courier service</b> gives every package a number. The receiving depot checks each package's seal. Every so often it calls back: "got everything up to number 57, all fine" (<b>ACK</b>). If package 58 arrives with a broken seal, it calls: "58 was damaged — resend everything after 57" (<b>NAK</b>). The sending depot keeps a photocopy of every package in a back room (<b>replay buffer</b>) until it hears it was received, and if nobody calls back for too long, it re-sends anyway (<b>replay timer</b>).</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>The courier service works <b>per hop</b>: each switch is a depot that re-numbers and re-seals packages for the next link. The NAK means "resend from here", so even good packages after the damaged one are resent (go-back-N, not selective repeat — in non-FLIT mode). And the "phone calls" (DLLPs) can themselves be corrupted; the protocol tolerates lost Acks because a later Ack covers all earlier numbers.</p></div>
+
+<h3>15.2 What a DLLP is</h3>
+<p>A <b>Data Link Layer Packet</b> is a small packet that originates and terminates in the Data Link Layer of the two ports of one link. It is never forwarded through a switch, never seen by the Transaction Layer as a TLP, and has no sequence number (it is not replayed; lost DLLPs are tolerated by design: periodic and cumulative information). In non-FLIT mode a DLLP is 6 bytes: 1 type byte, 3 bytes of content, 16-bit CRC, plus framing (SDP token in 128b/130b, SDP/END symbols in 8b/10b) <span class="tag verified">verified</span>.</p>
+<div class="table-wrap"><table class="bitfield">
+<thead><tr><th>Byte</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th></tr></thead>
+<tbody>
+<tr><td>Ack / Nak</td><td>Type 00h (Ack) / 10h (Nak)</td><td>Reserved</td><td>Reserved [7:4] | AckNak_Seq_Num[11:8]</td><td>AckNak_Seq_Num[7:0]</td><td colspan="2">16-bit CRC</td></tr>
+<tr><td>InitFC / UpdateFC</td><td>Type (class + VC ID)</td><td>[7:6] HdrScale or reserved | HdrFC[7:2]</td><td>HdrFC[1:0] | [5:4] DataScale or reserved | DataFC[11:8]</td><td>DataFC[7:0]</td><td colspan="2">16-bit CRC</td></tr>
+</tbody></table></div>
+<div class="table-wrap"><table>
+<thead><tr><th>DLLP</th><th>Type byte</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td>Ack</td><td>00h</td><td>Acknowledge all TLPs up to and including AckNak_Seq_Num</td></tr>
+<tr><td>Nak</td><td>10h</td><td>Report a bad/missing TLP after AckNak_Seq_Num; request replay from the next sequence number</td></tr>
+<tr><td>InitFC1-P / -NP / -Cpl</td><td>40h / 50h / 60h + VC</td><td>Flow-control initialization, first phase</td></tr>
+<tr><td>InitFC2-P / -NP / -Cpl</td><td>C0h / D0h / E0h + VC</td><td>Flow-control initialization, second phase</td></tr>
+<tr><td>UpdateFC-P / -NP / -Cpl</td><td>80h / 90h / A0h + VC</td><td>Return credits as receive buffers free up</td></tr>
+<tr><td>PM_Enter_L1, PM_Enter_L23, PM_Active_State_Request_L1, PM_Request_Ack</td><td>20h, 21h, 23h, 24h</td><td>Link power-management handshakes</td></tr>
+<tr><td>Vendor-specific</td><td>30h</td><td>Vendor use</td></tr>
+<tr><td>Data_Link_Feature</td><td>02h</td><td>Exchange of DLL feature support (e.g. scaled flow control) <span class="tag version">version</span> (4.0+)</td></tr>
+</tbody></table></div>
+<p>Type encodings listed are those widely documented for non-FLIT mode <span class="tag verified">verified</span>; confirm the full table, including reserved encodings, in your revision.</p>
+
+<h3>15.3 Sequence numbers, LCRC and the counters</h3>
+<p>Every TLP the Data Link Layer transmits gets a <b>12-bit sequence number</b> (0–4095, wrapping) and a <b>32-bit LCRC</b> computed over sequence number and TLP. The transmitter keeps it in the <b>replay buffer</b>. State (names as used in the spec):</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Side</th><th>Variable</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>Transmitter</td><td>NEXT_TRANSMIT_SEQ</td><td>Sequence number for the next new TLP</td></tr>
+<tr><td>Transmitter</td><td>ACKD_SEQ</td><td>Highest sequence number acknowledged</td></tr>
+<tr><td>Transmitter</td><td>REPLAY_NUM (2 bits)</td><td>How many times the current buffer contents were replayed without forward progress</td></tr>
+<tr><td>Transmitter</td><td>REPLAY_TIMER</td><td>Running while unacknowledged TLPs exist; expiry triggers replay</td></tr>
+<tr><td>Receiver</td><td>NEXT_RCV_SEQ</td><td>Sequence number expected next</td></tr>
+<tr><td>Receiver</td><td>NAK_SCHEDULED</td><td>A Nak has been sent and not yet resolved (prevents Nak floods)</td></tr>
+<tr><td>Receiver</td><td>AckNak_LATENCY_TIMER</td><td>Bounds how long the receiver may delay (coalesce) Acks</td></tr>
+</tbody></table></div>
+
+<h3>15.4 Receiver rules (simplified)</h3>
+<ol>
+<li>LCRC bad (or framing/physical error affecting the TLP) → discard, report Bad TLP, send Nak with NEXT_RCV_SEQ − 1 (if NAK_SCHEDULED is clear), set NAK_SCHEDULED.</li>
+<li>LCRC good, sequence = NEXT_RCV_SEQ → forward TLP to Transaction Layer, increment NEXT_RCV_SEQ, clear NAK_SCHEDULED, schedule an Ack (may be coalesced).</li>
+<li>LCRC good, sequence earlier than expected (a duplicate from replay) → discard silently, schedule an Ack (so the transmitter can purge).</li>
+<li>LCRC good, sequence later than expected (a gap — a TLP was lost) → discard, report Bad TLP, Nak.</li>
+</ol>
+<h3>15.5 Transmitter rules (simplified)</h3>
+<ol>
+<li>Ack n → purge replay buffer entries ≤ n; if progress was made, reset REPLAY_NUM and restart REPLAY_TIMER (or stop it if buffer empty).</li>
+<li>Nak n → purge entries ≤ n, then replay all remaining entries in order; increment REPLAY_NUM.</li>
+<li>REPLAY_TIMER expires → replay all unacknowledged TLPs; increment REPLAY_NUM; report Replay Timer Timeout (correctable).</li>
+<li>REPLAY_NUM rolls over (00b after 11b, i.e. the fourth replay of the same contents) → report REPLAY_NUM Rollover (correctable) and direct the Physical Layer to retrain the link (Recovery) <span class="tag verified">verified</span>.</li>
+<li>Ack/Nak with a sequence number outside the window of outstanding TLPs → Data Link Protocol Error (uncorrectable, fatal by default).</li>
+</ol>
+<p>The replay buffer must hold at least a link round trip's worth of TLPs at full rate, or the transmitter stalls waiting for Acks even on a perfect link — a design parameter, implementation-dependent <span class="tag impl">impl</span>. REPLAY_TIMER and Ack latency limits are specified as functions of link width, speed and max payload <span class="tag verified">verified</span> (table values vary by revision).</p>
+
+<h3>15.6 ACK/NAK replay timeline</h3>
+<figure class="diagram"><svg viewBox="0 0 800 470" role="img" aria-label="ACK/NAK replay timeline: transmitter sends TLPs 10 to 13, TLP 11 corrupted, receiver sends Ack 10 and Nak 10, transmitter replays 11 to 13, receiver acks 13.">
+<text class="lbl" x="130" y="24" text-anchor="middle">Transmitter (SSD DLL)</text>
+<text class="lbl" x="670" y="24" text-anchor="middle">Receiver (Root Port DLL)</text>
+<line class="ln" x1="130" y1="35" x2="130" y2="460"/><line class="ln" x1="670" y1="35" x2="670" y2="460"/>
+<line class="ln" x1="130" y1="50" x2="670" y2="80" marker-end="url(#arrow)"/><text class="lbl small" x="300" y="56">TLP seq 10</text><text class="lbl small" x="680" y="84">OK → TL, NEXT_RCV=11</text>
+<line class="ln" x1="130" y1="80" x2="670" y2="110" marker-end="url(#arrow)"/><text class="lbl small" x="300" y="86">TLP seq 11 ✗ (bit error)</text><text class="lbl small" x="680" y="114">LCRC bad → discard</text>
+<line class="ln" x1="130" y1="110" x2="670" y2="140" marker-end="url(#arrow)"/><text class="lbl small" x="300" y="116">TLP seq 12</text><text class="lbl small" x="680" y="144">gap (want 11) → discard</text>
+<line class="ln" x1="130" y1="140" x2="670" y2="170" marker-end="url(#arrow)"/><text class="lbl small" x="300" y="146">TLP seq 13</text><text class="lbl small" x="680" y="174">gap → discard</text>
+<line class="ln" x1="670" y1="125" x2="130" y2="195" marker-end="url(#arrow)"/><text class="lbl small" x="420" y="175">Nak 10 (= "10 ok, resend from 11")</text>
+<rect class="box alt" x="10" y="200" width="115" height="44" rx="4"/><text class="lbl small" x="68" y="218" text-anchor="middle">purge ≤10</text><text class="lbl small" x="68" y="236" text-anchor="middle">REPLAY_NUM=1</text>
+<line class="ln" x1="130" y1="250" x2="670" y2="280" marker-end="url(#arrow)"/><text class="lbl small" x="300" y="256">replay seq 11</text><text class="lbl small" x="680" y="284">OK, NEXT_RCV=12</text>
+<line class="ln" x1="130" y1="280" x2="670" y2="310" marker-end="url(#arrow)"/><text class="lbl small" x="300" y="286">replay seq 12</text><text class="lbl small" x="680" y="314">OK</text>
+<line class="ln" x1="130" y1="310" x2="670" y2="340" marker-end="url(#arrow)"/><text class="lbl small" x="300" y="316">replay seq 13</text><text class="lbl small" x="680" y="344">OK, NEXT_RCV=14</text>
+<line class="ln" x1="130" y1="340" x2="670" y2="370" marker-end="url(#arrow)"/><text class="lbl small" x="300" y="346">new TLP seq 14</text><text class="lbl small" x="680" y="374">OK</text>
+<line class="ln" x1="670" y1="380" x2="130" y2="420" marker-end="url(#arrow)"/><text class="lbl small" x="420" y="398">Ack 14 (coalesced)</text>
+<rect class="box alt" x="10" y="425" width="115" height="30" rx="4"/><text class="lbl small" x="68" y="445" text-anchor="middle">purge ≤14, NUM=0</text>
+</svg><figcaption>Figure 15.1 — Go-back-N replay in non-FLIT mode <span class="tag conceptual">conceptual</span>. The cost of one corrupted TLP is the retransmission of every TLP sent after it within one Nak round trip.</figcaption></figure>
+
+<h3>15.7 CRC: LCRC, DLLP CRC, ECRC — who protects what</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Check</th><th>Size</th><th>Covers</th><th>Scope</th><th>On failure</th></tr></thead>
+<tbody>
+<tr><td>LCRC</td><td>32 bit</td><td>Seq# + TLP</td><td>One link</td><td>Nak + replay; Bad TLP (correctable)</td></tr>
+<tr><td>DLLP CRC</td><td>16 bit</td><td>DLLP content</td><td>One link</td><td>DLLP discarded; Bad DLLP (correctable); recovered by later DLLPs/timers</td></tr>
+<tr><td>ECRC</td><td>32 bit</td><td>Invariant TLP fields + data</td><td>End to end</td><td>ECRC Error (uncorrectable); no automatic retry</td></tr>
+<tr><td>FLIT CRC + FEC (6.0 FLIT mode)</td><td>8 B CRC + 6 B FEC per 256 B FLIT</td><td>Whole FLIT</td><td>One link</td><td>FEC corrects; CRC failure → FLIT retry <span class="tag version">version</span></td></tr>
+</tbody></table></div>
+
+<h3>15.8 Flow-control concepts in the DLL</h3>
+<p>The DLL is the courier for credit information: InitFC1/InitFC2 DLLPs exchange initial credits right after the link reaches L0 (DL_Init), and UpdateFC DLLPs return credits during operation. Until all required FC initialization completes for VC0, the link is not DL_Active and no TLPs flow — "link up but no traffic" can be an FC-initialization problem. The meaning of the credits belongs to the Transaction Layer: <a href="#p2-ch16-flow-control">Chapter 16</a>.</p>
+
+<h3>15.9 Hardware view</h3>
+<div class="callout hw"><div class="callout-title">🔧 Hardware</div><p>The replay buffer is SRAM inside each port's DLL; its size, Ack coalescing policy and replay timer settings are design choices within spec limits <span class="tag impl">impl</span>. A switch has a DLL per port; replays on the SSD's link are invisible on the uplink. Internal: buffer occupancy, ACK scheduling. Observable: DLLPs on the link (analyzer), AER correctable status (Bad TLP, Bad DLLP, Replay Timer Timeout, REPLAY_NUM Rollover, Receiver Error) and, on some devices, vendor counters.</p></div>
+
+<h3>15.10 Traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: coalesced Acks</div><div class="table-wrap"><table>
+<thead><tr><th>t (ns)</th><th>Dir</th><th>Packet</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↑</td><td>TLP seq 200 MWr 256 B</td><td></td></tr>
+<tr><td>36</td><td>↑</td><td>TLP seq 201</td><td></td></tr>
+<tr><td>72</td><td>↑</td><td>TLP seq 202</td><td></td></tr>
+<tr><td>110</td><td>↓</td><td>Ack 201</td><td>Acks cover multiple TLPs</td></tr>
+<tr><td>108–400</td><td>↑</td><td>TLP seq 203–210</td><td></td></tr>
+<tr><td>420</td><td>↓</td><td>Ack 209</td><td>No replays; replay buffer drains steadily</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: periodic Nak on a marginal link</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>Packet</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0.00</td><td>↑</td><td>TLP seq 512–520</td><td></td></tr>
+<tr class="first-bad"><td>0.35</td><td>↓</td><td>Nak 515</td><td>seq 516 arrived with bad LCRC</td></tr>
+<tr class="bad"><td>0.36–0.52</td><td>↑</td><td>TLP seq 516–520 (replayed), 521…</td><td>Duplicate sequence numbers = replay signature; ~5 TLPs resent</td></tr>
+<tr><td>…</td><td></td><td>Repeats every ~50 µs</td><td>≈ 1 error per 50 µs × 7.9 GB/s ≈ 1 per 400 KB; ~0.3% bandwidth lost plus latency jitter</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: replay rollover → Recovery</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>TLP seq 900 sent; no Ack</td><td>Acks being corrupted in the other direction</td></tr>
+<tr><td>+T<sub>replay</sub></td><td>Replay #1 (REPLAY_NUM=1)</td><td>Replay Timer Timeout</td></tr>
+<tr><td>+2T</td><td>Replay #2</td><td></td></tr>
+<tr><td>+3T</td><td>Replay #3</td><td></td></tr>
+<tr class="first-bad"><td>+4T</td><td>REPLAY_NUM rollover → LTSSM L0 → Recovery</td><td>Correctable REPLAY_NUM Rollover; retrain</td></tr>
+<tr class="bad"><td>+4T + µs</td><td>Recovery fails RcvrLock 24 ms → Detect</td><td>Link down → Surprise Down; NVMe controller lost</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: same sequence number seen twice</div><div class="table-wrap"><table>
+<thead><tr><th>Observation</th><th>Explanations</th><th>Evidence needed</th></tr></thead>
+<tbody>
+<tr><td>TLP seq 77 appears twice, no Nak captured</td><td>(a) timer-based replay after a lost Ack; (b) Nak was corrupted at the analyzer probe only; (c) analyzer duplicates on capture-buffer boundary</td><td>Reverse-direction capture quality, timing vs replay timer, AER Replay Timer Timeout bit. Insufficient trace evidence to choose.</td></tr>
+</tbody></table></div></div>
+
+<h3>15.11 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code># Correctable error status bits: RxErr BadTLP BadDLLP Rollover Timeout NonFatalErr
+sudo lspci -vv -s 0000:00:01.1 | grep -E 'CESta|CEMsk'
+sudo lspci -vv -s 0000:03:00.0 | grep -E 'CESta|CEMsk'
+# Cumulative counts (kernel AER statistics, if available)
+cat /sys/bus/pci/devices/0000:03:00.0/aer_dev_correctable</code></pre>
+<p>Illustrative format of the sysfs counter file <span class="tag synthetic">synthetic</span>: lines such as <code>RxErr 0</code>, <code>BadTLP 12</code>, <code>BadDLLP 0</code>, <code>Rollover 0</code>, <code>Timeout 1</code>, <code>TOTAL_ERR_COR 13</code>. <b>Can prove:</b> errors were detected and reported (subject to masks; masked errors are not counted). <b>Cannot prove:</b> how many TLPs were replayed in total, or the error distribution over time. Note which side reports what: Bad TLP is reported by the <i>receiver</i> of the damaged TLP; Replay Timer Timeout by the <i>transmitter</i>.</p>
+
+<h3>15.12 Five DLL failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Possible causes</th><th>Evidence</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Conclusion (confidence)</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>BadTLP climbing at root port only</td><td>SSD transmitter / upstream channel</td><td>RP correctable counters</td><td>SSD-side RxErr</td><td>Temperature/speed</td><td>Drop link speed (test)</td><td>Upstream-direction SI (medium)</td></tr>
+<tr><td>2</td><td>Replay Timer Timeouts, few BadTLP</td><td>Acks lost (corrupted DLLPs in reverse direction), replay timer misconfigured</td><td>Timeout bit at transmitter</td><td>BadDLLP count at the transmitter (it receives the Acks)</td><td>Ack latency on analyzer</td><td>Compare both directions' error bits at both ends</td><td>Reverse-direction errors (medium)</td></tr>
+<tr><td>3</td><td>Periodic latency spikes, no throughput loss</td><td>Replays on idle-ish link</td><td>Correctable bursts</td><td>Timestamps vs spikes</td><td>ASPM state changes</td><td>Disable ASPM (test)</td><td>Replay-induced jitter (medium)</td></tr>
+<tr><td>4</td><td>Link retrains under load</td><td>REPLAY_NUM rollover</td><td>Rollover bit</td><td>Link Bandwidth Mgmt Status</td><td>LnkSta changes</td><td>Stress test at lower speed</td><td>Marginal link (high)</td></tr>
+<tr><td>5</td><td>Uncorrectable DL Protocol Error</td><td>Design bug (bad Ack seq)</td><td>UESta DLP</td><td>Device/firmware version</td><td>Analyzer Ack sequence</td><td>Vendor escalation</td><td>Implementation bug (medium)</td></tr>
+</tbody></table></div>
+
+<div class="lab"><div class="lab-head">🧪 Lab 15.1 — Simulate Ack/Nak and replay <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> observe go-back-N cost as bit error rate rises.</p>
+<pre class="code" data-kind="simulation"><code>import random
+def run(n_tlps=100000, p_err=1e-4, window=16):
+    sent = 0; delivered = 0; nxt = 0
+    while delivered &lt; n_tlps:
+        burst = list(range(nxt, min(nxt + window, n_tlps)))
+        for i, seq in enumerate(burst):
+            sent += 1
+            if random.random() &lt; p_err:          # LCRC failure
+                sent += len(burst) - i - 1       # rest of window sent before Nak returns
+                nxt = seq                        # replay from bad TLP
+                break
+            delivered += 1; nxt = seq + 1
+    return sent / n_tlps
+for p in (1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
+    print(f"TLP error prob {p:g}: transmissions per TLP = {run(p_err=p):.4f}")</code></pre>
+<p><b>Questions:</b> at what TLP error probability does overhead exceed 10%? How does a larger window (longer round trip, faster link) change it?</p>
+<details class="answer"><summary>Solution</summary><p>Each error resends, on average, about half the window, so overhead ≈ p × window ÷ 2; with window 16 the simulation shows ~0.9% at p = 10<sup>−3</sup> and ~9% at p = 10<sup>−2</sup>, so 10% overhead appears near p ≈ 1.2×10<sup>−2</sup>. Larger in-flight windows (higher speed × same latency) multiply replay cost, which is one reason Gen6 moved to FEC plus FLIT retry.</p></details>
+<p><b>Extension:</b> add a REPLAY_NUM counter and count how often four consecutive failures would trigger retraining.</p></div>
+<div class="lab"><div class="lab-head">🧪 Lab 15.2 — Senior forensic: is this link safe for production? <span class="safety safe">SAFE</span></div>
+<p><b>Setup (synthetic evidence):</b> over 24 h, RP shows BadTLP 3,100, SSD shows RxErr 2,900, Rollover 0, no uncorrectable errors; link Gen4 x4; workload 3 GB/s average. <b>Questions:</b> error rate per byte? Risk? Action?</p>
+<details class="answer"><summary>Solution</summary><p>~3,000 errors per 86,400 s ≈ 0.035/s; at 3 GB/s that is roughly one error per 86 GB — corresponding to a bit error ratio around 10<sup>−12</sup>–10<sup>−13</sup> range, near the spec target <span class="tag derived">derived</span>. Errors in both directions suggest a shared channel element (connector, retimer, cable). No rollover → replay always succeeded. Risk: low for data integrity (LCRC + replay), measurable for tail latency; action: track trend, compare with sibling slots, inspect/reseat; escalate if rate grows or rollovers appear.</p></details></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Are DLLPs forwarded by switches?</p><details class="answer"><summary>Answer</summary><p>No, they are link-local.</p></details></li>
+<li><p>What does Nak 41 mean?</p><details class="answer"><summary>Answer</summary><p>TLPs up to 41 are good; replay starting at 42.</p></details></li>
+<li><p>What happens on the fourth replay without progress?</p><details class="answer"><summary>Answer</summary><p>REPLAY_NUM rollover → link retrain via Recovery.</p></details></li>
+<li><p>Why does a receiver Ack a duplicate TLP?</p><details class="answer"><summary>Answer</summary><p>To let the transmitter purge its replay buffer (the earlier Ack was probably lost).</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> Ack vs Completion? <details class="answer"><summary>Model answer</summary>Ack: link-level receipt confirmation of TLPs (DLLP). Completion: end-to-end response to a non-posted request (TLP).</details></li>
+<li><span class="lvl">Beginner</span> Sequence number size? <details class="answer"><summary>Model answer</summary>12 bits.</details></li>
+<li><span class="lvl">Beginner</span> What is the replay buffer? <details class="answer"><summary>Model answer</summary>Storage of sent, unacknowledged TLPs for retransmission.</details></li>
+<li><span class="lvl">Beginner</span> Is Bad TLP data loss? <details class="answer"><summary>Model answer</summary>No; it's recovered via replay.</details></li>
+<li><span class="lvl">Beginner</span> What does LCRC protect? <details class="answer"><summary>Model answer</summary>A TLP plus its sequence number across one link.</details></li>
+<li><span class="lvl">Intermediate</span> Why go-back-N? <details class="answer"><summary>Model answer</summary>Simple receiver: in-order acceptance only, no reordering buffer.</details></li>
+<li><span class="lvl">Intermediate</span> Why coalesce Acks? <details class="answer"><summary>Model answer</summary>Save bandwidth; bounded by AckNak latency timer.</details></li>
+<li><span class="lvl">Intermediate</span> What triggers Replay Timer Timeout? <details class="answer"><summary>Model answer</summary>No Ack/Nak progress within the replay timer period.</details></li>
+<li><span class="lvl">Intermediate</span> Which side reports Bad DLLP? <details class="answer"><summary>Model answer</summary>The receiver of the corrupted DLLP.</details></li>
+<li><span class="lvl">Intermediate</span> What is DL_Active? <details class="answer"><summary>Model answer</summary>DLL state after FC initialization; TLPs may flow.</details></li>
+<li><span class="lvl">Advanced</span> How big must the replay buffer be? <details class="answer"><summary>Model answer</summary>At least link bandwidth × Ack round trip (incl. Ack latency) to avoid stalls.</details></li>
+<li><span class="lvl">Advanced</span> How does FLIT mode change retry? <details class="answer"><summary>Model answer</summary>Retry per FLIT with FLIT sequence numbers, FEC corrects most errors first, selective retry options.</details></li>
+<li><span class="lvl">Advanced</span> Can DL errors cause NVMe timeouts? <details class="answer"><summary>Model answer</summary>Only indirectly: retrains/link loss stall traffic; replays alone add µs.</details></li>
+<li><span class="lvl">Advanced</span> What does a Data Link Protocol Error indicate? <details class="answer"><summary>Model answer</summary>Ack/Nak sequence outside outstanding window — protocol violation, usually design bug.</details></li>
+<li><span class="lvl">Advanced</span> Why does a replay on the SSD link not appear on the switch uplink? <details class="answer"><summary>Model answer</summary>DLL is per link; the switch absorbs it.</details></li>
+<li><span class="lvl">Senior</span> Set an alerting policy for correctable errors in a fleet. <details class="answer"><summary>Model answer</summary>Rate-based thresholds per link normalized by traffic, trend detection, immediate alert on rollover/recovery events or uncorrectables, correlation with slot/platform.</details></li>
+<li><span class="lvl">Senior</span> Customer masks correctable errors to silence logs. Risk? <details class="answer"><summary>Model answer</summary>Loses early warning of degrading links; masked errors still cost replays.</details></li>
+<li><span class="lvl">Senior</span> Errors only at Gen4, none at Gen3. Next steps? <details class="answer"><summary>Model answer</summary>Equalization review, margining, channel loss budget, retimer; decide production speed policy.</details></li>
+<li><span class="lvl">Senior</span> How do you prove a latency spike was caused by replay? <details class="answer"><summary>Model answer</summary>Analyzer timestamps of Nak/replay aligned with the slow command's TLPs; AER counter delta at the same time.</details></li>
+<li><span class="lvl">Senior</span> Why might ECRC still be worth enabling? <details class="answer"><summary>Model answer</summary>Detects corruption inside switches/RC between links, which LCRC cannot see; cost is 4 bytes per TLP and platform support.</details></li>
+</ol></div>
+<div class="callout remember"><div class="callout-title">📌 Teach-back</div><p>Child: "numbered packages, a photocopy kept until the depot says 'got it'." Junior: "12-bit seq + LCRC per TLP, Ack/Nak DLLPs, go-back-N replay, rollover → retrain." Senior: "correctable DLL errors are bandwidth and latency taxes with an escalation path to link loss; interpret both directions' counters."</p></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can draw the Ack/Nak replay timeline from memory.</li>
+<li>I can state receiver and transmitter rules including rollover.</li>
+<li>I can decode an Ack/Nak and FC DLLP layout.</li>
+<li>I can map AER correctable bits to DLL events and sides.</li>
+<li>I can distinguish DLL acknowledgement from TL completion.</li>
+</ul></div>
+<p><b>Next:</b> <a href="#p2-ch16-flow-control">Chapter 16 — flow control</a>.</p>
+</section>
+
+<section class="chapter" id="p2-ch16-flow-control" data-part="PART VI — PCIe DATA LINK LAYER">
+<h2><span class="num">16</span> PCIe Flow Control</h2>
+<h3>16.1 Why this chapter exists</h3>
+<p>PCIe never drops a TLP because a buffer is full. Instead, a transmitter may only send a TLP if the receiver has advertised enough buffer space — <b>credits</b>. When credits run out, the transmitter waits: <b>backpressure</b>. Credit sizing determines whether a link can run at full speed at all, and credit starvation is one of the few PCIe causes of "low throughput with no errors". For high-throughput NVMe — especially many drives behind a switch — this is where bandwidth quietly disappears.</p>
+<ul class="objectives">
+<li><b>Beginner:</b> explain credits and backpressure.</li>
+<li><b>Intermediate:</b> name the six credit types (PH, PD, NPH, NPD, CplH, CplD) and compute credits consumed by any TLP.</li>
+<li><b>Advanced:</b> run the initialization (InitFC1/InitFC2) and the transmitter gating arithmetic with modular counters; explain infinite credits.</li>
+<li><b>Senior:</b> size credits for bandwidth × credit-loop latency; diagnose starvation behind switches.</li>
+<li><b>Trace/debug/validation:</b> identify credit stalls in a synthetic trace and design an experiment that proves them.</li>
+</ul>
+<p><b>Prerequisites:</b> <a href="#p2-ch12-posted">posted/non-posted</a>, <a href="#p2-ch15-dllp">DLLPs</a>.</p>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>Your friend's toy box has room for 10 toys. Your friend gives you 10 tokens. Each toy you throw over costs a token. When you're out of tokens, you must wait. When your friend takes toys out of the box to play, they hand tokens back. Nobody ever throws a toy at a full box.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>There are six separate token jars (three traffic classes × header/data), per Virtual Channel, and big toys cost several data tokens (16 bytes each) plus one header token. Tokens are returned not one by one but as running totals in UpdateFC DLLPs, and counters wrap around, so the arithmetic is modular. Some jars are "infinite": the receiver promises it will always have room.</p></div>
+
+<h3>16.2 Credit types</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Credit</th><th>Unit</th><th>Consumed by</th><th>NVMe examples</th></tr></thead>
+<tbody>
+<tr><td><b>PH</b> — Posted Header</td><td>1 TLP header</td><td>Each MWr, Msg/MsgD</td><td>Doorbells (at the SSD), read-data writes, CQE and MSI-X writes (at the root port)</td></tr>
+<tr><td><b>PD</b> — Posted Data</td><td>16 bytes (4 DW)</td><td>MWr/MsgD payload, rounded up</td><td>256 B data write = 16 PD</td></tr>
+<tr><td><b>NPH</b> — Non-Posted Header</td><td>1 TLP header</td><td>MRd, CfgRd/Wr, IORd/Wr, AtomicOps</td><td>SSD's SQE/PRP/data reads at the root port</td></tr>
+<tr><td><b>NPD</b> — Non-Posted Data</td><td>16 bytes</td><td>CfgWr, IOWr, AtomicOp operands (MRd consumes none)</td><td>Config writes during enumeration</td></tr>
+<tr><td><b>CplH</b> — Completion Header</td><td>1 TLP header</td><td>Cpl, CplD</td><td>Completions returning to the SSD (endpoint: infinite)</td></tr>
+<tr><td><b>CplD</b> — Completion Data</td><td>16 bytes</td><td>CplD payload</td><td>Write data returning to the SSD</td></tr>
+</tbody></table></div>
+<p>Unit sizes and types <span class="tag verified">verified</span>. Credits are per Virtual Channel; most NVMe systems use only VC0.</p>
+<div class="formula">Credits(TLP) = 1 header credit of its class + ⌈ payload_bytes ÷ 16 ⌉ data credits of its class</div>
+<ul class="vars"><li><b>class</b> — Posted, Non-Posted or Completion, from the TLP type</li><li><b>payload_bytes</b> — data payload length (Length × 4); 0 for MRd and Cpl without data</li></ul>
+
+<h3>16.3 Initialization</h3>
+<p>After the Physical Layer reports LinkUp, the DLL enters DL_Init. <b>FC_INIT1:</b> each side repeatedly sends InitFC1-P, InitFC1-NP, InitFC1-Cpl for VC0, each carrying its receive buffer size in header and data credits. <b>FC_INIT2:</b> after recording the partner's values, each side sends InitFC2 DLLPs (confirming). When both complete, the link is DL_Active and TLPs may flow <span class="tag verified">verified</span>. An advertised value of <b>0</b> means <b>infinite</b> credits for that type: the receiver guarantees it can always absorb that traffic, and the transmitter never gates on it. Endpoints are required to advertise infinite completion credits (with spec-defined exceptions — confirm in your revision) <span class="tag verified">verified</span>; therefore an endpoint must only issue reads for which it has reserved completion buffer space.</p>
+<p>Field sizes: header credits 8 bits (max 127 usable in normal mode), data credits 12 bits (max 2047). PCIe 6.0 adds <b>Scaled Flow Control</b> (HdrScale/DataScale) to advertise larger values for high-speed links, negotiated through Data Link Feature exchange in 4.0+ ecosystems <span class="tag version">version</span>.</p>
+
+<h3>16.4 The gating arithmetic</h3>
+<p>Transmitter keeps, per type: <b>CREDIT_LIMIT (CL)</b> — the latest cumulative credits the receiver granted (from InitFC/UpdateFC) — and <b>CREDITS_CONSUMED (CC)</b> — cumulative credits used. Receiver keeps <b>CREDITS_ALLOCATED</b> (cumulative granted, sent in UpdateFC) and <b>CREDITS_RECEIVED</b> (for overflow checking). All are modular counters (2<sup>8</sup> for headers, 2<sup>12</sup> for data).</p>
+<div class="formula">Send allowed if: (CL − (CC + PTLP)) mod 2<sup>F</sup> ≤ 2<sup>F</sup> ÷ 2</div>
+<ul class="vars"><li><b>CL</b> — credit limit (cumulative, modular)</li><li><b>CC</b> — credits consumed so far (cumulative, modular)</li><li><b>PTLP</b> — credits this TLP needs</li><li><b>F</b> — field size: 8 for header, 12 for data</li></ul>
+<p>The "≤ half the range" test makes wraparound safe: as long as no more than half the counter space is outstanding, the subtraction correctly tells "enough" from "not enough" <span class="tag verified">verified</span>.</p>
+
+<h3>16.5 Worked flow-control example</h3>
+<p>Root port receive buffers (posted, VC0) <span class="tag synthetic">synthetic</span>: advertises PH = 32, PD = 256 (= 4 KiB). The SSD streams read data as MWr 256 B (1 PH + 16 PD each). Header counter F = 8 (mod 256), data F = 12 (mod 4096).</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Step</th><th>Event</th><th>PH CL</th><th>PH CC</th><th>PD CL</th><th>PD CC</th><th>Check for next TLP (PD): (CL − (CC+16)) mod 4096</th><th>Send?</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>InitFC: PH 32, PD 256</td><td>32</td><td>0</td><td>256</td><td>0</td><td>(256 − 16) = 240 ≤ 2048</td><td>Yes</td></tr>
+<tr><td>1</td><td>After 15 TLPs</td><td>32</td><td>15</td><td>256</td><td>240</td><td>(256 − 256) = 0 ≤ 2048</td><td>Yes (exactly enough)</td></tr>
+<tr class="first-bad"><td>2</td><td>After 16 TLPs</td><td>32</td><td>16</td><td>256</td><td>256</td><td>(256 − 272) mod 4096 = 4080 &gt; 2048</td><td><b>No — PD exhausted</b> (PH still has 16)</td></tr>
+<tr><td>3</td><td>UpdateFC-P: RC freed 8 TLPs' worth → CL PH 40, PD 384</td><td>40</td><td>16</td><td>384</td><td>256</td><td>(384 − 272) = 112</td><td>Yes</td></tr>
+<tr><td>4</td><td>After 8 more TLPs</td><td>40</td><td>24</td><td>384</td><td>384</td><td>(384 − 400) mod 4096 = 4080</td><td>No — wait</td></tr>
+<tr><td>…</td><td>Counters wrap: PD CL 4000 → 4112 mod 4096 = 16</td><td></td><td></td><td>16</td><td>4000</td><td>(16 − 4016) mod 4096 = 96 ≤ 2048</td><td>Yes — wrap handled</td></tr>
+</tbody></table></div>
+<p><b>Bandwidth consequence</b> <span class="tag derived">derived</span>: the credit loop time T<sub>loop</sub> is the time from the SSD sending a TLP until the matching UpdateFC returns (RC buffer drain + UpdateFC scheduling + link latency). Sustained throughput ≤ advertised data buffer ÷ T<sub>loop</sub>. With 4 KiB and T<sub>loop</sub> = 1 µs → ≤ 4.1 GB/s: a Gen4 x4 link (7.88 GB/s) would be held to roughly half speed. To sustain 7.88 GB/s with T<sub>loop</sub> = 1 µs requires ≥ 7.88 KB ≈ 493 PD credits. Real root ports advertise enough for their supported widths and speeds <span class="tag impl">impl</span>; switches with many ports and shared buffers are where sizing compromises appear.</p>
+<div class="formula">BW<sub>max</sub> ≈ (Data credits × 16 B) ÷ T<sub>loop</sub></div>
+<ul class="vars"><li><b>Data credits</b> — advertised (and refreshed) data credits for the class</li><li><b>T<sub>loop</sub></b> — credit round-trip time</li></ul>
+
+<h3>16.6 Starvation and backpressure</h3>
+<ul>
+<li><b>Backpressure</b> is normal: a slow receiver throttles a fast sender without loss. It propagates hop by hop: a congested root complex memory path → root port stops returning posted credits → switch upstream port queue fills → switch stops returning credits to the SSD's downstream port → SSD stalls.</li>
+<li><b>Head-of-line blocking:</b> within one credit class and VC, a TLP waiting for credits blocks those behind it in the same queue. Separate classes are why posted writes can bypass stalled non-posted reads (and the ordering rules require it, <a href="#p2-ch14-ordering">Chapter 14</a>).</li>
+<li><b>Starvation:</b> a requester that cannot get NPH credits cannot issue reads at all — e.g. many SSDs behind a switch sharing a root port's limited NP buffer; one device's flood of reads may delay others' reads (arbitration fairness is implementation-dependent <span class="tag impl">impl</span>).</li>
+<li><b>Header vs data starvation:</b> many small TLPs exhaust header credits first (e.g. 4 KiB random reads with small payloads, CQE writes, MSI-X); large TLPs exhaust data credits first.</li>
+</ul>
+
+<h3>16.7 How this affects high-throughput NVMe</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>NVMe flow</th><th>Credit pool consumed (receiver side)</th><th>Typical limiter</th></tr></thead>
+<tbody>
+<tr><td>Read command data (SSD → host MWr)</td><td>RP/switch PH + PD</td><td>RC posted buffer + memory write bandwidth; MPS (header credits per byte)</td></tr>
+<tr><td>Write command data fetch (SSD MRd)</td><td>RP NPH</td><td>NP buffer depth at RP; tags; RTT</td></tr>
+<tr><td>Write data return (CplD to SSD)</td><td>SSD CplH/CplD = infinite</td><td>SSD's own completion buffer reservation (internal)</td></tr>
+<tr><td>Doorbells, register writes</td><td>SSD PH/PD</td><td>Rarely limiting</td></tr>
+<tr><td>CQE + MSI-X</td><td>RP PH/PD</td><td>Header credits at high IOPS (2 small TLPs per I/O)</td></tr>
+</tbody></table></div>
+<p>At 2 million IOPS of 4 KiB reads, the root port receives per second ≈ 2 M × (16 data MWr + 1 CQE + 1 MSI-X) ≈ 36 M posted headers (fewer if CQEs/interrupts are coalesced) — header-credit turnover, not data bandwidth, can become the binding constraint on some fabrics <span class="tag derived">derived</span>.</p>
+
+<h3>16.8 Traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: steady UpdateFC cadence</div><div class="table-wrap"><table>
+<thead><tr><th>t (ns)</th><th>Dir</th><th>Packet</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0–540</td><td>↑</td><td>MWr ×15 (256 B)</td><td>Back-to-back</td></tr>
+<tr><td>300</td><td>↓</td><td>UpdateFC-P HdrFC=40 DataFC=384</td><td>Credits return before exhaustion</td></tr>
+<tr><td>600</td><td>↓</td><td>UpdateFC-P HdrFC=48 DataFC=512</td><td>No gaps: credit loop shorter than buffer drain</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: posted data credit stalls</div><div class="table-wrap"><table>
+<thead><tr><th>t (ns)</th><th>Dir</th><th>Packet</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0–576</td><td>↑</td><td>MWr ×16</td><td>PD exhausted at 576</td></tr>
+<tr class="first-bad"><td>576–1100</td><td>↑</td><td>(no TLPs; link idle except SKP/DLLPs)</td><td>Transmitter gated; ~45% idle</td></tr>
+<tr><td>1100</td><td>↓</td><td>UpdateFC-P</td><td>Late credit return: RC memory path congestion or under-sized buffer</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: FC initialization never completes</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>Packet</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↔</td><td>LTSSM reaches L0</td><td></td></tr>
+<tr><td>+ns</td><td>↓</td><td>InitFC1-P/NP/Cpl repeated</td><td>RP initializing</td></tr>
+<tr class="first-bad"><td>+µs…</td><td>↑</td><td>No InitFC1 from device (or Bad DLLP on each)</td><td>DL never becomes Active; DLActive- in RP LnkSta although LTSSM is in L0</td></tr>
+<tr class="bad"><td>later</td><td>—</td><td>Implementation-specific timeout → retrain / link down</td><td>"Link up, device missing" symptom</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: gaps between TLPs</div><div class="table-wrap"><table>
+<thead><tr><th>Observation</th><th>Explanations</th><th>Evidence needed</th></tr></thead>
+<tbody>
+<tr><td>SSD MWr stream shows 500 ns gaps every ~16 TLPs</td><td>(a) PD credit stall; (b) SSD internal NAND/DMA scheduling; (c) replay activity; (d) analyzer hiding DLLPs</td><td>UpdateFC timing relative to gaps; computed CL−CC at gap start; Nak presence. Without reverse-direction DLLPs: insufficient trace evidence.</td></tr>
+</tbody></table></div></div>
+
+<h3>16.9 Linux view</h3>
+<p>Linux has no standard interface exposing credit counters; <code>lspci</code> does not show advertised credits for VC0 (the Virtual Channel capability, when present, shows arbitration, not credit values) <span class="tag impl">impl</span>. Evidence is indirect: throughput vs link ceiling, <code>perf</code>/uncore PCIe counters on some CPUs (platform-specific events for inbound write bandwidth/occupancy) <span class="tag impl">impl</span>, and analyzer captures.</p>
+<pre class="code" data-kind="read-only inspection"><code># Indirect: link ceiling and MPS (credits per byte), then compare with measured bandwidth
+cat /sys/bus/pci/devices/0000:03:00.0/current_link_speed /sys/bus/pci/devices/0000:03:00.0/current_link_width
+sudo lspci -vv -s 0000:03:00.0 | grep -E 'MaxPayload'
+# Platform PCIe/IIO uncore events (names vary by CPU; list before using)
+perf list 2&gt;/dev/null | grep -i -E 'iio|pcie' | head</code></pre>
+
+<h3>16.10 Five flow-control failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Possible causes</th><th>Evidence</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Conclusion (confidence)</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Read throughput ~50–60% of link, no errors</td><td>Posted credit stall at RP/switch</td><td>Analyzer gaps aligned with UpdateFC</td><td>MPS (more headers at small MPS)</td><td>Other devices' traffic on same RP</td><td>Run SSD alone vs with neighbors</td><td>Credit/buffer limit (medium)</td></tr>
+<tr><td>2</td><td>Write throughput drops when neighbors read heavily</td><td>NPH starvation at shared RP</td><td>MRd issue gaps</td><td>Topology (shared RP/switch)</td><td>Per-device MRd rates</td><td>Move one SSD to another RP</td><td>NP starvation (medium)</td></tr>
+<tr><td>3</td><td>Link up, no TLPs, DLActive-</td><td>FC init failure</td><td>No InitFC from partner</td><td>LnkSta DLActive</td><td>BadDLLP counts</td><td>Swap device</td><td>Device DLL failure (medium)</td></tr>
+<tr><td>4</td><td>Flow Control Protocol Error / Receiver Overflow (fatal)</td><td>Credit accounting bug</td><td>UESta FCP / RxOF</td><td>Device firmware version</td><td>Reproduce with analyzer</td><td>Vendor update</td><td>Implementation bug (medium)</td></tr>
+<tr><td>5</td><td>High IOPS plateau far below rated, data BW low</td><td>Header credit turnover (many small TLPs)</td><td>Many small MWr (CQE/MSI)</td><td>Interrupt coalescing settings</td><td>CQE batching</td><td>Enable NVMe interrupt coalescing (test)</td><td>Header-bound (low-medium)</td></tr>
+</tbody></table></div>
+
+<div class="lab"><div class="lab-head">🧪 Lab 16.1 — Credit-gated link simulator <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> show how advertised data credits and credit-loop latency cap throughput.</p>
+<pre class="code" data-kind="simulation"><code>def throughput(pd_credits, loop_ns, link_gbps=7.88, payload=256):
+    tlp_ns = (payload + 24) / link_gbps        # wire time per TLP (bytes / (bytes/ns))
+    per_tlp = payload // 16                      # PD credits per TLP
+    t, cc, cl, returns, sent = 0.0, 0, pd_credits, [], 0
+    while t &lt; 200_000:                         # 200 us of simulated time
+        while returns and returns[0][0] &lt;= t:    # credits come back after loop_ns
+            cl += returns.pop(0)[1]
+        if cl - cc &gt;= per_tlp:
+            cc += per_tlp; sent += 1
+            returns.append((t + loop_ns, per_tlp)); t += tlp_ns
+        else:
+            t = returns[0][0]                    # stall until next UpdateFC
+    return sent * payload / t                    # GB/s
+for credits in (128, 256, 512, 1024):
+    print(credits, "PD credits:", round(throughput(credits, loop_ns=1000), 2), "GB/s")</code></pre>
+<p><b>Questions:</b> at what credit count does throughput reach the link limit? How does doubling loop latency change it?</p>
+<details class="answer"><summary>Solution</summary><p>Throughput ≈ min(link, credits × 16 B / loop). With a 1 µs loop: 128 → ~2 GB/s, 256 → ~4.1 GB/s, 512 → link-limited ~7.2 GB/s (payload efficiency 256/280 of 7.88). Doubling the loop halves the credit-limited throughput — why buffers must scale with speed × latency (and why 6.0 added scaled credits).</p></details>
+<p><b>Extension:</b> add header credits and 64-byte TLPs to show header-bound behavior.</p></div>
+<div class="lab"><div class="lab-head">🧪 Lab 16.2 — Advanced: prove a shared-root-port credit bottleneck <span class="safety caution">CAUTION</span></div>
+<p><b>Objective:</b> experimentally separate SSD limits from fabric credit limits. <b>Prerequisites:</b> two or more SSDs (test data only), read-only fio. <b>Procedure:</b> (1) measure each SSD alone; (2) run both under the same root port; (3) run both under different root ports; (4) vary block size (4 KiB vs 128 KiB) to shift header vs data pressure. <b>Expected reasoning:</b> if the pair under one RP loses more than its link sum would predict while the split pair scales, a shared fabric resource — possibly credits/buffers — limits; it cannot be attributed to credits specifically without an analyzer or uncore counters.</p>
+<details class="answer"><summary>Solution</summary><p>State the conclusion with its confidence: "shared upstream resource" (high) vs "credit buffer specifically" (low without DLLP evidence). This is the evidence discipline of Part IV–VI in one sentence.</p></details></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Credits consumed by a CfgWr of 4 bytes?</p><details class="answer"><summary>Answer</summary><p>1 NPH + 1 NPD.</p></details></li>
+<li><p>Credits consumed by a 512-byte CplD?</p><details class="answer"><summary>Answer</summary><p>1 CplH + 32 CplD.</p></details></li>
+<li><p>What does an advertised value of 0 mean in InitFC?</p><details class="answer"><summary>Answer</summary><p>Infinite credits.</p></details></li>
+<li><p>Why the "≤ half the range" check?</p><details class="answer"><summary>Answer</summary><p>Safe comparison of wrapping modular counters.</p></details></li>
+<li><p>Which credits does an NVMe read-data stream use at the root port?</p><details class="answer"><summary>Answer</summary><p>PH and PD.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> What is credit-based flow control? <details class="answer"><summary>Model answer</summary>Receiver advertises buffer space; sender transmits only within it; no drops.</details></li>
+<li><span class="lvl">Beginner</span> Name the six credit types. <details class="answer"><summary>Model answer</summary>PH, PD, NPH, NPD, CplH, CplD.</details></li>
+<li><span class="lvl">Beginner</span> Size of one data credit? <details class="answer"><summary>Model answer</summary>16 bytes.</details></li>
+<li><span class="lvl">Beginner</span> Which DLLP returns credits? <details class="answer"><summary>Model answer</summary>UpdateFC.</details></li>
+<li><span class="lvl">Beginner</span> What is backpressure? <details class="answer"><summary>Model answer</summary>A full receiver stopping the sender via credits.</details></li>
+<li><span class="lvl">Intermediate</span> Why do endpoints advertise infinite completion credits? <details class="answer"><summary>Model answer</summary>Completions must never be blocked (deadlock avoidance); the requester pre-reserves space before issuing reads.</details></li>
+<li><span class="lvl">Intermediate</span> What's FC_INIT1 vs FC_INIT2? <details class="answer"><summary>Model answer</summary>Phase 1 advertises; phase 2 confirms both sides recorded values.</details></li>
+<li><span class="lvl">Intermediate</span> How does MPS affect header credits? <details class="answer"><summary>Model answer</summary>Smaller MPS → more TLPs per byte → more header credits.</details></li>
+<li><span class="lvl">Intermediate</span> Can posted traffic stall because NP credits are exhausted? <details class="answer"><summary>Model answer</summary>No, separate pools; posted must be able to pass.</details></li>
+<li><span class="lvl">Intermediate</span> Where do you see credit stalls? <details class="answer"><summary>Model answer</summary>Analyzer: idle gaps with pending traffic aligned to UpdateFC arrivals.</details></li>
+<li><span class="lvl">Advanced</span> Compute credits needed for 15.75 GB/s with 1.5 µs loop. <details class="answer"><summary>Model answer</summary>15.75e9 × 1.5e-6 = 23.6 KB ≈ 1477 data credits — near the 12-bit (2047) limit; motivates scaled FC at higher speeds.</details></li>
+<li><span class="lvl">Advanced</span> What is Receiver Overflow? <details class="answer"><summary>Model answer</summary>Receiver got more than it advertised — transmitter accounting bug; fatal by default.</details></li>
+<li><span class="lvl">Advanced</span> How do switches handle credits? <details class="answer"><summary>Model answer</summary>Each port advertises its own buffers; credits are per link; internal arbitration maps ingress to egress.</details></li>
+<li><span class="lvl">Advanced</span> What did 6.0 change? <details class="answer"><summary>Model answer</summary>Scaled FC, FLIT-mode shared credit pools, DLP-carried FC info (version-dependent details).</details></li>
+<li><span class="lvl">Advanced</span> Header vs data starvation example? <details class="answer"><summary>Model answer</summary>High-IOPS small writes/CQEs exhaust PH; large DMA exhausts PD.</details></li>
+<li><span class="lvl">Senior</span> Eight Gen4 SSDs behind a switch deliver 30% less than predicted. Plan. <details class="answer"><summary>Model answer</summary>Compute uplink ceiling; check MPS; per-SSD solo vs group; analyzer on uplink for UpdateFC cadence; vendor switch buffer configuration; consider spreading across RPs.</details></li>
+<li><span class="lvl">Senior</span> How would you validate a new root port design's credit sizing? <details class="answer"><summary>Model answer</summary>Model BW × loop latency for all widths/speeds/MPS, test with traffic generator at worst-case MPS and mixed classes, verify no gaps at line rate.</details></li>
+<li><span class="lvl">Senior</span> Can credits cause unfairness between SSDs? <details class="answer"><summary>Model answer</summary>Yes, via shared buffers and arbitration policies at switches/RC; implementation-dependent.</details></li>
+<li><span class="lvl">Senior</span> What evidence is needed before blaming flow control? <details class="answer"><summary>Model answer</summary>DLLP-level capture showing gaps aligned with credit exhaustion; otherwise only "shared resource" can be claimed.</details></li>
+<li><span class="lvl">Senior</span> Why does a Gen5 SSD in a Gen5 slot behind a Gen4-era switch underperform? <details class="answer"><summary>Model answer</summary>Link speed mismatch, buffers sized for lower BW × latency, header credits at high IOPS.</details></li>
+</ol></div>
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>Flow control problems never show up in error logs. If the link is healthy, the SSD is fast in isolation, and the CPU is idle, but bandwidth is missing — think credits and shared buffers, and go get DLLP-level evidence before you say so.</p></div>
+<div class="callout remember"><div class="callout-title">📌 Teach-back</div><p>Child: "tokens for space in the toy box." Junior: "six credit types, header = 1 per TLP, data = 16 B units; InitFC then UpdateFC; modular gating; 0 = infinite." Senior: "throughput ≤ credits × 16 B / loop latency; starvation and HOL blocking happen per class at shared ports; prove with DLLP timing."</p></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can compute credits for any TLP.</li>
+<li>I can run the modular gating example including wraparound.</li>
+<li>I can derive the credit-limited throughput formula and apply it.</li>
+<li>I can explain starvation, backpressure and HOL blocking in an NVMe topology.</li>
+<li>I can state what Linux can and cannot show about credits.</li>
+<li>I can cite the Flow Control sections of the PCIe Base Specification as the normative source.</li>
+</ul></div>
+<h3>16.11 Parts IV–VI summary</h3>
+<p>You now hold the full PCIe picture an NVMe engineer needs: a tree of point-to-point links (Ch 4) made of differential lanes (Ch 5) at generation-specific rates and encodings (Ch 6), organized in three layers (Ch 7), trained by the LTSSM with TS1/TS2 and equalization (Ch 8–9), carrying TLPs (Ch 10–11) that are posted or non-posted (Ch 12), matched by tags (Ch 13), constrained by ordering (Ch 14), delivered reliably by Ack/Nak and replay (Ch 15), and paced by credits (Ch 16). When something goes wrong, a useful heuristic (not an absolute rule) is to start at the bottom: is the link up and healthy? Are transactions completing? Only then move up into NVMe queues and commands.</p>
+<p><b>Further reading:</b> PCI Express Base Specification (Data Link Layer; Flow Control; Transaction Ordering); Linux <code>Documentation/PCI/pcieaer-howto.rst</code>. <b>Next:</b> the following Part of this book builds the NVMe controller on top of this PCIe foundation.</p>
+</section>

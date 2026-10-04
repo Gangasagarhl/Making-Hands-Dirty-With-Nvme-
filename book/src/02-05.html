@@ -1,0 +1,436 @@
+<section class="chapter" id="p2-ch12-posted" data-part="PART V — PCIe TRANSACTION LAYER">
+<h2><span class="num">12</span> Posted vs Non-Posted Transactions (and Completions)</h2>
+<h3>12.1 Why this chapter exists</h3>
+<p>The posted/non-posted distinction explains three things every NVMe engineer must understand: why ringing a doorbell is cheap for the CPU but reading a register is expensive; why an SSD's write throughput depends on how many reads it can keep in flight; and why errors on writes are reported "somewhere else, later". It also hosts the deep dive on completions: status codes, splitting, timeouts and the configuration-retry mechanism used while a freshly reset SSD boots.</p>
+<ul class="objectives">
+<li><b>Beginner:</b> define posted, non-posted, completion, and classify every TLP type.</li>
+<li><b>Intermediate:</b> connect doorbells (posted) and DMA reads (non-posted) to NVMe performance.</li>
+<li><b>Advanced:</b> explain completion status codes, split completions, RCB, Completion Timeout ranges, CRS/RRS.</li>
+<li><b>Senior:</b> reason about error visibility for posted writes and design flushes (read-after-write) correctly.</li>
+<li><b>Trace/debug/validation:</b> find missing or erroneous completions and decide whether a timeout is real.</li>
+</ul>
+<p><b>Prerequisites:</b> <a href="#p2-ch10-tlps">Chapter 10</a>, <a href="#p2-ch11-header">Chapter 11</a>.</p>
+
+<h3>12.2 Story and analogy</h3>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>A <b>posted</b> transaction is sending a <b>postcard</b>: you drop it in the box and walk away. You never hear back, and you don't wait. A <b>non-posted</b> transaction is <b>asking a librarian a question</b>: you hand over your question with your name and a ticket number, and you must wait (or do other things) until the librarian comes back with an answer slip carrying your name and ticket number. That answer slip is the <b>completion</b>.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>Postcards can be lost silently; posted TLPs are delivered reliably link by link, and if the destination rejects one, an error <i>message</i> goes to the root complex (not to the sender as a reply). The librarian may answer in several slips (split completions), and if you wait too long, <i>you</i> declare a timeout — the librarian never says "I give up". Also, a non-posted <i>write</i> exists (config writes): a question whose answer is just "done".</p></div>
+
+<h3>12.3 The classification</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Category</th><th>TLPs</th><th>Completion returned?</th><th>Requester waits?</th><th>Flow-control credit class</th><th>Error reporting</th></tr></thead>
+<tbody>
+<tr><td><b>Posted</b></td><td>MWr, Msg/MsgD</td><td>No</td><td>No — retires as soon as credits allow transmission</td><td>PH / PD</td><td>Completer logs error and sends ERR_* Message to RC; sender learns nothing directly</td></tr>
+<tr><td><b>Non-posted</b></td><td>MRd, MRdLk, IORd/IOWr, CfgRd0/1, CfgWr0/1, AtomicOps</td><td>Yes, always (success or error)</td><td>Must track until completion or timeout</td><td>NPH / NPD</td><td>Completion status (UR/CA/CRS) to requester + possibly ERR_* messages</td></tr>
+<tr><td><b>Completion</b></td><td>Cpl, CplD, CplLk, CplDLk</td><td>— (is the response)</td><td>—</td><td>CplH / CplD</td><td>Unexpected Completion at receiver if no matching request</td></tr>
+</tbody></table></div>
+<p>Classification <span class="tag verified">verified</span>. Why posted writes exist: waiting a full round trip (often ~0.5–2 µs through a root complex) for every write would destroy write throughput; memory writes are therefore "fire and forget" with ordering guarantees instead of acknowledgements.</p>
+
+<h3>12.4 Connection to NVMe: doorbells and DMA</h3>
+<h4>Doorbells are posted</h4>
+<p>When the NVMe driver writes the SQ tail doorbell, the CPU store becomes a MWr. The CPU core does not wait for the SSD; the store retires once the write is accepted into the uncached write path. Consequences:</p>
+<ul>
+<li>Doorbell writes are cheap for the CPU (tens to hundreds of ns of core time, platform-dependent <span class="tag impl">impl</span>), which is why NVMe's design of "one MMIO write per batch of commands" scales.</li>
+<li>The driver gets no confirmation the doorbell arrived. If the SSD is gone, the write vanishes into a UR (or is dropped by a downstream port with link down) and the only symptom is a command timeout later.</li>
+<li>Host-side ordering between writing the SQE into host memory and ringing the doorbell is a <b>CPU memory-ordering</b> problem (Linux uses write barriers before MMIO writes, e.g. <code>writel()</code> semantics include ordering against prior normal memory writes <span class="tag verified">verified</span> for Linux's documented MMIO accessor rules), not a PCIe ordering problem.</li>
+</ul>
+<h4>Register reads are non-posted</h4>
+<p>Reading CSTS, CAP or any BAR register stalls the CPU core for a full round trip: MRd down, CplD up. Polling CSTS in a hot path is expensive; NVMe uses CQ phase tags in host memory precisely so that the data path needs <b>no MMIO reads at all</b>. A read is also a <b>flush</b>: because a read request must not pass earlier posted writes in the same direction (<a href="#p2-ch14-ordering">Chapter 14</a>), reading any register of a device after writing to it guarantees the earlier writes reached the device (on that path) before the read's completion returns.</p>
+<h4>DMA: reads are non-posted, writes are posted</h4>
+<ul>
+<li><b>NVMe Read command</b> (data to host): the SSD issues posted MWr TLPs — throughput limited mainly by link bandwidth and posted credits.</li>
+<li><b>NVMe Write command</b> (data from host): the SSD issues non-posted MRd TLPs and waits for CplD — throughput limited by <b>outstanding read bytes ÷ round-trip latency</b> (Little's law), i.e. by tags, MRRS, completion buffering, and host memory latency.</li>
+<li>SQE fetches, PRP list and SGL fetches are reads: on a long-latency path (remote NUMA, IOMMU miss) they add directly to command latency.</li>
+</ul>
+<div class="formula">Throughput<sub>read-DMA</sub> ≤ (N<sub>outstanding</sub> × S<sub>request</sub>) ÷ RTT</div>
+<ul class="vars"><li><b>N<sub>outstanding</sub></b> — number of MRd requests in flight (bounded by tags and completion buffer space)</li>
+<li><b>S<sub>request</sub></b> — bytes per read request (≤ MRRS)</li>
+<li><b>RTT</b> — time from MRd transmission to the last CplD for it</li></ul>
+<p>Example <span class="tag derived">derived</span>: RTT = 1.2 µs, MRRS = 512 B, target 7 GB/s → N ≥ 7×10<sup>9</sup> × 1.2×10<sup>−6</sup> / 512 ≈ 16.4 → at least 17 reads in flight. With 32 tags this is easy; at RTT = 4 µs it needs 55.</p>
+
+<h3>12.5 Completions deep dive</h3>
+<h4>Completion status</h4>
+<div class="table-wrap"><table>
+<thead><tr><th>Status</th><th>Code</th><th>Meaning</th><th>Typical NVMe-context cause</th></tr></thead>
+<tbody>
+<tr><td>SC</td><td>000b</td><td>Successful Completion</td><td>Normal</td></tr>
+<tr><td>UR</td><td>001b</td><td>Unsupported Request</td><td>Address not decoded by any BAR/window; Memory Space Enable or Bus Master Enable cleared; config read to absent function; IOMMU-blocked DMA on some platforms <span class="tag impl">impl</span></td></tr>
+<tr><td>CRS (RRS in 6.0+)</td><td>010b</td><td>Configuration Request Retry Status</td><td>Device not yet ready after reset (firmware still booting); only valid for config requests</td></tr>
+<tr><td>CA</td><td>100b</td><td>Completer Abort</td><td>Completer understood but refused (internal error, violation of its programming model)</td></tr>
+</tbody></table></div>
+<p><b>CRS</b> lets a device that has just been reset say "ask again". With CRS Software Visibility enabled in the root port, a config read of the Vendor ID returns a special value (0001h) to software so the OS can poll instead of the hardware retrying invisibly <span class="tag verified">verified</span>. After a conventional reset, devices are allowed a defined period (commonly cited 1 s) before they must answer config requests successfully <span class="tag version">version</span>; SSDs whose firmware takes long to boot rely on this.</p>
+<h4>Split completions and RCB</h4>
+<p>A read may be answered by several completions. Rules (simplified <span class="tag verified">verified</span>): each CplD ≤ MPS; completions for a single request are returned in increasing address order; if split, each completion except the last must end on a naturally aligned Read Completion Boundary (64 or 128 bytes; root complexes report their RCB, endpoints are configured via Link Control); Byte Count and Lower Address let the requester place data (worked example in <a href="#p2-ch11-header">§11.11</a>). Completions of <i>different</i> requests may interleave and arrive in any order relative to each other.</p>
+<h4>Completion Timeout</h4>
+<p>A requester must implement a timer for every non-posted request; if no (final) completion arrives in time, it reports a Completion Timeout (uncorrectable, non-fatal by default) and frees the tag. Device Control 2 selects the range when the device supports programmability; ranges are commonly listed as default 50 µs–50 ms, Range A 50 µs–10 ms, B 10 ms–250 ms, C 250 ms–4 s, D 4 s–64 s, and the timeout can be disabled if supported <span class="tag verified">verified</span> (confirm sub-range details in your revision). For an SSD, a Completion Timeout on its DMA read means the host never answered — rare, and usually a root-complex/IOMMU/link-reset event. For the root complex, a Completion Timeout on a CPU read of a BAR register means the SSD stopped answering — the classic "device hung" signature, after which Linux typically reads all-ones (FFFFFFFFh) from the device.</p>
+<div class="callout warn"><div class="callout-title">⚠️ All-ones is not data</div><p>Many root complexes synthesize FFFFFFFFh for a failed MMIO read (UR/CA/timeout) <span class="tag impl">impl</span>. The Linux NVMe driver treats CSTS = FFFFFFFFh as "controller gone" — the ffff pattern is evidence of a <i>PCIe</i> failure, not a valid NVMe status.</p></div>
+<h4>Unexpected Completion</h4>
+<p>A completion whose Requester ID/Tag matches no outstanding request at the receiver. Causes: a completion arriving after the requester already timed out and freed the tag; a completer corrupting the tag; a switch misrouting. Reported (often advisory) as Unexpected Completion; the completion is discarded.</p>
+
+<h3>12.6 Hardware and protocol view</h3>
+<div class="callout hw"><div class="callout-title">🔧 Hardware</div><p>The requester's outstanding-request table (tag → buffer address, size, timer) and its completion reassembly buffer are internal and invisible. Completer side: the root complex has read queues toward memory; their depth and the IOMMU translation cache determine RTT. Observable: TLP timing on the link, AER logs, and indirect throughput effects.</p></div>
+
+<h3>12.7 Traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: posted burst vs non-posted round trips</div><div class="table-wrap"><table>
+<thead><tr><th>t (ns)</th><th>Dir</th><th>TLP</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↑</td><td>MWr 256 B</td><td>Read data to host (posted: next one immediately)</td></tr>
+<tr><td>36</td><td>↑</td><td>MWr 256 B</td><td>Back-to-back, ~36 ns apart at Gen4 x4</td></tr>
+<tr><td>72</td><td>↑</td><td>MWr 256 B</td><td></td></tr>
+<tr><td>100</td><td>↑</td><td>MRd 512 B Tag 30h</td><td>Write-command data fetch (non-posted)</td></tr>
+<tr><td>1350</td><td>↓</td><td>CplD 256 B Tag 30h BC 512</td><td>RTT ≈ 1.25 µs</td></tr>
+<tr><td>1386</td><td>↓</td><td>CplD 256 B Tag 30h BC 256</td><td>Last (BC = payload)</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: write throughput limited by one outstanding read</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Dir</th><th>TLP</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0.00</td><td>↑</td><td>MRd 512 B Tag 01h</td><td></td></tr>
+<tr><td>1.25</td><td>↓</td><td>CplD ×2 Tag 01h</td><td></td></tr>
+<tr class="first-bad"><td>1.30</td><td>↑</td><td>MRd 512 B Tag 01h</td><td>Next read only after previous completes: 512 B / 1.3 µs ≈ 0.39 GB/s — a serialized requester (implementation or configuration issue)</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: CPU reads CSTS of a hung SSD</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>TLP / event</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↓</td><td>MRd 3DW Len 1 Addr FE00001Ch Tag 05h</td><td>CSTS read</td></tr>
+<tr class="first-bad"><td>…50 ms</td><td>—</td><td>No CplD with Tag 05h</td><td>Completion missing</td></tr>
+<tr class="bad"><td>~50 ms</td><td>RC</td><td>Completion Timeout logged at root port; CPU load returns FFFFFFFFh</td><td>Driver: "controller is down" / reset path</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: analyzer flags "Completion Timeout"</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>Event</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↑</td><td>MRd Tag 2Ah</td><td></td></tr>
+<tr><td>10 µs</td><td>tool</td><td>"Completion timeout" marker</td><td>Tool default threshold 10 µs (a UI setting, not the device's timer)</td></tr>
+<tr><td>14 µs</td><td>↓</td><td>CplD Tag 2Ah SC</td><td>The completion did arrive. Insufficient evidence of a protocol timeout; this is a slow completion. Check device's configured Completion Timeout range and AER status.</td></tr>
+</tbody></table></div></div>
+
+<h3>12.8 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code># Completion Timeout range / disable support and setting
+sudo lspci -vv -s 0000:03:00.0 | grep -E 'DevCap2|DevCtl2'
+# Uncorrectable error status incl. CmpltTO, UnxCmplt, UnsupReq, CmpltAbrt
+sudo lspci -vv -s 0000:03:00.0 | grep -E 'UESta|UEMsk|UESvrt'
+# Driver-level evidence of all-ones reads / resets
+journalctl -k | grep -i -E 'nvme.*(timeout|reset|down|CSTS)'</code></pre>
+
+<h3>12.9 Five completion failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Disambiguating experiment</th><th>Conclusion (confidence)</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>CSTS reads FFFFFFFFh</td><td>Link down, device hung, surprise removal</td><td>Parent port LnkSta DLActive</td><td>Config read of Vendor ID</td><td>If config works but MMIO fails → BAR/MSE issue or controller hang</td><td>Link vs controller (medium-high)</td></tr>
+<tr><td>2</td><td>Device invisible for ~1 s after reset, then appears</td><td>CRS while firmware boots</td><td>Timing of enumeration vs reset</td><td>CRS SV enabled?</td><td>Increase delay after reset</td><td>Normal slow boot (high)</td></tr>
+<tr><td>3</td><td>Unexpected Completion advisory at SSD</td><td>Late completion after SSD timeout</td><td>SSD Completion Timeout range</td><td>Host memory latency spikes</td><td>Lengthen timeout range (test)</td><td>Timeout too aggressive (medium)</td></tr>
+<tr><td>4</td><td>UR completions to SSD DMA reads</td><td>IOMMU blocks; BME toggled; bad PRP address</td><td>IOMMU fault log</td><td>PRP values in failing command</td><td>Passthrough IOMMU on test machine</td><td>Mapping vs driver bug (medium)</td></tr>
+<tr><td>5</td><td>Low write throughput, high link idle</td><td>Too few outstanding reads; small MRRS</td><td>DevCtl MaxReadReq</td><td>Analyzer: concurrent tags</td><td>Raise MRRS (test)</td><td>Read pipeline limit (medium)</td></tr>
+</tbody></table></div>
+<div class="lab"><div class="lab-head">🧪 Lab 12.1 — Measure MMIO read cost vs write cost <span class="safety caution">CAUTION</span></div>
+<p><b>Objective:</b> feel the posted/non-posted asymmetry. <b>Prerequisites:</b> a test machine, root; a <b>non-critical</b> PCIe device. <b>Setup:</b> use a tiny C program mapping BAR0 via <code>/sys/bus/pci/devices/…/resource0</code> read-only (<code>O_RDONLY</code>, <code>PROT_READ</code>) and timing 1,000,000 32-bit reads of a harmless read-only register (e.g. NVMe CAP at offset 0 or VS at 08h). <b>Do not write</b> to NVMe registers of a device in use. <b>Observations:</b> ns per read. <b>Questions:</b> why is it ~0.5–2 µs? What would a write cost?</p>
+<details class="answer"><summary>Solution</summary><p>Each read is MRd + CplD round trip through the root complex, so the CPU core stalls ~RTT. Writes (not measured here for safety) would retire in tens of ns because they are posted. This asymmetry is why NVMe avoids MMIO reads in the I/O path.</p></details>
+<p><b>Extension:</b> compare the result for a device behind a switch vs directly attached.</p></div>
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Is MSI-X posted?</p><details class="answer"><summary>Answer</summary><p>Yes, it is a MWr.</p></details></li>
+<li><p>Why does an MMIO read "flush" prior writes?</p><details class="answer"><summary>Answer</summary><p>Read requests may not pass posted writes in the same direction, and the read's completion cannot pass them either, so the completion's arrival proves the writes ahead of it were delivered.</p></details></li>
+<li><p>Which status can only appear for config requests?</p><details class="answer"><summary>Answer</summary><p>CRS (RRS).</p></details></li>
+<li><p>Why is NVMe write throughput sensitive to host memory latency?</p><details class="answer"><summary>Answer</summary><p>The SSD pulls write data with non-posted reads; throughput ≤ outstanding bytes / RTT.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> Postcard vs librarian — explain. <details class="answer"><summary>Model answer</summary>Posted: fire-and-forget; non-posted: wait for a completion.</details></li>
+<li><span class="lvl">Intermediate</span> How does the host learn a doorbell write failed? <details class="answer"><summary>Model answer</summary>Not directly; via AER error messages, an Invalid Doorbell async event if enabled, or command timeout.</details></li>
+<li><span class="lvl">Advanced</span> What is RCB and why does it exist? <details class="answer"><summary>Model answer</summary>Read Completion Boundary; split completions end at RCB-aligned addresses so requesters can manage buffers simply; root complexes have RCB 64 or 128.</details></li>
+<li><span class="lvl">Advanced</span> What happens to a late completion? <details class="answer"><summary>Model answer</summary>Unexpected Completion at requester; discarded.</details></li>
+<li><span class="lvl">Senior</span> Design a safe "flush" after writing controller registers. <details class="answer"><summary>Model answer</summary>Read back a register on the same device (non-posted), which orders behind the writes on that path; note it does not cover writes to other devices.</details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can classify every TLP as posted, non-posted or completion.</li>
+<li>I can explain doorbell cost, MMIO read cost, and Little's-law DMA read limits.</li>
+<li>I know SC/UR/CRS/CA meanings and Completion Timeout ranges.</li>
+<li>I can distinguish an analyzer's timeout marker from a protocol Completion Timeout.</li>
+</ul></div>
+<p><b>Next:</b> <a href="#p2-ch13-tags">Chapter 13 — tags and outstanding requests</a>.</p>
+</section>
+
+<section class="chapter" id="p2-ch13-tags" data-part="PART V — PCIe TRANSACTION LAYER">
+<h2><span class="num">13</span> Tags and Outstanding Requests</h2>
+<h3>13.1 Why this chapter exists</h3>
+<p>Tags are what make non-posted reads scalable: each outstanding request gets a unique ticket number so completions can come back in any order and still be matched. The number of tags caps how many reads a function can have in flight, which, with latency, caps its read bandwidth. At Gen5 and Gen6 speeds this cap is real — the reason 10-bit and 14-bit tags exist.</p>
+<ul class="objectives">
+<li>Explain the transaction ID (Requester ID + Tag) and why tags exist.</li>
+<li>Describe 5-bit, 8-bit (Extended Tag), 10-bit and FLIT-mode 14-bit tag spaces and enabling rules.</li>
+<li>Read a trace with many simultaneous reads and out-of-order completions.</li>
+<li>Compute the number of outstanding requests needed to hide latency.</li>
+<li>Recognize tag-related failures (reuse, exhaustion, mismatch).</li>
+</ul>
+<p><b>Prerequisites:</b> <a href="#p2-ch12-posted">Chapter 12</a>.</p>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>At a busy bakery you get a numbered ticket. You can order five cakes and get tickets 1–5; cake 3 may be ready before cake 1. When "3!" is called, you know exactly which cake it is. If the bakery only has 32 tickets, the 33rd customer waits even if the ovens are free.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>Tickets are per <b>requester</b>, not per bakery: tag 3 of the SSD and tag 3 of the NIC are different because the Requester ID differs. And a "cake" may be delivered in several boxes (split completions), all bearing the same ticket; the ticket is returned only after the last box (Byte Count says so).</p></div>
+
+<h3>13.2 The transaction ID</h3>
+<p>A non-posted request is uniquely identified by its <b>Transaction ID = Requester ID (16 bits) + Tag</b> <span class="tag verified">verified</span>. The completer copies both into every completion. The requester must not reuse a tag while a request with that tag is outstanding. Completers and switches do not interpret tags; they just copy them. Posted requests also carry a tag field but it has no matching role (some implementations put arbitrary values there).</p>
+
+<h3>13.3 Tag sizes</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Mode</th><th>Bits</th><th>Max outstanding (per function)</th><th>Enable</th><th>Revision</th></tr></thead>
+<tbody>
+<tr><td>Default (legacy)</td><td>5</td><td>32</td><td>Extended Tag Field Enable = 0</td><td>1.0+</td></tr>
+<tr><td>Extended Tag</td><td>8</td><td>256</td><td>Device Control: Extended Tag Field Enable (completer support is mandatory in later revisions; default-enable rules changed via ECN) <span class="tag version">version</span></td><td>1.0+ optional</td></tr>
+<tr><td>10-bit Tag</td><td>10 (T9, T8 + 8)</td><td>up to 768 commonly cited (values with T9:T8 = 00 not used in 10-bit mode) <span class="tag uncertain">uncertain</span></td><td>Device Control 2: 10-Bit Tag Requester Enable; completers advertise 10-Bit Tag Completer Supported; every element on the path must support it</td><td>4.0+</td></tr>
+<tr><td>FLIT-mode Tag</td><td>14</td><td>up to 16384 space</td><td>FLIT mode negotiated</td><td>6.0+ <span class="tag version">version</span></td></tr>
+</tbody></table></div>
+<div class="callout spec"><div class="callout-title">📘 Enabling rule that bites</div><p>A requester may use 10-bit tags toward a completer only if the completer (and for peer-to-peer, routing elements) support them. Root ports advertise 10-Bit Tag Completer Supported. Linux enables 10-bit tags for endpoints only when the path supports it <span class="tag impl">impl</span>; some peer-to-peer configurations require disabling them. Tag width is invisible in TLP labels — you must see T9/T8 bits.</p></div>
+
+<h3>13.4 Latency hiding: how many tags do I need?</h3>
+<div class="formula">N<sub>tags</sub> ≥ BW × RTT ÷ S<sub>req</sub></div>
+<ul class="vars"><li><b>BW</b> — target read-DMA throughput (bytes/s)</li><li><b>RTT</b> — request-to-last-completion latency</li><li><b>S<sub>req</sub></b> — bytes per read request (≤ MRRS)</li></ul>
+<div class="table-wrap"><table>
+<thead><tr><th>Link</th><th>Target BW</th><th>RTT</th><th>MRRS</th><th>Tags needed</th><th>Fits 32? 256?</th></tr></thead>
+<tbody>
+<tr><td>Gen3 x4</td><td>3.5 GB/s</td><td>1 µs</td><td>512 B</td><td>6.8 → 7</td><td>Yes / Yes</td></tr>
+<tr><td>Gen4 x4</td><td>7 GB/s</td><td>1.5 µs</td><td>512 B</td><td>20.5 → 21</td><td>Yes / Yes</td></tr>
+<tr><td>Gen5 x4</td><td>14 GB/s</td><td>2 µs</td><td>512 B</td><td>54.7 → 55</td><td>No / Yes</td></tr>
+<tr><td>Gen5 x16</td><td>56 GB/s</td><td>3 µs</td><td>512 B</td><td>328</td><td>No / No → 10-bit</td></tr>
+<tr><td>Gen6 x16</td><td>110 GB/s</td><td>3 µs</td><td>512 B</td><td>645</td><td>No / No → 10-bit</td></tr>
+</tbody></table></div>
+<p>Derived <span class="tag derived">derived</span> with illustrative RTTs. Tags are not the only limit: the requester also needs completion buffer space for all outstanding data (it must advertise infinite completion credits as an endpoint, so it must never request more than it can absorb), and its internal DMA engines.</p>
+
+<h3>13.5 Trace: several simultaneous reads</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: four outstanding 512-byte reads, completions out of order (SSD at 03:00.0)</div><div class="table-wrap"><table>
+<thead><tr><th>t (ns)</th><th>Dir</th><th>TLP</th><th>Tag</th><th>Address / BC</th><th>Outstanding after</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↑</td><td>MRd Len 128</td><td>40h</td><td>1_6000_0000h</td><td>{40}</td></tr>
+<tr><td>30</td><td>↑</td><td>MRd Len 128</td><td>41h</td><td>1_6000_0200h</td><td>{40,41}</td></tr>
+<tr><td>60</td><td>↑</td><td>MRd Len 128</td><td>42h</td><td>1_6000_0400h</td><td>{40,41,42}</td></tr>
+<tr><td>90</td><td>↑</td><td>MRd Len 128</td><td>43h</td><td>1_6000_0600h</td><td>{40..43}</td></tr>
+<tr><td>1210</td><td>↓</td><td>CplD 256 B</td><td>41h</td><td>BC 512, LA 00h</td><td>{40..43}</td></tr>
+<tr><td>1246</td><td>↓</td><td>CplD 256 B</td><td>40h</td><td>BC 512, LA 00h</td><td>{40..43}</td></tr>
+<tr><td>1282</td><td>↓</td><td>CplD 256 B</td><td>41h</td><td>BC 256, LA 00h → last</td><td>{40,42,43}</td></tr>
+<tr><td>1318</td><td>↓</td><td>CplD 256 B</td><td>43h</td><td>BC 512</td><td>{40,42,43}</td></tr>
+<tr><td>1354</td><td>↓</td><td>CplD 256 B</td><td>40h</td><td>BC 256 → last</td><td>{42,43}</td></tr>
+<tr><td>1390</td><td>↓</td><td>CplD 256 B</td><td>43h</td><td>BC 256 → last</td><td>{42}</td></tr>
+<tr><td>1400</td><td>↑</td><td>MRd Len 128</td><td>41h</td><td>1_6000_0800h (tag 41h reused — legal, it completed)</td><td>{41,42}</td></tr>
+<tr><td>1426</td><td>↓</td><td>CplD 256 B ×2</td><td>42h</td><td>BC 512 then 256</td><td>{41}</td></tr>
+</tbody></table></div>
+<p>Observe: completions of <i>different</i> tags interleave; completions of the <i>same</i> tag arrive in address order. The requester's view at each moment is the "outstanding" set — a tag table.</p></div>
+<div class="table-wrap"><table>
+<thead><tr><th>Tag</th><th>State at t = 1300 ns</th><th>Bytes requested</th><th>Bytes received</th><th>Destination buffer</th></tr></thead>
+<tbody>
+<tr><td>40h</td><td>outstanding</td><td>512</td><td>256</td><td>SSD internal write buffer slot A</td></tr>
+<tr><td>41h</td><td>free (completed)</td><td>512</td><td>512</td><td>slot B</td></tr>
+<tr><td>42h</td><td>outstanding</td><td>512</td><td>0</td><td>slot C</td></tr>
+<tr><td>43h</td><td>outstanding</td><td>512</td><td>256</td><td>slot D</td></tr>
+</tbody></table></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: tag exhaustion (5-bit tags, long RTT)</div><div class="table-wrap"><table>
+<thead><tr><th>t (µs)</th><th>Event</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0.0–1.0</td><td>32 MRd issued, tags 00h–1Fh</td><td>All tags in use</td></tr>
+<tr class="first-bad"><td>1.0–3.0</td><td>No MRd issued; link upstream idle</td><td>Requester stalled waiting for tags; RTT 3 µs → BW ≤ 32 × 512 / 3 µs ≈ 5.5 GB/s</td></tr>
+<tr><td>3.0</td><td>CplD for 00h → MRd tag 00h reissued</td><td>Throughput clamped by tags</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: duplicate tag in flight</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Dir</th><th>TLP</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>↑</td><td>MRd Tag 07h Addr A</td><td></td></tr>
+<tr class="first-bad"><td>200 ns</td><td>↑</td><td>MRd Tag 07h Addr B</td><td>Tag reused while outstanding — requester bug</td></tr>
+<tr class="bad"><td>1.2 µs</td><td>↓</td><td>CplD Tag 07h (data of A)</td><td>Requester cannot tell A from B: possible data placed in wrong buffer, Unexpected Completion later, or Completion Timeout for one request</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: "tag 0x07" twice from different BDFs</div><div class="table-wrap"><table>
+<thead><tr><th>Dir</th><th>TLP</th><th>Requester</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>↑</td><td>MRd Tag 07h</td><td>03:00.0</td><td></td></tr>
+<tr><td>↑</td><td>MRd Tag 07h</td><td>03:00.1 (or analyzer column hidden)</td><td>Legal if Requester IDs differ (two functions). If the Requester ID column is not captured: insufficient trace evidence — cannot call it a duplicate.</td></tr>
+</tbody></table></div></div>
+
+<h3>13.6 Ordering and tags</h3>
+<p>Tags do not impose order; completions for different tags may return in any order. Within one tag, multiple completions return in increasing address order. With 10-bit tags, an analyzer decoding only 8 bits will show apparent duplicates (tag 107h and 007h both shown as "07"): a classic analyzer-configuration trap.</p>
+
+<h3>13.7 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code># Extended Tag supported/enabled, 10-bit tag capability and enable
+sudo lspci -vv -s 0000:03:00.0 | grep -E 'ExtTag|10BitTag'
+# (illustrative fields: DevCap: ... ExtTag+ ; DevCap2: ... 10BitTagComp+ 10BitTagReq+ ; DevCtl2: ... 10BitTagReq+)</code></pre>
+<p>Field names depend on pciutils version <span class="tag version">version</span>. <b>Can prove:</b> capability and enable bits. <b>Cannot prove:</b> how many tags the device actually uses — that is an implementation choice visible only on an analyzer.</p>
+
+<h3>13.8 Five tag failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Experiment</th><th>Conclusion</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Write BW plateaus below link</td><td>Tag exhaustion</td><td>ExtTag / 10-bit enable</td><td>Analyzer outstanding count</td><td>Enable ExtTag (test)</td><td>Tag-limited (medium)</td></tr>
+<tr><td>2</td><td>P2P DMA fails after upgrade</td><td>10-bit tags toward a completer without support</td><td>10BitTagComp of target</td><td>Kernel log on tag config</td><td>Disable 10-bit requester (test)</td><td>Capability mismatch (medium-high)</td></tr>
+<tr><td>3</td><td>Rare data corruption on writes</td><td>Tag reuse bug, completer tag corruption</td><td>Analyzer for duplicates</td><td>ECRC enable</td><td>Stress with many outstanding reads</td><td>Requester/completer bug (low-medium)</td></tr>
+<tr><td>4</td><td>Unexpected Completions</td><td>Late completion after timeout; wrong tag</td><td>Completion Timeout range</td><td>RTT distribution</td><td>Lengthen range</td><td>Latency outlier (medium)</td></tr>
+<tr><td>5</td><td>Analyzer shows duplicate tags</td><td>10-bit tags decoded as 8-bit</td><td>Decoder settings</td><td>T9/T8 bits in raw header</td><td>Re-decode</td><td>Analyzer artifact (high)</td></tr>
+</tbody></table></div>
+<div class="lab"><div class="lab-head">🧪 Lab 13.1 — Build a tag tracker <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> simulate a requester with N tags and RTT jitter and measure achieved bandwidth. <b>Setup:</b> Python 3.</p>
+<pre class="code" data-kind="simulation"><code>import random, heapq
+def simulate(ntags, mrrs=512, rtt_us=2.0, jitter=0.5, total_reqs=20000, issue_ns=30):
+    t, free, inflight, done, events = 0.0, list(range(ntags)), 0, 0, []
+    issued = 0
+    while done &lt; total_reqs:
+        while free and issued &lt; total_reqs:
+            tag = free.pop()
+            rtt = (rtt_us + random.uniform(-jitter, jitter)) * 1000
+            heapq.heappush(events, (t + rtt, tag)); issued += 1
+            t += issue_ns                      # serialization of request TLPs
+        t_done, tag = heapq.heappop(events)
+        t = max(t, t_done); free.append(tag); done += 1
+    return total_reqs * mrrs / t               # bytes per ns == GB/s
+for n in (32, 64, 256, 768):
+    print(n, "tags:", round(simulate(n), 2), "GB/s (ignores link cap)")</code></pre>
+<p><b>Questions:</b> where does bandwidth stop scaling with tags? (In reality, the link cap: add <code>min(result, link_bw)</code>.)</p>
+<details class="answer"><summary>Solution</summary><p>Bandwidth ≈ ntags × 512 / 2000 ns until request-issue serialization (30 ns per request → ~17 GB/s) or the link cap dominates. 32 tags ≈ 8 GB/s, 64 ≈ 16 GB/s, beyond that the issue rate limits — mirroring the formula in §13.4.</p></details>
+<p><b>Extension:</b> model split completions occupying the downstream link and add a completion-buffer limit.</p></div>
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>What uniquely identifies a non-posted request?</p><details class="answer"><summary>Answer</summary><p>Requester ID + Tag (Transaction ID).</p></details></li>
+<li><p>When may a tag be reused?</p><details class="answer"><summary>Answer</summary><p>After the final completion for it arrived (or after a Completion Timeout freed it).</p></details></li>
+<li><p>Why did PCIe 4.0 add 10-bit tags?</p><details class="answer"><summary>Answer</summary><p>To allow enough outstanding reads to cover bandwidth × latency at higher speeds.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> Why do tags exist? <details class="answer"><summary>Model answer</summary>To match completions to outstanding requests in a split-transaction protocol.</details></li>
+<li><span class="lvl">Intermediate</span> Can completions of different requests arrive out of order? <details class="answer"><summary>Model answer</summary>Yes; only completions of one request must be in address order.</details></li>
+<li><span class="lvl">Advanced</span> What limits outstanding reads besides tags? <details class="answer"><summary>Model answer</summary>Completion buffer space (endpoints advertise infinite Cpl credits, so they self-limit), DMA engine contexts, MRRS.</details></li>
+<li><span class="lvl">Senior</span> Customer's Gen5 x16 accelerator reads at 35 GB/s, expecting 55. Approach? <details class="answer"><summary>Model answer</summary>Compute required tags from RTT; check 10-bit tag enable on device and RP; measure RTT; check MRRS; analyzer outstanding count.</details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can explain Transaction ID and tag reuse rules.</li>
+<li>I know 5/8/10/14-bit tag modes and their enabling rules.</li>
+<li>I can compute tags needed for a BW/RTT target.</li>
+<li>I can read a multi-tag trace and maintain the outstanding set.</li>
+</ul></div>
+<p><b>Next:</b> <a href="#p2-ch14-ordering">Chapter 14 — ordering</a>.</p>
+</section>
+
+<section class="chapter" id="p2-ch14-ordering" data-part="PART V — PCIe TRANSACTION LAYER">
+<h2><span class="num">14</span> PCIe Ordering</h2>
+<h3>14.1 Why this chapter exists</h3>
+<p>NVMe correctness relies on PCIe ordering: the host must never see a Completion Queue Entry before the data it describes is in memory, and must never take an interrupt before the CQE is visible. PCIe guarantees this — under specific conditions. Change attributes (Relaxed Ordering), traffic classes, or paths (peer-to-peer, multiple root ports) and the guarantees change. Ordering is also where oversimplification is most dangerous; this chapter keeps the rules precise and labels every simplification.</p>
+<ul class="objectives">
+<li>State the producer–consumer model PCIe ordering is designed to support.</li>
+<li>Explain the core rules: posted writes stay in order; reads and completions do not pass posted writes; posted writes must be able to pass non-posted requests (deadlock avoidance).</li>
+<li>Explain Relaxed Ordering, ID-based Ordering and TC/VC scope.</li>
+<li>Apply the rules to NVMe data → CQE → MSI-X, and to doorbells.</li>
+<li>Recognize ordering bugs and their evidence.</li>
+</ul>
+<p><b>Prerequisites:</b> <a href="#p2-ch12-posted">Chapter 12</a>, <a href="#p2-ch13-tags">Chapter 13</a>.</p>
+<div class="callout kid"><div class="callout-title">🧒 Kid analogy</div><p>A one-lane tunnel with a few passing bays. Delivery trucks (posted writes) must stay in line behind each other, so a "dinner's ready" sign truck can't get ahead of the food trucks. But delivery trucks <i>are</i> allowed to drive past cars waiting to ask questions (non-posted), so a stuck question can't block deliveries forever. Some trucks have a sticker "I don't mind being overtaken" (Relaxed Ordering).</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>There isn't one tunnel: ordering is defined per direction, per Traffic Class/Virtual Channel, and only for transactions that travel the same path. Two writes going to different root ports, or in different TCs, have no ordering relationship at all.</p></div>
+
+<h3>14.2 The producer–consumer model</h3>
+<p>PCIe ordering is designed so that the classic producer–consumer pattern works without any extra handshake <span class="tag verified">verified</span>: a producer writes data, then writes a flag; a consumer that sees the flag (by reading it, or by being interrupted) will see the data. NVMe completion is exactly this: data (MWr) → CQE with flipped phase (MWr, the flag) → MSI-X (MWr, the doorbell to the CPU).</p>
+
+<h3>14.3 Ordering rules table (simplified)</h3>
+<p>Rows are a <b>later</b> TLP; columns are an <b>earlier</b> TLP in the same direction, same TC/VC. Cell answers: may the row pass the column? <b>No</b> = must not pass; <b>Yes</b> = must be allowed to pass (to avoid deadlock); <b>Y/N</b> = permitted but not required.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Row passes column? →</th><th>Posted Request (MWr, Msg)</th><th>Non-Posted Read (MRd, CfgRd…)</th><th>Non-Posted Write (CfgWr, IOWr, AtomicOp)</th><th>Completion</th></tr></thead>
+<tbody>
+<tr><td><b>Posted Request</b></td><td><b>No</b><br/>(Y/N if the later write has RO = 1, or IDO with different Requester IDs)</td><td><b>Yes</b></td><td><b>Yes</b></td><td>Y/N (with stricter conditions in some bridge cases)</td></tr>
+<tr><td><b>Non-Posted Read</b></td><td><b>No</b><br/>(Y/N under IDO with different Requester IDs, per revision)</td><td>Y/N</td><td>Y/N</td><td>Y/N</td></tr>
+<tr><td><b>Non-Posted Write</b></td><td><b>No</b><br/>(Y/N under IDO, per revision)</td><td>Y/N</td><td>Y/N</td><td>Y/N</td></tr>
+<tr><td><b>Completion</b></td><td><b>No</b><br/>(Y/N if the completion has RO = 1, or IDO with different IDs)</td><td><b>Yes</b></td><td><b>Yes</b></td><td>Y/N — but completions of the <i>same</i> request stay in address order</td></tr>
+</tbody></table></div>
+<div class="callout warn"><div class="callout-title">⚠️ Simplification label</div><p>This table is a teaching summary <span class="tag conceptual">conceptual</span>. The normative "Transaction Ordering" table in the PCIe Base Specification has more sub-cases (PCI-X/legacy bridge variants, AtomicOp specifics, lock, revision-specific IDO details, and FLIT-mode considerations). Use it to reason, not to sign off a design.</p></div>
+
+<h3>14.4 Why each core rule exists</h3>
+<ul>
+<li><b>Posted must not pass posted (RO=0):</b> producer–consumer — the flag must not overtake the data.</li>
+<li><b>Read must not pass posted:</b> a read of the flag/data after writes must return the written values; also makes MMIO reads usable as write flushes.</li>
+<li><b>Completion must not pass posted:</b> if a device writes data to memory then a CPU read of device status returns "done", the data must already be visible — the completion carrying "done" may not overtake the device's earlier writes in that direction.</li>
+<li><b>Posted must be able to pass non-posted and completions-may-pass-non-posted:</b> deadlock avoidance. Non-posted requests can be blocked for lack of NP credits or of completion resources; if posted writes and completions could be stuck behind them, circular waits could freeze the fabric.</li>
+<li><b>No ordering between different TCs:</b> each VC has independent queues and credits; TC mapping is the system's way of saying "these flows are independent".</li>
+</ul>
+
+<h3>14.5 Attributes: Relaxed Ordering, ID-based Ordering, No Snoop</h3>
+<p><b>Relaxed Ordering (RO, Attr[1]):</b> a TLP with RO = 1 is permitted to pass earlier posted writes (row-side rule) <span class="tag verified">verified</span>. Note the asymmetry: a later TLP with RO = 0 still may not pass earlier writes, whatever their RO. So an NVMe controller may mark bulk data writes RO = 1 (letting the root complex commit them to memory in any order, which can help throughput on some platforms) and send the CQE with RO = 0; the CQE then still cannot pass any of the data writes. A device may set RO only if "Enable Relaxed Ordering" in its Device Control register is set <span class="tag verified">verified</span>. Some platforms have had problems with RO and Linux contains quirks that clear the enable for specific root ports <span class="tag impl">impl</span>.</p>
+<p><b>ID-based Ordering (IDO, Attr[2]):</b> permits TLPs from different Requester IDs (or different completers for completions) to pass each other where otherwise forbidden, since unrelated requesters rarely have producer–consumer relationships. Enabled per function in Device Control 2.</p>
+<p><b>No Snoop (NS, Attr[0]):</b> not an ordering attribute; it tells the root complex coherency snooping is not required. Misuse yields stale data, which can masquerade as an ordering bug.</p>
+<p><b>Traffic Class (TC):</b> TC 0–7 maps onto Virtual Channels. Ordering applies only within a TC (strictly, within the VC). NVMe devices almost universally use TC0 / VC0.</p>
+
+<h3>14.6 Practical NVMe implications</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>NVMe pattern</th><th>TLPs</th><th>What guarantees order</th><th>What would break it</th></tr></thead>
+<tbody>
+<tr><td>Read data, then CQE</td><td>MWr(data)… → MWr(CQE)</td><td>Posted–posted ordering, CQE RO = 0</td><td>CQE sent with RO = 1; data and CQE in different TCs; data via a different path (e.g. P2P to another device's memory)</td></tr>
+<tr><td>CQE, then MSI-X</td><td>MWr(CQE) → MWr(MSI)</td><td>Posted–posted ordering</td><td>MSI with RO = 1 (devices must not do this in ways that break this; check device behavior)</td></tr>
+<tr><td>SQE in host memory, then doorbell</td><td>CPU stores to RAM → MWr(doorbell)</td><td>CPU memory ordering / write barrier before MMIO</td><td>Missing barrier in driver; PCIe cannot help: SQE write never crosses PCIe</td></tr>
+<tr><td>SSD reads SQE after doorbell</td><td>MWr(doorbell)↓ … MRd(SQE)↑</td><td>Causality: SSD issues the read after receiving the doorbell; host stores already globally visible</td><td>Driver bug ordering; SSD prefetch beyond tail (controller bug)</td></tr>
+<tr><td>Host writes CC.EN then polls CSTS</td><td>MWr↓ → MRd↓</td><td>Read must not pass posted write</td><td>Nothing within PCIe; device-internal delay to set RDY is normal</td></tr>
+<tr><td>CMB / P2P data then CQE</td><td>Writes to different destinations</td><td>No guarantee across different paths</td><td>Must use a read flush or spec-defined mechanism; NVMe specifications discuss CMB/PMR ordering requirements</td></tr>
+</tbody></table></div>
+
+<h3>14.7 Traces</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — normal: RO data, strict CQE</div><div class="table-wrap"><table>
+<thead><tr><th>Seq</th><th>TLP</th><th>RO</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>100–115</td><td>MWr data ×16</td><td>1</td><td>RC may commit to DRAM in any order among themselves</td></tr>
+<tr><td>116</td><td>MWr CQE</td><td>0</td><td>Cannot pass 100–115</td></tr>
+<tr><td>117</td><td>MWr MSI-X</td><td>0</td><td>Cannot pass 116</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — slow: posted writes waiting behind a stalled path? (no — they pass)</div><div class="table-wrap"><table>
+<thead><tr><th>t</th><th>Event at switch egress</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>MRd queued; downstream NP credits exhausted</td><td>Non-posted blocked</td></tr>
+<tr><td>+50 ns</td><td>MWr arrives, passes the blocked MRd</td><td>Required "Yes" rule; posted traffic continues</td></tr>
+<tr class="first-bad"><td>+5 µs</td><td>MRd still waiting</td><td>Slowness isolated to non-posted traffic; read latency spikes while writes flow</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — failed: CQE marked RO overtakes data (non-compliant device behavior)</div><div class="table-wrap"><table>
+<thead><tr><th>Seq</th><th>TLP</th><th>RO</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>200–215</td><td>MWr data</td><td>1</td><td></td></tr>
+<tr class="first-bad"><td>216</td><td>MWr CQE</td><td>1</td><td>CQE allowed to pass data — host may consume CQE before data visible</td></tr>
+<tr class="bad"><td>—</td><td>Host reads buffer: stale bytes in last 256 B</td><td>—</td><td>Silent data corruption, rare and timing-dependent</td></tr>
+</tbody></table></div></div>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — ambiguous: analyzer shows CQE before last data TLP</div><div class="table-wrap"><table>
+<thead><tr><th>Capture point</th><th>Order seen</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>Root port link</td><td>CQE (RO=0) appears before data #16</td><td>On a single link in one direction this would violate ordering — unless data #16 went to a different destination/path or the analyzer is showing merged multi-link captures with timestamp skew. Insufficient trace evidence until capture topology and per-link sequence numbers are checked.</td></tr>
+</tbody></table></div></div>
+
+<h3>14.8 Linux view</h3>
+<pre class="code" data-kind="read-only inspection"><code># RO and No Snoop enables, IDO enables
+sudo lspci -vv -s 0000:03:00.0 | grep -E 'DevCtl:|DevCtl2:' -A2 | grep -E 'RlxdOrd|NoSnoop|IDO'
+# Kernel quirks that disable RO for specific root ports are in drivers/pci/quirks.c (source inspection)</code></pre>
+
+<h3>14.9 Five ordering failure patterns</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Symptom</th><th>Possible causes</th><th>First check</th><th>Second check</th><th>Experiment</th><th>Conclusion</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Rare stale data in read buffers</td><td>RO on CQE/MSI; NS misuse</td><td>RO enable bit</td><td>Analyzer RO bits on CQE</td><td>Disable RO (test)</td><td>RO misuse (medium)</td></tr>
+<tr><td>2</td><td>Command submitted but SSD fetches old SQE</td><td>Missing CPU barrier before doorbell</td><td>Driver code path</td><td>SQE contents on analyzer</td><td>Insert barrier</td><td>Host ordering bug (medium)</td></tr>
+<tr><td>3</td><td>Corruption only with P2P/CMB</td><td>No ordering across paths</td><td>Data destination</td><td>Flush mechanism used?</td><td>Add read flush</td><td>Cross-path ordering (medium)</td></tr>
+<tr><td>4</td><td>Throughput drop after enabling RO quirk</td><td>RO disabled by kernel quirk on platform</td><td>DevCtl RlxdOrd</td><td>Kernel version / quirk list</td><td>Compare kernels</td><td>Platform quirk (medium)</td></tr>
+<tr><td>5</td><td>Fabric hang under mixed traffic</td><td>Device violating "posted may pass NP" (deadlock)</td><td>Analyzer: posted stuck behind NP</td><td>Credits state</td><td>Isolate device</td><td>Device bug (low-medium)</td></tr>
+</tbody></table></div>
+<div class="lab"><div class="lab-head">🧪 Lab 14.1 — Ordering checker on a synthetic trace <span class="safety safe">SAFE</span></div>
+<p><b>Objective:</b> write a checker that flags a posted write with RO = 0 that appears before an earlier posted write in a "delivery order" list.</p>
+<pre class="code" data-kind="simulation"><code># each tuple: (issue_seq, kind, ro, tc)  kind in {'P','NP','CPL'}
+issued = [(1,'P',1,0),(2,'P',1,0),(3,'P',0,0),(4,'P',0,0)]
+delivered = [2,1,4,3]                      # order seen at destination
+def check(issued, delivered):
+    info = {s:(k,ro,tc) for s,k,ro,tc in issued}
+    pos = {s:i for i,s in enumerate(delivered)}
+    bad = []
+    for later,(k,ro,tc) in info.items():
+        if k not in ('P','CPL') or ro: continue
+        for earlier,(k2,_,tc2) in info.items():
+            if earlier &lt; later and k2 == 'P' and tc2 == tc and pos[later] &lt; pos[earlier]:
+                bad.append((later, earlier))
+    return bad
+print(check(issued, delivered))            # [(4, 3)]: RO=0 write passed earlier write</code></pre>
+<details class="answer"><summary>Solution</summary><p>2 passing 1 is allowed (2 has RO = 1). 4 passing 3 is a violation (4 has RO = 0). Extend the checker to completions (completion with RO = 0 must not pass earlier posted writes) and to TC separation.</p></details>
+<p><b>Extension:</b> add IDO handling (different Requester IDs may pass when IDO is set).</p></div>
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>May a posted write pass a blocked read?</p><details class="answer"><summary>Answer</summary><p>Yes — and it must be able to (deadlock avoidance).</p></details></li>
+<li><p>Data writes have RO = 1, CQE RO = 0. Can the CQE pass data?</p><details class="answer"><summary>Answer</summary><p>No; the passing TLP's RO governs and it is 0.</p></details></li>
+<li><p>Are writes in TC0 and TC1 ordered relative to each other?</p><details class="answer"><summary>Answer</summary><p>No.</p></details></li>
+</ol></div>
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> Why must a flag write not pass a data write? <details class="answer"><summary>Model answer</summary>Consumer might read stale data after seeing the flag.</details></li>
+<li><span class="lvl">Intermediate</span> Why can posted writes pass non-posted requests? <details class="answer"><summary>Model answer</summary>To prevent deadlocks when non-posted requests are blocked.</details></li>
+<li><span class="lvl">Advanced</span> How does RO help performance? <details class="answer"><summary>Model answer</summary>Root complex can commit writes out of order (e.g. different memory channels, cache-line ownership), avoiding head-of-line blocking.</details></li>
+<li><span class="lvl">Advanced</span> What is IDO for? <details class="answer"><summary>Model answer</summary>Allowing unrelated requesters' traffic to bypass each other in switches/RC.</details></li>
+<li><span class="lvl">Senior</span> Prove NVMe data integrity relies on PCIe ordering, then find a case it doesn't. <details class="answer"><summary>Model answer</summary>Data→CQE→MSI same path posted ordering; breaks with CQE RO, different TCs, P2P/CMB destinations, or multi-path systems.</details></li>
+</ol></div>
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can reproduce the simplified ordering table and explain each "No" and "Yes".</li>
+<li>I can explain RO asymmetry and why CQE must carry RO = 0.</li>
+<li>I know ordering scope (direction, TC/VC, path).</li>
+<li>I can distinguish CPU memory ordering from PCIe ordering in the doorbell path.</li>
+<li>I can cite the "Transaction Ordering" section of the PCIe Base Specification as the normative source.</li>
+</ul></div>
+<p><b>Next:</b> <a href="#part-vi">Part VI — Data Link Layer</a>.</p>
+</section>
