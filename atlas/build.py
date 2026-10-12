@@ -3,7 +3,7 @@
 import glob, html, os, re, datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(os.path.dirname(HERE), "NVMe_PCIe_Error_Atlas.html")
+OUT = os.path.join(os.path.dirname(HERE), "PEX_Trace_Error_Atlas.html")
 
 def strip_tags(s):
     return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
@@ -14,16 +14,20 @@ content = "\n".join(open(f, encoding="utf-8").read() for f in files)
 
 # Auto-generate the master catalog from error cards (replaces <!--CATALOG--> in a fragment).
 cards=[]
+pexv=[]
 for m in re.finditer(r'<div class="err" id="([^"]+)">\s*<div class="err-head">(.*?)</div>', content, re.S):
     head=m.group(2)
     eid=re.search(r'class="err-id">(.*?)<',head); name=re.search(r'<b>(.*?)</b>',head,re.S)
     rep=re.search(r'class="rep (\w+)">(.*?)<',head); lyr=re.search(r'class="lyr">(.*?)<',head)
+    pexm=re.search(r'class="pex (yes|part|no)">(.*?)<', content[m.end():m.end()+4000])
+    pexv.append((pexm.group(1), strip_tags(pexm.group(2))) if pexm else ('',''))
     cards.append((m.group(1), strip_tags(eid.group(1)) if eid else '', strip_tags(name.group(1)) if name else m.group(1),
                   rep.group(1) if rep else '', strip_tags(rep.group(2)) if rep else '', strip_tags(lyr.group(1)) if lyr else ''))
-rows=''.join(f'<tr data-rep="{c[3]}"><td class="mono">{html.escape(c[1])}</td><td><a href="#{c[0]}">{html.escape(c[2])}</a></td><td><span class="rep {c[3]}">{html.escape(c[4])}</span></td><td>{html.escape(c[5])}</td></tr>' for c in cards)
+rows=''.join(f'<tr data-rep="{c[3]}"><td class="mono">{html.escape(c[1])}</td><td><a href="#{c[0]}">{html.escape(c[2])}</a></td><td>' + (f'<span class="pex {p[0]}">{html.escape(p[1])}</span>' if p[0] else '') + f'</td><td><span class="rep {c[3]}">{html.escape(c[4])}</span></td><td>{html.escape(c[5])}</td></tr>' for c,p in zip(cards,pexv))
+pc={k:sum(1 for p in pexv if p[0]==k) for k in ['yes','part','no']}
 counts={k:sum(1 for c in cards if c[3]==k) for k in ['reported','timeout','silent','degraded']}
-summary=f'<p><b>{len(cards)}</b> failure modes: {counts["reported"]} reported with an error code or log, {counts["timeout"]} caught only by a timer, {counts["silent"]} silent (no error anywhere), {counts["degraded"]} degraded but "working".</p>'
-content=content.replace('<!--CATALOG-->', summary+'<div class="table-wrap"><table><thead><tr><th>ID</th><th>Failure</th><th>How it shows</th><th>Layer</th></tr></thead><tbody>'+rows+'</tbody></table></div>')
+summary=f'<p><b>{len(cards)}</b> failure modes: {counts["reported"]} reported with an error code or log, {counts["timeout"]} caught only by a timer, {counts["silent"]} silent (no error anywhere), {counts["degraded"]} degraded but "working". In a PEX trace: <b>{pc["yes"]}</b> visible, <b>{pc["part"]}</b> partly visible, <b>{pc["no"]}</b> not visible at all.</p>'
+content=content.replace('<!--CATALOG-->', summary+'<div class="table-wrap"><table><thead><tr><th>ID</th><th>Failure</th><th>In a PEX trace</th><th>How it shows</th><th>Layer</th></tr></thead><tbody>'+rows+'</tbody></table></div>')
 
 # Resolve part-anchor aliases: agents used both "part-xvii" and "p6-part-xvii".
 ids = set(re.findall(r'\bid="([^"]+)"', content))

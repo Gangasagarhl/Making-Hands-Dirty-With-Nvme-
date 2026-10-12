@@ -60,3 +60,17 @@ Cite source files as `path:function` (and line numbers when helpful, from v7.2).
 `python3 /home/user/Making-Hands-Dirty-With-Nvme-/book/check.py <your files>` must be OK;
 `cd /home/user/Making-Hands-Dirty-With-Nvme-/atlas && python3 build.py` must succeed. Do not git commit.
 Report: files, chapter ids, number of error cards, sources used.
+
+## UPDATE — focus on the PEX trace (applies to every card)
+The user clarified: the atlas is about which errors can be found **using a PEX trace** (a Teledyne LeCroy PCIe
+protocol-analyzer capture file) — and which cannot. Every error card MUST have this row, placed FIRST in the dl:
+```html
+<dt>In a PEX trace</dt><dd><span class="pex yes">Visible</span> one or two sentences: the exact packet pattern / timing to look for</dd>
+```
+Verdict class is exactly one of: `pex yes` (label "Visible"), `pex part` (label "Partly visible": the trace shows a
+symptom or the command but not the proof), `pex no` (label "Not visible": need other evidence — say which).
+Replace your old "In a trace" row with this one. Be honest: device-internal behaviour (media, cache, FTL mapping,
+whether a trim really unmapped) is NOT visible; host-memory contents are visible only as TLP payloads that cross
+the probed link; anything on a different link is not visible; a timeout is visible only as an absence plus
+timestamps (a request with no completion within N); AER registers are visible only if software reads them over the
+link (config reads) or the device sends ERR_* messages.

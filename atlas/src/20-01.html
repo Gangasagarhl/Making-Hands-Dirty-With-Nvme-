@@ -1,0 +1,237 @@
+<section class="part" id="a-part-ii"><div class="part-num">PART II</div><h1>Errors That Come With a Code</h1>
+<p class="part-intro">This part covers the easy failures: the drive admits something went wrong. It gives a status code in the Completion Queue Entry (CQE), raises an Asynchronous Event, sets a bit in a log page, or sets the fatal bit in a controller register. Each failure gets an error card that says what the device means by it, why it usually happens (using the places where the QEMU NVMe model returns it), and what Linux v7.2 does with it. Most of the hard bugs are near these codes: a driver that ignores the More bit, a firmware that sets DNR when it should not, a retry loop that hides a dying drive. Reading the code correctly is step one. Chapter 3 covers the status field and the Linux code path. Chapters 4–6 hold the per-code cards, Chapter 7 is the complete code table, and Chapter 8 covers failures reported through logs, events and registers instead of a CQE.</p></section>
+
+<section class="chapter" id="a-status-anatomy">
+<h2><span class="num">3</span> The Status Field: Anatomy and the Linux Path</h2>
+
+<div class="callout remember"><div class="callout-title">📌 Four ways to show a failure (recap)</div>
+<p>Part I describes them in detail. In short, an NVMe failure reaches the host in one of four ways: <b>(1)</b> a non-zero status in a completion (this part), <b>(2)</b> no completion at all, so only a host timer notices (Part on timing), <b>(3)</b> a successful completion with the wrong effect (silent data problems), or <b>(4)</b> correct results delivered slowly or over a degraded link. Category 1 also includes failures reported <i>out of band</i>: Asynchronous Event Request (AER) completions, log pages and the CSTS register. Chapter 8 covers those.</p></div>
+
+<h3>3.1 Why this chapter exists</h3>
+<p>A failed command returns 15 bits of status, and engineers misread them all the time. Common mistakes: decoding SC without SCT (0x02 is "Invalid Field" under SCT 0 but "Invalid Queue Size" under SCT 1), treating DNR as a severity, ignoring the More bit and never reading the Error Information log, or forgetting that the host driver <i>invents</i> some status codes itself (0x370, 0x371) that never appeared on the PCIe link. The cards in the following chapters assume you can decode the field without hesitating and know which branch of the Linux completion path a code takes.</p>
+
+<ul class="objectives">
+<li>Decode a CQE status word into Phase, SC, SCT, CRD, More and DNR, both in raw CQE layout and in the Linux shifted layout.</li>
+<li>Predict whether Linux v7.2 retries, fails over, re-authenticates or completes a failed request, and which errno user space sees.</li>
+<li>Find the exact dmesg line, sysfs counter and tracepoint that record each failed command.</li>
+<li>Use the kernel's NVMe fault injection to test the host's handling of any status code without a misbehaving drive.</li>
+</ul>
+
+<h3>3.2 Where the status lives</h3>
+<p>A CQE is 16 bytes <span class="tag verified">verified</span>. Dword 0 (and in newer specs Dword 1) holds the command-specific result, DW2 holds SQ Head Pointer (SQHD) and SQ Identifier (SQID), and DW3 holds the Command Identifier (CID, bits 15:0), the Phase Tag (bit 16) and the 15-bit Status Field (bits 31:17). Linux's <code>struct nvme_completion</code> in <code>include/linux/nvme.h</code> declares DW3 as <code>__u16 command_id; __le16 status;</code>. So the 16-bit <code>status</code> includes the phase tag in bit 0, and the driver shifts it off.</p>
+
+<div class="table-wrap"><table class="bitfield">
+<thead><tr><th>CQE DW3 bit</th><th>31</th><th>30</th><th>29:28</th><th>27:25</th><th>24:17</th><th>16</th><th>15:0</th></tr></thead>
+<tbody>
+<tr><td>Field</td><td>DNR</td><td>M (More)</td><td>CRD</td><td>SCT</td><td>SC</td><td>P (Phase)</td><td>CID</td></tr>
+<tr><td>bit in <code>cqe.status</code> (16-bit)</td><td>15</td><td>14</td><td>13:12</td><td>11:9</td><td>8:1</td><td>0</td><td>—</td></tr>
+<tr><td>bit in <code>nvme_req(req)-&gt;status</code> (after <code>&gt;&gt; 1</code>)</td><td>14</td><td>13</td><td>12:11</td><td>10:8</td><td>7:0</td><td>dropped</td><td>—</td></tr>
+<tr><td>Linux mask</td><td><code>NVME_STATUS_DNR</code> 0x4000</td><td><code>NVME_STATUS_MORE</code> 0x2000</td><td><code>NVME_STATUS_CRD</code> 0x1800</td><td><code>NVME_SCT_MASK</code> 0x0700</td><td><code>NVME_SC_MASK</code> 0x00ff</td><td>—</td><td>—</td></tr>
+</tbody></table></div>
+
+<p>The shift happens in <code>drivers/nvme/host/nvme.h:nvme_try_complete_req()</code>: <code>rq-&gt;status = le16_to_cpu(status) &gt;&gt; 1;</code>. From that point on, every Linux constant (<code>NVME_SC_*</code>, <code>NVME_SCT_*</code>) is written in the shifted layout. The Generic codes are 0x000–0x0FF, Command Specific 0x100–0x1FF, Media 0x200–0x2FF and Path 0x300–0x3FF. This is why <code>include/linux/nvme.h</code> lists <code>NVME_SC_WRITE_FAULT = 0x280</code>: SCT 2, SC 0x80. libnvme's <code>types.h</code> instead lists the SC alone (<code>NVME_SC_WRITE_FAULT = 0x80</code>) and the SCT separately (<code>NVME_SCT_MEDIA = 0x2</code>, shift 8). <b>Always check which convention a tool prints.</b> nvme-cli and the Linux log line print SCT and SC as separate numbers. The QEMU trace and Linux's internal constants use the combined form.</p>
+
+<h3>3.3 The five sub-fields</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Field</th><th>Width</th><th>Meaning</th><th>Who acts on it</th></tr></thead>
+<tbody>
+<tr><td><b>SC</b> — Status Code</td><td>8</td><td>The specific reason. 0x00 with SCT 0 = success. Meaning depends on SCT.</td><td>Everyone. Only meaningful together with SCT.</td></tr>
+<tr><td><b>SCT</b> — Status Code Type</td><td>3</td><td>0 Generic Command Status, 1 Command Specific Status, 2 Media and Data Integrity Errors, 3 Path Related Status, 4–6 reserved, 7 Vendor Specific (libnvme <code>NVME_SCT_VS = 0x7</code>).</td><td>Linux checks SCT 3 explicitly (<code>nvme_is_path_error()</code>) to choose multipath failover.</td></tr>
+<tr><td><b>CRD</b> — Command Retry Delay</td><td>2</td><td>0 = no delay. 1–3 select CRDT1–CRDT3 from Identify Controller. Each is a time in units of 100 ms. Used only if the host enabled Advanced Command Retry Enable (ACRE) in the Host Behavior Support feature.</td><td>Linux <code>nvme_retry_req()</code>: <code>delay = ctrl-&gt;crdt[crd - 1] * 100</code> ms before kicking the requeue list.</td></tr>
+<tr><td><b>M</b> — More</td><td>1</td><td>More status information for this command is available in the Error Information log page (LID 01h).</td><td>Linux only prints "MORE" in the error line. It never reads LID 01h itself (no use of <code>NVME_LOG_ERROR</code> in <code>drivers/nvme/host/</code>).</td></tr>
+<tr><td><b>DNR</b> — Do Not Retry</td><td>1</td><td>If the same command is submitted again to any controller in the NVM subsystem, it is expected to fail (libnvme wording).</td><td>Linux <code>nvme_decide_disposition()</code>: DNR set → COMPLETE (no retry, no failover).</td></tr>
+</tbody></table></div>
+
+<div class="callout warn"><div class="callout-title">⚠️ DNR is a prediction, not a severity</div>
+<p>DNR=0 does not mean "minor", and DNR=1 does not mean "fatal". An Unrecovered Read Error with DNR=0 tells the host "try again, a re-read might succeed". The data is still at risk. An Invalid Field with DNR=1 tells the host "your command is wrong". Nothing is broken on the drive. Firmware that clears DNR on deterministic errors makes Linux resend the same bad command up to <code>max_retries</code> (default 5) times. Firmware that sets DNR on transient errors makes Linux fail I/O that would have succeeded on retry. Both are real conformance bugs. Check DNR on every error a drive under test returns.</p></div>
+
+<h3>3.4 What Linux v7.2 does with a non-zero status</h3>
+<p>All transports (PCIe, RDMA, TCP, FC, loop) reach the same core path. The diagram below follows a completion from the CQE to the errno.</p>
+
+<figure class="diagram" id="fig-a-status-path"><svg viewBox="0 0 1000 560" role="img" aria-label="Linux v7.2 NVMe completion status decision path">
+<rect class="b-dev" x="20" y="20" width="230" height="60" rx="8"/><text class="t-lbl" x="135" y="46" text-anchor="middle">CQE arrives (status, P)</text><text class="t-mono" x="135" y="66" text-anchor="middle">DW3[31:17]</text>
+<rect class="b-sw" x="300" y="20" width="300" height="60" rx="8"/><text class="t-lbl" x="450" y="44" text-anchor="middle">nvme_try_complete_req()</text><text class="t-mono" x="450" y="64" text-anchor="middle">status &gt;&gt; 1 ; nvme_should_fail()</text>
+<path class="ar dev" d="M250 50 L296 50" marker-end="url(#m-dev)"/>
+<rect class="b-sw" x="650" y="20" width="320" height="60" rx="8"/><text class="t-lbl" x="810" y="44" text-anchor="middle">nvme_complete_rq()</text><text class="t-mono" x="810" y="64" text-anchor="middle">trace nvme_complete_rq (status, retries)</text>
+<path class="ar sw" d="M600 50 L646 50" marker-end="url(#m-sw)"/>
+<rect class="b-hot" x="300" y="130" width="400" height="66" rx="8"/><text class="t-lbl" x="500" y="156" text-anchor="middle">nvme_decide_disposition()</text><text class="t-mono" x="500" y="178" text-anchor="middle">status==0 ? DNR ? retries&gt;=max ? AUTH ? path?</text>
+<path class="ar sw" d="M810 80 L810 105 L500 105 L500 126" marker-end="url(#m-sw)"/>
+<rect class="b-plain" x="20" y="260" width="220" height="74" rx="8"/><text class="t-lbl" x="130" y="286" text-anchor="middle">COMPLETE</text><text class="t-mono" x="130" y="306" text-anchor="middle">nvme_end_req()</text><text class="t-sub" x="130" y="324" text-anchor="middle">success, DNR, retries out</text>
+<rect class="b-plain" x="270" y="260" width="220" height="74" rx="8"/><text class="t-lbl" x="380" y="286" text-anchor="middle">RETRY</text><text class="t-mono" x="380" y="306" text-anchor="middle">nvme_retry_req()</text><text class="t-sub" x="380" y="324" text-anchor="middle">requeue + CRD delay</text>
+<rect class="b-plain" x="520" y="260" width="220" height="74" rx="8"/><text class="t-lbl" x="630" y="286" text-anchor="middle">FAILOVER</text><text class="t-mono" x="630" y="306" text-anchor="middle">nvme_failover_req()</text><text class="t-sub" x="630" y="324" text-anchor="middle">mpath + SCT 3</text>
+<rect class="b-plain" x="770" y="260" width="210" height="74" rx="8"/><text class="t-lbl" x="875" y="286" text-anchor="middle">AUTHENTICATE</text><text class="t-mono" x="875" y="306" text-anchor="middle">dhchap_auth_work</text><text class="t-sub" x="875" y="324" text-anchor="middle">SC 0x191 then retry</text>
+<path class="ar sw" d="M330 196 L130 256" marker-end="url(#m-sw)"/>
+<path class="ar sw" d="M440 196 L390 256" marker-end="url(#m-sw)"/>
+<path class="ar sw" d="M560 196 L620 256" marker-end="url(#m-sw)"/>
+<path class="ar sw" d="M670 196 L860 256" marker-end="url(#m-sw)"/>
+<rect class="b-sw" x="20" y="390" width="440" height="70" rx="8"/><text class="t-lbl" x="240" y="416" text-anchor="middle">__nvme_end_req(): nvme_log_error() / _passthru()</text><text class="t-mono" x="240" y="438" text-anchor="middle">ns-&gt;errors++ (command_error_count)</text>
+<path class="ar sw" d="M130 334 L130 386" marker-end="url(#m-sw)"/>
+<rect class="b-sw" x="520" y="390" width="460" height="70" rx="8"/><text class="t-lbl" x="750" y="416" text-anchor="middle">nvme_error_status(): NVMe status → blk_status_t</text><text class="t-mono" x="750" y="438" text-anchor="middle">blk_mq_end_request() → blk_status_to_errno()</text>
+<path class="ar sw" d="M460 425 L516 425" marker-end="url(#m-sw)"/>
+<rect class="b-mem" x="520" y="490" width="460" height="54" rx="8"/><text class="t-lbl" x="750" y="514" text-anchor="middle">blk_print_req_error(): "critical medium error, dev ..."</text><text class="t-sub" x="750" y="532" text-anchor="middle">errno to filesystem / application</text>
+<path class="ar sw" d="M750 460 L750 486" marker-end="url(#m-sw)"/>
+<path class="ar in" d="M380 334 L380 370 L290 370 L290 210 L300 196" marker-end="url(#m-in)"/>
+<text class="t-sub" x="300" y="364">re-submitted later</text>
+</svg><figcaption>Figure 3.1 — How Linux v7.2 handles a non-zero NVMe status, from <code>drivers/nvme/host/core.c</code> and <code>nvme.h</code>. The retry arrow is dashed because the request goes back through blk-mq and is resubmitted with the same command. <span class="tag verified">verified layout of v7.2 source</span></figcaption></figure>
+
+<h4>3.4.1 <code>nvme_decide_disposition()</code> — the one function that decides</h4>
+<pre class="code" data-kind="read-only inspection"><code>/* drivers/nvme/host/core.c (v7.2), abridged */
+static inline enum nvme_disposition nvme_decide_disposition(struct request *req)
+{
+	if (likely(nvme_req(req)-&gt;status == 0))
+		return COMPLETE;
+	if (blk_noretry_request(req) ||
+	    (nvme_req(req)-&gt;status &amp; NVME_STATUS_DNR) ||
+	    nvme_req(req)-&gt;retries &gt;= nvme_max_retries)
+		return COMPLETE;
+	if ((nvme_req(req)-&gt;status &amp; NVME_SCT_SC_MASK) == NVME_SC_AUTH_REQUIRED)
+		return AUTHENTICATE;
+	if (req-&gt;cmd_flags &amp; REQ_NVME_MPATH) {
+		if (nvme_is_path_error(nvme_req(req)-&gt;status) ||
+		    blk_queue_dying(req-&gt;q))
+			return FAILOVER;
+	} else {
+		if (blk_queue_dying(req-&gt;q))
+			return COMPLETE;
+	}
+	return RETRY;
+}</code></pre>
+<p>Consequences worth remembering <span class="tag verified">verified</span>:</p>
+<ul>
+<li><b>Linux does not look at the code when deciding to retry.</b> Any non-zero status without DNR is retried up to <code>nvme_core.max_retries</code> (module parameter, default 5), unless the request is marked no-retry (<code>blk_noretry_request()</code>, i.e. a REQ_FAILFAST_* flag). So for retries, the device's DNR choice is the policy.</li>
+<li>Path errors (SCT 3) fail over to another path <i>only</i> on a multipath namespace head (<code>REQ_NVME_MPATH</code>). On a single-path device they are plain retries.</li>
+<li>Older kernels had a helper named <code>nvme_req_needs_retry()</code>. It does not exist in v7.2. Its logic is now inside <code>nvme_decide_disposition()</code>.</li>
+<li>Admin and passthrough requests use the same function, but most are submitted with flags that make them no-retry. If you see an admin error, assume it was not retried.</li>
+<li><code>nvme_retry_req()</code> increments <code>nvme_req(req)-&gt;retries</code> and the per-namespace <code>ns-&gt;retries</code> (sysfs <code>command_retries_count</code>), then calls <code>blk_mq_delay_kick_requeue_list()</code> with the CRD-derived delay.</li>
+</ul>
+
+<h4>3.4.2 <code>nvme_error_status()</code> — status to block-layer error</h4>
+<p>Only a few codes get a specific <code>blk_status_t</code>. Everything else becomes <code>BLK_STS_IOERR</code> → <code>-EIO</code>. The errno column comes from the <code>blk_errors[]</code> table in <code>block/blk-core.c</code>.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>NVMe status (Linux constant, shifted value)</th><th>blk_status_t</th><th>errno</th><th>blk_print_req_error text</th></tr></thead>
+<tbody>
+<tr><td>NVME_SC_SUCCESS 0x000</td><td>BLK_STS_OK</td><td>0</td><td>—</td></tr>
+<tr><td>NVME_SC_CAP_EXCEEDED 0x081</td><td>BLK_STS_NOSPC</td><td>-ENOSPC</td><td>critical space allocation</td></tr>
+<tr><td>NVME_SC_LBA_RANGE 0x080, NVME_SC_CMD_INTERRUPTED 0x021, NVME_SC_NS_NOT_READY 0x082</td><td>BLK_STS_TARGET</td><td>-EREMOTEIO</td><td>critical target</td></tr>
+<tr><td>NVME_SC_BAD_ATTRIBUTES 0x180, NVME_SC_INVALID_OPCODE 0x001, NVME_SC_INVALID_FIELD 0x002, NVME_SC_INVALID_NS 0x00B</td><td>BLK_STS_NOTSUPP</td><td>-EOPNOTSUPP</td><td>operation not supported</td></tr>
+<tr><td>NVME_SC_WRITE_FAULT 0x280, NVME_SC_READ_ERROR 0x281, NVME_SC_UNWRITTEN_BLOCK 0x287, NVME_SC_ACCESS_DENIED 0x286, NVME_SC_READ_ONLY 0x182, NVME_SC_COMPARE_FAILED 0x285</td><td>BLK_STS_MEDIUM</td><td>-ENODATA</td><td>critical medium</td></tr>
+<tr><td>NVME_SC_GUARD_CHECK 0x282, NVME_SC_APPTAG_CHECK 0x283, NVME_SC_REFTAG_CHECK 0x284, NVME_SC_INVALID_PI 0x181</td><td>BLK_STS_PROTECTION</td><td>-EILSEQ</td><td>protection</td></tr>
+<tr><td>NVME_SC_RESERVATION_CONFLICT 0x083</td><td>BLK_STS_RESV_CONFLICT</td><td>-EBADE</td><td>reservation conflict</td></tr>
+<tr><td>NVME_SC_HOST_PATH_ERROR 0x370</td><td>BLK_STS_TRANSPORT</td><td>-ENOLINK</td><td>recoverable transport</td></tr>
+<tr><td>NVME_SC_ZONE_TOO_MANY_ACTIVE 0x1BD</td><td>BLK_STS_ZONE_ACTIVE_RESOURCE</td><td>-EOVERFLOW</td><td>active zones exceeded</td></tr>
+<tr><td>NVME_SC_ZONE_TOO_MANY_OPEN 0x1BE</td><td>BLK_STS_ZONE_OPEN_RESOURCE</td><td>-ETOOMANYREFS</td><td>open zones exceeded</td></tr>
+<tr><td><i>everything else</i> (Internal Error, Data Transfer Error, aborts, ANA codes, Host Aborted 0x371, all other zone codes, vendor-specific)</td><td>BLK_STS_IOERR</td><td>-EIO</td><td>I/O</td></tr>
+</tbody></table></div>
+<p>Note that the <code>switch</code> masks with <code>NVME_SCT_SC_MASK</code>, so CRD/More/DNR do not affect the mapping. Also, <code>BLK_STS_NOTSUPP</code> for Invalid Field means a Write Zeroes or Discard the drive rejects becomes "operation not supported". blk-lib callers use this to fall back, which can hide an Invalid Field caused by a host bug as "feature absent". <span class="tag derived">derived</span></p>
+
+<h4>3.4.3 What gets printed</h4>
+<p><code>nvme_log_error()</code> (rate-limited <code>pr_err</code>) runs for every failing non-passthrough request that does not carry <code>RQF_QUIET</code>:</p>
+<pre class="code" data-kind="read-only inspection"><code>/* I/O command on a namespace (format string from v7.2 core.c) */
+"%s: %s(0x%x) @ LBA %llu, %u blocks, %s (sct 0x%x / sc 0x%x) %s%s\n"
+/* admin command (no namespace) */
+"%s: %s(0x%x), %s (sct 0x%x / sc 0x%x) %s%s\n"
+/* passthrough (nvme_log_err_passthru) adds cdw10..cdw15 */
+
+# illustrative, abbreviated (synthetic values):
+nvme0n1: Read(0x2) @ LBA 1048576, 8 blocks, Unrecovered Read Error (sct 0x2 / sc 0x81) DNR
+critical medium error, dev nvme0n1, sector 8388608 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 2</code></pre>
+<p>The text "Unrecovered Read Error" comes from <code>nvme_get_error_status_str()</code> in <code>drivers/nvme/host/constants.c</code>, which indexes <code>nvme_statuses[]</code> with <code>status &amp; NVME_SCT_SC_MASK</code> and returns <code>"Unknown"</code> for gaps. The second line comes from the block layer (<code>block/blk-mq.c:blk_print_req_error()</code>). Note that it reports a 512-byte <i>sector</i>, not an LBA. Two quirks of the string table <span class="tag derived">derived</span>:</p>
+<ul>
+<li>0x104 (<code>NVME_SC_ABORT_MISSING</code>) is printed as "Reserved" (the source carries an <code>/* XXX */</code> comment).</li>
+<li>Fabrics Connect codes share the numbers 0x180–0x184 with NVM command-set codes. The table only has the NVM names, so a Fabrics status decoded by this function shows the NVM text (0x182 → "Attempted Write to Read Only Range"). Connect failures are logged separately by <code>drivers/nvme/host/fabrics.c:nvmf_log_connect_error()</code>, which uses its own wording.</li>
+</ul>
+<p>The log line appears <b>only when the request finally completes with an error</b>. A command that failed twice and then succeeded on the third retry prints nothing. Only <code>command_retries_count</code> and the tracepoint record it. This is a common way intermittent drive errors stay invisible.</p>
+
+<h4>3.4.4 Counters and tracepoints</h4>
+<div class="table-wrap"><table>
+<thead><tr><th>Where</th><th>What it counts</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td><code>/sys/block/nvmeXnY/command_retries_count</code> (per-namespace device attribute; exact path depends on multipath layout)</td><td>Every <code>nvme_retry_req()</code> on that namespace</td><td><code>sysfs.c:command_retries_count_show</code></td></tr>
+<tr><td>namespace <code>command_error_count</code></td><td>Requests that ended with non-zero status (logged path)</td><td><code>sysfs.c:nvme_io_errors_show</code>, incremented in <code>__nvme_end_req()</code></td></tr>
+<tr><td>controller <code>command_error_count</code></td><td>Same, for admin requests (no ns)</td><td><code>sysfs.c:nvme_adm_errors_show</code></td></tr>
+<tr><td>namespace <code>multipath_failover_count</code></td><td>Each <code>nvme_failover_req()</code></td><td><code>multipath.c</code></td></tr>
+<tr><td>tracepoint <code>nvme:nvme_complete_rq</code></td><td>Every completion: qid, cmdid, result, <b>retries</b>, flags, <b>status</b></td><td><code>drivers/nvme/host/trace.h</code></td></tr>
+<tr><td>tracepoint <code>nvme:nvme_async_event</code></td><td>Every AEN result dword, decoded type</td><td><code>trace.h</code>, called from <code>nvme_complete_async_event()</code></td></tr>
+</tbody></table></div>
+<pre class="code" data-kind="read-only inspection"><code># Catch every non-zero NVMe completion, including ones later retried successfully
+echo 'status != 0' &gt; /sys/kernel/tracing/events/nvme/nvme_complete_rq/filter
+echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_complete_rq/enable
+echo 1 &gt; /sys/kernel/tracing/events/nvme/nvme_async_event/enable
+cat /sys/kernel/tracing/trace_pipe
+# the 'status=' value printed is the shifted Linux layout (DNR=0x4000, More=0x2000)</code></pre>
+
+<h4>3.4.5 Passthrough and ioctl users see the raw status</h4>
+<p>For <code>NVME_IOCTL_ADMIN_CMD</code> / <code>NVME_IOCTL_IO_CMD</code> (what nvme-cli uses), the ioctl return value is the positive NVMe status (shifted layout) when the device fails the command, and a negative errno for host-side failures (<code>drivers/nvme/host/ioctl.c</code>). For io_uring passthrough, <code>nvme_uring_cmd_end_io()</code> places <code>nvme_req(req)-&gt;status</code> in the CQE result and only falls back to <code>blk_status_to_errno()</code> when the status is zero but the block layer reported an error. This is why nvme-cli can print "NVMe status: Invalid Field in Command(0x2)" while a filesystem would only see EOPNOTSUPP.</p>
+
+<h3>3.5 Host-generated statuses — codes that were never on the wire</h3>
+<p>Two path-related codes are mostly <b>synthesised by the host driver</b>. In a protocol-analyzer capture there is no CQE carrying them.</p>
+<ul>
+<li><code>NVME_SC_HOST_PATH_ERROR</code> (0x370): set by <code>nvme_host_path_error()</code> when a transport cannot even submit (e.g. the controller is not live). Mapped to BLK_STS_TRANSPORT / -ENOLINK.</li>
+<li><code>NVME_SC_HOST_ABORTED_CMD</code> (0x371): set by <code>nvme_cancel_request()</code> for every in-flight request when the driver tears down queues (reset, removal, timeout recovery). Not DNR, so it is retried or failed over. If the retry budget runs out or the queue is dying, the application sees -EIO.</li>
+</ul>
+<p>Likewise <b>NVMe fault injection</b> (<code>drivers/nvme/host/fault_inject.c</code>, built with <code>CONFIG_FAULT_INJECTION_DEBUG_FS</code>) overwrites <code>nvme_req(req)-&gt;status</code> inside <code>nvme_try_complete_req()</code>. The drive really returned success, and the trace shows a good CQE.</p>
+
+<div class="lab"><div class="lab-head">🧪 Lab 3.1 — Make Linux see any status code you choose <span class="safety caution">CAUTION</span></div>
+<p><b>Objective:</b> exercise the host's error handling for a specific status (e.g. 0x281 Unrecovered Read Error) without a faulty drive.</p>
+<div class="callout warn"><div class="callout-title">⚠️ Safety</div><p>Injected write failures make filesystems go read-only or remount, and can corrupt a mounted filesystem's view. Use a scratch namespace or a QEMU guest. The drive's media is never touched.</p></div>
+<p><b>Setup:</b> kernel with <code>CONFIG_FAULT_INJECTION_DEBUG_FS=y</code>, debugfs mounted. Per-namespace directory: <code>/sys/kernel/debug/nvme0n1/fault_inject/</code> (the parent is named after the disk or controller device).</p>
+<pre class="code" data-kind="hardware-dependent"><code>cd /sys/kernel/debug/nvme0n1/fault_inject
+echo 0x281 &gt; status        # SCT 2 / SC 0x81, shifted Linux layout
+echo 1     &gt; dont_retry    # ORs NVME_STATUS_DNR into the injected status
+echo 100   &gt; probability
+echo 1     &gt; times
+dd if=/dev/nvme0n1 of=/dev/null bs=4k count=1 iflag=direct
+dmesg | tail -3            # expect the nvme_log_error line + "critical medium error"
+echo 0 &gt; dont_retry; echo 3 &gt; times   # now observe retries in command_retries_count</code></pre>
+<p><b>Observations:</b> with <code>dont_retry=1</code>, dd fails at once with "No data available" (ENODATA). With <code>dont_retry=0</code> and <code>times</code> &lt; 6, the read succeeds after retries, nothing is printed, and <code>command_retries_count</code> goes up.</p>
+<details class="answer"><summary>Solution / explanation</summary><p>The injected status passes through <code>nvme_decide_disposition()</code> exactly like a real one. DNR → COMPLETE → <code>nvme_error_status()</code> maps 0x281 to BLK_STS_MEDIUM → -ENODATA. Without DNR, the request is requeued and the next attempt succeeds because <code>times</code> is used up. This is the "retry hides the error" pattern from §3.4.3.</p></details>
+<p><b>Extension:</b> inject 0x302 (ANA Inaccessible) on one path of a multipath namespace and watch <code>multipath_failover_count</code>.</p>
+</div>
+
+<h3>3.6 How the device side decides — the QEMU reference model</h3>
+<p>The QEMU NVMe controller (<code>hw/nvme/ctrl.c</code>) is the most readable open model of <i>when</i> a controller returns each status. Its checks are a useful baseline for "typical cause" <span class="tag impl">impl</span>. Real firmware has many more error sources (media, power, thermal), but argument validation usually looks very similar. Status names in QEMU's <code>include/block/nvme.h</code> differ from Linux's (e.g. <code>NVME_DATA_TRAS_ERROR</code>, <code>NVME_INTERNAL_DEV_ERROR</code>, <code>NVME_DULB</code>), and its values use the same combined SCT/SC layout as Linux. A static scan of <code>return</code> sites in QEMU's <code>ctrl.c</code> shows how lopsided real error traffic is: <code>NVME_INVALID_FIELD | NVME_DNR</code> is returned from about 86 places, <code>NVME_INVALID_NSID | NVME_DNR</code> from about 15, and everything else from a handful <span class="tag derived">derived from grep, approximate</span>.</p>
+<p>QEMU has a few useful behaviours for testers <span class="tag verified">verified in source</span>:</p>
+<ul>
+<li>Backend I/O failure is turned into a media status in <code>nvme_rw_complete_cb()</code>: reads → <code>NVME_UNRECOVERED_READ</code>, writes / Write Zeroes / Zone Append → <code>NVME_WRITE_FAULT</code>. A host-side blkdebug rule therefore gives a real SCT 2 error on the emulated wire.</li>
+<li>Its Error Information log (<code>nvme_error_info()</code>) always returns zeroed entries, so QEMU never sets More meaningfully.</li>
+<li>Its Abort (<code>nvme_abort()</code>) only cancels outstanding AERs, plus queued backend AIO on a best-effort basis, and otherwise completes with result bit 0 = 1 ("not aborted").</li>
+<li>SMART critical warnings can be injected at run time through the QOM property <code>smart_critical_warning</code> (<code>nvme_set_smart_warning()</code>), which raises the matching SMART AEN if the host enabled it.</li>
+</ul>
+
+<h3>3.7 A synthetic trace of the retry pattern</h3>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic trace — transient read error retried by Linux, then success (no dmesg line)</div>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>t (µs)</th><th>Dir</th><th>Event</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>0.0</td><td>H→D</td><td>MWr SQ1 tail doorbell</td><td>Read, CID 0x0041, SLBA 0x100000, NLB 7</td></tr>
+<tr><td>2</td><td>1.2</td><td>D→H</td><td>MRd SQE / CplD</td><td>device fetches 64-byte SQE</td></tr>
+<tr class="first-bad"><td>3</td><td>412.0</td><td>D→H</td><td>MWr CQE (16 B)</td><td>CID 0x0041, SCT 2, SC 0x81, DNR=0, M=1, CRD=0 — no data MWr preceded it</td></tr>
+<tr><td>4</td><td>413.0</td><td>D→H</td><td>MSI-X MWr</td><td>vector 1</td></tr>
+<tr><td>5</td><td>420.5</td><td>H→D</td><td>MWr CQ1 head doorbell</td><td>driver consumed CQE; nvme_decide_disposition → RETRY</td></tr>
+<tr class="bad"><td>6</td><td>431.0</td><td>H→D</td><td>MWr SQ1 tail doorbell</td><td>same Read re-submitted, new CID 0x1041 (genctr bumped in CID upper bits)</td></tr>
+<tr><td>7</td><td>560.0</td><td>D→H</td><td>MWr data ×8, MWr CQE</td><td>status 0 — success; application never sees an error</td></tr>
+</tbody></table></div></div>
+<p>What to notice: the only host-visible evidence is the tracepoint and <code>command_retries_count</code>. The <b>More</b> bit in row 3 says the drive stored detail in LID 01h, and Linux will never fetch it. A validation harness should read the Error Information log after every test.</p>
+
+<h3>3.8 Common mistakes</h3>
+<ul>
+<li>Comparing a raw CQE <code>status</code> (phase still in bit 0) with a Linux <code>NVME_SC_*</code> constant: you are off by one bit and everything looks like a different code.</li>
+<li>Assuming "sct 0x0 / sc 0x2" and "sct 0x1 / sc 0x2" are the same error.</li>
+<li>Reading only dmesg: retried-then-successful errors never print. Read the tracepoint, the counters and the Error Information log.</li>
+<li>Assuming a 0x371 in dmesg means the drive aborted a command: it means <i>Linux</i> cancelled it, usually during a reset that a timeout or CSTS.CFS triggered. Look for the root cause earlier in the log.</li>
+<li>Expecting CRD to work without the host enabling ACRE. Linux v7.2 enables ACRE (<code>nvme_configure_host_options()</code>) only if <code>crdt1</code> is non-zero in Identify Controller.</li>
+</ul>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>The raw 16-bit CQE status word is 0x8103. Decode it.</p><details class="answer"><summary>Answer</summary><p>Bit 0 (P) = 1. Shifting right by one gives 0x4081: DNR=1 (0x4000), More=0, CRD=0, SCT=0 (bits 10:8 of 0x081 = 0), SC=0x81 → Generic "Capacity Exceeded". Linux maps it to BLK_STS_NOSPC → -ENOSPC and does not retry.</p></details></li>
+<li><p>A drive returns Internal Error (0x006) with DNR=0 on every attempt. How many times does Linux v7.2 send the command, and what does the application see?</p><details class="answer"><summary>Answer</summary><p>With the default <code>max_retries=5</code>: the first attempt plus 5 retries = 6 submissions. Then <code>retries &gt;= nvme_max_retries</code> → COMPLETE, one log line, and BLK_STS_IOERR → -EIO.</p></details></li>
+<li><p>Why can't you find status 0x371 in an analyzer trace that covers the failure?</p><details class="answer"><summary>Answer</summary><p>Because the driver created it in <code>nvme_cancel_request()</code> while tearing down queues. No CQE carried it.</p></details></li>
+</ol></div>
+
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can convert between raw CQE status, Linux shifted status and libnvme SCT/SC pairs.</li>
+<li>I can predict COMPLETE / RETRY / FAILOVER / AUTHENTICATE for any status and request type.</li>
+<li>I know which codes map to ENOSPC, EREMOTEIO, EOPNOTSUPP, ENODATA, EILSEQ, EBADE, ENOLINK, and that the rest map to EIO.</li>
+<li>I can show a retried error that never reached dmesg.</li>
+</ul></div>
+</section>
