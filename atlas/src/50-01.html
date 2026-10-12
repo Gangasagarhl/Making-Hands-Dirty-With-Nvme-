@@ -1,0 +1,199 @@
+<section class="part" id="a-part-v"><div class="part-num">PART V</div><h1>PCIe Link and Transaction Errors</h1><p class="part-intro">Every NVMe command travels as PCIe Transaction Layer Packets (TLPs), and every one of them can be damaged, refused, dropped or delayed on the way. PCIe has its own error system, Advanced Error Reporting (AER). AER is separate from NVMe status codes, and the NVMe driver often never hears about it. This part covers every AER status bit that Linux v7.2 defines, then the many link and fabric failures that set no AER bit at all: a link that trained narrow or slow, a recovery storm, a surprise link-down, Downstream Port Containment (DPC), lost interrupts, Input/Output Memory Management Unit (IOMMU) faults and bad Base Address Register (BAR) assignment. Card ids use the prefix <b>L-</b>.</p></section>
+
+<section class="chapter" id="a-50-aer-basics">
+<h2><span class="num">V.1</span> How AER Works, and What Linux v7.2 Does With It</h2>
+
+<h3>V.1.1 Why this chapter exists</h3>
+<p>When an NVMe drive "disappears", the first evidence is usually a few lines from <code>AER:</code> or <code>pcieport</code> in the kernel log, not an NVMe status code. To read those lines you need four things: what each register holds, which layer of PCIe detected the problem, how severity is decided, and what Linux does next. Linux can do nothing, reset the link, or remove the device. This chapter explains all four and ends with a reference table of every AER status bit in <code>include/uapi/linux/pci_regs.h</code>. Chapters 21 and 22 give each bit its own card.</p>
+
+<ul class="objectives">
+<li>Name the AER registers (Uncorrectable Status/Mask/Severity, Correctable Status/Mask, Capabilities and Control, Header Log, Root Error Command/Status, Error Source ID) and their offsets inside the AER extended capability.</li>
+<li>Explain correctable, non-fatal uncorrectable and fatal uncorrectable, and who decides which one applies.</li>
+<li>Follow Linux v7.2 from the Root Port interrupt to <code>pcie_do_recovery()</code> to the NVMe driver's <code>nvme_error_detected()</code>.</li>
+<li>Find the per-device AER counters in sysfs and know why they can read zero on the device that caused the problem.</li>
+</ul>
+
+<h3>V.1.2 The AER capability in one picture</h3>
+<p>AER is a PCI Express <em>extended</em> capability (ID 0001h) in configuration space at offset 100h or above. The offsets below are relative to the start of that capability. They come from <code>include/uapi/linux/pci_regs.h</code> in Linux v7.2 <span class="tag verified">verified</span>.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Offset</th><th>Register (Linux macro)</th><th>What it holds</th><th>Who writes it</th></tr></thead>
+<tbody>
+<tr><td>04h</td><td>Uncorrectable Error Status (<code>PCI_ERR_UNCOR_STATUS</code>)</td><td>One RW1C bit per uncorrectable error type: <code>PCI_ERR_UNC_*</code></td><td>Hardware sets; software clears by writing 1</td></tr>
+<tr><td>08h</td><td>Uncorrectable Error Mask (<code>PCI_ERR_UNCOR_MASK</code>)</td><td>Same bit layout. A masked error is not logged in the Header Log, is not the First Error Pointer and sends no message.</td><td>Firmware / OS</td></tr>
+<tr><td>0Ch</td><td>Uncorrectable Error Severity (<code>PCI_ERR_UNCOR_SEVER</code>)</td><td>Same bit layout. 1 = Fatal (ERR_FATAL), 0 = Non-Fatal (ERR_NONFATAL).</td><td>Firmware / OS</td></tr>
+<tr><td>10h</td><td>Correctable Error Status (<code>PCI_ERR_COR_STATUS</code>)</td><td><code>PCI_ERR_COR_*</code> bits</td><td>Hardware sets, RW1C</td></tr>
+<tr><td>14h</td><td>Correctable Error Mask (<code>PCI_ERR_COR_MASK</code>)</td><td>Same layout as 10h</td><td>Firmware / OS</td></tr>
+<tr><td>18h</td><td>Advanced Error Capabilities and Control (<code>PCI_ERR_CAP</code>)</td><td>First Error Pointer (bits 4:0); ECRC Generation/Check Capable and Enable; TLP Prefix Log Present; Completion Timeout header-log capable; Flit-mode TLP log fields</td><td>Hardware / OS</td></tr>
+<tr><td>1Ch</td><td>Header Log (<code>PCI_ERR_HEADER_LOG</code>)</td><td>Header of the TLP that caused the first logged error</td><td>Hardware</td></tr>
+<tr><td>2Ch</td><td>Root Error Command (<code>PCI_ERR_ROOT_COMMAND</code>)</td><td>Interrupt enables for received ERR_COR, ERR_NONFATAL and ERR_FATAL (Root Ports and RCECs only)</td><td>OS</td></tr>
+<tr><td>30h</td><td>Root Error Status (<code>PCI_ERR_ROOT_STATUS</code>)</td><td>ERR_COR received, multiple ERR_COR, ERR_FATAL/NONFATAL received, multiple, first-uncorrectable-is-fatal, non-fatal received, fatal received, interrupt message number</td><td>Hardware</td></tr>
+<tr><td>34h</td><td>Error Source Identification (<code>PCI_ERR_ROOT_ERR_SRC</code>)</td><td>Requester ID of the last ERR_COR source (low 16 bits) and the last ERR_FATAL/NONFATAL source (high 16 bits)</td><td>Hardware</td></tr>
+</tbody></table></div>
+
+<div class="callout analogy"><div class="callout-title">🌍 Analogy</div><p>Think of each PCIe device as a building with a fire panel. The status register is the panel of lamps, one per alarm type. The mask register is the set of lamps someone has taped over. The severity register decides whether a lamp calls the fire brigade (fatal) or only the caretaker (non-fatal). The Root Port is the central dispatch. It receives a short message ("building 03:00.0 has an alarm") and must then phone the building to find out which lamp is lit.</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>The message that reaches the Root Port (ERR_COR, ERR_NONFATAL, ERR_FATAL) carries only a Requester ID and a class, never the specific bit. Linux has to read the device's AER registers over the same link that may just have failed. On a fatal error Linux does not read the endpoint's uncorrectable registers at all. Section V.1.5 shows the code.</p></div>
+
+<h3>V.1.3 Three classes of error, and who decides</h3>
+<ul>
+<li><b>Correctable.</b> Hardware already fixed it. Examples are a bad Link CRC (LCRC) that a Data Link Layer replay fixed, or a receiver symbol error. The device sends ERR_COR. No data was lost, but each one costs bandwidth and latency. A rising rate is the most important early warning of a marginal link.</li>
+<li><b>Uncorrectable, non-fatal.</b> One transaction was lost or refused, but the link itself still works. The device sends ERR_NONFATAL. Examples are an Unsupported Request, a Completion Timeout, or a Poisoned TLP. The link is usable, so recovery may not need a reset.</li>
+<li><b>Uncorrectable, fatal.</b> The link or the device's protocol state can no longer be trusted. The device sends ERR_FATAL. Examples are a Data Link Protocol error, Surprise Down, a Malformed TLP or a Receiver Overflow. The link must be reset.</li>
+</ul>
+<p>The <em>Severity</em> register decides fatal versus non-fatal for each uncorrectable bit. It has a spec-defined default, but firmware or the OS can change it. Before you reason from the log line, check the actual value with <code>lspci -vvv</code> ("UESvrt:"). The defaults are in the table in section V.1.8.</p>
+
+<div class="callout notsaid"><div class="callout-title">📭 What the spec does not say</div><p>The PCIe Base Specification says when an error must be <em>detected</em> and <em>signalled</em>. It does not require the OS to do anything in particular. Whether a non-fatal Completion Timeout ends up as an NVMe I/O error, a controller reset or nothing visible depends entirely on the OS and the device. Everything in this part about "what happens next" describes Linux v7.2 behaviour <span class="tag impl">impl</span>.</p></div>
+
+<h3>V.1.4 Which layer detects what (as Linux reports it)</h3>
+<p>Every AER log line contains <code>type=Physical Layer</code>, <code>Data Link Layer</code> or <code>Transaction Layer</code>. Linux v7.2 does not read this from the hardware. It derives it from the status bits with the macro <code>AER_GET_LAYER_ERROR</code> in <code>drivers/pci/pcie/aer.c</code> <span class="tag verified">verified</span>:</p>
+<pre class="code" data-kind="read-only inspection"><code>/* drivers/pci/pcie/aer.c (v7.2), abbreviated */
+#define AER_PHYSICAL_LAYER_ERROR_MASK(t) ((t == AER_CORRECTABLE) ? PCI_ERR_COR_RCVR : 0)
+#define AER_DATA_LINK_LAYER_ERROR_MASK(t) ((t == AER_CORRECTABLE) ?  \
+        (PCI_ERR_COR_BAD_TLP | PCI_ERR_COR_BAD_DLLP |                  \
+         PCI_ERR_COR_REP_ROLL | PCI_ERR_COR_REP_TIMER) : PCI_ERR_UNC_DLP)
+/* everything else is reported as "Transaction Layer" */</code></pre>
+<p>So Receiver Error is reported as Physical Layer. Bad TLP, Bad DLLP, REPLAY_NUM Rollover, Replay Timer Timeout and Data Link Protocol Error are reported as Data Link Layer. Every other bit is reported as Transaction Layer, <em>including Surprise Down</em>, even though the PCIe spec counts Surprise Down as a Data Link Layer error. When several bits are set, the line names only the first matching layer. The "agent" part of the line is derived the same way: Completer Abort gives Completer ID; Completion Timeout and Unsupported Request give Requester ID; Rollover and Replay Timer give Transmitter ID; everything else gives Receiver ID.</p>
+
+<h3>V.1.5 The Linux v7.2 AER path, step by step</h3>
+<p>The step-through below follows one error from the wire to the NVMe driver. The function names are the ones in <code>drivers/pci/pcie/aer.c</code>, <code>err.c</code> and <code>drivers/nvme/host/pci.c</code>.</p>
+
+<div class="flow" id="a-50-flow-aer">
+<div class="legend-roles"><span><i class="dev"></i>Device / Root Port hardware</span><span><i class="pcie"></i>PCIe message</span><span><i class="sw"></i>Linux PCI core</span><span><i class="in"></i>NVMe driver</span></div>
+<figure class="diagram"><svg viewBox="0 0 1000 400" role="img" aria-label="AER flow from detecting device to Root Port to Linux AER driver to NVMe driver callbacks">
+<rect class="b-dev" x="30" y="40" width="200" height="90" rx="8"/>
+<text x="130" y="70" text-anchor="middle" class="t-title">NVMe ENDPOINT</text>
+<text x="130" y="92" text-anchor="middle" class="t-sub">AER status bit set</text>
+<text x="130" y="110" text-anchor="middle" class="t-sub">Header Log captured</text>
+<rect class="b-pcie" x="30" y="170" width="940" height="44" rx="6"/>
+<text x="500" y="197" text-anchor="middle" class="t-lbl">PCIe link (ERR_COR / ERR_NONFATAL / ERR_FATAL message)</text>
+<rect class="b-dev" x="400" y="40" width="200" height="90" rx="8"/>
+<text x="500" y="70" text-anchor="middle" class="t-title">ROOT PORT</text>
+<text x="500" y="92" text-anchor="middle" class="t-sub">Root Error Status</text>
+<text x="500" y="110" text-anchor="middle" class="t-sub">Error Source ID</text>
+<rect class="b-sw" x="400" y="260" width="200" height="110" rx="8"/>
+<text x="500" y="288" text-anchor="middle" class="t-title">AER DRIVER</text>
+<text x="500" y="310" text-anchor="middle" class="t-mono">aer_irq / aer_isr</text>
+<text x="500" y="330" text-anchor="middle" class="t-mono">aer_print_error</text>
+<text x="500" y="350" text-anchor="middle" class="t-mono">pcie_do_recovery</text>
+<rect class="b-plain" x="760" y="260" width="210" height="110" rx="8"/>
+<text x="865" y="288" text-anchor="middle" class="t-title">NVME DRIVER</text>
+<text x="865" y="310" text-anchor="middle" class="t-mono">nvme_error_detected</text>
+<text x="865" y="330" text-anchor="middle" class="t-mono">nvme_slot_reset</text>
+<text x="865" y="350" text-anchor="middle" class="t-mono">nvme_error_resume</text>
+<g class="fstep dev" data-step="1"><path class="ar dev" d="M230 85 L395 85" marker-end="url(#m-dev)"/><text x="312" y="76" text-anchor="middle" class="alab dev">ERR_* message</text><g class="badge dev"><circle cx="312" cy="105" r="11"/><text x="312" y="109" text-anchor="middle">1</text></g></g>
+<g class="fstep sw" data-step="2"><path class="ar sw" d="M500 130 L500 255" marker-end="url(#m-sw)"/><text x="512" y="240" class="alab sw">MSI: aer_irq</text><g class="badge sw"><circle cx="560" cy="150" r="11"/><text x="560" y="154" text-anchor="middle">2</text></g></g>
+<g class="fstep sw" data-step="3"><path class="ar sw" d="M400 300 C 250 300, 150 250, 130 135" marker-end="url(#m-sw)"/><text x="220" y="250" text-anchor="middle" class="alab sw">CfgRd AER regs</text><g class="badge sw"><circle cx="300" cy="300" r="11"/><text x="300" y="304" text-anchor="middle">3</text></g></g>
+<g class="fstep sw" data-step="4"><path class="ar sw" d="M600 300 L755 300" marker-end="url(#m-sw)"/><text x="678" y="290" text-anchor="middle" class="alab sw">error_detected()</text><g class="badge sw"><circle cx="678" cy="320" r="11"/><text x="678" y="324" text-anchor="middle">4</text></g></g>
+<g class="fstep sw" data-step="5"><path class="ar sw" d="M600 85 L 700 85 L 700 165" marker-end="url(#m-sw)"/><text x="760" y="80" text-anchor="middle" class="alab sw">reset link (fatal)</text><g class="badge sw"><circle cx="720" cy="120" r="11"/><text x="720" y="124" text-anchor="middle">5</text></g></g>
+<g class="fstep sw" data-step="6"><path class="ar sw" d="M865 255 L865 225" marker-end="url(#m-sw)"/><text x="880" y="240" class="alab sw">slot_reset / resume</text><g class="badge sw"><circle cx="840" cy="240" r="11"/><text x="840" y="244" text-anchor="middle">6</text></g></g>
+</svg><figcaption>Figure 20.1 — AER from detection to the NVMe driver's callbacks in Linux v7.2 <span class="tag conceptual">conceptual</span></figcaption></figure>
+<ol class="flow-steps">
+<li data-who="dev"><b>Device detects and signals</b><div class="flow-detail"><p>The detecting device sets a bit in its AER status register. If the bit is unmasked it records the header of the offending TLP and sends an error message upstream. The detecting device can be the NVMe endpoint or the Root Port itself (for example, a Root Port that receives a bad TLP from the SSD). ERR_COR is used for correctable errors, and ERR_NONFATAL or ERR_FATAL for uncorrectable ones, chosen by the Severity register.</p><div class="flow-meta"><span>Where: endpoint or port hardware</span><span class="pc">PCIe: Yes, device → Root Port · Message TLP</span></div><div class="flow-ex">e.g. endpoint 0000:03:00.0 sets UNCOR_STATUS bit 14 (Completion Timeout), severity 0 → ERR_NONFATAL (synthetic)</div></div></li>
+<li data-who="sw"><b>Root Port interrupts the CPU</b><div class="flow-detail"><p>The Root Port sets Root Error Status and Error Source ID, then raises its AER interrupt. In Linux v7.2 <code>aer_irq()</code> reads Root Error Status and Error Source ID, writes them back to clear them, and queues them in a kfifo. The threaded handler <code>aer_isr()</code> drains the fifo with <code>aer_isr_one_error()</code>, which handles the correctable part first and then the uncorrectable part.</p><div class="flow-meta"><span>Where: drivers/pci/pcie/aer.c</span><span class="pc">PCIe: MSI/MSI-X from Root Port</span></div></div></li>
+<li data-who="sw"><b>Find the source and read its registers</b><div class="flow-detail"><p><code>find_source_device()</code> walks the hierarchy below the Root Port. <code>aer_get_device_error_info()</code> reads status and mask from each candidate. For correctable errors it reads the correctable registers. For uncorrectable errors it reads the uncorrectable registers only if the device is a Root Port, an RCEC or a Downstream Port, <em>or</em> the error is non-fatal. On a fatal error from an endpoint the link is assumed broken, so the endpoint's registers are not read. It then prints with <code>aer_print_error()</code>. All devices are printed before any is handled, "to not lose records by reset".</p><div class="flow-meta"><span>Where: aer_process_err_devices()</span><span class="pc">PCIe: CfgRd0/CfgRd1 to each candidate</span></div></div></li>
+<li data-who="sw"><b>Broadcast error_detected()</b><div class="flow-detail"><p><code>pci_aer_handle_error()</code> clears a correctable error and calls the driver's optional <code>cor_error_detected</code>. For non-fatal errors it calls <code>pcie_do_recovery(dev, pci_channel_io_normal, aer_root_reset)</code>, and for fatal errors the same with <code>pci_channel_io_frozen</code>. <code>pcie_do_recovery()</code> in <code>err.c</code> calls every driver below the bridge. The NVMe driver's <code>nvme_error_detected()</code> returns CAN_RECOVER for <em>normal</em>, disables the controller and returns NEED_RESET for <em>frozen</em>, and returns DISCONNECT for <em>perm_failure</em>.</p><div class="flow-meta"><span>Where: drivers/pci/pcie/err.c</span><span class="pc">PCIe: No (software)</span></div></div></li>
+<li data-who="sw"><b>Reset the link if needed</b><div class="flow-detail"><p>If the channel was frozen or any driver voted NEED_RESET, <code>aer_root_reset()</code> runs. It does a secondary bus reset of the Root or Downstream Port via <code>pci_bus_error_reset()</code>, or an FLR for an RCiEP, and logs <code>"%s Port link has been reset (%d)"</code>. With DPC, <code>dpc_reset_link()</code> is used instead, because the hardware has already taken the link down.</p><div class="flow-meta"><span>Where: aer_root_reset() / dpc_reset_link()</span><span class="pc">PCIe: Yes, link goes down and retrains</span></div></div></li>
+<li data-who="sw"><b>slot_reset and resume</b><div class="flow-detail"><p><code>nvme_slot_reset()</code> logs <code>"restart after slot reset"</code>, restores config space and schedules the NVMe reset work. <code>nvme_error_resume()</code> waits for that work to finish. If everything voted RECOVERED, the PCI core logs <code>"device recovery successful"</code>. Otherwise it calls error_detected again with perm_failure and logs <code>"device recovery failed"</code>.</p><div class="flow-meta"><span>Where: drivers/nvme/host/pci.c</span><span class="pc">PCIe: Yes, config restore and controller re-init</span></div></div></li>
+</ol>
+</div>
+
+<h3>V.1.6 What the log looks like</h3>
+<p>The format strings below are copied from <code>aer.c</code> v7.2. The bus type is "PCIe", or "CXL" for CXL devices. Linux adds the prefix <code>AER: </code> through <code>dev_fmt</code>. The example output is <span class="tag synthetic">synthetic</span> and abbreviated, built only from those format strings.</p>
+<pre class="code" data-kind="read-only inspection"><code>pcieport 0000:00:1d.0: AER: Uncorrectable (Non-Fatal) error message received from 0000:03:00.0
+nvme 0000:03:00.0: AER: PCIe Bus Error: severity=Uncorrectable (Non-Fatal), type=Transaction Layer, (Requester ID)
+nvme 0000:03:00.0: AER:   device [144d:a80a] error status/mask=00004000/00400000
+nvme 0000:03:00.0: AER:    [14] CmpltTO                (First)
+pcieport 0000:00:1d.0: AER: device recovery successful</code></pre>
+<p>Details to know when reading these lines:</p>
+<ul>
+<li><code>error status/mask</code> are the raw 32-bit values. The bit list that follows is <code>status &amp; ~mask</code>. A set bit with no name in Linux's string table prints as <code>Unknown Error Bit</code>.</li>
+<li><code>(First)</code> marks the bit that the First Error Pointer (<code>PCI_ERR_CAP_FEP</code>) names. When several bits are set, this one caused the Header Log capture.</li>
+<li>A <code>TLP Header:</code> line is printed only for the bits in <code>AER_LOG_TLP_MASKS</code>: Poisoned TLP, Poisoned TLP Egress Blocked, ECRC, UR, CA, Unexpected Completion, ACS Violation, MC Blocked, AtomicOp Egress Blocked, DMWr Blocked, TLP Translation Egress Blocked, TLP Prefix Blocked, Malformed TLP, IDE Check, Misrouted IDE and PCRC. It is also printed for Completion Timeout, but only if the device sets the "Completion Timeout Prefix/Header Log Capable" bit (<code>PCI_ERR_CAP_COMP_TIME_LOG</code>). See <code>tlp_header_logged()</code>.</li>
+<li>If the source cannot be found, the Root Port line ends with <code>(no details found</code>. If the status read returns zero, the line reads <code>type=Inaccessible, (Unregistered Agent ID)</code>. Both mean "something sent an error message and Linux could not get the details". This is common when the device has already dropped off the bus.</li>
+<li>Correctable errors are logged at KERN_WARNING and uncorrectable errors at KERN_ERR, so <code>dmesg -l err</code> hides every correctable error.</li>
+</ul>
+
+<h3>V.1.7 Rate limits, counters and the "it was the other end" trap</h3>
+<p>Linux v7.2 rate-limits AER <em>printing</em> per device. Correctable and non-fatal errors each get a ratelimit state initialised in <code>pci_aer_init()</code> with <code>DEFAULT_RATELIMIT_INTERVAL</code> and <code>DEFAULT_RATELIMIT_BURST</code>. <code>Documentation/PCI/pcieaer-howto.rst</code> gives these as 10 events per 5 seconds. Fatal errors are never rate-limited. The limits can be tuned in sysfs under <code>/sys/bus/pci/devices/&lt;BDF&gt;/aer/</code>: <code>correctable_ratelimit_interval_ms</code>, <code>correctable_ratelimit_burst</code>, <code>nonfatal_ratelimit_interval_ms</code> and <code>nonfatal_ratelimit_burst</code>. <b>Counting is not rate-limited.</b> <code>pci_dev_aer_stats_incr()</code> runs before the ratelimit check, so the counters are the reliable source.</p>
+<pre class="code" data-kind="read-only inspection"><code># per-device counters (every AER-capable device)
+cat /sys/bus/pci/devices/0000:03:00.0/aer_dev_correctable
+cat /sys/bus/pci/devices/0000:03:00.0/aer_dev_nonfatal
+cat /sys/bus/pci/devices/0000:03:00.0/aer_dev_fatal
+# Root Port totals (messages received, including its own)
+cat /sys/bus/pci/devices/0000:00:1d.0/aer_rootport_total_err_cor
+cat /sys/bus/pci/devices/0000:00:1d.0/aer_rootport_total_err_nonfatal
+cat /sys/bus/pci/devices/0000:00:1d.0/aer_rootport_total_err_fatal</code></pre>
+<p>Each <code>aer_dev_*</code> file prints one line per named bit (<code>RxErr 0</code>, <code>BadTLP 3</code>, ...) followed by <code>TOTAL_ERR_COR</code>, <code>TOTAL_ERR_FATAL</code> or <code>TOTAL_ERR_NONFATAL</code>. The correctable array has 16 entries (<code>AER_MAX_TYPEOF_COR_ERRS</code>).</p>
+<div class="callout warn"><div class="callout-title">⚠️ The "it was the other end" trap</div><p>The comment above <code>struct aer_info</code> in <code>aer.c</code> warns that counters show errors "as seen by this device". If the SSD's transmitter is bad, the Root Port's receiver sees the errors, so the Root Port's counters go up and the SSD's stay at 0. Always read <em>both ends</em> of the link: the SSD and its upstream port, which may be a switch Downstream Port rather than the Root Port.</p></div>
+
+<div class="callout impl"><div class="callout-title">🏭 Implementation-dependent: firmware-first</div><p>Linux handles AER only if firmware gives it control through ACPI <code>_OSC</code> (<code>pcie_aer_is_native()</code>). On many servers firmware keeps control ("firmware-first"). Errors then arrive as APEI/GHES records, go through <code>aer_recover_queue()</code> and are printed by <code>pci_print_aer()</code> in a different format (<code>aer_status:</code>, <code>aer_mask:</code>, <code>aer_layer=</code>, <code>aer_agent=</code>). Firmware may also hide, mask or count errors that Linux never sees. If <code>dmesg</code> shows no AER lines at all, first check that this is not the reason.</p></div>
+
+<h3>V.1.8 Reference table: every AER status bit in Linux v7.2</h3>
+<p>Name, bit and Linux string come from <code>pci_regs.h</code> and the string tables in <code>aer.c</code> <span class="tag verified">verified</span>. "Default severity" is the reset value of the Uncorrectable Error Severity bit as commonly documented for the PCIe Base Specification (Fatal = 1). The classic bits are widely documented. Values marked "verify" come from newer revisions and should be confirmed in the specification. "Default mask" is noted only where the bit is masked by default. The NVMe-context column is engineering experience <span class="tag derived">derived</span>, not spec text.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Bit</th><th>Macro</th><th>Linux string</th><th>Class</th><th>Default severity / mask</th><th>Linux layer / agent</th><th>Typical NVMe-context cause</th><th>Card</th></tr></thead>
+<tbody>
+<tr><td>C0</td><td>PCI_ERR_COR_RCVR</td><td>RxErr</td><td>Correctable</td><td>—</td><td>Physical / Receiver</td><td>Signal integrity: bad riser, retimer, connector, poor equalization at Gen4/Gen5</td><td><a href="#e-l-01">L-01</a></td></tr>
+<tr><td>C6</td><td>PCI_ERR_COR_BAD_TLP</td><td>BadTLP</td><td>Correctable</td><td>—</td><td>Data Link / Receiver</td><td>LCRC or sequence-number error on a TLP; replayed by the transmitter</td><td><a href="#e-l-02">L-02</a></td></tr>
+<tr><td>C7</td><td>PCI_ERR_COR_BAD_DLLP</td><td>BadDLLP</td><td>Correctable</td><td>—</td><td>Data Link / Receiver</td><td>CRC error on Ack/Nak/UpdateFC DLLP; same causes as BadTLP</td><td><a href="#e-l-03">L-03</a></td></tr>
+<tr><td>C8</td><td>PCI_ERR_COR_REP_ROLL</td><td>Rollover</td><td>Correctable</td><td>—</td><td>Data Link / Transmitter</td><td>Same TLP replayed 4 times without success; link goes to Recovery</td><td><a href="#e-l-04">L-04</a></td></tr>
+<tr><td>C12</td><td>PCI_ERR_COR_REP_TIMER</td><td>Timeout</td><td>Correctable</td><td>—</td><td>Data Link / Transmitter</td><td>No Ack/Nak within the replay timer: lost DLLPs, very long L0s/L1 exit</td><td><a href="#e-l-05">L-05</a></td></tr>
+<tr><td>C13</td><td>PCI_ERR_COR_ADV_NFAT</td><td>NonFatalErr</td><td>Correctable</td><td>Masked by default</td><td>Transaction / Receiver</td><td>An uncorrectable error (often UR or Unexpected Completion) downgraded to advisory</td><td><a href="#e-l-06">L-06</a></td></tr>
+<tr><td>C14</td><td>PCI_ERR_COR_INTERNAL</td><td>CorrIntErr</td><td>Correctable</td><td>Masked by default</td><td>Transaction / Receiver</td><td>Corrected ECC inside the controller's PCIe core or buffers (vendor-defined)</td><td><a href="#e-l-07">L-07</a></td></tr>
+<tr><td>C15</td><td>PCI_ERR_COR_LOG_OVER</td><td>HeaderOF</td><td>Correctable</td><td>Masked by default</td><td>Transaction / Receiver</td><td>Header log full (multi-header logging) while more errors arrive</td><td><a href="#e-l-08">L-08</a></td></tr>
+<tr><td>U0</td><td>PCI_ERR_UNC_UND</td><td>Undefined</td><td>Uncorrectable</td><td>— (was "Training Error" in early PCIe; now undefined)</td><td>Transaction / Receiver</td><td>Should never be set by a modern device; treat as a device bug</td><td><a href="#e-l-09">L-09</a></td></tr>
+<tr><td>U4</td><td>PCI_ERR_UNC_DLP</td><td>DLP</td><td>Uncorrectable</td><td>Fatal</td><td>Data Link / Receiver</td><td>Ack/Nak sequence number out of range; DL state machine bug</td><td><a href="#e-l-10">L-10</a></td></tr>
+<tr><td>U5</td><td>PCI_ERR_UNC_SURPDN</td><td>SDES</td><td>Uncorrectable</td><td>Fatal</td><td>Transaction* / Receiver</td><td>SSD pulled, lost power, firmware crash dropped the link; seen at the Downstream Port</td><td><a href="#e-l-11">L-11</a></td></tr>
+<tr><td>U12</td><td>PCI_ERR_UNC_POISON_TLP</td><td>TLP</td><td>Uncorrectable</td><td>Non-fatal</td><td>Transaction / Receiver</td><td>Write data or read completion marked poisoned (EP bit): uncorrectable host memory ECC, or controller internal SRAM error</td><td><a href="#e-l-12">L-12</a></td></tr>
+<tr><td>U13</td><td>PCI_ERR_UNC_FCP</td><td>FCP</td><td>Uncorrectable</td><td>Fatal</td><td>Transaction / Receiver</td><td>Flow-control credit protocol violation (credit overflow, bad InitFC)</td><td><a href="#e-l-13">L-13</a></td></tr>
+<tr><td>U14</td><td>PCI_ERR_UNC_COMP_TIME</td><td>CmpltTO</td><td>Uncorrectable</td><td>Non-fatal</td><td>Transaction / Requester</td><td>SSD's DMA read of SQ entry / PRP list / write data not answered; or host MMIO read of a hung controller</td><td><a href="#e-l-14">L-14</a></td></tr>
+<tr><td>U15</td><td>PCI_ERR_UNC_COMP_ABORT</td><td>CmpltAbrt</td><td>Uncorrectable</td><td>Non-fatal</td><td>Transaction / Completer</td><td>Completer refused a request it understood (e.g. IOMMU-blocked access at the RC, controller refusing an MMIO access)</td><td><a href="#e-l-15">L-15</a></td></tr>
+<tr><td>U16</td><td>PCI_ERR_UNC_UNX_COMP</td><td>UnxCmplt</td><td>Uncorrectable</td><td>Non-fatal</td><td>Transaction / Receiver</td><td>Completion for a tag not outstanding: late completion after a timeout, misrouted completion</td><td><a href="#e-l-16">L-16</a></td></tr>
+<tr><td>U17</td><td>PCI_ERR_UNC_RX_OVER</td><td>RxOF</td><td>Uncorrectable</td><td>Fatal</td><td>Transaction / Receiver</td><td>Transmitter sent more than advertised credits</td><td><a href="#e-l-17">L-17</a></td></tr>
+<tr><td>U18</td><td>PCI_ERR_UNC_MALF_TLP</td><td>MalfTLP</td><td>Uncorrectable</td><td>Fatal</td><td>Transaction / Receiver</td><td>TLP payload larger than MPS, length/byte-enable mismatch, crossed 4 KB; firmware bug or MPS misconfiguration</td><td><a href="#e-l-18">L-18</a></td></tr>
+<tr><td>U19</td><td>PCI_ERR_UNC_ECRC</td><td>ECRC</td><td>Uncorrectable</td><td>Non-fatal</td><td>Transaction / Receiver</td><td>End-to-end CRC mismatch (only if ECRC generation and checking enabled) — corruption inside a switch</td><td><a href="#e-l-19">L-19</a></td></tr>
+<tr><td>U20</td><td>PCI_ERR_UNC_UNSUP</td><td>UnsupReq</td><td>Uncorrectable</td><td>Non-fatal</td><td>Transaction / Requester</td><td>SSD DMA to an address no one claims; MMIO to a disabled BAR; config read of a missing function</td><td><a href="#e-l-20">L-20</a></td></tr>
+<tr><td>U21</td><td>PCI_ERR_UNC_ACSV</td><td>ACSViol</td><td>Uncorrectable</td><td>Non-fatal</td><td>Transaction / Receiver</td><td>Peer-to-peer TLP blocked by Access Control Services at a switch port (e.g. P2P DMA to a GPU)</td><td><a href="#e-l-21">L-21</a></td></tr>
+<tr><td>U22</td><td>PCI_ERR_UNC_INTN</td><td>UncorrIntErr</td><td>Uncorrectable</td><td>Fatal; masked by default</td><td>Transaction / Receiver</td><td>Uncorrectable internal error inside the PCIe function (SRAM parity, internal bus)</td><td><a href="#e-l-22">L-22</a></td></tr>
+<tr><td>U23</td><td>PCI_ERR_UNC_MCBTLP</td><td>BlockedTLP</td><td>Uncorrectable</td><td>Non-fatal</td><td>Transaction / Receiver</td><td>Multicast TLP blocked (rare in storage)</td><td><a href="#e-l-23">L-23</a></td></tr>
+<tr><td>U24</td><td>PCI_ERR_UNC_ATOMEG</td><td>AtomicOpBlocked</td><td>Uncorrectable</td><td>Non-fatal</td><td>Transaction / Receiver</td><td>AtomicOp request blocked at an egress port</td><td><a href="#e-l-23">L-23</a></td></tr>
+<tr><td>U25</td><td>PCI_ERR_UNC_TLPPRE</td><td>TLPBlockedErr</td><td>Uncorrectable</td><td>Non-fatal</td><td>Transaction / Receiver</td><td>End-End TLP Prefix blocked (e.g. PASID prefix not supported along path)</td><td><a href="#e-l-23">L-23</a></td></tr>
+<tr><td>U26</td><td>PCI_ERR_UNC_POISON_BLK</td><td>PoisonTLPBlocked</td><td>Uncorrectable</td><td>Non-fatal; masked by default (verify)</td><td>Transaction / Receiver</td><td>Port configured to block (not forward) poisoned TLPs did so</td><td><a href="#e-l-23">L-23</a></td></tr>
+<tr><td>U27</td><td>PCI_ERR_UNC_DMWR_BLK</td><td>DMWrReqBlocked</td><td>Uncorrectable</td><td>verify in spec</td><td>Transaction / Receiver</td><td>Deferrable Memory Write request blocked at egress</td><td><a href="#e-l-23">L-23</a></td></tr>
+<tr><td>U28</td><td>PCI_ERR_UNC_IDE_CHECK</td><td>IDECheck</td><td>Uncorrectable</td><td>verify in spec</td><td>Transaction / Receiver</td><td>Integrity and Data Encryption (IDE) MAC/integrity check failed</td><td><a href="#e-l-24">L-24</a></td></tr>
+<tr><td>U29</td><td>PCI_ERR_UNC_MISR_IDE</td><td>MisIDETLP</td><td>Uncorrectable</td><td>verify in spec</td><td>Transaction / Receiver</td><td>IDE TLP arrived on the wrong stream / port</td><td><a href="#e-l-24">L-24</a></td></tr>
+<tr><td>U30</td><td>PCI_ERR_UNC_PCRC_CHECK</td><td>PCRC_CHECK</td><td>Uncorrectable</td><td>verify in spec</td><td>Transaction / Receiver</td><td>IDE plaintext CRC (PCRC) check failed</td><td><a href="#e-l-24">L-24</a></td></tr>
+<tr><td>U31</td><td>PCI_ERR_UNC_XLAT_BLK</td><td>TLPXlatBlocked</td><td>Uncorrectable</td><td>verify in spec</td><td>Transaction / Receiver</td><td>TLP translation egress blocked (newer translation features)</td><td><a href="#e-l-23">L-23</a></td></tr>
+</tbody></table></div>
+<p>* Linux v7.2 reports Surprise Down as "Transaction Layer" because its layer macro only special-cases DLP among the uncorrectable bits. The PCIe spec classes it as a Data Link Layer error.</p>
+<p>Bits not listed are reserved in Linux v7.2's tables: correctable 1–5 and 9–11, and uncorrectable 1–3 and 6–11. If hardware sets one, the log line reads <code>Unknown Error Bit</code>.</p>
+
+<h3>V.1.9 What a PEX trace shows of AER</h3>
+<p>A protocol analyzer capture (for example a Teledyne LeCroy <code>.pex</code> file) records the TLPs and DLLPs on <em>one</em> probed link. AER is mostly register state inside the devices, so an AER error can show up in a trace in only three ways:</p>
+<ol>
+<li><b>The error condition itself is a packet.</b> A Nak DLLP and its replay (Bad TLP), a Cpl with status UR, CA or RRS, a TLP with the EP (poisoned) bit set, an oversize or 4 KB-crossing TLP (Malformed), or bad flow-control DLLPs. The analyzer decodes these directly.</li>
+<li><b>The error is an absence.</b> A non-posted request with no completion within N microseconds or milliseconds (Completion Timeout), or no Ack within the replay window. You find these with timestamps and the analyzer's outstanding-request view.</li>
+<li><b>The device reports it.</b> ERR_COR, ERR_NONFATAL and ERR_FATAL are <em>Message TLPs</em> (routed to the Root Complex) and are visible when they cross the probed link. They carry only the class and the sender's Requester ID, not the bit. The bit is visible only if software reads the AER capability over that link: Linux's <code>aer_get_device_error_info()</code> issues CfgRd to offsets 04h–1Ch of the AER capability after each event, and the completion data holds the status, mask and header log.</li>
+</ol>
+<div class="table-wrap"><table>
+<thead><tr><th>AER bit(s)</th><th>Condition on the wire?</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td>RxErr</td><td>Physical-layer event (covered in the physical-layer part); protocol view shows Nak + replay</td><td><span class="pex part">Partly visible</span></td></tr>
+<tr><td>BadTLP, BadDLLP, Rollover, Replay Timer</td><td>Nak, replay, CRC-flagged DLLP, TS1s in L0, missing Ack</td><td><span class="pex yes">Visible</span></td></tr>
+<tr><td>Advisory NF, Header Log Overflow</td><td>The underlying request or completion only</td><td><span class="pex part">Partly visible</span></td></tr>
+<tr><td>Corrected / Uncorrectable Internal, Undefined</td><td>No; only the ERR_* message</td><td><span class="pex no">Not visible</span></td></tr>
+<tr><td>DLP, FCP, RxOF</td><td>Bad Ack/Nak sequence numbers, illegal FC DLLPs, credit overrun</td><td><span class="pex yes">Visible</span></td></tr>
+<tr><td>Surprise Down</td><td>Abrupt electrical idle on the SSD link; the bit is in the port</td><td><span class="pex part">Partly visible</span></td></tr>
+<tr><td>Poisoned TLP, CA, UR (non-posted), Unexpected Completion, Malformed, ECRC</td><td>EP bit, Cpl status, orphan tag, oversize TLP, bad digest</td><td><span class="pex yes">Visible</span></td></tr>
+<tr><td>Completion Timeout</td><td>Request with no completion (absence + timestamps)</td><td><span class="pex part">Partly visible</span></td></tr>
+<tr><td>ACS Violation, egress-blocked family, IDE family</td><td>The ingress TLP only; blocking is inside a port; IDE payload encrypted</td><td><span class="pex part">Partly visible</span></td></tr>
+</tbody></table></div>
+<div class="callout trace"><div class="callout-title">🔍 Trace tip</div><p>Set the analyzer trigger on "Message TLP, code ERR_COR / ERR_NONFATAL / ERR_FATAL" with a large pre-trigger buffer. The packets just <em>before</em> the message usually contain the cause (the Nak, the UR completion, the poisoned CplD). The CfgRd completions just <em>after</em> it, issued by Linux's AER handler, contain the status bits, so a single capture gives you both the cause and the AER verdict.</p></div>
+
+<div class="callout senior"><div class="callout-title">💡 Senior insight</div><p>The NVMe controller and the PCIe AER block are different pieces of logic, often from different IP vendors. AER errors usually do <em>not</em> appear in the NVMe Error Information log page (Log ID 01h), and NVMe status codes do not appear in AER. To diagnose a failure, line up three timelines: the AER lines in <code>dmesg</code>, the NVMe driver lines (<code>nvme nvme0: ...</code>), and the device's own logs (<code>nvme error-log</code>, telemetry). A Completion Timeout in AER that comes 50 ms before an NVMe "I/O timeout, aborting" is almost always the cause, not a coincidence.</p></div>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>The SSD logs nothing, but the Root Port's <code>aer_dev_correctable</code> shows thousands of BadTLP. Which side's transmitter is suspect?</p><details class="answer"><summary>Answer</summary><p>The SSD's. The Root Port <em>received</em> bad TLPs, so the SSD's transmit path is the one to examine: its TX lanes, the connector, a retimer, or the Root Port's receiver equalization. Counters show what each device received.</p></details></li>
+<li><p>Why does Linux not read an endpoint's uncorrectable status after an ERR_FATAL?</p><details class="answer"><summary>Answer</summary><p><code>aer_get_device_error_info()</code> reads uncorrectable registers only for Root Ports, RCECs, Downstream Ports, or non-fatal errors. After a fatal error the link to the endpoint is assumed unreliable, so a config read could hang or return all-ones.</p></details></li>
+<li><p>You see <code>[14] CmpltTO</code> with no TLP Header line. Is the Header Log empty?</p><details class="answer"><summary>Answer</summary><p>Not necessarily. Linux prints the header for Completion Timeout only if the device sets <code>PCI_ERR_CAP_COMP_TIME_LOG</code>. Otherwise it assumes no header was logged.</p></details></li>
+</ol></div>
+</section>

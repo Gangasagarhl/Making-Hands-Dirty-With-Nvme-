@@ -1,0 +1,378 @@
+<section class="part" id="a-part-iv"><div class="part-num">PART IV</div><h1>Silent Failures: Success That Isn't</h1><p class="part-intro">The worst failures are the ones that never show up anywhere. The command is sent, the device accepts it, it posts a completion with status 0 (Success), and the analyzer, the kernel log and the SMART log all look clean. But the drive did not do the job: blocks that should be deallocated are still there, a flush did not reach the NAND, a write went to the wrong place, an erase left data behind. This part starts with a full worked chapter on the case you raised: <em>"I wrote 10 GB, trimmed the last 5 GB, the drive said Success, and nothing changed."</em> Then it lists every other kind of silent or semantic failure as an error card (D-01 to D-33), and ends with a chapter on how to catch them. The main idea of this part: <b>a Success completion only means the controller accepted the command. To know the command did its job, you need a separate check that reads the result back.</b></p></section>
+
+<section class="chapter" id="a-d-dealloc" data-part="PART IV — Silent Failures: Success That Isn't">
+<h2><span class="num">IV.1</span> The deallocate that didn't: a full worked case</h2>
+
+<div class="callout remember"><div class="callout-title">📌 The question this chapter answers</div>
+<p>After writing 10 GiB to a namespace, the host deallocates (trims/discards) the last 5 GiB. The drive completes the command with Success, but it does not actually deallocate. The PEX trace (the Teledyne LeCroy PCIe analyzer capture) looks normal, <code>dmesg</code> shows nothing, and <code>nvme error-log</code> is empty. <b>How do you find out what really happened, and how do you prove it either way?</b></p></div>
+
+<h3 id="a-d-dealloc-why">IV.1.1 Why this chapter exists</h3>
+<p>Deallocate is the clearest example of a command whose <em>acceptance</em> is visible but whose <em>effect</em> is not. Every step you can see on the wire happens normally: the Dataset Management (DSM) command, the fetch of its range list, the completion queue entry (CQE) and the MSI-X interrupt. The step that matters, the flash translation layer (FTL) dropping the logical-to-physical mapping entries, happens inside the controller and never crosses the PCIe link. So a trace can never prove that deallocation happened. It can only prove that it was <em>requested</em> correctly. Proof has to come from somewhere else: what a later read returns, an error that only appears when a feature is turned on, the namespace utilization counter, or a performance signature.</p>
+<p>There is a second, less obvious point. In many cases the NVMe specification <b>allows</b> the drive to "not deallocate" without being wrong. Before calling a drive broken, you must work out which guarantee it actually made. The Identify Namespace fields DLFEAT and NSFEAT tell you that, and this chapter shows how to read them.</p>
+
+<ul class="objectives">
+<li>Trace a discard from <code>fstrim</code>/<code>blkdiscard</code>/file truncate through the Linux v7.2 block layer and <code>nvme_setup_discard()</code> down to the DSM command and its 16-byte range descriptors.</li>
+<li>Know what Linux v7.2 sends in each case: DSM with the Attribute – Deallocate (AD) bit, or Write Zeroes with the Deallocate (DEAC) bit. Know the quirks that change this (<code>NVME_QUIRK_DEALLOCATE_ZEROES</code>, <code>NVME_QUIRK_DISABLE_WRITE_ZEROES</code>).</li>
+<li>Say exactly what the NVMe specification promises for deallocated blocks (DLFEAT read behaviour, DULBE, NUSE), and what it does <em>not</em> promise.</li>
+<li>Explain why the analyzer trace, the kernel log and the error log all look normal.</li>
+<li>Prove whether deallocation happened, using five independent kinds of evidence, and run the procedure as a CAUTION lab on a spare drive.</li>
+</ul>
+
+<div class="callout notsaid"><div class="callout-title">📭 What the spec does not say</div>
+<p>The spec does not define the drive's internal mapping table, when garbage collection runs, or how fast deallocated space is reclaimed. Deallocation is described by its <em>visible effects</em>: what a read of a deallocated block returns (DLFEAT), whether a read can be made to fail (DULBE), and how the Namespace Utilization (NUSE) count behaves. If a drive gives none of these guarantees, "it didn't deallocate" may be impossible to see from outside, and may not even count as a failure.</p></div>
+
+<h3 id="a-d-dealloc-story">IV.1.2 The story, the analogy, and where the analogy breaks</h3>
+<p>A validation engineer runs a simple script on a 1 TB drive formatted with 4096-byte logical blocks. The script writes a known pattern over LBAs 0 to 2,621,439 (10 GiB), then runs <code>blkdiscard --offset 5GiB --length 5GiB /dev/nvme0n1</code>. The command returns 0. The analyzer captured one DSM command and a Success completion. Then the engineer reads LBA 2,000,000 and gets the original pattern back, not zeroes. Is the drive broken? <b>That depends on DLFEAT.</b> If DLFEAT says reads of deallocated blocks return zeroes (read behaviour 001b), the drive has broken its promise: it either did not deallocate, or it deallocated and then returned stale data. If DLFEAT says 000b ("not reported"), old data is an allowed result and the read-back proves nothing.</p>
+<div class="callout analogy"><div class="callout-title">🌍 Analogy</div><p>You tell a warehouse to "throw away everything on shelves 50 to 99". The clerk signs the form and hands it back. The signed form is the CQE. Whether the shelves are actually empty, you only find out by walking over and looking (a read), by asking for the inventory count (NUSE), or by noticing that the warehouse suddenly has room for new deliveries (better write performance).</p></div>
+<div class="callout breaks"><div class="callout-title">🧩 Where the analogy breaks</div><p>In a real warehouse an empty shelf always looks empty. In an SSD, the drive may be allowed to show you the old content of a "thrown away" shelf (DLFEAT read behaviour 000b), so looking is not always proof. Also, the drive may legally throw things away <em>later</em> (in the background). The only thing it must get right immediately is what a read returns, and only when it has promised a value.</p></div>
+
+<h3 id="a-d-dealloc-linux">IV.1.3 The host path in Linux v7.2: who turns "free these blocks" into NVMe commands</h3>
+<p>There are three common ways the request starts. All of them end in the block layer as a <code>REQ_OP_DISCARD</code> (or <code>REQ_OP_WRITE_ZEROES</code>) request, which the NVMe driver turns into an NVMe command in <code>nvme_setup_cmd()</code>.</p>
+<div class="table-wrap"><table><thead><tr><th>Where it starts</th><th>What happens before the NVMe driver</th><th>Easy-to-miss trap</th></tr></thead><tbody>
+<tr><td><code>blkdiscard -o 5GiB -l 5GiB /dev/nvme0n1</code></td><td><code>BLKDISCARD</code> ioctl on the raw block device → <code>blkdev_issue_discard()</code> (in <code>block/blk-lib.c</code>; that file is not in the local source snapshot used for this atlas, so the name comes from general kernel knowledge) → discard bios.</td><td>Fails with <code>EOPNOTSUPP</code> if the queue's <code>discard_max_bytes</code> is 0. This is the one case where you <em>are</em> told something.</td></tr>
+<tr><td><code>fstrim -v /mnt</code></td><td><code>FITRIM</code> ioctl → the filesystem walks its free-space map and issues discards for <em>free</em> extents only.</td><td>The "N GiB trimmed" number is what the filesystem asked for, not what the drive did. Some filesystems report the whole free space every run.</td></tr>
+<tr><td>File truncate / <code>rm</code> on a filesystem mounted with <code>-o discard</code></td><td>The filesystem issues discards for freed extents, usually after the journal transaction commits (online discard).</td><td>Without <code>-o discard</code>, a truncate sends <b>nothing</b> to the drive. The blocks are freed only in the filesystem's map until the next <code>fstrim</code> (often a weekly timer). File LBAs are also not "the last 5 GiB of the device".</td></tr>
+</tbody></table></div>
+
+<h4>Discard limits: how big pieces can be</h4>
+<p><code>drivers/nvme/host/core.c:nvme_update_disk_info()</code> sets the queue limits from Identify data (v7.2, around lines 2123–2170):</p>
+<ul>
+<li><b>Maximum discard size</b>: if the controller reports DMRSL (Dataset Management Range Size Limit, from the I/O Command Set specific Identify Controller structure, read in <code>nvme_init_non_mdts_limits()</code>), then <code>max_hw_discard_sectors</code> is DMRSL converted to 512-byte sectors. Otherwise, if ONCS bit 2 (DSM supported) is set, it is <code>UINT_MAX</code>. If ONCS.DSM is clear, it is 0 and discard is disabled.</li>
+<li><b>Maximum number of ranges</b>: <code>max_discard_segments</code> = DMRL (Dataset Management Ranges Limit) if non-zero, else <code>NVME_DSM_MAX_RANGES</code> = 256.</li>
+<li><b>Granularity</b>: <code>discard_granularity</code> comes from NPDG/NPDGL and NPDA/NPDAL (preferred deallocate granularity and alignment) when the OPTPERF bits say they are valid, otherwise the logical block size. The block layer uses this to round discards, so a discard smaller than the granularity, or not aligned to it, may be trimmed or dropped <em>on the host side</em> before it is ever sent.</li>
+</ul>
+<p>You can see all of this in sysfs: <code>/sys/block/nvme0n1/queue/discard_max_bytes</code>, <code>discard_max_hw_bytes</code>, <code>discard_granularity</code>, <code>max_discard_segments</code>, <code>write_zeroes_max_bytes</code>.</p>
+
+<h4>Building the DSM command: <code>nvme_setup_discard()</code></h4>
+<p><code>drivers/nvme/host/core.c:nvme_setup_discard()</code> (v7.2 line 840) does four things:</p>
+<ol>
+<li>It allocates a range buffer sized for <b>all 256 ranges</b> (<code>sizeof(*range) * NVME_DSM_MAX_RANGES</code> = 4096 bytes), even if only one range is used. The source comment says why: <em>"Some devices do not consider the DSM 'Number of Ranges' field when determining how much data to DMA."</em> This is a real device bug that the driver works around silently (see card <a href="#e-d-32">D-32</a>). If the allocation fails, it falls back to a per-controller <code>discard_page</code>.</li>
+<li>It fills one <code>struct nvme_dsm_range</code> per bio: <code>cattr</code> = 0 (context attributes), <code>nlb</code> = length in logical blocks, <code>slba</code> = starting LBA. Each descriptor is 16 bytes.</li>
+<li>It checks that the number of ranges built equals <code>blk_rq_nr_discard_segments()</code>. If not, it does <code>WARN_ON_ONCE</code> and fails the request with <code>BLK_STS_IOERR</code>. This is a host-side error you <em>would</em> see.</li>
+<li>It builds the 64-byte command: opcode <code>nvme_cmd_dsm</code> (09h), <code>nr</code> = segments − 1 (a 0's based count in CDW10), <code>attributes</code> = <code>NVME_DSMGMT_AD</code> (bit 2 of CDW11), and attaches the range buffer as a "special payload" (<code>RQF_SPECIAL_PAYLOAD</code>), so the PRP entries point at it.</li>
+</ol>
+<pre class="code" data-kind="read-only inspection"><code>/* Linux v7.2 drivers/nvme/host/core.c, nvme_setup_discard() (excerpt) */
+	memset(cmnd, 0, sizeof(*cmnd));
+	cmnd-&gt;dsm.opcode = nvme_cmd_dsm;
+	cmnd-&gt;dsm.nsid = cpu_to_le32(ns-&gt;head-&gt;ns_id);
+	cmnd-&gt;dsm.nr = cpu_to_le32(segments - 1);
+	cmnd-&gt;dsm.attributes = cpu_to_le32(NVME_DSMGMT_AD);
+
+	bvec_set_virt(&amp;req-&gt;special_vec, range, alloc_size);
+	req-&gt;rq_flags |= RQF_SPECIAL_PAYLOAD;</code></pre>
+<p>Note that Linux never sets IDR or IDW (Integral Dataset for Read/Write, bits 0 and 1). It sends only AD. Context attributes are always 0.</p>
+
+<h4>Write Zeroes and the DEAC bit: <code>nvme_setup_write_zeroes()</code></h4>
+<p><code>REQ_OP_WRITE_ZEROES</code> (from <code>blkdev_issue_zeroout()</code>, <code>blkdiscard -z</code>, <code>fallocate</code> zero-range, or filesystems) is handled by <code>nvme_setup_write_zeroes()</code> (v7.2 line 949):</p>
+<ul>
+<li>If the controller has <code>NVME_QUIRK_DEALLOCATE_ZEROES</code>, the function simply calls <code>nvme_setup_discard()</code>: <b>a "write zeroes" request is sent as a DSM deallocate</b>. The quirk's comment says the controller "deterministically returns 0's on reads to logical blocks that deallocate was called on". In <code>drivers/nvme/host/pci.c</code> v7.2 this quirk is set for Intel device IDs 0953h (750/P3500/P3600/P3700) and 0A53h (P3520). With this quirk and ONCS.DSM set, <code>max_write_zeroes_sectors</code> becomes <code>UINT_MAX</code>.</li>
+<li>Otherwise it builds a real Write Zeroes command (opcode 08h) with SLBA and NLB. It sets <code>NVME_WZ_DEAC</code> (bit 9 of the control word, so CDW12 bit 25) <b>only</b> if the request does not have <code>REQ_NOUNMAP</code> and the namespace has <code>NVME_NS_DEAC</code>.</li>
+<li><code>NVME_NS_DEAC</code> is set in <code>nvme_update_ns_info_block()</code> (v7.2 around line 2483) only when <code>(dlfeat &amp; 0x7) == 0x1</code> (deallocated blocks read as zeroes) <b>and</b> <code>dlfeat</code> bit 3 is set (Write Zeroes supports the Deallocate bit). The comment explains: the DEAC bit itself does not require zeroes, "it must be a no-op if reads from deallocated data do not return zeroes".</li>
+<li>If PI is enabled, it also sets PRACT so the controller generates protection information.</li>
+</ul>
+<p>Write Zeroes can also be turned off: <code>nvme_init_non_mdts_limits()</code> sets <code>max_zeroes_sectors</code> to 0 if ONCS bit 3 (Write Zeroes) is clear or the controller has <code>NVME_QUIRK_DISABLE_WRITE_ZEROES</code> ("Broken Write Zeroes"). Many entries in the v7.2 <code>nvme_id_table</code> carry that quirk, including the Intel 600P/P3100 (F1A5h) and the QEMU emulated controller (Intel ID 5845h). When Write Zeroes is off, the block layer falls back to writing real zero-filled buffers, which is slower but cannot fail silently in the same way.</p>
+
+<div class="callout senior"><div class="callout-title">💡 Senior insight: the quirk table is a list of drives that lied</div>
+<p>Each entry in <code>nvme_id_table</code> is a drive that once failed silently or behaved against the spec, and someone found out the hard way. <code>NVME_QUIRK_DEALLOCATE_ZEROES</code> goes the other way: the drive guaranteed more than it said in Identify, so Linux trusts it more. When a new drive behaves strangely, read the quirk list first. If your drive's vendor already has entries, look at what they were for.</p></div>
+
+<div class="callout hw"><div class="callout-title">🔧 What Linux v7.2 does after the CQE</div>
+<p>When the DSM completes with status 0, <code>nvme_complete_rq()</code> finishes the request with <code>BLK_STS_OK</code> and <code>nvme_cleanup_cmd()</code> frees the range buffer (or releases <code>discard_page</code>). Nothing checks the result. There is no read-back, no NUSE check, nothing. If the DSM fails, <code>nvme_error_status()</code> maps the status: Invalid Field / Invalid Opcode → <code>BLK_STS_NOTSUPP</code>, LBA Out of Range → <code>BLK_STS_TARGET</code>, others → <code>BLK_STS_IOERR</code>, and <code>nvme_log_error()</code> prints a rate-limited line such as <code>nvme0n1: Dataset Management(0x9) @ LBA …, … blocks, … (sct 0x0 / sc 0x2)</code>. So <b>you only get a log line when the drive refuses. A drive that accepts and then does nothing leaves no trace at all.</b></p></div>
+
+<h3 id="a-d-dealloc-spec">IV.1.4 What the specification actually promises</h3>
+<p>The table separates what can be checked in the local sources (Linux headers, libnvme <code>types.h</code>, the QEMU model) from what you should read in the NVM Command Set specification yourself. Field names are reliable. Exact normative wording is paraphrased, so <span class="tag uncertain">verify in spec</span> before quoting it in a bug report.</p>
+<div class="table-wrap"><table><thead><tr><th>Item</th><th>Where</th><th>What it means for "did it deallocate?"</th><th>Confidence</th></tr></thead><tbody>
+<tr><td>ONCS bit 2 (DSM) / bit 3 (Write Zeroes) / bit 11 (Write Zeroes Deallocate size limit, MAXWZD)</td><td>Identify Controller, ONCS</td><td>Says only that the commands are <em>supported</em>. Nothing about what deallocation does.</td><td><span class="tag verified">verified</span> (bit names in <code>include/linux/nvme.h</code>, libnvme <code>enum nvme_id_ctrl_oncs</code>)</td></tr>
+<tr><td>DSM CDW11.AD (bit 2), CDW10.NR (0's based, up to 256 ranges), 16-byte range: Context Attributes, Length (NLB), Starting LBA</td><td>NVM Command Set, Dataset Management</td><td>AD expresses the host's intent. It is generally understood to let the controller deallocate, without requiring it. Older base-spec text said the NVM subsystem "may" deallocate, and that a read of a deallocated LBA returns zeroes, ones, or the last data written. Newer specs tie read results to DLFEAT.</td><td>Layout <span class="tag verified">verified</span>; "may" wording <span class="tag uncertain">verify in spec</span></td></tr>
+<tr><td>DLFEAT bits 2:0 read behaviour: 000b not reported, 001b reads return all 00h, 010b reads return all FFh</td><td>Identify Namespace, DLFEAT</td><td><b>The key field.</b> With 001b or 010b the drive promises a value, and a read-back can prove a failure. With 000b old data on read-back is allowed.</td><td><span class="tag verified">verified</span> (libnvme <code>enum nvme_id_ns_dlfeat</code>)</td></tr>
+<tr><td>DLFEAT bit 3: Write Zeroes supports the Deallocate bit. Bit 4: Guard field of deallocated blocks with PI is the CRC of the returned data.</td><td>Identify Namespace, DLFEAT</td><td>Bit 3 together with RB = 001b is what makes Linux set DEAC. Bit 4 matters for PI namespaces: otherwise reading a deallocated block may raise a Guard error, or PI checks may be skipped for it <span class="tag uncertain">verify in spec</span>.</td><td><span class="tag verified">verified</span> (libnvme; Linux <code>nvme_update_ns_info_block</code>)</td></tr>
+<tr><td>NSFEAT bit 2: DULBE supported. Feature 05h (Error Recovery) CDW11 bit 16: DULBE enable.</td><td>Identify Namespace NSFEAT; Set Features FID 05h</td><td>When supported and enabled, reads (and Compare/Verify) of deallocated or unwritten blocks fail with status <b>287h, "Deallocated or Unwritten Logical Block"</b> (SCT 2h Media and Data Integrity). This turns deallocation into something you can <em>observe as an error</em>.</td><td>Bits <span class="tag verified">verified</span> (libnvme <code>NVME_FEAT_ERROR_RECOVERY_DULBE_SHIFT = 16</code>; Linux <code>NVME_SC_UNWRITTEN_BLOCK = 0x287</code>); exact command coverage <span class="tag uncertain">verify in spec</span></td></tr>
+<tr><td>NSZE, NCAP, NUSE; NSFEAT bit 0 (THIN)</td><td>Identify Namespace</td><td>NUSE = "current number of logical blocks allocated". If deallocation works and the drive tracks allocation, NUSE should go down by about the number of blocks deallocated (rounded to the internal granularity). Many drives report NUSE = NCAP all the time, and QEMU does exactly that (<code>hw/nvme/ns.c</code>: "no thin provisioning", <code>nuse = ncap</code>). In that case NUSE tells you nothing.</td><td>Definition <span class="tag verified">verified</span> (libnvme comment); whether your drive tracks it is <span class="tag impl">impl</span></td></tr>
+<tr><td>NPDG/NPDA, NPDGL/NPDAL (preferred deallocate granularity / alignment)</td><td>Identify Namespace / NVM CS Identify Namespace</td><td>Deallocating less than this, or misaligned, may have only partial effect inside the drive. It is a <em>preference</em>, not an error condition.</td><td><span class="tag verified">verified</span> (Linux comment cites NVM CS 1.1)</td></tr>
+<tr><td>DMRL, DMRSL, WZDSL</td><td>I/O Command Set specific Identify Controller (NVM)</td><td>Limits on number of ranges, size of one range, and Write Zeroes size. What a controller does when a host exceeds them varies, see the QEMU note below.</td><td><span class="tag verified">verified</span> (Linux <code>nvme_init_non_mdts_limits</code>)</td></tr>
+<tr><td>Get LBA Status (admin opcode 86h), OACS bit "GLSS"</td><td>Admin command</td><td>Mainly reports <em>Potentially Unrecoverable</em> LBAs (action types 10h/11h). libnvme also lists action type 02h "Return tracked allocated LBAs status", a newer addition. Do not assume Get LBA Status shows deallocation on a given drive. It does so only if action type 02h is supported, and its meaning should be <span class="tag uncertain">verified in spec</span>.</td><td>Opcode <span class="tag verified">verified</span>; ATYPE 02h semantics <span class="tag version">version</span></td></tr>
+<tr><td>Write Zeroes</td><td>NVM Command Set</td><td>Unlike DSM, Write Zeroes is a <em>write</em>: after it completes, reads must return zeroes (and PI as specified). With DEAC the controller may implement it by deallocating, but the read result is still mandatory. So <b>Write Zeroes failing to zero is a clear spec violation, while DSM failing to deallocate often is not.</b></td><td><span class="tag derived">derived</span> from Linux DEAC comment + spec semantics; <span class="tag uncertain">verify in spec</span></td></tr>
+</tbody></table></div>
+
+<div class="callout impl"><div class="callout-title">🏭 Implementation-dependent: the QEMU model skips ranges silently</div>
+<p>The QEMU NVMe controller in the local snapshot (<code>hw/nvme/ctrl.c:nvme_dsm_cb()</code>) processes each range in turn. A range whose <code>nlb</code> is larger than <code>n-&gt;dmrsl</code> is skipped with only a trace event (<code>pci_nvme_dsm_single_range_limit_exceeded</code>, then <code>goto next</code>). A range that is out of bounds is also skipped (<code>pci_nvme_err_invalid_lba_range</code>, <code>goto next</code>). The command still completes with Success. QEMU also sets <code>dlfeat = 0x9</code> (reads of deallocated blocks return zeroes, Write Zeroes supports DEAC) in <code>nvme_ns_init()</code>, and passes the discard to its block backend with <code>blk_aio_pdiscard()</code>. If that backend ignores discards (an option of the QEMU drive configuration, <span class="tag uncertain">verify the default for your QEMU version</span>), you get exactly the case in this chapter: DSM Success, DLFEAT promises zeroes, and a read-back returns old data. That makes QEMU a safe place to practise the proof procedure before using real hardware.</p></div>
+
+<h3 id="a-d-dealloc-trace">IV.1.5 What the PEX trace contains, and why it looks perfect</h3>
+<p>A PEX trace is a Teledyne LeCroy PCIe protocol-analyzer capture of the link between the root port (or switch) and the SSD. It records every TLP and DLLP that crosses that link, with timestamps, and the analyzer software decodes the NVMe structures inside the payloads: the 64-byte SQE in the completion data of the device's fetch, the DSM range list, the 16-byte CQE, and data buffers. For the trim of the last 5 GiB, this is <b>everything</b> the capture holds. Every packet is correct. A drive that deallocated and a drive that did nothing produce the same sequence, byte for byte, apart from timestamps.</p>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic PEX-style trace — DSM deallocate of LBA 1,310,720 + 1,310,720 blocks (4 KiB LBA format), I/O queue 3, CID 0x1047. The good drive and the lying drive produce the SAME trace.</div><div class="table-wrap"><table><thead><tr><th>#</th><th>Time (µs)</th><th>Dir</th><th>TLP</th><th>Decoded content</th><th>What it proves</th></tr></thead><tbody>
+<tr><td>1</td><td>0.000</td><td>H→D</td><td>MWr 32b, 4 B</td><td>BAR0+0x1018 (SQ3 tail doorbell) = 0x0000_0012</td><td>Host submitted one command</td></tr>
+<tr><td>2</td><td>0.410</td><td>D→H</td><td>MRd 64b, 64 B, tag 0x21</td><td>Address = SQ3 base + 0x11×64</td><td>Device saw the doorbell and fetched the SQE</td></tr>
+<tr><td>3</td><td>0.980</td><td>H→D</td><td>CplD 64 B, tag 0x21, SC</td><td>SQE: OPC=09h (Dataset Management), CID=0x1047, NSID=1, PRP1=0x0_7F3A_1000, CDW10=0000_0000h (NR=0 → 1 range), CDW11=0000_0004h (AD=1)</td><td>The command is a deallocate, not only an IDR/IDW hint</td></tr>
+<tr><td>4</td><td>1.350</td><td>D→H</td><td>MRd 64b, 16 B, tag 0x22</td><td>Address = 0x0_7F3A_1000 (range list)</td><td>Device fetched the ranges. <b>Length matters</b>: 16 B for NR=0 is correct. A 4096-B read means it ignores NR (D-32). Less than 16×(NR+1) means it never saw some ranges (D-02).</td></tr>
+<tr><td>5</td><td>1.910</td><td>H→D</td><td>CplD 16 B, tag 0x22, SC</td><td>Range 0: CATTR=0000_0000h, NLB=0014_0000h (1,310,720), SLBA=0000_0000_0014_0000h (1,310,720)</td><td>The exact LBAs requested: LBA 1,310,720 … 2,621,439 = the last 5 GiB. <b>This is the only place they appear on the wire.</b></td></tr>
+<tr class="first-bad"><td>—</td><td>1.9 … 9.6</td><td>—</td><td>(no TLPs)</td><td>FTL updates its mapping table, or doesn't</td><td>Invisible. The link is idle either way.</td></tr>
+<tr><td>6</td><td>9.640</td><td>D→H</td><td>MWr 64b, 16 B</td><td>CQE to CQ3: DW0=0, SQHD=0x12, SQID=3, CID=0x1047, P=1, Status=0000h (SCT 0 / SC 0 = Success)</td><td>Command <em>accepted and finished without reported error</em></td></tr>
+<tr><td>7</td><td>9.700</td><td>D→H</td><td>MWr 32b, 4 B</td><td>MSI-X vector 4 message (address 0xFEE0_xxxx)</td><td>Interrupt</td></tr>
+<tr><td>8</td><td>11.200</td><td>H→D</td><td>MWr 32b, 4 B</td><td>BAR0+0x101C (CQ3 head doorbell) = 0x12</td><td>Host consumed the CQE. The trim is "done" for the host.</td></tr>
+</tbody></table></div></div>
+<p><b>Why it looks perfect.</b> The analyzer's protocol checks (TLP format, ordering, completion timeouts, credit flow, NVMe field decoding) all pass, because nothing here breaks a rule. The SQE is well-formed, the range list is fetched with the right length, the CQE matches the CID, the phase bit is right, and the interrupt follows the CQE. NVMe has no status code that means "accepted but I will not deallocate". The FTL change, which is the thing that failed, happens in controller memory and never produces a TLP. Timing does not help either: a drive that only logs the request and unmaps later in the background (legal) completes as fast as a drive that does nothing.</p>
+<p><b>What the trace does tell you.</b> (a) The deallocate was sent, which rules out the host-side drops in <a href="#e-d-04">D-04</a>. (b) It carried the LBAs you expected; wrong LBAs point to host bugs such as partition offsets, dm-crypt, LVM or granularity rounding. (c) It was fetched completely and accepted. It cannot tell you (d): did the FTL change.</p>
+
+<h4>The extra evidence, and how much of it can be put into the same capture</h4>
+<p>The proof comes from <em>later</em> commands whose results are visible as payloads. If you keep the analyzer running while you run the checks from section IV.1.7, the same PEX file can contain the proof. That is the best bug report you can hand a drive vendor: one capture with the promise, the trim and the broken result.</p>
+<div class="trace" data-trace="synthetic"><div class="trace-head">Synthetic PEX-style trace — the proof sequence captured after the trim (lying drive, DLFEAT = 09h, NSFEAT bit 2 = 1)</div><div class="table-wrap"><table><thead><tr><th>#</th><th>Dir</th><th>TLP</th><th>Decoded content</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>9</td><td>D→H</td><td>MWr, 4096 B (in several MPS-sized TLPs)</td><td>Identify Namespace data (admin CNS 00h, NSID 1): bytes 16–23 NUSE = 0x0000_0000_0028_0000 (2,621,440); byte 24 NSFEAT = 05h; byte 33 DLFEAT = 09h</td><td>The promise (zeroes after deallocate, DULBE supported) is on the wire. NUSE did not drop by 1,310,720.</td></tr>
+<tr><td>10</td><td>H→D / D→H</td><td>SQE fetch + CQE</td><td>Read: OPC=02h, SLBA=2,000,000 (0x1E8480), NLB=0 (1 block), CID=0x1050 → Status 0</td><td>The read is accepted</td></tr>
+<tr class="first-bad"><td>11</td><td>D→H</td><td>MWr, 4096 B</td><td>Data payload to the read buffer: <code>A5 A5 A5 A5 … 4c 1e 00 …</code> (the fio verify header and pattern written before the trim)</td><td><b>Visible proof:</b> DLFEAT RB = 001b promises 00h, and the drive returned the old data</td></tr>
+<tr><td>12</td><td>H→D / D→H</td><td>Admin SQE + CQE</td><td>Set Features FID=05h, CDW11=0001_0000h (DULBE=1) → Success</td><td>Error for deallocated/unwritten blocks enabled</td></tr>
+<tr class="bad"><td>13</td><td>D→H</td><td>MWr 4096 B + CQE</td><td>Read SLBA 2,000,000 → data payload returned, CQE Status = 0</td><td>Expected CQE Status SCT 2h / SC 87h (287h, Deallocated or Unwritten Logical Block). Success means the drive still treats the block as allocated.</td></tr>
+<tr><td>14</td><td>D→H</td><td>CQE only</td><td>Read SLBA 2,621,440 (never written) → CQE Status SCT 2h / SC 87h, no data MWr</td><td>Control: DULBE works, so step 13 is meaningful</td></tr>
+</tbody></table></div></div>
+<div class="table-wrap"><table><thead><tr><th>Evidence</th><th>In the PEX trace?</th><th>Where to look</th></tr></thead><tbody>
+<tr><td>Deallocate requested, which LBAs</td><td><span class="pex yes">Visible</span></td><td>SQE CplD (OPC 09h, CDW11 bit 2) and range-list CplD</td></tr>
+<tr><td>Deallocate accepted</td><td><span class="pex yes">Visible</span></td><td>CQE MWr, Status 0</td></tr>
+<tr><td>FTL unmapped the LBAs</td><td><span class="pex no">Not visible</span></td><td>Only indirectly, through the rows below</td></tr>
+<tr><td>DLFEAT/NSFEAT promise</td><td><span class="pex yes">Visible</span> if Identify is captured</td><td>Identify Namespace data MWr, bytes 24 and 33</td></tr>
+<tr><td>Read after trim returns old data</td><td><span class="pex yes">Visible</span></td><td>Read data MWr payload. It is proof only if DLFEAT RB = 001b/010b.</td></tr>
+<tr><td>DULBE result</td><td><span class="pex yes">Visible</span></td><td>CQE status field of the Read (287h or 0)</td></tr>
+<tr><td>NUSE before/after</td><td><span class="pex yes">Visible</span> if both Identify commands are captured</td><td>Identify Namespace bytes 16–23</td></tr>
+<tr><td>Reclaimed space / lower write amplification</td><td><span class="pex no">Not visible</span></td><td>Long performance runs, vendor or OCP logs (log page payloads are visible, but the counters are vendor-defined)</td></tr>
+<tr><td>Data that never left the host (D-04)</td><td><span class="pex yes">Visible</span> as an absence</td><td>No OPC 09h SQE in the capture window</td></tr>
+</tbody></table></div>
+<div class="callout trace"><div class="callout-title">🔍 Host-side trace without an analyzer</div>
+<p>Linux tracepoints show the command but not the ranges: <code>nvme_setup_cmd</code> for a DSM prints <code>nr=…, attributes=…</code> via <code>drivers/nvme/host/trace.c:nvme_trace_dsm()</code>, and <code>attributes=4</code> means AD. The LBAs live in the payload, so to see them use <code>blktrace</code>/<code>blkparse</code> (discard requests show RWBS containing <code>D</code> with sector and size), or a bpftrace probe on <code>nvme_setup_discard</code>. The PEX trace is the only view that shows the range list <em>as the device fetched it</em>.</p></div>
+
+<h3 id="a-d-dealloc-flow">IV.1.6 The discard path and where the evidence is: interactive figure</h3>
+<p>Click a step to follow one deallocate from the filesystem to the FTL, and then the probes you use afterwards to get evidence. Grey dashed arrows are inside the SSD and never appear on PCIe. Those are exactly the steps an analyzer cannot show you. <span class="tag synthetic">synthetic</span></p>
+<div class="flow" id="a-d-flow-discard">
+<div class="legend-roles"><span><i class="sw"></i>Software / host starts it</span><span><i class="dev"></i>Device starts it (visible on PCIe)</span><span><i class="in"></i>Inside the SSD (NOT visible on PCIe)</span><span><i class="pcie"></i>PCIe link</span></div>
+<figure class="diagram"><svg viewBox="0 0 1000 640" role="img" aria-label="Block diagram of a discard: software stack (filesystem, block layer, NVMe driver, evidence tools), host memory (submission queue, DSM range list, completion queue, read-back buffer), the PCIe link, and the SSD (doorbells, controller, FTL mapping table, NAND, Identify and log pages). Ten numbered arrows show the order: discard bios, build command and range list, doorbell, fetch command, fetch range list, internal unmap, completion, interrupt, evidence queries, read-back data.">
+  <rect class="z-sw" x="8" y="52" width="586" height="512" rx="14"/>
+  <text x="22" y="76" class="t-title c-sw">HOST</text>
+  <rect class="z-dev" x="738" y="52" width="254" height="512" rx="14"/>
+  <text x="752" y="76" class="t-title c-dev">SSD</text>
+  <rect class="b-pcie" x="656" y="52" width="30" height="512" rx="6"/>
+  <text transform="translate(676,320) rotate(-90)" text-anchor="middle" class="t-lbl c-pcie">PCIe link</text>
+
+  <rect class="b-sw" x="22" y="100" width="190" height="450" rx="10"/>
+  <text x="117" y="124" text-anchor="middle" class="t-title">SOFTWARE</text>
+  <rect class="b-plain" x="36" y="138" width="162" height="44" rx="6"/>
+  <text x="117" y="157" text-anchor="middle" class="t-lbl">filesystem / blkdiscard</text>
+  <text x="117" y="174" text-anchor="middle" class="t-mono">truncate, fstrim</text>
+  <rect class="b-plain" x="36" y="206" width="162" height="44" rx="6"/>
+  <text x="117" y="225" text-anchor="middle" class="t-lbl">block layer</text>
+  <text x="117" y="242" text-anchor="middle" class="t-mono">split by discard limits</text>
+  <rect class="b-plain" x="36" y="274" width="162" height="44" rx="6"/>
+  <text x="117" y="293" text-anchor="middle" class="t-lbl">nvme driver</text>
+  <text x="117" y="310" text-anchor="middle" class="t-mono">nvme_setup_discard()</text>
+  <rect class="b-plain" x="36" y="452" width="162" height="60" rx="6"/>
+  <text x="117" y="472" text-anchor="middle" class="t-lbl">evidence tools</text>
+  <text x="117" y="489" text-anchor="middle" class="t-mono">nvme-cli, cmp, fio</text>
+  <text x="117" y="504" text-anchor="middle" class="t-mono">verify</text>
+
+  <rect class="b-mem" x="284" y="92" width="296" height="458" rx="10"/>
+  <text x="432" y="118" text-anchor="middle" class="t-title">HOST MEMORY</text>
+  <text x="300" y="148" class="t-lbl">I/O SQ 3 · slot 0x11</text>
+  <rect class="b-hot" x="300" y="154" width="264" height="30" rx="4"/>
+  <text x="432" y="174" text-anchor="middle" class="t-mono">DSM  OPC 09h  NR=0  AD=1</text>
+  <text x="300" y="216" class="t-lbl">DSM range list (PRP1)</text>
+  <rect class="b-plain" x="300" y="222" width="264" height="44" rx="4"/>
+  <text x="432" y="240" text-anchor="middle" class="t-mono">SLBA 0x140000</text>
+  <text x="432" y="257" text-anchor="middle" class="t-mono">NLB 0x140000  (5 GiB)</text>
+  <text x="300" y="306" class="t-lbl">I/O CQ 3</text>
+  <rect class="b-plain" x="300" y="312" width="264" height="30" rx="4"/>
+  <text x="432" y="332" text-anchor="middle" class="t-mono">CID 0x1047  Status 0</text>
+  <text x="300" y="414" class="t-lbl">Read-back buffer</text>
+  <rect class="b-plain" x="300" y="420" width="264" height="44" rx="4"/>
+  <text x="432" y="438" text-anchor="middle" class="t-mono">zeroes? FFh? old pattern?</text>
+  <text x="432" y="455" text-anchor="middle" class="t-mono">DULBE error 287h?</text>
+
+  <rect class="b-dev" x="760" y="88" width="200" height="52" rx="8"/>
+  <text x="860" y="110" text-anchor="middle" class="t-lbl">Doorbell registers</text>
+  <text x="860" y="128" text-anchor="middle" class="t-mono">SQ3 tail · CQ3 head</text>
+  <rect class="b-dev" x="760" y="156" width="200" height="140" rx="8"/>
+  <text x="860" y="196" text-anchor="middle" class="t-lbl">Controller</text>
+  <text x="860" y="214" text-anchor="middle" class="t-sub">parses DSM, queues</text>
+  <text x="860" y="230" text-anchor="middle" class="t-sub">unmap work</text>
+  <rect class="b-dev" x="760" y="318" width="200" height="66" rx="8"/>
+  <text x="860" y="342" text-anchor="middle" class="t-lbl">FTL mapping table</text>
+  <text x="860" y="360" text-anchor="middle" class="t-mono">LBA → NAND page</text>
+  <rect class="b-dev" x="760" y="402" width="200" height="56" rx="8"/>
+  <text x="860" y="426" text-anchor="middle" class="t-lbl">NAND flash</text>
+  <text x="860" y="444" text-anchor="middle" class="t-sub">old data stays until GC</text>
+  <rect class="b-dev" x="760" y="476" width="200" height="74" rx="8"/>
+  <text x="860" y="496" text-anchor="middle" class="t-lbl">Identify / logs</text>
+  <text x="860" y="514" text-anchor="middle" class="t-mono">NUSE, DLFEAT, SMART</text>
+  <text x="860" y="530" text-anchor="middle" class="t-mono">Get LBA Status</text>
+
+  <g class="fstep sw" data-step="1">
+    <path class="ar sw" d="M117,182 V202" marker-end="url(#m-sw)"/>
+    <g class="badge sw"><circle cx="150" cy="193" r="11"/><text x="150" y="197">1</text></g>
+  </g>
+  <g class="fstep sw" data-step="2">
+    <path class="ar sw" d="M117,250 V270" marker-end="url(#m-sw)"/>
+    <path class="ar sw" d="M198,290 H246 V169 H296" marker-end="url(#m-sw)"/>
+    <path class="ar sw" d="M246,244 H296" marker-end="url(#m-sw)"/>
+    <g class="badge sw"><circle cx="150" cy="261" r="11"/><text x="150" y="265">2</text></g>
+  </g>
+  <g class="fstep sw" data-step="3">
+    <path class="ar sw" d="M80,100 V40 H860 V84" marker-end="url(#m-sw)"/>
+    <text x="300" y="34" class="alab sw">ring SQ3 tail doorbell</text>
+    <g class="badge sw"><circle cx="80" cy="70" r="11"/><text x="80" y="74">3</text></g>
+  </g>
+  <g class="fstep dev" data-step="4">
+    <path class="ar dev" d="M760,169 H568" marker-end="url(#m-dev)" marker-start="url(#m-dev)"/>
+    <text x="584" y="161" class="alab dev">fetch SQE</text>
+    <g class="badge dev"><circle cx="720" cy="169" r="11"/><text x="720" y="173">4</text></g>
+  </g>
+  <g class="fstep dev" data-step="5">
+    <path class="ar dev" d="M760,244 H568" marker-end="url(#m-dev)" marker-start="url(#m-dev)"/>
+    <text x="584" y="236" class="alab dev">fetch ranges</text>
+    <g class="badge dev"><circle cx="720" cy="244" r="11"/><text x="720" y="248">5</text></g>
+  </g>
+  <g class="fstep in" data-step="6">
+    <path class="ar in" d="M900,296 V314" marker-end="url(#m-in)"/>
+    <g class="badge in"><circle cx="930" cy="305" r="11"/><text x="930" y="309">6</text></g>
+    <text x="772" y="311" class="alab in">unmap? (invisible)</text>
+  </g>
+  <g class="fstep dev" data-step="7">
+    <path class="ar dev" d="M760,282 H706 V327 H568" marker-end="url(#m-dev)"/>
+    <text x="584" y="319" class="alab dev">CQE OK</text>
+    <g class="badge dev"><circle cx="706" cy="304" r="11"/><text x="706" y="308">7</text></g>
+  </g>
+  <g class="fstep dev" data-step="8">
+    <path class="ar dev" d="M960,226 H984 V610 H60 V516" marker-end="url(#m-dev)"/>
+    <text x="300" y="604" class="alab dev">MSI-X interrupt</text>
+    <g class="badge dev"><circle cx="560" cy="610" r="11"/><text x="560" y="614">8</text></g>
+  </g>
+  <g class="fstep sw" data-step="9">
+    <path class="ar sw" d="M140,512 V582 H900 V554" marker-end="url(#m-sw)"/>
+    <text x="300" y="576" class="alab sw">Identify NS · logs · Read</text>
+    <g class="badge sw"><circle cx="140" cy="548" r="11"/><text x="140" y="552">9</text></g>
+  </g>
+  <g class="fstep dev" data-step="10">
+    <path class="ar in" d="M800,402 V388" marker-end="url(#m-in)"/>
+    <path class="ar dev" d="M760,442 H568" marker-end="url(#m-dev)"/>
+    <text x="584" y="434" class="alab dev">read data</text>
+    <g class="badge dev"><circle cx="720" cy="442" r="11"/><text x="720" y="446">10</text></g>
+  </g>
+</svg><figcaption>Figure IV.1 — One deallocate and the evidence trail. Blue = host-initiated, orange = device-initiated PCIe traffic, grey dashed = internal to the SSD. Step 6 is the one that matters and the one no analyzer can see. Steps 9–10 are how you get evidence afterwards. <span class="tag conceptual">conceptual</span></figcaption></figure>
+<ol class="flow-steps">
+<li data-who="sw"><b>The filesystem or tool asks the block layer to discard</b><div class="flow-detail"><p><code>blkdiscard</code> (BLKDISCARD ioctl), <code>fstrim</code> (FITRIM) or a filesystem mounted with <code>-o discard</code> after a truncate creates discard bios. If the filesystem is not mounted with discard, a truncate stops here and nothing is ever sent.</p><div class="flow-meta"><span>Where: kernel, block layer entry</span><span class="pc">PCIe: No</span></div><div class="flow-ex">blkdiscard -o 5368709120 -l 5368709120 /dev/nvme0n1
+→ REQ_OP_DISCARD, sector 10485760, 10485760 sectors (512 B units)</div></div></li>
+<li data-who="sw"><b>The block layer splits the discard; the driver builds the DSM command and range list</b><div class="flow-detail"><p>The block layer cuts the request to <code>discard_max_bytes</code>, granularity and <code>max_discard_segments</code>. <code>nvme_setup_discard()</code> writes one 16-byte range per bio into a 4096-byte buffer and builds the 64-byte SQE with opcode 09h, NR = ranges − 1, and AD set.</p><div class="flow-meta"><span>Where: host memory (SQ slot + range buffer)</span><span class="pc">PCIe: No. The CPU writes its own RAM.</span></div><div class="flow-ex">SQE: OPC=09h CID=0x1047 NSID=1 CDW10=0 (NR=0 → 1 range) CDW11=4 (AD)
+Range[0]: CATTR=0 NLB=0x140000 SLBA=0x140000
+(Large requests may become several ranges or several DSM commands: check with blktrace.)</div></div></li>
+<li data-who="sw"><b>The driver rings the SQ tail doorbell</b><div class="flow-detail"><p>A 4-byte posted write to the SQ3 tail doorbell. Only the new tail index crosses the link.</p><div class="flow-meta"><span>Where: BAR0 + 1000h + (2·3)·(4&lt;&lt;DSTRD)</span><span class="pc">PCIe: Yes, host → device · MWr 4 B</span></div><div class="flow-ex">With DSTRD=0: offset 0x1018, value 0x12</div></div></li>
+<li data-who="dev"><b>The controller fetches the SQE</b><div class="flow-detail"><p>A memory read of the 64-byte slot. An analyzer that decodes NVMe shows "Dataset Management, AD".</p><div class="flow-meta"><span>Where: host memory, SQ3 slot 0x11</span><span class="pc">PCIe: Yes · MRd 64 B + CplD</span></div><div class="flow-ex">First evidence point: the command IS a deallocate (CDW11 bit 2 = 1).</div></div></li>
+<li data-who="dev"><b>The controller fetches the range list</b><div class="flow-detail"><p>The controller reads the range descriptors from PRP1. This is the only place on the wire where the LBAs appear. Check that the read length matches 16 × (NR+1). A 4096-byte read when NR=0 shows the device ignores NR, the bug Linux allocates around.</p><div class="flow-meta"><span>Where: host memory, range buffer</span><span class="pc">PCIe: Yes · MRd 16 B (expected) + CplD</span></div><div class="flow-ex">Second evidence point: SLBA 0x140000, NLB 0x140000 → exactly LBAs 1,310,720 … 2,621,439</div></div></li>
+<li data-who="in"><b>Internal: the FTL unmaps the LBAs (or doesn't)</b><div class="flow-detail"><p>A correct drive marks the mapping entries invalid (often lazily, in a journal or bitmap). A lying drive does nothing, or only part of it. The old NAND pages stay physically present until garbage collection either way. This is the step in question, and it is invisible.</p><div class="flow-meta"><span>Where: controller SRAM/DRAM, FTL metadata</span><span class="pc">PCIe: No. Nothing differs on the link.</span></div><div class="flow-ex">Good: 1,310,720 map entries → UNMAPPED  (NUSE −1,310,720 if tracked)
+Bad:  0 map entries changed; same CQE, same timing</div></div></li>
+<li data-who="dev"><b>The controller posts a Success CQE</b><div class="flow-detail"><p>A 16-byte completion with status 0. This means the command was accepted and processed without an error the controller chose to report. It does not mean the blocks are now deallocated.</p><div class="flow-meta"><span>Where: host memory, CQ3</span><span class="pc">PCIe: Yes, device → host · MWr 16 B</span></div><div class="flow-ex">DW2: SQHD=0x12 SQID=3   DW3: CID=0x1047 P=1 Status=0x0000</div></div></li>
+<li data-who="dev"><b>MSI-X interrupt; Linux completes the request</b><div class="flow-detail"><p>The handler calls <code>nvme_handle_cqe()</code>, the request ends with <code>BLK_STS_OK</code>, the range buffer is freed, <code>blkdiscard</code> exits 0. No log line is printed.</p><div class="flow-meta"><span>Where: CPU, nvme_irq → nvme_handle_cqe</span><span class="pc">PCIe: Yes · MWr 4 B to MSI-X address</span></div><div class="flow-ex">dmesg: (nothing)    nvme error-log: (no new entry)</div></div></li>
+<li data-who="sw"><b>Evidence queries: Identify Namespace, log pages, and Reads</b><div class="flow-detail"><p>The host sends normal admin and I/O commands to measure the result: Identify Namespace (NUSE, DLFEAT, NSFEAT), Get Features 05h (DULBE), SMART log, Get LBA Status if supported, and Reads of sample LBAs from inside, at the edges of, and outside the range.</p><div class="flow-meta"><span>Where: admin and I/O queues</span><span class="pc">PCIe: Yes · normal command traffic</span></div><div class="flow-ex">nvme id-ns /dev/nvme0n1 -H | grep -iE 'nuse|dlfeat|nsfeat'
+nvme read /dev/nvme0n1 -s 2000000 -c 0 -z 4096 -d out.bin</div></div></li>
+<li data-who="dev"><b>Read-back data or a DULBE error comes back: this is the evidence</b><div class="flow-detail"><p>The NAND→controller step is internal. The data (or error status) the controller returns is on the wire and in your buffer. Compare it with the DLFEAT promise: zeroes, FFh, an error 287h (DULBE enabled), or the old pattern.</p><div class="flow-meta"><span>Where: host memory, read buffer / CQE status</span><span class="pc">PCIe: Yes · MWr data + CQE</span></div><div class="flow-ex">DLFEAT RB=001b and data = old pattern → PROVEN failure
+DLFEAT RB=000b and data = old pattern → allowed; use DULBE / NUSE instead</div></div></li>
+</ol>
+</div>
+
+<h3 id="a-d-dealloc-prove">IV.1.7 How to prove it: the evidence ladder</h3>
+<p>Use the strongest evidence the drive supports. Each rung says what it proves, what it cannot prove, and when it applies. Rung 0 always comes first. Most reported cases of "the drive ignored my trim" turn out to be <b>a discard that never left the host</b>.</p>
+<div class="table-wrap"><table><thead><tr><th>Rung</th><th>Method</th><th>Proves</th><th>Cannot prove / caveats</th><th>Needs</th></tr></thead><tbody>
+<tr><td>0</td><td>blktrace / tracepoint / analyzer: DSM with AD sent, ranges as expected, Success CQE</td><td>The host asked correctly and the device accepted it</td><td>Anything about the FTL</td><td>Always possible</td></tr>
+<tr><td>1</td><td>Read-back of sample LBAs, compared with the DLFEAT read behaviour</td><td>With RB = 001b/010b: any old data = <b>violation proven</b>. All zeroes/FFh = consistent with deallocation (or with a Write Zeroes-like implementation).</td><td>With RB = 000b old data is legal. Data matching the promised pattern does not prove the space was <em>reclaimed</em> internally.</td><td>DLFEAT RB ≠ 000b</td></tr>
+<tr><td>2</td><td>DULBE: enable Feature 05h bit 16, then read sample LBAs with passthrough</td><td>Status 287h (Deallocated or Unwritten Logical Block) for blocks in the range = the controller's own metadata says they are deallocated. Success with old data = not deallocated.</td><td>Only if NSFEAT bit 2 = 1. Affects every reader of the namespace (Linux returns <code>BLK_STS_MEDIUM</code>, so filesystems will see I/O errors).</td><td>NSFEAT.DULBE</td></tr>
+<tr><td>3</td><td>NUSE before/after (Identify Namespace)</td><td>A drop of about NLB (± granularity) = allocation accounting changed</td><td>Many drives report NUSE = NCAP always. NUSE may update lazily. It counts the whole namespace, so other writers skew it.</td><td>Drive that tracks NUSE (test: does NUSE drop after a Format? after a known-good DSM?)</td></tr>
+<tr><td>4</td><td>Get LBA Status with action type 02h (tracked allocated), where supported</td><td>Per-range allocation view from the controller</td><td>Newer feature. Action types 10h/11h report <em>potentially unrecoverable</em> LBAs, not deallocation. <span class="tag version">version</span></td><td>OACS.GLSS + ATYPE 02h support</td></tr>
+<tr><td>5</td><td>Performance / write amplification signature</td><td>After real deallocation of half the drive, sustained random writes over the other half run faster and with lower write amplification than a control run without deallocate</td><td>Indirect and statistical. Needs a preconditioned drive and a control. Some drives reclaim slowly.</td><td>Hours of drive time; vendor NAND-write counter helps</td></tr>
+<tr><td>6</td><td>SMART / vendor logs: host vs NAND writes</td><td>Data Units Written should not change from DSM. A vendor "NAND bytes written" counter lets you compute write amplification for rung 5.</td><td>SMART has no "deallocated" counter. Vendor log formats are vendor- or OCP-specific <span class="tag impl">impl</span>.</td><td>Vendor/OCP log support</td></tr>
+<tr><td>7</td><td>Vendor debug (FTL dump, internal trace)</td><td>Direct view of the map</td><td>Under NDA, firmware-specific</td><td>Vendor engagement</td></tr>
+</tbody></table></div>
+
+<div class="callout debug"><div class="callout-title">🐞 Decision procedure</div>
+<ol>
+<li><b>Did it leave the host?</b> If there is no DSM/Write Zeroes in blktrace or the analyzer, the bug is host-side (<a href="#e-d-04">D-04</a>). Stop and fix the mount option, dm layer or <code>discard_max_bytes</code>.</li>
+<li><b>Were the ranges right?</b> Decode the range list. If the LBAs are wrong, it is a partition/LVM/offset bug, not a drive bug.</li>
+<li><b>Was it rejected?</b> A non-zero status shows in dmesg via <code>nvme_log_error()</code> and in <code>nvme error-log</code>. Not silent.</li>
+<li><b>What did the drive promise?</b> <code>nvme id-ns -H</code>: DLFEAT RB, NSFEAT DULBE/THIN, NPDG/NPDA. <code>nvme id-ctrl -H</code>: ONCS, OACS.GLSS. NVM Identify Controller (<code>nvme nvm-id-ctrl</code>, if your nvme-cli has it): DMRL, DMRSL.</li>
+<li><b>Pick the strongest rung</b> (1 &gt; 2 &gt; 3 &gt; 4 &gt; 5) the promises allow, and repeat with a known-good reference drive or the QEMU model as a control.</li>
+<li><b>Classify</b>: promise broken (RB=001b, old data back) → <a href="#e-d-01">D-01</a>/<a href="#e-d-03">D-03</a>, a spec violation. Partial (edges or some ranges only) → <a href="#e-d-02">D-02</a>. No promise, accounting unchanged → "deallocate not effective", a quality or performance issue for the vendor, not a conformance failure.</li>
+</ol></div>
+
+<h3 id="a-d-dealloc-worked">IV.1.8 Worked example with numbers <span class="tag synthetic">synthetic</span></h3>
+<p>Drive: 1.0 TB, one namespace, LBA format 4096 + 0 (lba_shift 12). Identify Namespace: NSZE = NCAP = 244,190,646. NSFEAT = 05h (THIN + DULBE). DLFEAT = 09h (RB 001b + Write Zeroes DEAC). NPDG = NPDA = 7 (0's based → 8 blocks = 32 KiB). NVM Identify Controller: DMRL = 0, DMRSL = 0.</p>
+<div class="formula">LBAs written = 10 GiB / 4096 = 2,621,440 (LBA 0 … 2,621,439)<br>Range to deallocate = LBA 1,310,720 (0x140000), NLB = 1,310,720 (0x140000)<br>Granularity check: 1,310,720 mod 8 = 0 and 1,310,720 mod 8 = 0 → aligned</div>
+<ul class="vars"><li><b>NUSE expected</b> — before: ≥ 2,621,440 (plus any earlier data); after: before − 1,310,720, within one granule (8 blocks) per range edge.</li><li><b>DLFEAT 09h</b> — reads of deallocated blocks must return 00h, and Linux will set DEAC on Write Zeroes for this namespace.</li></ul>
+<p>Observations on the "lying" drive: DSM completes in 11 µs with status 0. <code>nvme id-ns</code> NUSE before = 2,621,440, after = 2,621,440 (unchanged, even after 60 s idle). Reads of LBA 1,310,720, 2,000,000 and 2,621,439 return the original pattern. With DULBE enabled, reading LBA 2,000,000 returns Success, not 287h. Reads of LBA 2,621,440 (never written) <em>do</em> return 287h, which proves DULBE works and the drive tracks unwritten blocks. <b>Conclusion:</b> the drive promised zeroes (RB 001b) and returned old data. Its own allocation tracking (DULBE, NUSE) shows the range is still mapped. The deallocate was accepted and not performed. This is a conformance failure, card <a href="#e-d-01">D-01</a>, and the evidence package is: the trace (rungs 0), Identify before/after, read-back dumps, and the DULBE control read.</p>
+
+<div class="lab"><div class="lab-head">🧪 Lab IV.1 — Prove or disprove a deallocate on a spare drive <span class="safety caution">CAUTION LAB</span></div>
+<div class="callout warn"><div class="callout-title">⚠️ Destroys data</div><p>Every write, discard and Set Features below acts on the whole namespace. Use a <b>spare drive or a QEMU NVMe device</b> with nothing mounted, and double-check the device name (<code>nvme list</code>, <code>lsblk</code>). Enabling DULBE makes reads of unwritten blocks fail for all users of the namespace. Turn it off again at the end. Never run this on a disk holding a filesystem you care about.</p></div>
+<p><b>Objective.</b> Write 10 GiB of verifiable data, deallocate the last 5 GiB, and collect at least three independent kinds of evidence about whether deallocation took effect.</p>
+<p><b>Setup.</b> Linux with nvme-cli, fio, util-linux (<code>blkdiscard</code>), optionally blktrace. Note the namespace's LBA size (<code>nvme id-ns -H</code>, "in use" LBA format). The example assumes 4096-byte LBAs; recompute LBA numbers for 512.</p>
+<pre class="code" data-kind="hardware-dependent"><code># 0. What does the drive promise?  (read-only)
+DEV=/dev/nvme0n1; CTRL=/dev/nvme0
+nvme id-ctrl $CTRL -H | grep -iE 'oncs|oacs|vwc'
+nvme id-ns   $DEV  -H | grep -iE 'nsze|ncap|nuse|nsfeat|dlfeat|npdg|npda|in use'
+cat /sys/block/nvme0n1/queue/{discard_max_bytes,discard_granularity,max_discard_segments,write_zeroes_max_bytes}
+nvme get-feature $CTRL -f 0x05 -n 1 -H          # Error Recovery (TLER, DULBE)
+
+# 1. Write 10 GiB of self-verifying data (header with offset + checksum per block)
+fio --name=fill --filename=$DEV --rw=write --bs=128k --size=10G --direct=1 \
+    --verify=crc32c --do_verify=0 --ioengine=libaio --iodepth=16
+nvme id-ns $DEV | grep -i nuse            # record NUSE_1
+
+# 2. Optional: start blktrace in another shell to capture the discard
+#    blktrace -d $DEV -o - | blkparse -i - | grep ' D '
+
+# 3. Deallocate the last 5 GiB (LBA 1310720, 1310720 blocks)
+blkdiscard --offset 5GiB --length 5GiB $DEV ; echo "exit=$?"
+sleep 30
+nvme id-ns $DEV | grep -i nuse            # record NUSE_2
+
+# 4. Read-back: inside, both edges, and just outside the range
+for L in 1310719 1310720 2000000 2621439; do
+  nvme read $DEV -s $L -c 0 -z 4096 -d /tmp/lba_$L.bin
+  echo "LBA $L:"; od -A d -t x1 /tmp/lba_$L.bin | head -2
+done
+
+# 5. DULBE (only if NSFEAT bit 2 = 1): enable, read, disable
+nvme set-feature $CTRL -f 0x05 -n 1 -v 0x10000
+nvme read $DEV -s 2000000 -c 0 -z 4096 -d /dev/null   # expect status 0x287 if deallocated
+nvme read $DEV -s 2621440 -c 0 -z 4096 -d /dev/null   # never written: control, expect 0x287
+nvme set-feature $CTRL -f 0x05 -n 1 -v 0x0
+
+# 6. fio verify of the first half must still pass (deallocate must not touch it)
+fio --name=check --filename=$DEV --rw=read --bs=128k --size=5G --direct=1 \
+    --verify=crc32c --verify_only --ioengine=libaio</code></pre>
+<p><b>Observations to record:</b> DLFEAT RB, NSFEAT bits, NUSE_1 and NUSE_2, the first bytes of each read-back, DULBE statuses, the fio verify result for the first half, and (if captured) the discard line from blkparse with its sector and size.</p>
+<p><b>Questions.</b> (1) If LBA 1,310,719 (just outside) reads back as zeroes, what went wrong? (2) If NUSE does not change but read-backs are zero, is the drive failing? (3) Why is the never-written LBA a necessary control for step 5?</p>
+<details class="answer"><summary>Solution</summary><p>(1) The deallocate covered too much. Either the host rounded the range out (granularity or offset error, check blkparse) or the drive deallocated outside the range. Both are serious, see <a href="#e-d-02">D-02</a>. (2) Not necessarily. NUSE may be reported as NCAP on drives that do not track allocation, or update lazily. Zero read-back with RB=001b means the promise was kept. (3) It proves DULBE is really enabled and implemented. Without it, "Success" on LBA 2,000,000 could mean "DULBE is ignored" rather than "block still allocated".</p></details>
+<p><b>Extension.</b> Repeat with <code>blkdiscard -z</code> (Write Zeroes; with DLFEAT 09h Linux sets DEAC) and compare. Repeat in QEMU with a backend that ignores discards to reproduce a "lying" controller, and with one that honours them as a control.</p></div>
+
+<h3 id="a-d-dealloc-mistakes">IV.1.9 Common mistakes</h3>
+<ul>
+<li><b>Treating the Success CQE as proof.</b> It shows acceptance. For DSM it is not even a promise of action.</li>
+<li><b>Calling old data on read-back a failure when DLFEAT RB = 000b.</b> That is allowed. Use DULBE or NUSE instead.</li>
+<li><b>Testing through a filesystem.</b> File extents are not device LBAs, discard may be deferred or not sent at all, and the filesystem may never read freed blocks again. Test on the raw namespace.</li>
+<li><b>Ignoring granularity.</b> Ranges not aligned to NPDA/NPDG may be partly deallocated by design. Test aligned and misaligned cases separately.</li>
+<li><b>Measuring right after the CQE only.</b> Background unmapping is legal for the internal space accounting. Check NUSE again after idle time. Read results must be correct immediately.</li>
+<li><b>Leaving DULBE enabled.</b> A filesystem reading never-written metadata areas will see I/O errors.</li>
+</ul>
+
+<div class="quiz"><h4>Quiz</h4><ol>
+<li><p>Which Identify Namespace field decides whether a read-back of old data after a deallocate is a spec violation?</p><details class="answer"><summary>Answer</summary><p>DLFEAT bits 2:0 (read behaviour). 001b promises zeroes, 010b promises FFh, 000b promises nothing.</p></details></li>
+<li><p>Under what exact condition does Linux v7.2 set the DEAC bit in Write Zeroes?</p><details class="answer"><summary>Answer</summary><p>When <code>(dlfeat &amp; 7) == 1</code> and <code>dlfeat</code> bit 3 is set (so <code>NVME_NS_DEAC</code> is set), and the request does not carry <code>REQ_NOUNMAP</code>. With <code>NVME_QUIRK_DEALLOCATE_ZEROES</code> it sends a DSM instead of Write Zeroes at all.</p></details></li>
+<li><p>Where in a PCIe trace do the LBAs of a deallocate appear?</p><details class="answer"><summary>Answer</summary><p>Only in the CplD that returns the range list to the device's MRd at PRP1. They are not in the SQE.</p></details></li>
+<li><p>Why does <code>nvme_setup_discard()</code> always allocate 4096 bytes for ranges?</p><details class="answer"><summary>Answer</summary><p>Some devices ignore the NR field and DMA-read the maximum of 256 ranges. A small buffer would make them read past its end (card D-32).</p></details></li>
+<li><p>Which status code does a DULBE-enabled read of a deallocated LBA return, and what does Linux turn it into?</p><details class="answer"><summary>Answer</summary><p>287h "Deallocated or Unwritten Logical Block" (SCT 2h). <code>nvme_error_status()</code> maps it to <code>BLK_STS_MEDIUM</code>.</p></details></li>
+</ol></div>
+
+<div class="interview"><h4>Interview questions</h4><ol>
+<li><span class="lvl">Beginner</span> Why can't a protocol analyzer show whether a trim worked? <details class="answer"><summary>Model answer</summary>The analyzer sees the PCIe link. The DSM command, its range list and the completion are on the link, but the FTL change is inside the controller. A drive that unmaps and one that does nothing produce identical traffic.</details></li>
+<li><span class="lvl">Intermediate</span> A customer says "fstrim says 400 GiB trimmed but performance never recovers." Walk through your investigation. <details class="answer"><summary>Model answer</summary>First confirm discards reach the device (blktrace for D requests, tracepoint <code>nvme_setup_cmd</code> with attributes=4, dm layers' discard passthrough, <code>discard_max_bytes</code>). Then check promises (DLFEAT, NSFEAT, NPDG), then do a raw-device controlled test: write, deallocate, read-back per DLFEAT, DULBE probe, NUSE delta. Finally a performance A/B with a control. fstrim's number is the request size, not the effect.</details></li>
+<li><span class="lvl">Senior</span> When is "deallocate not performed" a conformance bug and when is it a quality issue? <details class="answer"><summary>Model answer</summary>Conformance: when an observable promise is broken: DLFEAT RB 001b/010b with old data returned, DULBE enabled and supported but a deallocated block reads Success, Write Zeroes (with or without DEAC) not returning zeroes. Quality: with RB 000b and no DULBE/NUSE tracking, nothing observable is promised, so a no-op deallocate only costs space and performance. That is a vendor-qualification problem, and you prove it with performance and write-amplification A/B tests.</details></li>
+</ol></div>
+
+<div class="mastery"><div class="callout-title">✅ Mastery gate</div><ul class="checklist">
+<li>I can name the Linux v7.2 functions from discard request to SQE, and the limits that apply.</li>
+<li>I can read DLFEAT/NSFEAT and state what a read-back can prove for this drive.</li>
+<li>I can explain to a manager why a clean trace is not evidence.</li>
+<li>I have run Lab IV.1 on QEMU or a spare drive and recorded three independent kinds of evidence.</li>
+</ul></div>
+<p><b>Summary.</b> A deallocate is visible on the wire only as a request and an acceptance. Whether it took effect is visible only through promised read behaviour (DLFEAT), errors you can turn on (DULBE), allocation accounting (NUSE, Get LBA Status 02h), or long-term performance. Rule out host-side drops first, then use the strongest evidence the drive supports. The next chapter turns each variant of this problem into an error card.</p>
+</section>
