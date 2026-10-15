@@ -1,3 +1,5 @@
+
+
 # The NVMe + PCIe Engineering Journey
 
 **Open `NVMe_PCIe_Engineering_Journey.html` in any browser.** It is a single self-contained file (no internet needed):
@@ -26,3 +28,10 @@ rule violations (with a checker script for exported traces), performance failure
 Grounded in the Linux kernel v7.2 NVMe/PCI source, QEMU's NVMe controller model and libnvme; the NVMe/PCIe specs
 themselves could not be downloaded here, so spec wording is paraphrased and unconfirmed items are tagged.
 Rebuild: `python3 atlas/build.py` (fragments in `atlas/src/`).
+
+
+
+# Commands to run
+
+pip install requests tiktoken
+python llm_stress_test.py --csv D:\traces\export.csv --base-url <URL> --api-key <KEY> --model <MODEL> --context 128000 --rps 5 --concurrency 20 --max-requests 20
