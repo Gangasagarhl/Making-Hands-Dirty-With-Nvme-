@@ -15,8 +15,7 @@ DATA = os.path.join(HERE, "data")
 SIDE_NAMES = {"H": "host", "D": "device", "L": "link/platform", "B": "either (host or device)", "N": "expected behaviour",
               "A": "analyzer artifact"}
 
-CATEGORIES = ["timing", "timeout", "reordering", "protocol-state", "status-code", "link-layer", "performance",
-              "data-integrity"]
+CATEGORIES = ["timing", "timeout", "reordering", "protocol-state", "status-code", "link-layer", "performance"]
 
 
 def _clean(s: str) -> str:

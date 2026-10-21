@@ -255,6 +255,13 @@ class NvmeMixin:
         self.ghost_slots = 0
         self.hmb_enabled = False
         self.queue_overrides_applied = False
+        self._wake_of = {}
+        self.cur_ps = None
+        self.ps_wake = None
+        self.fw_commit = None
+        self.preformat = {}
+        self.io_stats = {"writes": 0, "fua": 0, "flush": 0, "misaligned_writes": 0, "read_bytes": 0, "write_bytes": 0}
+        self.reset_had_ioq = None
 
     # =============================================================================================== output
     def open_commands_csv(self, path):
@@ -350,10 +357,18 @@ class NvmeMixin:
             if k == S.MRD:
                 self.open_np(f, d, k, -1, length * 4, length)
             return
-        fbe = S.hexint(f[ix["first_be"]]) if f[ix["first_be"]] else -1
-        lbe = S.hexint(f[ix["last_be"]]) if f[ix["last_be"]] else -1
-        nbytes = S.be_bytes(fbe, lbe, length) if (fbe >= 0 and fbe != 0xF) or (lbe >= 0 and lbe not in (0xF, 0)) else length * 4
-        a_eff = a + (S.be_offset(fbe) if fbe > 0 else 0)
+        fs = f[ix["first_be"]]
+        ls_ = f[ix["last_be"]]
+        if (fs == "0xF" or fs == "F" or not fs) and (ls_ == "0xF" or ls_ == "0x0" or not ls_ or ls_ == "F" or ls_ == "0"):
+            fbe = 0xF if fs else -1
+            lbe = (0xF if ls_ in ("0xF", "F") else 0) if ls_ else -1
+            nbytes = length * 4
+            a_eff = a
+        else:
+            fbe = S.hexint(fs) if fs else -1
+            lbe = S.hexint(ls_) if ls_ else -1
+            nbytes = S.be_bytes(fbe, lbe, length) if (fbe >= 0 and fbe != 0xF) or (lbe >= 0 and lbe not in (0xF, 0)) else length * 4
+            a_eff = a + (S.be_offset(fbe) if fbe > 0 else 0)
         if length and ((a & 0xFFF) + length * 4) > 4096:
             self.emit("V-28", "4K-CROSS", "error", "protocol-state",
                       f"{S.TLP_NAMES[k]} {self.dname(d)} at 0x{a:X} with {length * 4} bytes crosses a 4 KiB address boundary.",
@@ -409,10 +424,23 @@ class NvmeMixin:
         if 0 <= off < 0x1000:
             self.mmio_write(off, length, data, fbe)
             return
+        if self.in_msix_table(a):
+            self.check_msix_table_write(a, length, data)
+            return
         if 0x1000 <= off < 0x1000 + 65536 * 2 * self.doorbell_stride():
             self.on_doorbell(off - 0x1000, length, data, fbe, lbe, a)
             return
         self.check_msix_table_write(a, length, data)
+
+    def in_msix_table(self, a):
+        t = self.msix_table
+        if t is None:
+            return False
+        base = self.bars.get(t[0])
+        if base is None:
+            return False
+        rel = a - (base + t[1])
+        return 0 <= rel < (self.msix_table_size or 2048) * 16
 
     def check_msix_table_write(self, a, length, data):
         t = self.msix_table
@@ -509,6 +537,7 @@ class NvmeMixin:
             self.emit("C-06", "RESET-LOOP", "error", "protocol-state",
                       f"{len(self.resets)} controller resets (CC.EN 1->0) within 5 minutes: the host keeps resetting the controller.",
                       evidence=[self.ev("earlier reset", r, None, t) for t, r in list(self.resets)[:-1]], related=["C-17", "T-22"])
+        self.reset_had_ioq = (ts, self.ev_here("controller reset")) if any(q > 0 for q in self.sqs) else None
         out = [c for c in self.cmds.values() if not c.done]
         for c in out:
             c.flags.append("outstanding at controller reset")
@@ -752,6 +781,14 @@ class NvmeMixin:
                       + (f"; read as a backwards move by {behind} it means the host withdrew entries" if behind < N // 2 else "")
                       + ": the host overwrote SQEs the controller had not consumed.",
                       metrics={"qid": qid, "old_tail": old, "new_tail": v, "outstanding": q.outstanding, "unfetched": unfetched})
+            if behind < N // 2:
+                # backwards move: the withdrawn slots are no longer pending; do not invent N-k phantom commands
+                s = old
+                for _ in range(behind):
+                    s = (s - 1) % N
+                    q.slots.pop(s, None)
+                q.tail = v
+                return
         ts = self.now
         n_sq, n_all = self.qdepth(qid)
         link = (self.ltssm, self.speed, self.width)
@@ -759,7 +796,10 @@ class NvmeMixin:
         wake = self.wake
         s = old
         for i in range(new):
-            q.slots[s] = [ts, self.row, pk, n_sq + i, n_all + i, link, wake]
+            stale = q.slots.get(s)
+            if stale is not None and (ts - stale[0]) * 1e3 > self.cfg.pending_min_ms:
+                self.stale_slot(q, s, stale, ts, reused=True)
+            q.slots[s] = [ts, self.row, pk, n_sq + i + 1, n_all + i + 1, link, wake]
             s = (s + 1) % N
             if len(q.slots) > N:
                 break
@@ -847,7 +887,8 @@ class NvmeMixin:
         if kind == "data" or kind == "dsm":
             c = r.obj
             if not r.live:
-                self.dma_after_completion(c, a, nbytes, "MRd")
+                if c.cqe_ts is not None:
+                    self.dma_after_completion(c, a, nbytes, "MRd")
                 return
             end = a + nbytes
             if end > r.end and self.lookup(r.end) is None or (end > r.end and self.lookup(r.end).obj is not c):
@@ -866,6 +907,9 @@ class NvmeMixin:
                 c.fd_ts, c.fd_row, c.fd_pkt = self.now, self.row, self.pkt()
             if c.cqe_ts is not None:
                 self.dma_after_completion(c, a, nbytes, "MRd")
+            return
+        if kind == "trunc":
+            self.dma_truncated(r.obj, a, "MRd")
             return
         if kind == "cq":
             self.emit("D-31", "READ-CQ", "warning", "data-integrity",
@@ -918,11 +962,15 @@ class NvmeMixin:
         if kind == "cq":
             self.on_cqe(r.obj, a, data, nbytes, attr)
             return
+        if kind == "trunc":
+            self.dma_truncated(r.obj, a, "MWr")
+            return
         if kind == "data" or kind == "dsm":
             c = r.obj
             self.counts_nvme["data_tlps"] += 1
             if not r.live:
-                self.dma_after_completion(c, a, nbytes, "MWr")
+                if c.cqe_ts is not None:
+                    self.dma_after_completion(c, a, nbytes, "MWr")
                 return
             end = a + nbytes
             if end > r.end:
@@ -938,7 +986,8 @@ class NvmeMixin:
             if c.fd_ts is None:
                 c.fd_ts, c.fd_row, c.fd_pkt = ts, self.row, self.pkt()
             c.ld_ts, c.ld_row, c.ld_pkt = ts, self.row, self.pkt()
-            self.capture_payload(c, r, a, data, nbytes)
+            if c.capture is not None or c.vbuf is not None:
+                self.capture_payload(c, r, a, data, nbytes)
             if self.poison_pending is not None and self.poison_pending[0] == self.row:
                 self.poisoned_data(c)
             if c.cqe_ts is not None:
@@ -949,6 +998,12 @@ class NvmeMixin:
                       f"Device wrote {nbytes} bytes at 0x{a:X}, inside {'SQ' + str(r.obj.qid) if kind == 'sq' else 'a ' + kind + ' of ' + r.obj.name} "
                       f"memory: a controller must never write there (corrupts host structures).",
                       cmd=r.obj if kind != "sq" else None)
+
+    def dma_truncated(self, c: Cmd, a, how):
+        self.emit("C-26", "DMA-48BIT", "error", "data-integrity",
+                  f"Device {how} to 0x{a:X}, which is the data pointer 0x{c.sqe.prp1:X} of {c.name} SQ{c.sqid} CID 0x{c.cid:X} with its "
+                  f"upper address bits dropped: the device truncates DMA addresses above {48 if a < (1 << 48) else 32} bits.",
+                  cmd=c, related=["D-31", "L-36"])
 
     def dma_after_completion(self, c: Cmd, a, nbytes, how):
         if "dma_after_cqe" in c.flags:
@@ -1026,11 +1081,6 @@ class NvmeMixin:
     def _fill_from_slot(self, c: Cmd, p, rec):
         if p is not None:
             c.db_ts, c.db_row, c.db_pkt, c.qd_sq, c.qd_all, c.link = p[0], p[1], p[2], p[3], p[4], p[5]
-            if p[6] is not None:
-                c.flags.append("first command after link wake")
-                c.__setattr__("cq", None)
-                c._wake = p[6] if hasattr(c, "_wake") else None
-            c.prev_wake = None if False else None if True else None
         c.fetch_ts, c.fetch_row, c.fetch_pkt = rec.ts, rec.row, rec.pkt
         c.sqe_ts, c.sqe_row, c.sqe_pkt = self.now, self.row, self.pkt()
 
@@ -1044,7 +1094,7 @@ class NvmeMixin:
         else:
             wake = None
             n_sq, n_all = self.qdepth(sqid)
-            c.qd_sq, c.qd_all, c.link = n_sq, n_all, (self.ltssm, self.speed, self.width)
+            c.qd_sq, c.qd_all, c.link = n_sq + 1, n_all + 1, (self.ltssm, self.speed, self.width)
         c.fetch_ts, c.fetch_row, c.fetch_pkt = rec.ts, rec.row, rec.pkt
         c.sqe_ts, c.sqe_row, c.sqe_pkt = self.now, self.row, self.pkt()
         c.sqe = sqe
@@ -1057,9 +1107,19 @@ class NvmeMixin:
         lba = self.ns_info.get(sqe.nsid, {}).get("lba_size", self.lba_size)
         c.nbytes = nd.data_length(sqid, sqe, lba)
         c.prev = [x.summary() for x in self.recent_cmds]
+        if self.cur_ps and sqid != 0 and c.db_ts is not None:
+            pss = self.ctrl_info.get("ps")
+            ent = pss[self.cur_ps] if pss and self.cur_ps < len(pss) else None
+            if ent is not None and ent["nops"]:
+                dt_us = (c.fetch_ts - c.db_ts) * 1e6
+                if ent["exlat_us"] and dt_us > ent["exlat_us"]:
+                    self.emit("T-14", "PS-EXIT", "warning", "timing",
+                              f"First command after the host set non-operational power state {self.cur_ps}: doorbell -> SQE fetch took "
+                              f"{dt_us:.1f} us, longer than that state's EXLAT {ent['exlat_us']} us (Identify Controller).",
+                              cmd=c, at=self.ev("doorbell", c.db_row, c.db_pkt, c.db_ts), related=["P-07", "C-07"])
+                self.cur_ps = None
         if wake is not None:
-            c.flags.append(f"wake:{wake['exit_us']:.1f}us@{wake['row']}")
-            c.wake = wake if False else None
+            c.flags.append(f"first command after L1 exit ({wake['exit_us']:.1f} us, row {wake['row']})")
             self._wake_of[(sqid, sqe.cid)] = wake
         key = (sqid, sqe.cid)
         prev = self.cmds.get(key)
@@ -1088,7 +1148,6 @@ class NvmeMixin:
             return 1
         return 0
 
-    _wake_of: dict = {}
 
     def validate_sqe(self, q: SQ, c: Cmd, s: nd.SQE):
         sqid = q.qid
@@ -1199,90 +1258,63 @@ class NvmeMixin:
         # PRP2 is a PRP list pointer
         need = -(-rem // P)
         c.prp_needed = need
-        c.prp_entries = []
+        c.prp_entries = 0          # data entries registered so far
+        c.prp_list_base = []       # list pages: [region, first_global_index, n_entries, chained]
         c.ranges_known = False
-        self.add_prp_list_region(c, p2, need)
+        self.add_prp_list_region(c, p2, need, 0)
 
-    def add_prp_list_region(self, c: Cmd, ptr, remaining_entries):
+    def add_prp_list_region(self, c: Cmd, ptr, remaining, gidx):
         P = self.page_size
         if ptr & 7:
             self.emit("V-17", "PRPL-PTR-ALIGN", "error", "protocol-state",
                       f"{c.name} CID 0x{c.cid:X}: PRP list pointer 0x{ptr:X} is not 8-byte aligned.", cmd=c)
+            ptr &= ~7
         fit = (P - (ptr % P)) // 8
-        n = remaining_entries if remaining_entries <= fit else fit
-        c.prp_list_base = ptr
-        c.regions.append(self.add_region(ptr, ptr + n * 8, "prpl", c, len(c.prp_entries) * 8))
+        chained = remaining > fit
+        n = fit if chained else remaining
+        r = self.add_region(ptr, ptr + n * 8, "prpl", c, 0)
+        c.regions.append(r)
+        c.prp_list_base.append([r, gidx, n, chained, set()])
 
     def prp_list_fetched(self, rec):
         c = rec.obj
-        if c.done or rec.buf is None:
+        if c.done or rec.buf is None or not isinstance(c.prp_list_base, list):
             return
         r = rec.extra
-        b = bytes(rec.buf)
-        P = self.page_size
-        base_idx = (r.boff + (rec.addr - r.start)) // 8
-        ents = c.prp_entries
-        for i in range(len(b) // 8):
-            v = struct.unpack_from("<Q", b, i * 8)[0]
-            idx = base_idx + i
-            while len(ents) <= idx:
-                ents.append(None)
-            ents[idx] = v
-        # walk what we have
-        if any(e is None for e in ents) or len(ents) == 0:
+        ent = next((x for x in c.prp_list_base if x[0] is r), None)
+        if ent is None:
             return
-        need = c.prp_needed
+        _, gidx, n, chained, seen = ent
+        P = self.page_size
+        b = bytes(rec.buf)
+        j0 = (rec.addr - r.start) // 8
         first = P - (c.sqe.prp1 % P)
-        boff = first
-        rem = c.nbytes - first
-        # entries used so far (chain-aware: if more needed than fit in a list page, last entry of the page is a pointer)
-        page_cap = (P - (c.prp_list_base % P)) // 8 if c.prp_list_base is not None else need
-        data_entries = []
-        i = 0
-        ptr_next = None
-        for i, e in enumerate(ents):
-            if len(data_entries) >= need:
-                break
-            if i == page_cap - 1 and need - len(data_entries) > 1 and len(ents) == page_cap:
-                ptr_next = e
-                break
-            data_entries.append(e)
-        for e in data_entries[len(getattr(c, "_prp_done", [])):] if False else data_entries:
-            pass
-        done_n = getattr(self, "_dummy", 0)
-        # register data regions for entries not registered yet
-        reg_count = sum(1 for x in c.regions if x.kind == c.regions[0].kind) - 1
-        start_i = max(0, reg_count - (1 if c.sqe.prp1 else 0) + 1) if False else len([x for x in c.regions if x.boff >= first])
-        for j in range(start_i, len(data_entries)):
-            e = data_entries[j]
-            if e % P:
+        kind = "dsm" if (c.opc == 0x09 and c.sqid) else "data"
+        for i in range(len(b) // 8):
+            j = j0 + i
+            if j >= n or j in seen:
+                continue
+            seen.add(j)
+            v = struct.unpack_from("<Q", b, i * 8)[0]
+            if chained and j == n - 1:
+                if v % P:
+                    self.emit("V-19", "PRPL-CHAIN-ALIGN", "error", "protocol-state",
+                              f"{c.name} CID 0x{c.cid:X}: chained PRP list pointer 0x{v:X} (last entry of a full list page) is "
+                              f"not page aligned.", cmd=c)
+                self.add_prp_list_region(c, v, c.prp_needed - (gidx + n - 1), gidx + n - 1)
+                continue
+            g = gidx + j
+            if v % P:
                 self.emit("V-17", "PRPL-ENTRY-OFFSET", "error", "protocol-state",
-                          f"{c.name} CID 0x{c.cid:X}: PRP list entry {j} = 0x{e:X} has a page offset; list entries must be page "
+                          f"{c.name} CID 0x{c.cid:X}: PRP list entry {g} = 0x{v:X} has a page offset; list entries must be page "
                           f"aligned ({P} B pages, {self.page_src}).", cmd=c, related=["S-12", "V-19"])
-            o = first + j * P
+            o = first + g * P
             ln = min(P, c.nbytes - o)
             if ln > 0:
-                c.regions.append(self.add_region(e, e + ln, "dsm" if c.opc == 0x09 and c.sqid else "data", c, o))
-        if ptr_next is not None:
-            c.prp_entries = ents[:page_cap - 1]
-            c.prp_needed = need
-            # continue the list on the next page
-            remaining = need - (page_cap - 1)
-            self._prp_chain(c, ptr_next, remaining, page_cap - 1)
-            return
-        if len(data_entries) >= need:
+                c.regions.append(self.add_region(v, v + ln, kind, c, o))
+                c.prp_entries += 1
+        if c.prp_entries >= c.prp_needed:
             c.ranges_known = True
-
-    def _prp_chain(self, c, ptr, remaining, done_entries):
-        P = self.page_size
-        if ptr % P:
-            self.emit("V-19", "PRPL-CHAIN-ALIGN", "error", "protocol-state",
-                      f"{c.name} CID 0x{c.cid:X}: chained PRP list pointer 0x{ptr:X} is not page aligned.", cmd=c)
-        fit = P // 8
-        n = min(remaining, fit)
-        c.prp_list_base = ptr
-        # extend the entries array so indexes continue
-        c.regions.append(self.add_region(ptr, ptr + n * 8, "prpl", c, done_entries * 8))
 
     def check_trunc(self, c, addr):
         if addr >= 1 << 48:
@@ -1375,6 +1407,12 @@ class NvmeMixin:
                           f"I/O timer expired (or a tool aborted it).", cmd=tgt, related=["T-22", "T-09"],
                           evidence=[self.ev_here("Abort SQE")], metrics={"outstanding_ms": round(age * 1e3, 3)})
             self.aborts.append([c, tsq, tcid, None])
+            acl = self.ctrl_info.get("acl")
+            pend = sum(1 for a in self.aborts if a[3] is None)
+            if acl is not None and pend > acl + 1:
+                self.emit("C-21", "ABORT-LIMIT", "warning", "protocol-state",
+                          f"{pend} Abort commands outstanding at once; Identify Controller ACL allows {acl + 1}: the controller may answer "
+                          f"Abort Command Limit Exceeded and the host must defer aborts.", cmd=c, related=["S-33", "C-14"], side="H")
 
     def validate_create(self, c: Cmd, s: nd.SQE):
         is_sq = s.opc == 0x01
@@ -1416,8 +1454,20 @@ class NvmeMixin:
         if c.sqid == 0:
             return
         o = s.opc
+        st = self.io_stats
         if o == 0x01:
             self.writes_since_flush += c.nbytes
+            st["writes"] += 1
+            st["write_bytes"] += c.nbytes
+            if nd.fua(c.sqid, s):
+                st["fua"] += 1
+            lba = self.ns_info.get(c.nsid, {}).get("lba_size", self.lba_size)
+            if c.slba is not None and ((c.slba * lba) % 4096 or c.nbytes % 4096):
+                st["misaligned_writes"] += 1
+        elif o == 0x02:
+            st["read_bytes"] += c.nbytes
+        elif o == 0x00:
+            st["flush"] += 1
         elif o == 0x09 and (s.cdw11 >> 2) & 1:
             self.dsm_ranges += (s.cdw10 & 0xFF) + 1
             c.flags.append("deallocate")
@@ -1494,6 +1544,9 @@ class NvmeMixin:
         # ---- match the command
         key = (sqid, cid)
         c = self.cmds.get(key)
+        if c is not None and c.cqe_ts is not None:
+            self.recent_done[key] = c
+            c = None
         if c is None or c.done:
             alt = None
             for sq in self.sqs.values():
@@ -1629,7 +1682,7 @@ class NvmeMixin:
         lim = self.cfg.admin_timeout_s if c.sqid == 0 else self.cfg.io_timeout_s
         if lat > lim and not c.timeout_flag and not (c.sqid == 0 and c.opc in nd.LONG_LIVED_ADMIN):
             c.timeout_flag = True
-            self.emit("T-23" if c.sqid == 0 else "T-22", "LATE-COMPLETION", "error", "timeout",
+            self.emit(("T-11" if c.opc == 0x80 else "T-23") if c.sqid == 0 else "T-22", "LATE-COMPLETION", "error", "timeout",
                       f"{c.name} SQ{c.sqid} CID 0x{c.cid:X} completed {lat:.3f} s after its doorbell, beyond the "
                       f"{'admin' if c.sqid == 0 else 'I/O'} timeout of {lim:g} s (configurable; Linux default): the host has most likely "
                       f"already aborted or reset.", cmd=c, related=["T-01", "C-14"] + (["T-11"] if c.opc == 0x80 and c.sqid == 0 else []),
@@ -1707,6 +1760,25 @@ class NvmeMixin:
                 self.acre = bool(s.cdw11 & 1)       # Host Behavior Support: data buffer; ACRE is byte 0 of the buffer
             elif fid == 0x0D:
                 self.hmb_enabled = bool(s.cdw11 & 1)
+        elif o == 0x10 and (ok or (status >> 8 & 7, status & 0xFF) in nd.SUCCESS_LIKE):
+            mtfa = self.ctrl_info.get("mtfa")
+            lat = self.now - (c.db_ts if c.db_ts is not None else c.fetch_ts)
+            ca = (s.cdw10 >> 3) & 7
+            if mtfa and ca == 3 and lat > mtfa * 0.1:
+                self.emit("T-10", "FW-ACTIVATE-SLOW", "error", "timeout",
+                          f"Firmware Commit with immediate activation (CA=3) took {lat:.3f} s; Identify Controller MTFA allows "
+                          f"{mtfa * 0.1:.1f} s.", cmd=c, related=["C-12", "S-41"], metrics={"latency_s": round(lat, 6)})
+            self.fw_commit = (self.now, self.ctrl_info.get("fr"), self.ev_here("Firmware Commit CQE"))
+        elif o == 0x80 and ok and self.verify is not None:
+            self.preformat.update(self.verify)
+            self.verify.clear()
+        elif o == 0x7C and ok:
+            self.emit("V-12", "SHADOW-DB", "info", "protocol-state",
+                      "Doorbell Buffer Config completed: from now on the host may update shadow doorbells in host memory instead of the "
+                      "MMIO doorbells, so doorbell-based pairing can miss submissions (partly visible: only the device's DMA reads of the "
+                      "shadow buffer are on the link).", cmd=c)
+        elif o == 0x09 and ok and (s.cdw10 & 0xFF) == 0x02:
+            self.cur_ps = s.cdw11 & 0x1F
         elif o == 0x08 and ok:
             for a in self.aborts:
                 if a[0] is c:
@@ -1739,6 +1811,20 @@ class NvmeMixin:
                     info["mtfa"] = struct.unpack_from("<H", b, 270)[0]
                 if len(b) >= 92:
                     info["rtd3e"] = struct.unpack_from("<I", b, 88)[0]
+                if len(b) >= 3072:
+                    ps = []
+                    for i in range(32):
+                        o_ = 2048 + 32 * i
+                        ps.append({"nops": bool(b[o_ + 3] & 2), "enlat_us": struct.unpack_from("<I", b, o_ + 4)[0],
+                                   "exlat_us": struct.unpack_from("<I", b, o_ + 8)[0]})
+                    info["ps"] = ps
+                fc = self.fw_commit
+                if fc is not None and fc[1] and info.get("fr") == fc[1] and self.resets and self.resets[-1][0] > fc[0]:
+                    self.emit("D-26", "FW-NOT-ACTIVATED", "warning", "protocol-state",
+                              f"Identify Controller after the Firmware Commit (row {fc[2]['row']}) and a controller reset still reports "
+                              f"firmware revision '{fc[1]}': the new image is not running (partly visible: check the Firmware Slot log "
+                              f"and the commit action used).", cmd=c, evidence=[fc[2]], related=["S-92", "S-40"])
+                    self.fw_commit = None
                 self.ctrl_info.update(info)
                 if not self.cfg.mdts_bytes and "mdts" in info:
                     m = info["mdts"]
@@ -1774,6 +1860,23 @@ class NvmeMixin:
                         self.emit(card, "SMART-WARN", "warning", "status-code",
                                   f"SMART / Health log read by the host shows critical warning bit {bit}: {nm} (critical_warning=0x{cw:02X}).",
                                   cmd=c)
+            elif lid == 0x06 and len(b) >= 32:
+                for i in range(min(20, (len(b) - 4) // 28)):
+                    res = b[4 + 28 * i] & 0xF
+                    if res == 0xF:
+                        break
+                    if res not in (0, 1, 2):
+                        names = {3: "aborted by a format", 4: "fatal error / unknown", 5: "failed segment unknown",
+                                 6: "one or more segments failed", 7: "aborted for unknown reason", 8: "aborted by sanitize"}
+                        self.emit("S-88", "SELFTEST-FAIL", "warning", "status-code",
+                                  f"Device Self-test log entry {i} result code {res} ({names.get(res, 'failure')}).", cmd=c)
+                        break
+            elif lid == 0x81 and len(b) >= 4:
+                sstat = struct.unpack_from("<H", b, 2)[0]
+                if sstat & 7 == 3:
+                    self.emit("S-89", "SANITIZE-FAIL", "warning", "status-code",
+                              f"Sanitize Status log: SSTAT=0x{sstat:04X}, the most recent sanitize operation failed.", cmd=c,
+                              related=["S-18", "D-18"])
             elif lid == 0x03 and len(b) >= 1:
                 afi = b[0]
                 if afi >> 4 & 7:
@@ -1855,6 +1958,11 @@ class NvmeMixin:
                         return
                     continue
                 w = self.verify.get(l)
+                if w is None and l in self.preformat and self.preformat[l][0] == h and any(blk):
+                    self.emit("D-20", "FORMAT-OLD-DATA", "error", "data-integrity",
+                              f"Read of LBA {l} after a successful Format NVM returned exactly the data written before the format "
+                              f"(write doorbell row {self.preformat[l][1]}).", cmd=c, related=["D-18", "D-19"])
+                    return
                 if w is not None and w[0] != h:
                     self.emit("D-15", "READ-MISMATCH", "error", "data-integrity",
                               f"Read of LBA {l} ({c.name} CID 0x{c.cid:X}) returned data that differs from the last write captured to it "
@@ -1895,6 +2003,8 @@ class NvmeMixin:
                 c.msix_ts, c.msix_row, c.msix_pkt = ts, row, pkt
 
     def on_msix(self, a, data, attr):
+        if self.counts_nvme["msix"]:
+            self.msix_periodic()
         self.counts_nvme["msix"] += 1
         b = self.payload(data)
         dv = struct.unpack_from("<I", b, 0)[0] if len(b) >= 4 else None
@@ -2209,21 +2319,30 @@ class NvmeMixin:
     def nvme_finish(self):
         end = self.t_last if self.t_last is not None else self.now
         self.msix_periodic()
-        # slots rung but never fetched
+        # slots rung but never fetched (one finding per queue: later slots of the same queue are stuck behind it)
         for q in self.sqs.values():
             for s, p in list(q.slots.items()):
-                age = end - p[0]
-                if age * 1e3 > self.cfg.pending_min_ms:
-                    c = Cmd(q.qid, s)
-                    c.db_ts, c.db_row, c.db_pkt, c.qd_sq, c.qd_all, c.link = p[0], p[1], p[2], p[3], p[4], p[5]
-                    c.name = f"(unfetched SQ{q.qid} slot {s})"
-                    lim = self.cfg.admin_timeout_s if q.qid == 0 else self.cfg.io_timeout_s
-                    card = ("T-23" if q.qid == 0 else "T-22") if age > lim else ("C-08" if q.qid == 0 else "T-01")
-                    self.emit(card, "NEVER-FETCHED", "error", "timeout",
-                              f"SQ{q.qid} slot {s} was made visible by the tail doorbell at row {p[1]} but the device never fetched it "
-                              f"({age * 1e3:.1f} ms until the end of the trace).", at=self.ev("doorbell", p[1], p[2], p[0]),
-                              cmd=c, related=["T-01", "V-01"], metrics={"age_ms": round(age * 1e3, 3)})
+                if (end - p[0]) * 1e3 > self.cfg.pending_min_ms:
+                    self.stale_slot(q, s, p, end)
                     break
+        self._nvme_finish_cmds(end)
+
+    def stale_slot(self, q, s, p, end, reused=False):
+        age = end - p[0]
+        c = Cmd(q.qid, s)
+        c.db_ts, c.db_row, c.db_pkt, c.qd_sq, c.qd_all, c.link = p[0], p[1], p[2], p[3], p[4], p[5]
+        c.name = f"(unfetched SQ{q.qid} slot {s})"
+        lim = self.cfg.admin_timeout_s if q.qid == 0 else self.cfg.io_timeout_s
+        card = ("T-23" if q.qid == 0 else "T-22") if age > lim else ("C-08" if q.qid == 0 else "T-01")
+        how = (f"the device's SQE fetch (row {p[7][1]}) was never completed by the host" if len(p) > 7 else
+               "the device never fetched it")
+        self.emit(card, "NEVER-FETCHED", "error", "timeout",
+                  f"SQ{q.qid} slot {s} was made visible by the tail doorbell at row {p[1]} but {how}; the command can never run "
+                  f"({age * 1e3:.1f} ms " + ("later the host reused the slot)." if reused else "until the end of the trace)."),
+                  at=self.ev("doorbell", p[1], p[2], p[0]), cmd=c, related=["T-01", "V-01", "V-05"],
+                  metrics={"age_ms": round(age * 1e3, 3)})
+
+    def _nvme_finish_cmds(self, end):
         for c in list(self.cmds.values()):
             if c.done:
                 continue
@@ -2254,6 +2373,24 @@ class NvmeMixin:
             self.emit("P-08", "IRQ-STORM", "warning", "performance",
                       f"{m} MSI-X messages for {cq} CQEs ({m / cq:.1f} per completion): interrupt storm or coalescing misconfiguration.",
                       at=self.ev("end of trace", self.row, None, end))
+        st = self.io_stats
+        if self.reset_had_ioq is not None and not any(q > 0 for q in self.sqs) and end - self.reset_had_ioq[0] > 1.0:
+            self.emit("C-20", "NO-IOQ-AFTER-RESET", "warning", "protocol-state",
+                      f"The controller was reset at row {self.reset_had_ioq[1]['row']} while I/O queues existed, and no I/O queue was "
+                      f"created again in the remaining {end - self.reset_had_ioq[0]:.2f} s of the capture.", at=self.reset_had_ioq[1],
+                      related=["C-17", "T-25"])
+        if st["writes"] >= 100 and self.ctrl_info.get("vwc") is not None and not (self.ctrl_info["vwc"] & 1):
+            r = (st["flush"] + st["fua"]) / st["writes"]
+            if r > 0.1:
+                self.emit("P-14", "FLUSH-HEAVY", "info", "performance",
+                          f"{st['flush']} Flush and {st['fua']} FUA writes for {st['writes']} writes ({r * 100:.0f} %) on a drive whose "
+                          f"Identify Controller VWC says it has no volatile write cache: the flushes buy nothing and cost latency.",
+                          at=self.ev("end of trace", self.row, None, end), side="H")
+        if st["writes"] >= 100 and st["misaligned_writes"] / st["writes"] > 0.2:
+            self.emit("P-13", "MISALIGNED-WRITES", "info", "performance",
+                      f"{st['misaligned_writes']} of {st['writes']} writes ({st['misaligned_writes'] / st['writes'] * 100:.0f} %) are not "
+                      f"4 KiB aligned or not a multiple of 4 KiB: likely read-modify-write inside the SSD (partly visible: the internal "
+                      f"mapping unit is not on the wire).", at=self.ev("end of trace", self.row, None, end), side="H")
         if self.ctrl_info.get("hmpre") and not self.hmb_enabled and self.counts_nvme["completed"] > 100:
             self.emit("T-16", "HMB-MISSING", "info", "performance",
                       f"Identify Controller reports HMPRE={self.ctrl_info['hmpre']} (the drive wants a Host Memory Buffer) but no Set "

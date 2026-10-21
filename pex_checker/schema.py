@@ -209,11 +209,21 @@ def direction(s: str) -> str:
     return ""
 
 
+_HEX_TOKEN = re.compile(r"\b(?:0x[0-9a-f]+|[0-9a-f]*\d[0-9a-f]*)\b")
+_BAD_WORD = re.compile(r"bad|err|invalid|fail|mismatch|incorrect|wrong")
+
+
 def is_bad(cell: str) -> bool:
+    """'0x1234ABCD (Bad)', 'Bad', 'Error', 'CRC mismatch' -> True.  Pure hex values such as 0x6446BADA -> False."""
     if not cell:
         return False
-    t = cell.lower()
-    return "bad" in t or "err" in t or "invalid" in t or "fail" in t or "mismatch" in t
+    if " " not in cell and "(" not in cell:
+        t = cell.lower()
+        if t.startswith("0x") or (all(ch in "0123456789abcdef" for ch in t) and any(ch.isdigit() for ch in t)):
+            return False
+        return bool(_BAD_WORD.search(t))
+    t = _HEX_TOKEN.sub(" ", cell.lower())
+    return bool(_BAD_WORD.search(t))
 
 
 def truthy(cell: str) -> bool:

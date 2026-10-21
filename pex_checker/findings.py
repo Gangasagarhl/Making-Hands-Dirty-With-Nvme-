@@ -100,10 +100,13 @@ class FindingsMixin:
         self.card_counts[card] += 1
         if SEV_ORDER.get(severity, 2) < SEV_ORDER.get(self.card_sev.get(card, "info"), 2) or card not in self.card_sev:
             self.card_sev[card] = severity
-        if self.card_counts[card] > self.max_per_card:
+        if self.card_counts[card] > (self.cfg.max_per_card_info if severity == "info" else self.max_per_card):
             self.suppressed[card] += 1
             return None
         A = atlas()
+        sub = None
+        if category == "data-integrity":
+            category, sub = "protocol-state", "data-integrity"
         if at is None:
             at = self.ev_here("finding")
         evidence = evidence or []
@@ -114,7 +117,7 @@ class FindingsMixin:
         f = {
             "id": self._fid,
             "card_id": card, "card_name": A.name(card), "visibility": A.visibility(card), "rule": rule,
-            "category": category, "severity": severity,
+            "category": category, "subcategory": sub, "severity": severity,
             "fault_side": SIDE_NAMES.get(sd, sd), "fault_side_code": sd,
             "pkt": at["pkt"], "row": at["row"], "timestamp": at["ts"],
             "what": what,

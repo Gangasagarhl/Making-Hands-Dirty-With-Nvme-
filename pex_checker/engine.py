@@ -81,6 +81,7 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
         self.dllp_cache = {}
         self.counts = Counter()
         self.tlp_types = Counter()
+        self.tlp_kind_n = [0] * 12
         self.cpl_hist = LogHist()
         self.mps = self.cfg.mps
         self.mps_src = "cli" if self.cfg.mps else ""
@@ -156,9 +157,9 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
     # ================================================================================================ main loop
     def run(self, path: str, quiet=False):
         reader = TraceReader(path)
-        rows = reader.rows()
+        blocks = reader.blocks()
         try:
-            first = next(rows)
+            first = next(blocks)
         except StopIteration:
             first = None
         self.header = reader.header
@@ -178,19 +179,22 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
         self.use_delta = "time" in self.missing_cols and "delta" not in self.missing_cols
         self.width = width
         self.reader = reader
+        self.rows_total = 0
+        self.i_crc16 = self.ix["crc16"]
+        self.i_acknak = self.ix["acknak"]
         prog = Progress(reader, "pass 1", self.cfg.progress_every_s, quiet=quiet)
         self.t_start_wall = time.time()
         if first is not None:
-            self._loop(self._chain(first, rows), prog)
+            self._loop(self._chain(first, blocks), prog)
         self.finish()
-        prog.done(self.row)
+        prog.done(self.rows_total)
         self.wall_s = time.time() - self.t_start_wall
         return self
 
     @staticmethod
-    def _chain(first, rows):
+    def _chain(first, blocks):
         yield first
-        yield from rows
+        yield from blocks
 
     def _detect_time_unit(self, s: str):
         cu = self.cfg.time_unit
@@ -228,9 +232,15 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
         acc_t = 0.0
         next_periodic = 4096
         n = 0
-        tick_every = 65536
-        for row, f in rows:
+        row = 0
+        delim = self.reader.delimiter
+        on_tlp, on_dllp, on_os, on_event = self.on_tlp, self.on_dllp, self.on_os, self.on_event
+        ack_fast = self.on_ack_fast
+        for blk in rows:
+          for rec in blk:
+            row += 1
             n += 1
+            f = rec.split(delim) if rec.__class__ is str else rec
             nf = len(f)
             if nf == width:
                 f.append("")
@@ -299,24 +309,26 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
                 dcache[d] = dd
             t = f[i_tlp]
             if t:
-                self.on_tlp(f, dd, t)
+                on_tlp(f, dd, t)
             else:
                 t = f[i_dllp]
                 if t:
-                    self.on_dllp(f, dd, t)
+                    if t == "Ack":
+                        ack_fast(f, dd)
+                    else:
+                        on_dllp(f, dd, t)
                 else:
                     t = f[i_os]
                     if t:
-                        self.on_os(f, dd, t)
+                        on_os(f, dd, t)
                     else:
                         t = f[i_ev]
                         if t:
-                            self.on_event(f, dd, t)
+                            on_event(f, dd, t)
             if n >= next_periodic:
                 next_periodic = n + 4096
                 self.periodic()
-                if n % tick_every < 4096:
-                    prog.tick(n)
+                prog.tick(n)
         self.rows_total = n
         self.t_last = self.now
 
@@ -326,8 +338,9 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
         psn_s = f[ix["psn"]]
         psn = S.autoint(psn_s) if psn_s else -1
         lc = f[ix["lcrc"]]
-        bad = bool(lc) and S.is_bad(lc)
-        self.saw_dl_traffic(d)
+        bad = bool(lc) and ("(" in lc or " " in lc or not lc.startswith("0x")) and S.is_bad(lc)
+        if self.ltssm != "L0":
+            self.enter_l0()
         if not self.dll_tlp(d, psn, bad):
             return
         self.tlp_accepted(f, d)
@@ -335,16 +348,26 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
     def tlp_accepted(self, f, d):
         ix = self.ix
         ttext = f[ix["tlp_type"]]
-        k = self.tcache.get(ttext)
-        if k is None:
+        tc = self.tcache.get(ttext)
+        if tc is None:
             k = S.classify_tlp(ttext)
-            self.tcache[ttext] = k
-        self.tlp_types[S.TLP_NAMES[k]] += 1
+            fct = "P" if k in S.POSTED else ("NP" if k in S.NON_POSTED else ("CPL" if k in S.COMPLETIONS else None))
+            dat = k in (S.MWR, S.MSGD, S.CPLD) or (k in S.NON_POSTED and k in S.WITH_DATA)
+            tc = self.tcache[ttext] = (k, fct, dat)
+        k, fct, dat = tc
+        self.tlp_kind_n[k] += 1
         ls = f[ix["length"]]
-        length = S.autoint(ls) if ls else 0
-        if length < 0:
+        if ls:
+            try:
+                length = int(ls)
+            except ValueError:
+                length = S.autoint(ls)
+                if length < 0:
+                    length = 0
+        else:
             length = 0
-        if f[ix["ep"]] and S.truthy(f[ix["ep"]]):
+        ep = f[ix["ep"]]
+        if ep and ep != "0" and S.truthy(ep):
             self.on_poisoned(k, d)
         ec = f[ix["ecrc"]]
         if ec and S.is_bad(ec):
@@ -352,12 +375,10 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
                       f"{ttext.strip()} {self.dname(d)} with a bad ECRC (TLP Digest mismatch: '{ec.strip()}'): corrupted inside a "
                       f"component after the link CRC was checked.", related=["L-19"], side="L")
         # flow-control consumption by the transmitter of this TLP
-        if k in S.POSTED:
-            self.fc_consume(d, "P", length * 4 if k != S.MSG else 0)
-        elif k in S.NON_POSTED:
-            self.fc_consume(d, "NP", length * 4 if k in S.WITH_DATA else 0)
-        elif k in S.COMPLETIONS:
-            self.fc_consume(d, "CPL", length * 4 if k == S.CPLD else 0)
+        if fct is not None:
+            st = self.fc[d][fct]
+            if st is not None and st["synced"]:
+                self.fc_consume(d, fct, length * 4 if dat else 0)
         data = f[ix["data"]]
         if k in (S.MWR, S.CPLD, S.MSGD) and length:
             self.check_payload(k, d, length, data, ttext)
@@ -382,6 +403,8 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
                       f"({self.mps_src}): the receiver must treat it as a Malformed TLP.",
                       related=["L-18", "L-32"], metrics={"payload_bytes": nbytes, "mps": mps}, side=side)
         if data:
+            if len(data) == nbytes * 3 - 1 and data[2:3] == " ":
+                return
             shown = S.payload_len(data)
             if shown > 0:
                 if shown > self.data_cap:
@@ -936,11 +959,6 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
             self._l32 = True
             self.emit("L-32", "MPS-CAP", "error", "protocol-state",
                       f"Max_Payload_Size programmed to {self.mps} B but the SSD's Device Capabilities supports only {sup} B.", side="H")
-        if sup >= 256 and self.mps == 128 and not getattr(self, "_p12", False):
-            self._p12 = True
-            self.emit("P-12", "MPS-SMALL", "info", "performance",
-                      f"Max_Payload_Size is 128 B although the SSD supports {sup} B: every 4 KiB read needs 32 TLPs instead of "
-                      f"{4096 // sup}; check the root port's capability and the OS MPS policy.", side="H")
 
     def link_cap_l1_exit_us(self):
         lc = getattr(self, "linkcap", None)
@@ -1005,6 +1023,13 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
         self.link_finish()
 
     def link_finish(self):
+        dc = getattr(self, "devcap", None)
+        if dc is not None and self.mps == 128 and self.mps_src != "cli" and (128 << (dc & 7)) >= 256:
+            sup = 128 << (dc & 7)
+            self.emit("P-12", "MPS-SMALL", "info", "performance",
+                      f"Max_Payload_Size ended at 128 B although the SSD supports {sup} B: every 4 KiB read needs 32 TLPs instead of "
+                      f"{4096 // min(sup, 4096)}; check the root port's capability and the OS MPS policy.", side="H",
+                      at=self.ev("end of trace", self.row, None, self.now))
         # trained below capability (L-25 / P-11)
         cur_rate = self.speed or (getattr(self, "linksta", (0, 0))[0])
         cur_w = self.width or (getattr(self, "linksta", (0, 0))[1])
@@ -1026,6 +1051,10 @@ class Engine(FindingsMixin, LinkMixin, NvmeMixin):
                       f"was seen as capable ({', '.join(src)}). Check the root port's LnkCap too: the trace shows only this link.",
                       related=["P-11", "X-09", "X-13"], metrics={"final_gts": cur_rate, "final_width": cur_w,
                                                                  "capable_gts": cap_rate, "capable_width": cap_w})
+        if self.bar_probe and 0 not in self.bars:
+            self.emit("L-31", "BAR-UNASSIGNED", "warning", "protocol-state",
+                      f"BAR{min(self.bar_probe)} was sized (all-ones written) but never assigned an address in this capture.",
+                      at=self.ev("end of trace", self.row, None, self.now), side="H")
         if not self.l0_seen and self.training_t0 is not None and self.t_last is not None:
             dur = (self.t_last - self.training_t0) * 1e3
             self.emit("L-39", "NO-L0", "error", "link-layer",

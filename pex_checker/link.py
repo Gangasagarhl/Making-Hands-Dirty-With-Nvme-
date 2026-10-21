@@ -212,7 +212,7 @@ class LinkMixin:
     def on_replay(self, d, psn, e):
         ts = self.now
         ln = self.last_nak[d]
-        nak_driven = ln is not None and ts - ln[0] < 2e-4
+        nak_driven = ln is not None and ln[0] >= e[0] and ts - ln[0] < 2e-5
         ep = self.replay_ep[d]
         orig = self.ev(f"original transmission of PSN {psn}", e[3], self.pkt_of_row(e[3]), e[0])
         if ep is not None and ts - ep[1] < 2e-5:
@@ -232,8 +232,8 @@ class LinkMixin:
             else:
                 age_us = (ts - e[0]) * 1e6
                 fnd = self.emit("T-35", "REPLAY-TIMER", "warning", "link-layer",
-                                f"{self.dname(d)} transmitter re-sent PSN {psn} {age_us:.2f} us after the original with no Nak in "
-                                f"the previous 200 us: the replay timer expired because no Ack arrived in time.",
+                                f"{self.dname(d)} transmitter re-sent PSN {psn} {age_us:.2f} us after the original with no Nak since "
+                                f"the original transmission: the replay timer expired because no Ack arrived in time.",
                                 evidence=[orig], related=["L-05", "V-35", "T-37"],
                                 metrics={"psn": psn, "us_since_original": round(age_us, 3)}, side="L")
                 self.replay_ep[d] = [ts, ts, 1, fnd, "timer", self.ev_here("replay")]
@@ -271,6 +271,33 @@ class LinkMixin:
             return
         if kind == S.D_PM:
             self.on_pm_dllp(d, text)
+
+    def on_ack_fast(self, f, d):
+        if self.ltssm != "L0":
+            self.enter_l0()
+        crc = f[self.i_crc16]
+        if crc and ("(" in crc or " " in crc) and S.is_bad(crc):
+            self.on_dllp(f, d, "Ack")
+            return
+        s = f[self.i_acknak]
+        try:
+            seq = int(s)
+        except ValueError:
+            seq = S.autoint(s)
+            if seq < 0:
+                return
+        td = "U" if d == "D" else "D"
+        ua = self.unacked[td]
+        # common case: the Ack covers exactly the one outstanding TLP, which was transmitted once
+        if len(ua) == 1 and ua[0][0] == seq:
+            e = self.psn_tab[td][seq]
+            if e is not None and e[1] == 1:
+                lat_us = (self.now - ua[0][1]) * 1e6
+                if lat_us <= self.cfg.ack_latency_us:
+                    ua.popleft()
+                    self.ack_hist[td].add(lat_us)
+                    return
+        self.on_acknak(td, seq, False, d)
 
     def on_acknak(self, td, seq, is_nak, sender):
         ts = self.now
@@ -562,7 +589,8 @@ class LinkMixin:
         self.ep_speed_before = self.speed
         self.ep_eq = False
         rt = self.recovery_times
-        rt.append(ts)
+        if self.nvme_active:
+            rt.append(ts)
         win = self.cfg.recovery_storm_window_s
         while rt and ts - rt[0] > win:
             rt.popleft()

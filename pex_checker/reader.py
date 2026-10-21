@@ -52,15 +52,22 @@ class TraceReader:
         self.header = [h.replace("﻿", "").strip() for h in self.header]
 
     # ------------------------------------------------------------------------------------------- iteration
-    def rows(self):
-        """Generator of (row_no, fields).  Constant memory."""
+    def blocks(self):
+        """Generator of lists of records.  A record is either an unsplit line (str, no quote characters) or an already
+        split list of fields (quoted lines).  Empty lines are dropped.  Constant memory (one block at a time)."""
         self._sniff()
         if self.encoding == "utf-16":
-            yield from self._rows_text()
+            buf = []
+            for _, fields in self._rows_text():
+                buf.append(fields)
+                if len(buf) >= 50000:
+                    yield buf
+                    buf = []
+            if buf:
+                yield buf
             return
         delim = self.delimiter
         skip = self.header_line_no + 1
-        row_no = 0
         pending = None          # accumulated text of a quoted record spanning lines
         with open(self.path, "rb") as f:
             rest = b""
@@ -68,11 +75,9 @@ class TraceReader:
             while True:
                 blk = f.read(self.block)
                 if not blk:
-                    if rest:
-                        lines = [rest]
-                        rest = b""
-                    else:
+                    if not rest:
                         break
+                    chunk, rest = rest, b""
                 else:
                     blk = rest + blk
                     cut = blk.rfind(b"\n")
@@ -80,17 +85,27 @@ class TraceReader:
                         rest = blk
                         continue
                     rest = blk[cut + 1:]
-                    lines = blk[:cut].split(b"\n")
+                    chunk = blk[:cut]
                 if first:
-                    if lines and lines[0].startswith(b"\xef\xbb\xbf"):
-                        lines[0] = lines[0][3:]
+                    if chunk.startswith(b"\xef\xbb\xbf"):
+                        chunk = chunk[3:]
                     first = False
                 self.bytes_done = f.tell() - len(rest)
-                text_lines = b"\n".join(lines).decode("utf-8", "replace").split("\n")
-                for line in text_lines:
-                    if skip:
-                        skip -= 1
-                        continue
+                text = chunk.decode("utf-8", "replace")
+                lines = text.split("\n")
+                if skip:
+                    n = min(skip, len(lines))
+                    del lines[:n]
+                    skip -= n
+                if pending is None and '"' not in text and "\r" not in text:
+                    if lines and not lines[-1]:
+                        lines.pop()
+                    if "\n\n" in text:
+                        lines = [x for x in lines if x]
+                    yield lines
+                    continue
+                out = []
+                for line in lines:
                     if line.endswith("\r"):
                         line = line[:-1]
                     if pending is not None:
@@ -98,22 +113,33 @@ class TraceReader:
                         if pending.count('"') % 2:
                             continue
                         line, pending = pending, None
-                    elif '"' in line:
-                        if line.count('"') % 2:
-                            pending = line
-                            continue
+                    elif '"' in line and line.count('"') % 2:
+                        pending = line
+                        continue
                     if not line:
                         continue
-                    row_no += 1
                     if '"' in line:
                         try:
-                            fields = next(csv.reader([line], delimiter=delim))
+                            out.append(next(csv.reader([line], delimiter=delim)))
                         except Exception:
-                            fields = line.split(delim)
-                        yield row_no, fields
+                            out.append(line.split(delim))
                     else:
-                        yield row_no, line.split(delim)
+                        out.append(line)
+                yield out
+            if pending is not None:
+                yield [pending.split(delim)]
             self.bytes_done = self.size
+
+    def rows(self):
+        """Generator of (row_no, fields)."""
+        delim = None
+        row_no = 0
+        for blk in self.blocks():
+            if delim is None:
+                delim = self.delimiter
+            for rec in blk:
+                row_no += 1
+                yield row_no, (rec.split(delim) if rec.__class__ is str else rec)
 
     def _rows_text(self):
         skip = self.header_line_no + 1

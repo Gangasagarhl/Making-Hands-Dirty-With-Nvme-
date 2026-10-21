@@ -29,6 +29,24 @@ Grounded in the Linux kernel v7.2 NVMe/PCI source, QEMU's NVMe controller model 
 themselves could not be downloaded here, so spec wording is paraphrased and unconfirmed items are tagged.
 Rebuild: `python3 atlas/build.py` (fragments in `atlas/src/`).
 
+# pex_checker: streaming checker for PEX trace CSV exports
+
+`pex_checker/` reads one Teledyne LeCroy `.pex` → CSV packet export (2–5 GB) in a single streaming pass with
+constant memory. It rebuilds every NVMe command from its packets (doorbell → SQE fetch → data → CQE → MSI-X). Each
+problem is reported with the packet, row and timestamp where it happened, why it happened, its category, its PEX
+Trace Error Atlas card, the likely fault side, and an nvme-cli command that reproduces it. The tool uses only the
+Python standard library.
+
+```
+python -m pex_checker TRACE.csv --out OUTDIR      # findings.jsonl, commands.csv, summary.json, report.html, coverage.md
+python -m pytest -q pex_checker/tests             # synthetic traces with injected faults, plus a clean trace
+```
+
+243 of the 326 atlas cards have their own rule, 34 are covered by a sibling rule, and 49 cannot be checked from a
+trace (each with a reason). Measured speed is about 100k rows/s (about 50 MB/s) on 2 cores, with a peak RSS of
+about 175 MB on a 1 GB synthetic export. See `pex_checker/README.md` for export settings, options, outputs, design
+and limits.
+
 
 
 # Commands to run
